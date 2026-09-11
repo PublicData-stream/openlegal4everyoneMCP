@@ -1,9 +1,13 @@
-# Planned Rust architecture
+# Rust architecture
 
 ## Status and decisions
 
-This is the architecture contract for backend bootstrap, not a description of
-existing Rust code. No crates, endpoints, storage engine, or CI workflow exist yet.
+The server foundation is implemented in `apps/server` as one library/binary package.
+It provides a startup tool registry and endpoint supervisor shared by Streamable HTTP
+and WebTransport adapters. The production binary requires both, plus a private
+health listener. Tests and CI exist. Legal-data domain, retrieval, normalization,
+providers and storage remain planned. The [server contract](server.md) owns the
+implemented extension interfaces and transport configuration.
 
 - Support multiple jurisdictions without imposing one provider's identity or
   date semantics on all records.
@@ -15,16 +19,16 @@ existing Rust code. No crates, endpoints, storage engine, or CI workflow exist y
 
 ## Proposed responsibility map
 
-All paths below are future locations. Introduce them with their implementations;
-do not create empty crates or placeholder directories merely to complete the map.
+Only `apps/server` currently exists. Introduce the other paths with their actual
+implementations; do not create empty crates or placeholder directories.
 
-| Future component | Responsibility | Project dependencies |
+| Component | Responsibility | Project dependencies |
 | --- | --- | --- |
 | `crates/domain` | Legal identifiers, records, date/revision representations, provenance, domain errors | No other project layer |
 | `crates/normalization` | Pure parsing and provider-specific normalization modules | Domain |
 | `crates/application` | Retrieval use cases, freshness decisions, refresh orchestration, coalescing and budgets; upstream/storage interfaces | Domain |
 | `crates/adapters` | Separate modules for upstream HTTP clients and cache-storage implementations | Application interfaces, domain, normalization |
-| `apps/server` | Composition/configuration loading, hosted MCP tool layer, later separate HTTP handler modules | Application and adapters |
+| `apps/server` (implemented) | Configuration, immutable tool registry/shared MCP handler, endpoint supervision, HTTP/WebTransport boundaries and private health | No project dependencies yet; future application/adapters only through composition |
 | `apps/cli` | Future CLI/admin commands and composition | Application and adapters; not server routing |
 
 Within adapters, keep each provider's transport and each storage implementation in
@@ -86,9 +90,13 @@ process must coordinate with the hosted backend or operate under an explicitly
 isolated maintenance procedure; it cannot silently run a second unbudgeted crawler.
 No public cache-bypass or unrestricted URL-fetching interface is implied here.
 
-Exact Rust traits, wire schemas, MCP SDK/transport details, HTTP framework, and
-authentication are backend implementation decisions. Propose and document these
-interfaces with the implementation and their applicable review evidence.
+The server uses rmcp, Axum/Hyper and wtransport; startup registration validates tool
+names/schemas and endpoint bindings before accepting traffic. Required endpoints
+share admission budgets and cancellation. Read-only modules are trusted Rust code,
+not dynamically loaded or sandboxed plugins. The [server contract](server.md)
+specifies the interfaces, supported revisions, framing and lifecycle. Authentication
+remains future work. The [OxiBelt integration](oxibelt.md) keeps TLS edge configuration
+and its pinned acceptance harness separate from application policy.
 
 ## Tests and fixtures
 

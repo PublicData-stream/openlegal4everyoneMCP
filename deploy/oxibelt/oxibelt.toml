@@ -1,0 +1,96 @@
+# Schema/source pin: 72564d165dfd05cb29a64aeebd19fccd7944ea6f.
+[config]
+strict_unknown_fields = true
+
+[logging]
+level = "warn"
+
+[runtime]
+linux_only = true
+read_only_rootfs_compatible = true
+memory_only_state = true
+unprivileged_mode = true
+worker_threads = 2
+
+[runtime.accept]
+workers = 1
+reuse_port = false
+
+[quic.socket]
+workers = 1
+reuse_port = false
+
+[runtime.hot_reload]
+mode = "off"
+
+[listeners]
+https_bind = "0.0.0.0:8443"
+http1 = true
+http2 = true
+http3 = true
+
+[tls]
+cert_chain = "edge.pem"
+private_key = "edge-key.pem"
+
+[tls.ocsp]
+mode = "disabled"
+
+[proxy]
+trusted_ca_certs = ["ca.pem"]
+
+[proxy.auto_upgrade]
+enabled = true
+max_http_version = "h3"
+
+[proxy.buffering]
+request = "streaming"
+response = "streaming"
+
+[compression]
+enabled = false
+
+[cache]
+enabled = false
+
+[waf]
+enabled = false
+
+[[upstreams]]
+name = "mcp-http"
+origin = "http://backend:8080"
+max_http_version = "h1"
+preserve_host = false
+connect_timeout_ms = 3000
+request_timeout_ms = 40000
+
+[[upstreams]]
+name = "mcp-webtransport"
+origin = "https://backend:4433"
+max_http_version = "h3"
+preserve_host = false
+webtransport = true
+connect_timeout_ms = 3000
+request_timeout_ms = 40000
+idle_timeout_ms = 65000
+
+[upstreams.tls.ech]
+mode = "disabled"
+
+[[routes]]
+name = "mcp-http"
+hosts = ["edge"]
+upstream = "mcp-http"
+compression = "off"
+[routes.match.path]
+exact = "/mcp"
+
+[[routes]]
+name = "mcp-webtransport"
+hosts = ["edge"]
+upstream = "mcp-webtransport"
+[routes.match]
+methods = ["CONNECT"]
+protocols = ["webtransport"]
+[routes.match.path]
+exact = "/mcp-wt/v1"

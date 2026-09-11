@@ -1,0 +1,35 @@
+[package]
+name = "openlegal-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = "0.8"
+futures = "0.3"
+http = "1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+jsonschema = { version = "0.56.0", default-features = false }
+rmcp = { version = "=3.3.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+wtransport = { version = "=0.7.2", default-features = false, features = ["ring", "quinn"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+tempfile = "3"

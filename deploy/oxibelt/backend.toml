@@ -1,0 +1,15 @@
+# Both transport listeners are reachable only on the private container network.
+[http]
+bind = "0.0.0.0:8080"
+allowed_hosts = ["backend:8080"]
+allowed_origins = ["https://example.test"]
+
+[webtransport]
+bind = "0.0.0.0:4433"
+certificate = "/fixture/cert/backend.pem"
+private_key = "/fixture/cert/backend-key.pem"
+allowed_hosts = ["backend:4433"]
+allowed_origins = ["https://example.test"]
+
+[health]
+bind = "0.0.0.0:9090"

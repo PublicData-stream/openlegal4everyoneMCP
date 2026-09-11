@@ -6,11 +6,12 @@
 product. It is intended to provide open legal-information infrastructure through
 a Rust backend, hosted MCP, and potentially a public HTTP API.
 
-At this governance bootstrap, the repository contains documentation and templates,
-but no Cargo workspace, runtime, tests, or CI. Verify the checkout before acting;
-do not report proposed components or future validation commands as implemented.
-The [architecture](docs/architecture.md) contains the planned responsibility map.
-Update this orientation when the backend is introduced.
+The repository implements a Rust server foundation in `apps/server`: pluggable
+read-only tools, Streamable HTTP, native WebTransport, tests, and CI. Legal-data
+providers, application retrieval/cache services and public deployment remain planned.
+Verify the checkout before acting. The [architecture](docs/architecture.md) separates
+implemented serving responsibilities from the future legal-data layers; the
+[server contract](docs/server.md) documents extensions, configuration and transports.
 
 ## Authoritative guidance
 

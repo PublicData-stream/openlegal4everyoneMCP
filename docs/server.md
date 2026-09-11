@@ -1,0 +1,152 @@
+# Server and extension contract
+
+The implemented foundation is one `apps/server` library/binary package. It serves
+anonymous read-only MCP tools over Streamable HTTP and WebTransport. Both adapters
+are required by the production binary. No provider, database, legal record, user
+account, or ChatGPT widget is implemented.
+
+## Configure and run
+
+The binary accepts one TOML configuration path. All tables below are required
+except `limits`; unknown fields are rejected. Generate certificates only for local
+fixtures, or supply operator-managed certificates for hosting.
+
+```toml
+[http]
+bind = "127.0.0.1:8080"
+allowed_hosts = ["127.0.0.1:8080"]
+allowed_origins = []
+
+[webtransport]
+bind = "127.0.0.1:4433"
+certificate = "certs/server.pem"
+private_key = "certs/server-key.pem"
+allowed_hosts = ["127.0.0.1:4433"]
+allowed_origins = []
+
+[health]
+bind = "127.0.0.1:9090"
+```
+
+```sh
+cargo run --locked -p openlegal-server -- server.toml
+```
+
+HTTP `/mcp` is private plaintext behind the TLS edge. WebTransport `/mcp-wt/v1`
+always uses TLS/QUIC. Both must bind successfully before readiness becomes true.
+Keep health `/live`, `/ready`, and `/metrics` private; they have no authentication.
+`/metrics` exposes aggregate tool call/failure counts, not request payloads.
+SIGINT/SIGTERM stop admission and drain the server. An unexpected required endpoint
+failure also stops the server. Shutdown deadline exhaustion is an error.
+
+The actual proxied configuration and reproducible native-client acceptance gate
+are in [OxiBelt integration](oxibelt.md). Browser and live ChatGPT behavior are
+unverified. To test ChatGPT manually, configure a developer-mode connection to a
+deployed HTTPS `/mcp` endpoint, inspect the listed `server_info` tool, and call it.
+The result must identify the server foundation without claiming legal retrieval.
+No plugin directory submission or deployment is automated here.
+
+## Rust extension API
+
+Construct `ToolRegistry`, register modules implementing `ToolModule`, and pass it
+to `ServerBuilder::new(registry, limits)`. Modules call
+`ToolRegistry::register::<Input, _, _>(name, description, handler)` where `Input`
+implements Serde deserialization and Schemars JSON Schema. The asynchronous handler
+receives typed input and `ToolContext`, returning `Result<Value, ToolError>`.
+`register_with_annotations` supplies accurate MCP annotations; only read-only
+modules are accepted by this anonymous foundation. Annotations are descriptive,
+not a sandbox or authorization mechanism.
+
+Registration validates object input schemas, names, descriptions, duplicate names,
+and registry size. Remote/file schema resolution is disabled. Each invocation
+validates its arguments against the registered schema before deserializing or
+calling a handler. Input errors remain protocol errors; not-found, unavailable,
+rate-limited, and internal execution failures are bounded structured tool errors
+with distinct codes. Raw implementation diagnostics never become tool errors.
+
+Use `ServerBuilder::register_endpoint` with an implementation of `Endpoint` to
+add a transport. Its binding declaration is checked before startup; `bind` returns
+a `BoundEndpoint` that owns its listeners and serving future. Dropping a bound
+endpoint must release its listeners. `EndpointContext` supplies the shared MCP
+handler, shutdown token, global admission semaphores and limits. Adapters must use
+these budgets before spawning request work, validate their boundary, and join
+their owned tasks during shutdown. The generic API does not require boxing an
+SDK transport trait object. Tests in `apps/server/tests/extensions.rs` exercise
+downstream endpoint implementations, conflicts and startup rollback.
+
+The registry is immutable once the server starts; no tool-list change events are
+advertised. Additional MCP resources, prompts, tasks, subscriptions, sampling and
+elicitation are not advertised. New Rust modules require rebuilding. Modules are
+trusted code: they must bound result construction, cooperate with cancellation,
+avoid detached tasks, and use shared application services for future legal-data
+operations. They cannot be sandboxed by a Rust trait or a serialized-byte limit.
+
+## Protocol compatibility
+
+Both adapters support `2026-07-28` and `2025-11-25`. Modern requests carry protocol
+version and client metadata per request; legacy clients initialize. HTTP uses SDK
+Streamable HTTP routing and JSON/SSE error/result translation. HTTP legacy mode
+is stateless: initialization works without issuing a persistent session ID. No
+standalone legacy HTTP+SSE listener, persistent event store or GET event stream is
+provided. HTTP protocol headers must be consistent with the body; missing or
+unsupported version headers are rejected except for legacy initialization.
+
+WebTransport binding v1 uses exactly one client-opened reliable bidirectional
+application stream per connection, UTF-8 JSON-RPC messages separated by LF (CRLF
+also accepted). Framing only is borrowed from stdio; it does not start a subprocess.
+An initialized legacy connection and modern per-request metadata are distinct
+lifecycles. Mixed-era traffic closes the connection without downgrade. The path
+versions the binding; it does not select the MCP revision. Application datagrams
+and additional application streams are rejected; HTTP/3 control streams remain
+available to the transport library.
+
+Request IDs cancel work through MCP cancellation notifications. Disconnect closes
+all connection work; cancellation suppresses late serialized responses. String IDs
+are limited to 128 bytes. Canceled IDs remain byte-accounted tombstones until
+reconnect, with at most `max_in_flight` tombstones, preventing late response/ID reuse
+ambiguity. Malformed framing, duplicate active/canceled IDs, overload, extra streams
+and exhausted tombstone capacity close the connection. Reconnect after closure;
+automatic request replay is not implemented.
+
+```sh
+cargo run --locked -p openlegal-server --example wt_client -- \
+  https://localhost:4433/mcp-wt/v1 certs/ca.pem 2026-07-28
+```
+
+An optional final argument supplies Origin. The reference client verifies TLS,
+lists tools and calls `server_info`; never disable certificate verification.
+
+## Resource and privacy defaults
+
+| Configuration under `[limits]` | Default |
+| --- | ---: |
+| `max_message_bytes` | 1,048,576 |
+| `max_buffer_bytes` | 67,108,864 |
+| `max_in_flight` | 64 |
+| `max_connections` | 128 |
+| `max_calls_per_connection` | 8 |
+| `io_timeout_secs` | 10 |
+| `call_timeout_secs` | 30 |
+| `idle_timeout_secs` | 60 |
+| `shutdown_timeout_secs` | 15 |
+
+Budgets are process-local and shared by both data transports. The buffering budget
+accounts for admitted application frames/bodies, with conservative HTTP copy
+reservations; it is not a bound on process RSS or arbitrary plugin allocations.
+TLS/QUIC, HTTP/2 and kernel buffers have separate finite limits. Registry discovery
+must fit in half a message. Tool output is preflighted before SDK serialization;
+structured values must fit one-eighth of a message, leaving room for its text copy,
+escaping and protocol metadata. Final serialized responses remain bounded.
+
+HTTP limits header parsing and socket write progress separately from tool work.
+An independent response watchdog closes the TCP connection after call plus I/O
+deadlines even if HTTP/2 flow control prevents body polling; other requests on that
+connection are also interrupted. Idle connections are retired. WebTransport bounds
+handshakes, partial frames, writes and connection idleness. Overload fails promptly
+without an unbounded waiting queue. Transport retirement is not proof that a
+misbehaving plugin detached no external work; that remains a module contract.
+
+Host allowlists are explicit. Native clients may omit Origin; an empty Origin
+allowlist rejects every present Origin. Forwarded headers do not establish identity.
+The server suppresses SDK payload logs, including when `RUST_LOG` is configured,
+and logs only bounded operational events. Public read-only tools need no secrets.

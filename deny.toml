@@ -1,0 +1,21 @@
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = false
+
+[advisories]
+unmaintained = "all"
+unsound = "all"
+
+[licenses]
+confidence-threshold = 0.93
+# Selected from the resolved graph; see docs/dependencies.md.
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
+         "MIT-0", "Unicode-3.0", "Zlib"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

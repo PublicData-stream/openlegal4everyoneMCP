@@ -1,7 +1,7 @@
 # Contributing to openlegal4everyoneMCP
 
 This repository develops **openlegal4everyone.stream**, open legal-information
-infrastructure with a planned Rust backend. Legal-data integrity and responsible
+infrastructure with a Rust MCP server foundation. Legal-data integrity and responsible
 upstream access are engineering requirements, not just documentation concerns.
 
 ## Policy ownership
@@ -40,10 +40,10 @@ not override higher-priority instructions, user scope, or execution permissions.
 5. Obtain required independent review and address findings before marking the
    change ready. Inspect the integrated diff, including new files and fixtures.
 
-At this bootstrap there is no Cargo workspace, Rust source, test suite, or CI.
-Use the documentation checks below now; Rust commands are future requirements.
-Do not add scaffolding, dependencies, live API requests, or repository settings
-merely because they appear in the proposed architecture.
+The Rust server foundation now lives in `apps/server`, with a committed workspace,
+lockfile, tests and CI. Legal-data application services and providers remain planned;
+do not create empty future crates or make live provider requests merely because
+they appear in the architecture.
 
 Use repository-relative paths in durable descriptions. Commands run from the
 repository root unless a different directory is explicitly stated. Keep local
@@ -115,10 +115,10 @@ git status --short
 `git diff` does not include untracked file contents: inspect newly added documents
 as well. Do not create Rust tests that merely assert policy wording or headings.
 
-### Future Rust baseline
+### Rust baseline
 
-After the workspace, lockfile, toolchain, and dependency policy exist, the baseline
-checks are:
+The baseline is Rust 1.98.1 on Linux x86_64 GNU, with both transports compiled
+together and no optional first-party features. Required checks are:
 
 ```sh
 cargo fmt --all -- --check
@@ -128,10 +128,11 @@ cargo audit
 cargo deny check
 ```
 
-These are not runnable project checks at this governance bootstrap. `cargo audit`
-and `cargo deny` are separately installed tools; bootstrap must document their
-versions/setup and advisory-data access. Distinguish an unavailable/stale advisory
-database from a successful current advisory check.
+Install `cargo-audit` 0.22.2 and `cargo-deny` 0.20.2 using the locked commands in
+[dependency admission](docs/dependencies.md). Both require current advisory-data
+access; unavailable/stale advisory data is not a successful current check.
+The separate `scripts/test-oxibelt.sh` Docker gate verifies both transports through
+the pinned edge and runs in CI. Ordinary Rust tests do not require Docker.
 
 Use focused tests while developing, then run the applicable workspace baseline
 before a Rust change is ready. Bootstrap must enumerate supported feature
@@ -184,9 +185,9 @@ capabilities exist.
 
 ## Secure development
 
-The current repository has no runtime attack surface. Apply these requirements
-when implementing or changing the planned boundaries; do not describe hypothetical
-authentication, tenancy, or deployments as existing features.
+The implemented HTTP and WebTransport boundaries accept untrusted input. Apply
+these requirements to their changes and to future providers; authentication, tenancy,
+and live deployment remain unimplemented unless explicitly introduced.
 
 | Boundary | Required consideration |
 | --- | --- |

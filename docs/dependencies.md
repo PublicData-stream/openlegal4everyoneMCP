@@ -1,0 +1,62 @@
+# Rust dependency admission
+
+Baseline: Rust 1.98.1, edition 2024, Linux x86_64 GNU. There is one supported
+production feature configuration: both transports are compiled together with
+the features in `apps/server/Cargo.toml`. No optional first-party features exist.
+Commit `Cargo.lock` and use locked resolution for builds and tests. Dependencies
+come from crates.io; unreviewed Git dependencies and registries fail `cargo deny`.
+
+## Direct dependencies and alternatives
+
+| Dependency | Purpose, choice and boundary considerations |
+| --- | --- |
+| rmcp 3.3.0 | Official MCP Rust SDK; handles both chosen revisions and HTTP protocol translation. Prefer its maintained protocol implementation over a new JSON-RPC stack. Public input reaches this code; host-level admission, strict Origin checks and bounded framing supplement its defaults. Disable its payload logging in the binary. Apache-2.0. |
+| wtransport 0.7.2 | Native WebTransport endpoint over Quinn/Rustls. Enables `ring` and `quinn` for TLS and explicit QUIC bounds; default self-signed and dangerous-configuration features remain off. Alternative lower-level H3/Quinn wiring would duplicate session mechanics. Upstream still cautions about production readiness; the pinned OxiBelt interoperability gate and independent boundary review are required, and broader deployment validation remains operator work. MIT OR Apache-2.0. |
+| Axum, Hyper, hyper-util | HTTP routing and serving. Hyper's connection APIs are used explicitly for header, stream and connection limits; the socket wrapper adds write deadlines. Axum-only defaults do not provide all required limits. MIT. |
+| Tokio, tokio-util, futures | Shared asynchronous runtime, cancellation, supervised tasks and stream adapters; mixing another executor would complicate task lifetimes. No Tokio process-spawning API is enabled by this application. MIT / Apache-2.0 alternatives in their manifests. |
+| Serde, serde_json, Schemars | Typed parameters, bounded serialization and schemas; handwritten schema copies risk drift. Derive macros execute only at build time. JSON nesting uses the parser's finite default recursion limit. MIT OR Apache-2.0. |
+| jsonschema 0.56 | Validate complete input constraints beyond Rust field types. HTTP/file reference resolution and TLS features are disabled; schemas are compiled once from trusted modules, never fetched from callers. Invalid/unresolved schemas fail startup. A limited handwritten validator would misrepresent JSON Schema support. MIT. |
+| http | HTTP vocabulary shared with the SDK stack; avoids incompatible representations and extra protocol conversions. MIT. |
+| TOML, url | Strict operator configuration and origin parsing. The URL parser normalizes origin tuples; raw string/prefix matching would be incorrect. MIT OR Apache-2.0. |
+| tracing, tracing-subscriber | Operational events and filtering; SDK payload logs are disabled regardless of the normal runtime log setting. MIT. |
+| rcgen, tempfile, reqwest (development only) | Isolated TLS fixtures, cleanup and native HTTP tests. Certificate generation uses ring; reqwest disables default features and uses Rustls. No production test certificates or live provider traffic. MIT / Apache-2.0 alternatives. |
+
+The listed versions are baseline anchors; exact versions and checksums for all
+dependencies live in the lockfile. Source review covered relevant installed SDK
+HTTP/lifecycle/framing code and wtransport's TLS/QUIC APIs. Updating a boundary
+dependency requires renewed relevant review and transport tests, not only a build.
+
+## License and build policy
+
+The initial resolved graph uses MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC,
+MIT-0, Unicode-3.0 and Zlib licenses (or expressions satisfiable by these choices).
+These are the explicit allowlist in `deny.toml`; no advisory or license exceptions
+are installed. Alternative-license expressions do not require accepting every
+offered license. Preserve license notices when distributing dependencies.
+
+First-party code denies unsafe Rust. Dependencies include unsafe implementation
+code, especially Tokio/socket layers and ring. Ring builds native C/assembly via
+its build script and needs a C compiler; this is an admitted cryptographic backend,
+not an exception permitting first-party unsafe. Procedural derives and ordinary
+platform/probing build scripts execute during Cargo builds. This is a package
+admission review, not a claim that every transitive line has been audited.
+
+Multiple transitive major versions are warnings, not blanket hidden exceptions:
+the initial graph includes base64 (SDK versus TLS helpers), getrandom (ring,
+schema hashing and current runtime dependencies), syn (derive ecosystems), and
+winnow (TOML parser dependencies). Check their callers when updates change the
+graph; do not force semver-incompatible replacements merely to erase a warning.
+
+## Required check tooling
+
+```sh
+cargo install cargo-audit --version 0.22.2 --locked
+cargo install cargo-deny --version 0.20.2 --locked
+cargo audit
+cargo deny check
+```
+
+Both advisory checks require access to the current RustSec advisory database.
+Unavailable or stale advisory data is not a passing current-advisory check.
+CI performs these on pushes, pull requests and a weekly schedule. Check commands
+and readiness requirements remain owned by [Contributing](../CONTRIBUTING.md).

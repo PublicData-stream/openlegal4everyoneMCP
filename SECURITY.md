@@ -17,10 +17,11 @@ Do not substitute a public issue, PR, discussion, or revealing commit.
 
 ## Development-stage support scope
 
-The repository currently contains governance documentation and templates. There
-are no supported released backend versions, official deployment artifacts, or
-verified hosted service in this repository yet. Security concerns in project code,
-defaults, documentation, and later dependencies as used by this project are relevant.
+The repository implements an anonymous HTTP/WebTransport MCP server foundation,
+with dependency checks and an isolated OxiBelt integration harness. No supported
+released backend version, production deployment artifact, or verified hosted
+service is established yet. Security concerns in code, defaults, dependencies as
+used by this project, and documentation are relevant.
 
 Maintain this scope when implementation or releases arrive. Do not infer release
 support windows, response-time guarantees, backports, or coverage of third-party

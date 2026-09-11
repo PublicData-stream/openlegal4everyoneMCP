@@ -1,0 +1,193 @@
+use futures::FutureExt;
+use openlegal_server::{
+    ServerBuilder, ServerError,
+    config::{AccessPolicy, Limits},
+    endpoint::{Binding, BoundEndpoint, Endpoint, EndpointContext, Network},
+    registry::{ToolError, ToolRegistry},
+};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio_util::sync::CancellationToken;
+
+struct ProbeEndpoint {
+    id: &'static str,
+    address: SocketAddr,
+    fail_bind: bool,
+    fail_run: bool,
+    fail_stop: bool,
+    drain_completed: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+struct OwnedListener {
+    _listener: tokio::net::TcpListener,
+    dropped: Arc<AtomicBool>,
+}
+impl Drop for OwnedListener {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+impl Endpoint for ProbeEndpoint {
+    fn id(&self) -> &str {
+        self.id
+    }
+    fn bindings(&self) -> Vec<Binding> {
+        vec![Binding {
+            network: Network::Tcp,
+            address: self.address,
+        }]
+    }
+    async fn bind(self, context: EndpointContext) -> Result<BoundEndpoint, ServerError> {
+        if self.fail_bind {
+            return Err("synthetic bind failure".into());
+        }
+        let listener = tokio::net::TcpListener::bind(self.address).await?;
+        let address = listener.local_addr()?;
+        let guard = OwnedListener {
+            _listener: listener,
+            dropped: self.dropped,
+        };
+        Ok(BoundEndpoint {
+            id: self.id.into(),
+            addresses: vec![address],
+            run: async move {
+                let _guard = guard;
+                if self.fail_run {
+                    return Err("synthetic endpoint failure".into());
+                }
+                context.shutdown.cancelled().await;
+                if self.fail_stop {
+                    return Err("synthetic shutdown failure".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                self.drain_completed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            .boxed(),
+        })
+    }
+}
+fn endpoint(id: &'static str) -> ProbeEndpoint {
+    ProbeEndpoint {
+        id,
+        address: "127.0.0.1:0".parse().unwrap(),
+        fail_bind: false,
+        fail_run: false,
+        fail_stop: false,
+        drain_completed: Arc::new(AtomicBool::new(false)),
+        dropped: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+#[tokio::test]
+async fn shutdown_error_does_not_skip_joining_other_endpoints() {
+    let first = endpoint("first");
+    let completed = first.drain_completed.clone();
+    let mut second = endpoint("second");
+    second.fail_stop = true;
+    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    builder.register_endpoint(first).unwrap();
+    builder.register_endpoint(second).unwrap();
+    let server = builder.bind().await.unwrap();
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    assert!(server.run(shutdown).await.is_err());
+    assert!(completed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn failed_startup_releases_previously_bound_listener() {
+    let first = endpoint("first");
+    let dropped = first.dropped.clone();
+    let mut second = endpoint("second");
+    second.fail_bind = true;
+    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    builder.register_endpoint(first).unwrap();
+    builder.register_endpoint(second).unwrap();
+    assert!(builder.bind().await.is_err());
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn failure_of_required_endpoint_stops_and_joins_others() {
+    let first = endpoint("first");
+    let dropped = first.dropped.clone();
+    let mut second = endpoint("second");
+    second.fail_run = true;
+    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    builder.register_endpoint(first).unwrap();
+    builder.register_endpoint(second).unwrap();
+    let running = builder.bind().await.unwrap();
+    assert!(running.run(CancellationToken::new()).await.is_err());
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn duplicate_ids_and_wildcard_bindings_are_rejected() {
+    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    let mut first = endpoint("first");
+    first.address = "0.0.0.0:8080".parse().unwrap();
+    builder.register_endpoint(first).unwrap();
+    assert!(builder.register_endpoint(endpoint("first")).is_err());
+    let mut second = endpoint("second");
+    second.address = "127.0.0.1:8080".parse().unwrap();
+    assert!(builder.register_endpoint(second).is_err());
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct Input {}
+#[test]
+fn registry_rejects_invalid_names_duplicates_and_nonobject_inputs() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register::<Input, _, _>("valid", "description", |_, _| async {
+            Ok(serde_json::json!({}))
+        })
+        .unwrap();
+    assert!(
+        registry
+            .register::<Input, _, _>("valid", "duplicate", |_, _| async {
+                Err(ToolError::Internal)
+            })
+            .is_err()
+    );
+    assert!(
+        registry
+            .register::<Input, _, _>("bad name", "description", |_, _| async {
+                Err(ToolError::Internal)
+            })
+            .is_err()
+    );
+    assert!(
+        registry
+            .register::<String, _, _>("string_input", "description", |_, _| async {
+                Err(ToolError::Internal)
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn empty_origin_policy_rejects_present_origins_and_limits_validate() {
+    let policy = AccessPolicy {
+        allowed_hosts: vec!["backend:8080".into()],
+        allowed_origins: vec![],
+    };
+    policy.validate().unwrap();
+    assert!(policy.permits("backend:8080", None));
+    assert!(!policy.permits("backend:8080", Some("https://caller.test")));
+    assert!(!policy.permits("backend:8080", Some("null")));
+    assert!(
+        Limits {
+            max_message_bytes: usize::MAX,
+            ..Limits::default()
+        }
+        .validate()
+        .is_err()
+    );
+}
