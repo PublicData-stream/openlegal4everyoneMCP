@@ -3,8 +3,8 @@
 ## Scope
 
 These invariants apply to every provider, normalization path, cache representation,
-MCP tool, and future API. They govern intended backend behavior; no implementation
-exists yet. Contributor review requirements are in
+MCP tool, and future API. The framework currently exercises synthetic data only;
+real legal mappings remain unimplemented. Contributor review requirements are in
 [Contributing](../CONTRIBUTING.md#review-gates).
 
 ## Identity, names, and languages

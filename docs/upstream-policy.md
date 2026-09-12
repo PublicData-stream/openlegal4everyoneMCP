@@ -5,7 +5,8 @@
 The backend is a responsible client of public legal-data services. Repeated
 equivalent MCP/API requests must reuse cached results or shared in-flight work;
 they must not independently trigger an equivalent number of upstream requests.
-These are requirements for the future backend, not implemented guarantees.
+The synthetic framework implements these controls as documented in the
+[retrieval contract](retrieval.md). Real providers still require separate onboarding.
 
 ## Provider onboarding
 

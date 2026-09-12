@@ -1,0 +1,27 @@
+[package]
+name = "openlegal-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+openlegal-domain = { version = "0.1.0", path = "../domain" }
+openlegal-normalization = { version = "0.1.0", path = "../normalization" }
+openlegal-application = { version = "0.1.0", path = "../application" }
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+tokio = { version = "1", features = ["net", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+url = "2"
+httpdate = "1"
+hickory-resolver = { version = "=0.26.2", default-features = false, features = ["tokio", "system-config"] }
+
+[dev-dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
