@@ -18,9 +18,10 @@ Rust modules at startup. WebTransport uses a documented custom binding and a nat
 Rust reference client; ChatGPT uses the HTTPS Streamable HTTP endpoint.
 
 The workspace includes tests, dependency checks, CI, and a pinned OxiBelt integration
-harness. Legal-data retrieval, caches, providers and user accounts remain planned.
-The product domain does not imply a deployed service, and browser/ChatGPT platform
-integration has not been verified.
+harness. A shared retrieval/cache framework, two synthetic JSON processors, and
+an opt-in React MCP Apps browser now demonstrate upstream extensions. Real legal
+providers and user accounts remain planned. Local browser tests use a simulated
+host; the product domain does not imply deployment or verified live ChatGPT access.
 
 ## Run and extend
 
@@ -37,6 +38,10 @@ complete local edge/CA fixture, run `scripts/test-oxibelt.sh` with Docker; see
 [OxiBelt setup](docs/oxibelt.md). Contributor validation and independent review
 requirements are in [Contributing](CONTRIBUTING.md).
 
+For the runnable fictional provider and interactive widget, follow the
+[synthetic demo guide](docs/demo.md). Ordinary server startup does not require
+Node or a widget build.
+
 ## Documentation
 
 - [Contributing](CONTRIBUTING.md): workflow, checks, security engineering, and review.
@@ -44,6 +49,9 @@ requirements are in [Contributing](CONTRIBUTING.md).
 - [Architecture](docs/architecture.md): implemented server and planned legal-data layers.
 - [Server contract](docs/server.md): configuration, extension API and transport behavior.
 - [Dependencies](docs/dependencies.md): admission rationale and check tooling.
+- [Retrieval framework](docs/retrieval.md): processors, caching, evidence and resource limits.
+- [Synthetic browser](docs/demo.md): local setup, tools, progress and ChatGPT manual checks.
+- [Retrieval validation](docs/retrieval-review.md): independent reviews, checks and remaining limits.
 - [Legal-data policy](docs/legal-data-policy.md): identity, dates, normalization, and citations.
 - [Upstream policy](docs/upstream-policy.md): caching, refresh, and service protection.
 - [Korean provider profile](docs/providers/kr-law-go-kr.md): sources, scope, and unresolved capabilities.

@@ -31,11 +31,12 @@ for command in git cargo openssl python3 docker; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
 cd "$repo"
-if [[ -z ${SERVER_BINARY:-} || -z ${WT_CLIENT_BINARY:-} ]]; then
+if [[ -z ${SERVER_BINARY:-} || -z ${WT_CLIENT_BINARY:-} || -z ${MOCK_UPSTREAM_BINARY:-} ]]; then
     cargo build --workspace --bins --examples --locked
 fi
 server_binary=${SERVER_BINARY:-"$repo/target/debug/openlegal-server"}
 client_binary=${WT_CLIENT_BINARY:-"$repo/target/debug/examples/wt_client"}
+mock_binary=${MOCK_UPSTREAM_BINARY:-"$repo/target/debug/examples/mock_upstream"}
 if [[ -n ${OXIBELT_BINARY:-} ]]; then
     oxibelt_binary=$OXIBELT_BINARY
 else
@@ -67,8 +68,23 @@ print("Verified OxiBelt revision:", identity["revision"])
 mkdir -p "$scratch/bin" "$scratch/fixture/config" "$scratch/fixture/cert"
 cp "$server_binary" "$scratch/bin/openlegal-server"
 cp "$client_binary" "$scratch/bin/wt_client"
+cp "$mock_binary" "$scratch/bin/mock_upstream"
 cp "$oxibelt_binary" "$scratch/bin/oxibelt"
 cp deploy/oxibelt/backend.toml scripts/http_smoke.py "$scratch/fixture/"
+if [[ -n ${DEMO_WIDGET_HTML:-} ]]; then
+    cp "$DEMO_WIDGET_HTML" "$scratch/fixture/widget.html"
+else
+    printf '%s\n' '<html><body>Synthetic transport resource fixture</body></html>' > "$scratch/fixture/widget.html"
+fi
+cat >> "$scratch/fixture/backend.toml" <<'TOML'
+
+[limits]
+max_message_bytes = 4194304
+
+[demo]
+upstream = "http://127.0.0.1:8081"
+widget_html = "/fixture/widget.html"
+TOML
 cp deploy/oxibelt/oxibelt.toml "$scratch/fixture/config/"
 cp deploy/oxibelt/Dockerfile.harness "$scratch/Dockerfile"
 printf '*\n!Dockerfile\n!bin/\n!bin/**\n' > "$scratch/.dockerignore"
@@ -109,6 +125,7 @@ tar -c -C "$scratch/fixture" . | docker run --rm -i --network none --user 0:0 \
 hardening=(--mount "type=volume,source=$fixture_volume,target=/fixture,readonly" --network "$network" --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs "/tmp:rw,noexec,nosuid,size=16m")
 docker run --rm "${hardening[@]}" --entrypoint /usr/local/bin/oxibelt "$image" --config /fixture/config/oxibelt.toml --check
 docker run -d --name "$backend" --network-alias backend "${hardening[@]}" --memory 512m "$image" >/dev/null
+docker exec -d "$backend" /usr/local/bin/mock_upstream 127.0.0.1:8081
 start_edge() {
     docker run -d --name "$edge" --network-alias edge "${hardening[@]}" --memory 1g --ulimit stack=67108864:67108864 \
         --entrypoint /usr/local/bin/oxibelt "$image" --config "$1" >/dev/null
@@ -126,7 +143,7 @@ reject_client() {
 start_edge /fixture/config/oxibelt.toml
 docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/http_smoke.py /fixture/cert/ca.pem
 for protocol in 2026-07-28 2025-11-25; do
-    client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$protocol"
+    client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$protocol" --demo
     # A fresh process creates a fresh QUIC connection, checking reconnection too.
     client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$protocol" https://example.test
 done

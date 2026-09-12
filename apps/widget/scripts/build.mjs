@@ -1,0 +1,10 @@
+import { build } from 'esbuild';
+import { mkdir, writeFile } from 'node:fs/promises';
+const result = await build({ entryPoints: ['src/main.tsx'], bundle: true, minify: true, write: false, outdir: 'dist', target: 'es2022', format: 'iife', legalComments: 'inline', define: { 'process.env.NODE_ENV': '"production"' } });
+const js = result.outputFiles.find(file => file.path.endsWith('.js')).text.replaceAll('</script', '<\\/script');
+const css = result.outputFiles.find(file => file.path.endsWith('.css')).text;
+const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Synthetic record browser</title><style>${css}</style></head><body><div id="root"></div><script>${js}</script></body></html>`;
+if (Buffer.byteLength(html) > 1024 * 1024) throw new Error('Widget exceeds the 1 MiB resource limit');
+await mkdir('dist', { recursive: true });
+await writeFile('dist/index.html', html);
+console.log(`Built self-contained dist/index.html (${Buffer.byteLength(html)} bytes)`);

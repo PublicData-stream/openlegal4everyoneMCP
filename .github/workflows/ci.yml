@@ -47,5 +47,31 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.98.1 --profile minimal
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+      - run: npm install --global --ignore-scripts pnpm@12.3.4
+      - run: pnpm --dir apps/widget install --frozen-lockfile
+      - run: pnpm --dir apps/widget build
       - name: Test both transports through the pinned edge
         run: scripts/test-oxibelt.sh
+        env:
+          DEMO_WIDGET_HTML: apps/widget/dist/index.html
+  widget:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+      - run: npm install --global --ignore-scripts pnpm@12.3.4
+      - run: pnpm --dir apps/widget install --frozen-lockfile
+      - run: pnpm --dir apps/widget typecheck
+      - run: pnpm --dir apps/widget test
+      - run: pnpm --dir apps/widget build
+      - run: pnpm --dir apps/widget exec playwright install --with-deps chromium
+      - run: pnpm --dir apps/widget test:browser
+      - run: pnpm --dir apps/widget check:dependencies

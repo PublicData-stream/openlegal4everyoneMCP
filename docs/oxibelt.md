@@ -41,8 +41,11 @@ The script archives the pinned Git object, ignoring working-tree modifications.
 `target/oxibelt`. `OXIBELT_BUILD_JOBS` defaults to two. `OXIBELT_BINARY` can reuse
 an already built, trusted binary only if its emitted build identity reports the
 exact clean revision. This identity check prevents accidental stale builds; it
-is not cryptographic provenance. `SERVER_BINARY` and `WT_CLIENT_BINARY` can
-select prebuilt server/client executables; both must be set to skip their build.
+is not cryptographic provenance. `SERVER_BINARY`, `WT_CLIENT_BINARY`, and
+`MOCK_UPSTREAM_BINARY` select prebuilt executables; set all three to skip their build.
+The mock runs on loopback inside the backend container. By default the resource
+is a small synthetic HTML fixture; set `DEMO_WIDGET_HTML=apps/widget/dist/index.html`
+after the widget build to test the complete bundled resource, as CI does.
 
 All service containers share an internal Docker network. No host port is
 published and no legal-data provider is contacted. The test generates a

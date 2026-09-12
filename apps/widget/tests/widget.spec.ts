@@ -1,0 +1,65 @@
+import { test, expect } from '@playwright/test';
+test('host bridge searches, paginates, changes source, and opens escaped details', async ({ page }) => {
+  const external: string[] = [];
+  page.on('request', request => { if (!request.url().startsWith('http://127.0.0.1:4173/')) external.push(request.url()); });
+  await page.goto('/');
+  const widget = page.frameLocator('iframe');
+  await expect(widget.getByRole('button', { name: 'Search', exact: true })).toBeEnabled();
+  await widget.getByLabel('Source', { exact: true }).selectOption('layout_b');
+  await widget.getByLabel('Require fresh results').check();
+  await widget.getByRole('button', { name: 'Search', exact: true }).click();
+  await expect(widget.getByText('Page 1 · 7 records')).toBeVisible();
+  await expect(widget.getByRole('button', { name: 'Previous' })).toBeDisabled();
+  await widget.getByRole('button', { name: 'Next', exact: true }).click();
+  await expect(widget.getByText('Page 2 · 7 records')).toBeVisible();
+  await expect(widget.getByRole('button', { name: 'Next', exact: true })).toBeDisabled();
+  await widget.getByRole('button', { name: 'Synthetic record 6', exact: true }).focus();
+  await page.keyboard.press('Enter');
+  await expect(widget.getByRole('heading', { name: 'Synthetic record 6' })).toBeFocused();
+  await expect(widget.getByText('Synthetic body 6. <b>Plain source text</b>')).toBeVisible();
+  await expect(widget.locator('article b')).toHaveCount(0);
+  await expect(widget.getByText('Synthetic · layout_b / demo-6')).toBeVisible();
+  await widget.getByText('Source and processing details').click();
+  await expect(widget.getByText('synthetic:fixture')).toBeVisible();
+  await expect(widget.getByText('1.0.0', { exact: true })).toBeVisible();
+  await widget.getByRole('button', { name: 'Back to results' }).click();
+  await expect(widget.getByText('Page 2 · 7 records')).toBeVisible();
+  const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  expect(calls[0].arguments).toEqual({ source: 'layout_b', query: '', page: 0, page_size: 5, fresh_only: true });
+  expect(calls[2]).toEqual({ name: 'demo_get_record', arguments: { source: 'layout_b', id: 'demo-6', fresh_only: true } });
+  expect(external).toEqual([]);
+});
+test('loading, stale, empty, tool failure and malformed results remain usable', async ({ page }) => {
+  await page.goto('/');
+  const widget = page.frameLocator('iframe');
+  const input = widget.getByLabel('Search records', { exact: true });
+  for (const query of ['slow', 'stale', 'empty', 'error', 'malformed']) {
+    await input.fill(query);
+    await widget.getByRole('button', { name: 'Search', exact: true }).click();
+    if (query === 'slow') { await expect(widget.getByRole('status')).toHaveText('Loading records…'); await expect(input).toBeDisabled(); }
+    if (query === 'stale') await expect(widget.getByText('Stale fallback when returned · age at retrieval 70s')).toHaveCount(5);
+    if (query === 'empty') await expect(widget.getByText('No records match this search.')).toBeVisible();
+    if (query === 'error') { await expect(widget.getByRole('alert')).toContainText('Try again'); await expect(widget.getByText('Private internal failure')).toHaveCount(0); }
+    if (query === 'malformed') await expect(widget.getByRole('alert')).toContainText('unsupported record response');
+    await expect(input).toBeEnabled();
+  }
+});
+test('initial rendering preserves each source and freshness, malformed initial data fails safely', async ({ page }) => {
+  await page.goto('/?initial');
+  const widget = page.frameLocator('iframe');
+  await expect(widget.getByText('Synthetic · layout_a / demo-1')).toBeVisible();
+  await expect(widget.getByText('Synthetic · layout_b / demo-1')).toBeVisible();
+  await expect(widget.getByText('Stale fallback when returned · age at retrieval 70s')).toBeVisible();
+  await expect(widget.getByText('Fresh when returned · age at retrieval 0s')).toBeVisible();
+  await page.goto('/?malformed');
+  await expect(widget.getByRole('alert')).toContainText('unsupported record response');
+});
+
+test('oversized UTF-8 search reports a local error without calling the host', async ({ page }) => {
+  await page.goto('/');
+  const widget = page.frameLocator('iframe');
+  await widget.getByLabel('Search records', { exact: true }).fill('가'.repeat(86));
+  await widget.getByRole('button', { name: 'Search', exact: true }).click();
+  await expect(widget.getByRole('alert')).toContainText('256 UTF-8 bytes');
+  expect(JSON.parse(await page.locator('#calls').textContent() || '[]')).toEqual([]);
+});

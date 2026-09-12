@@ -5,8 +5,9 @@
 The server foundation is implemented in `apps/server` as one library/binary package.
 It provides a startup tool registry and endpoint supervisor shared by Streamable HTTP
 and WebTransport adapters. The production binary requires both, plus a private
-health listener. Tests and CI exist. Legal-data domain, retrieval, normalization,
-providers and storage remain planned. The [server contract](server.md) owns the
+health listener. Shared retrieval, memory caching, two pure synthetic processors,
+and a React MCP Apps widget are implemented. Real legal-data models and providers
+remain planned. The [server contract](server.md) owns the
 implemented extension interfaces and transport configuration.
 
 - Support multiple jurisdictions without imposing one provider's identity or
@@ -17,18 +18,20 @@ implemented extension interfaces and transport configuration.
   [coordination design](upstream-policy.md#coordination-and-request-budgets).
 - Keep a small workspace, extracting additional crates only for an identified need.
 
-## Proposed responsibility map
+## Responsibility map
 
-Only `apps/server` currently exists. Introduce the other paths with their actual
-implementations; do not create empty crates or placeholder directories.
+The server, domain, normalization, application, and adapters contain working
+implementations. Their initial data model is explicitly synthetic; it does not
+preempt future evidence-backed legal mappings. The CLI remains planned.
 
 | Component | Responsibility | Project dependencies |
 | --- | --- | --- |
-| `crates/domain` | Legal identifiers, records, date/revision representations, provenance, domain errors | No other project layer |
+| `crates/domain` | Synthetic record/query types, provenance, freshness and errors; legal models remain future work | No other project layer |
 | `crates/normalization` | Pure parsing and provider-specific normalization modules | Domain |
 | `crates/application` | Retrieval use cases, freshness decisions, refresh orchestration, coalescing and budgets; upstream/storage interfaces | Domain |
 | `crates/adapters` | Separate modules for upstream HTTP clients and cache-storage implementations | Application interfaces, domain, normalization |
-| `apps/server` (implemented) | Configuration, immutable tool registry/shared MCP handler, endpoint supervision, HTTP/WebTransport boundaries and private health | No project dependencies yet; future application/adapters only through composition |
+| `apps/server` | Configuration, immutable tool/resource registries, worker/endpoint supervision, HTTP/WebTransport and private health | Application/adapters/normalization through demo composition; domain for typed tool results |
+| `apps/widget` | React presentation and MCP Apps host bridge; no source fetching or cache policy | MCP wire contracts |
 | `apps/cli` | Future CLI/admin commands and composition | Application and adapters; not server routing |
 
 Within adapters, keep each provider's transport and each storage implementation in
@@ -76,6 +79,12 @@ Application services select cached data, arrange bounded/coalesced refresh when
 needed, and publish validated records and provenance through storage interfaces.
 They expose enough retrieval metadata for transports to honor the
 [freshness contract](upstream-policy.md#freshness-and-failure-behavior).
+
+The [retrieval contract](retrieval.md) documents implemented source registration,
+processing, memory storage, and service lifecycle. Crate boundaries separate
+processors from application and adapter dependencies; trusted implementations
+must obey the side-effect contract. HTTP/storage mechanics remain replaceable. Synthetic
+demonstrations do not introduce a second model of real law.
 
 ## Transport and administration boundaries
 

@@ -19,12 +19,47 @@ come from crates.io; unreviewed Git dependencies and registries fail `cargo deny
 | http | HTTP vocabulary shared with the SDK stack; avoids incompatible representations and extra protocol conversions. MIT. |
 | TOML, url | Strict operator configuration and origin parsing. The URL parser normalizes origin tuples; raw string/prefix matching would be incorrect. MIT OR Apache-2.0. |
 | tracing, tracing-subscriber | Operational events and filtering; SDK payload logs are disabled regardless of the normal runtime log setting. MIT. |
-| rcgen, tempfile, reqwest (development only) | Isolated TLS fixtures, cleanup and native HTTP tests. Certificate generation uses ring; reqwest disables default features and uses Rustls. No production test certificates or live provider traffic. MIT / Apache-2.0 alternatives. |
+| rcgen, tempfile, reqwest test features | Isolated TLS fixtures, cleanup and native HTTP tests. rcgen and tempfile are development-only. Certificate generation uses ring; reqwest disables default features and uses Rustls. Production reqwest admission is described below. No production test certificates or live provider traffic. MIT / Apache-2.0 alternatives. |
 
 The listed versions are baseline anchors; exact versions and checksums for all
 dependencies live in the lockfile. Source review covered relevant installed SDK
 HTTP/lifecycle/framing code and wtransport's TLS/QUIC APIs. Updating a boundary
 dependency requires renewed relevant review and transport tests, not only a build.
+
+## Retrieval and widget additions
+
+- **reqwest 0.13** is now also a production adapter dependency with only `rustls`
+  and `stream`. It supplies bounded streamed HTTP bodies instead of a second
+  handwritten HTTP client. Automatic retries, redirects, environment proxies and
+  compression are disabled. Configured HTTPS hosts are pinned to previously checked
+  addresses, retaining TLS hostname/certificate verification. Source: crates.io;
+  MIT OR Apache-2.0. Existing native tests retain their development client features.
+- **Hickory resolver 0.26.2**, with locked net/proto 0.26.3, replaces blocking
+  libc DNS work that would outlive an aborted lookup. Only Tokio and system-config
+  features are enabled; encrypted DNS, DNSSEC and mDNS are not requested. The async
+  resolver reads operator DNS configuration at startup; request timeout, attempts,
+  active queries and cache size are bounded. Every returned IP is checked before
+  HTTP pinning. Alternative OS lookup could leave uninterruptible blocking work.
+  Sources: crates.io and the project's [resolver documentation](https://docs.rs/hickory-resolver/0.26.2/hickory_resolver/).
+  MIT OR Apache-2.0; new transitive cache/platform dependencies receive current
+  license/advisory admission checks. Isolated silent-resolver cancellation/deadline
+  tests supplement destination-policy tests for this security-critical boundary.
+- **sha2 0.11** computes evidence digests with RustCrypto, reusing the version
+  already required by WebTransport instead of introducing another cryptographic
+  implementation. Digests provide linkage, not legal authenticity. Default CPU
+  dispatch may select platform implementations; first-party unsafe remains denied.
+  MIT OR Apache-2.0, crates.io.
+- **httpdate 1** parses HTTP-date `Retry-After` guidance. Integer and date delays
+  are preserved without shortening the provider floor; unrepresentable cooldowns
+  pause the provider. It already existed transitively. MIT OR Apache-2.0, crates.io.
+
+Workspace path dependencies specify version `0.1.0`; no wildcard-policy exception
+is needed. React, TypeScript, esbuild, the MCP Apps SDK and Playwright use exact npm
+versions and a committed pnpm lockfile. The [widget admission rationale](../apps/widget/README.md#dependency-admission)
+documents alternatives, licenses, enabled build scripts and boundary implications.
+Only esbuild's installation script is enabled. The production resource bundles
+dependencies locally; it loads no CDN assets. Node 24.21.0/pnpm 12.3.4 are the
+declared frontend baseline, with browser and current advisory/license checks in CI.
 
 ## License and build policy
 

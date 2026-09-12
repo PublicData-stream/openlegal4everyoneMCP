@@ -41,7 +41,8 @@ not override higher-priority instructions, user scope, or execution permissions.
    change ready. Inspect the integrated diff, including new files and fixtures.
 
 The Rust server foundation now lives in `apps/server`, with a committed workspace,
-lockfile, tests and CI. Legal-data application services and providers remain planned;
+lockfile, tests and CI. Retrieval/cache services now exercise synthetic sources;
+real legal-data providers remain planned;
 do not create empty future crates or make live provider requests merely because
 they appear in the architecture.
 
@@ -146,6 +147,26 @@ on a schedule as well as relevant changes. Failures, cancellations, and unexpect
 skips must not be reported as successful validation. Make checks reproducible from
 a clean checkout and keep untrusted PR jobs free of production credentials and
 privileged publication actions. CI or check-policy changes update this section.
+
+### React MCP Apps widget
+
+Node 24.21.0 and pnpm 12.3.4 are the frontend baseline. For widget changes, run:
+
+```sh
+pnpm --dir apps/widget install --frozen-lockfile
+pnpm --dir apps/widget typecheck
+pnpm --dir apps/widget test
+pnpm --dir apps/widget build
+pnpm --dir apps/widget exec playwright install --with-deps chromium
+pnpm --dir apps/widget test:browser
+pnpm --dir apps/widget check:dependencies
+```
+
+The last command requires current npm advisory data and checks dependency licenses.
+Build output and browser artifacts are ignored. The local browser harness exercises
+the real MCP Apps bridge against synthetic responses; it is not a live ChatGPT test.
+For integrated widget/transport changes, set `DEMO_WIDGET_HTML=apps/widget/dist/index.html`
+when running the OxiBelt gate. Ordinary Rust tests remain independent of Node.
 
 ### Behavior and integration tests
 

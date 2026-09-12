@@ -10,7 +10,8 @@ CA = sys.argv[1] if len(sys.argv) > 1 else "/fixture/cert/ca.pem"
 CONTEXT = ssl.create_default_context(cafile=CA)
 MODERN = "2026-07-28"
 LEGACY = "2025-11-25"
-MAX_BODY = 1024 * 1024
+MAX_BODY = 4 * 1024 * 1024
+MAX_PROGRESS = 5
 
 
 def exchange(body, revision=MODERN, session=None, origin=None, path="/mcp", host=None, timeout=10):
@@ -19,7 +20,7 @@ def exchange(body, revision=MODERN, session=None, origin=None, path="/mcp", host
                "MCP-Protocol-Version": revision}
     if revision == MODERN:
         headers["Mcp-Method"] = body["method"]
-        name = body.get("params", {}).get("name")
+        name = body.get("params", {}).get("name") or body.get("params", {}).get("uri")
         if name:
             headers["Mcp-Name"] = name
     if session:
@@ -33,8 +34,10 @@ def exchange(body, revision=MODERN, session=None, origin=None, path="/mcp", host
         response = connection.getresponse()
         status, response_headers = response.status, dict(response.getheaders())
         result = None
+        progress_count = 0
         if response.getheader("content-type", "").startswith("text/event-stream"):
             consumed = 0
+            progress_value = 0
             # Read until this RPC's response, without waiting for SSE connection EOF.
             while consumed <= MAX_BODY:
                 line = response.readline(MAX_BODY + 1 - consumed)
@@ -43,6 +46,12 @@ def exchange(body, revision=MODERN, session=None, origin=None, path="/mcp", host
                     break
                 if line.startswith(b"data:"):
                     value = json.loads(line[5:].strip())
+                    if value.get("method") == "notifications/progress":
+                        progress_count += 1
+                        assert progress_count <= MAX_PROGRESS
+                        assert value["params"]["progressToken"] == body["params"]["_meta"]["progressToken"]
+                        assert value["params"]["progress"] > progress_value
+                        progress_value = value["params"]["progress"]
                     if value.get("id") == body.get("id"):
                         result = value
                         break
@@ -53,6 +62,11 @@ def exchange(body, revision=MODERN, session=None, origin=None, path="/mcp", host
             assert len(raw) <= MAX_BODY, "response exceeded bound"
             if raw and response.getheader("content-type", "").startswith("application/json"):
                 result = json.loads(raw)
+        if (body.get("method") == "tools/call"
+                and "progressToken" in body.get("params", {}).get("_meta", {})
+                and status == 200 and result and "result" in result
+                and not result["result"].get("isError", False)):
+            assert progress_count > 0, "successful token-bearing tool call emitted no progress"
         return status, {k.lower(): v for k, v in response_headers.items()}, result
     finally:
         connection.close()
@@ -60,11 +74,11 @@ def exchange(body, revision=MODERN, session=None, origin=None, path="/mcp", host
 
 def request(method, revision, ident=1, **params):
     if revision == MODERN:
-        params["_meta"] = {
+        params.setdefault("_meta", {}).update({
             "io.modelcontextprotocol/protocolVersion": revision,
             "io.modelcontextprotocol/clientInfo": {"name": "edge-smoke", "version": "1"},
             "io.modelcontextprotocol/clientCapabilities": {},
-        }
+        })
     return {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}
 
 
@@ -98,6 +112,20 @@ def smoke():
             assert not result.get("isError", False), result
             assert result.get("content"), result
         print(f"HTTP {revision}: discovery, tools/list, server_info, Origin accepted", flush=True)
+        for ident, tool, arguments in (
+            (4, "demo_search_records", {"source": "layout_a"}),
+            (5, "demo_get_record", {"source": "layout_b", "id": "001"}),
+            (6, "demo_show_records", {"records": [{"source": "layout_a", "id": "001"}]}),
+        ):
+            _, result = success(request("tools/call", revision, ident, name=tool,
+                                        arguments=arguments, _meta={"progressToken": f"http-{ident}"}), revision, session)
+            assert not result.get("isError", False), result
+            assert result["structuredContent"]["synthetic"] is True, result
+        _, result = success(request("resources/read", revision, 7,
+                                    uri="ui://openlegal-demo/records-v1.html"), revision, session)
+        assert result["contents"][0]["mimeType"] == "text/html;profile=mcp-app", result
+        assert "Synthetic" in result["contents"][0]["text"] or "synthetic" in result["contents"][0]["text"]
+        print(f"HTTP {revision}: synthetic search/detail/render, progress, resource read", flush=True)
     probe = request("tools/list", MODERN)
     assert exchange(probe, origin="https://rejected.test")[0] == 403
     assert exchange(probe, path="/mcp-other")[0] == 404

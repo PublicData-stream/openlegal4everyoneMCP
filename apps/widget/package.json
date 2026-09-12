@@ -1,0 +1,32 @@
+{
+  "name": "@openlegal4everyone/widget",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@12.3.4",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/model.test.ts",
+    "test:browser": "playwright test",
+    "harness": "node scripts/harness.mjs",
+    "check:dependencies": "pnpm audit --audit-level=low && node scripts/check-dependencies.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "2.0.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "24.10.1",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
+  }
+}
