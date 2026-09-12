@@ -175,7 +175,13 @@ impl Server {
         }
         let shutdown = CancellationToken::new();
         let context = EndpointContext {
-            handler: McpHandler::with_resources(registry, resources, limits.clone()).unwrap(),
+            handler: McpHandler::with_resources(
+                registry,
+                resources,
+                limits.clone(),
+                openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
+            )
+            .unwrap(),
             limits: limits.clone(),
             shutdown: shutdown.clone(),
             buffers: Arc::new(Semaphore::new(limits.max_buffer_bytes)),

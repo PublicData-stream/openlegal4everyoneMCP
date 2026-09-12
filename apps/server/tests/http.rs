@@ -92,7 +92,12 @@ impl Server {
             ..Limits::default()
         });
         let context = EndpointContext {
-            handler: McpHandler::new(registry, limits.clone()).unwrap(),
+            handler: McpHandler::new(
+                registry,
+                limits.clone(),
+                openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
+            )
+            .unwrap(),
             limits: limits.clone(),
             shutdown: CancellationToken::new(),
             ready: Arc::new(AtomicBool::new(true)),

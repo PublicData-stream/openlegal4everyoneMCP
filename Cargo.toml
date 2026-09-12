@@ -6,7 +6,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98.1"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 repository = "https://github.com/piquark6046/openlegal4everyoneMCP"
 
 [workspace.lints.rust]

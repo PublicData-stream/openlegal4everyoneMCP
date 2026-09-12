@@ -1,7 +1,10 @@
 //! Startup registration and structured supervision of required endpoint adapters.
 
 use crate::{
-    ServerError, config::Limits, handler::McpHandler, registry::ToolRegistry,
+    ServerError,
+    config::{Limits, SourceOffer},
+    handler::McpHandler,
+    registry::ToolRegistry,
     resources::ResourceRegistry,
 };
 use futures::{FutureExt, future::BoxFuture};
@@ -67,6 +70,7 @@ type WorkerFactory =
 
 pub struct ServerBuilder {
     registry: ToolRegistry,
+    source: SourceOffer,
     resources: ResourceRegistry,
     workers: Vec<WorkerFactory>,
     limits: Limits,
@@ -76,9 +80,10 @@ pub struct ServerBuilder {
 }
 
 impl ServerBuilder {
-    pub fn new(registry: ToolRegistry, limits: Limits) -> Self {
+    pub fn new(registry: ToolRegistry, limits: Limits, source: SourceOffer) -> Self {
         Self {
             registry,
+            source,
             resources: ResourceRegistry::new(),
             workers: Vec::new(),
             limits,
@@ -138,7 +143,12 @@ impl ServerBuilder {
         }
         let limits = Arc::new(self.limits);
         let context = EndpointContext {
-            handler: McpHandler::with_resources(self.registry, self.resources, limits.clone())?,
+            handler: McpHandler::with_resources(
+                self.registry,
+                self.resources,
+                limits.clone(),
+                self.source,
+            )?,
             buffers: Arc::new(Semaphore::new(limits.max_buffer_bytes)),
             requests: Arc::new(Semaphore::new(limits.max_in_flight)),
             connections: Arc::new(Semaphore::new(limits.max_connections)),

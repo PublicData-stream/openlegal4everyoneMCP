@@ -65,9 +65,20 @@ declared frontend baseline, with browser and current advisory/license checks in 
 
 The initial resolved graph uses MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC,
 MIT-0, Unicode-3.0 and Zlib licenses (or expressions satisfiable by these choices).
-These are the explicit allowlist in `deny.toml`; no advisory or license exceptions
-are installed. Alternative-license expressions do not require accepting every
-offered license. Preserve license notices when distributing dependencies.
+These remain the explicit third-party allowlist in `deny.toml`; no advisory
+exceptions are installed. The five first-party workspace packages use
+`AGPL-3.0-only`, admitted through exact package/version exceptions rather than a
+global AGPL allowance. Owner: PiQuark6046; review by 2026-12-12 and on package
+version changes. The exceptions implement the project's licensing choice and do
+not authorize new third-party AGPL dependencies. Alternative-license expressions
+do not require accepting every offered license. Preserve license notices when
+distributing dependencies; the widget build retains inline dependency legal
+comments and embeds the full first-party license.
+
+Each Rust package has a relative `LICENSE` symlink to the central license text.
+Cargo includes the referenced bytes as a regular file in source packages, so the
+license is delivered without maintaining divergent copies. Preserve these links
+when adding or moving workspace members.
 
 First-party code denies unsafe Rust. Dependencies include unsafe implementation
 code, especially Tokio/socket layers and ring. Ring builds native C/assembly via

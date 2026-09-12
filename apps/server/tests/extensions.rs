@@ -90,7 +90,11 @@ async fn shutdown_error_does_not_skip_joining_other_endpoints() {
     let completed = first.drain_completed.clone();
     let mut second = endpoint("second");
     second.fail_stop = true;
-    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    let mut builder = ServerBuilder::new(
+        ToolRegistry::new(),
+        Limits::default(),
+        openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
+    );
     builder.register_endpoint(first).unwrap();
     builder.register_endpoint(second).unwrap();
     let server = builder.bind().await.unwrap();
@@ -106,7 +110,11 @@ async fn failed_startup_releases_previously_bound_listener() {
     let dropped = first.dropped.clone();
     let mut second = endpoint("second");
     second.fail_bind = true;
-    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    let mut builder = ServerBuilder::new(
+        ToolRegistry::new(),
+        Limits::default(),
+        openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
+    );
     builder.register_endpoint(first).unwrap();
     builder.register_endpoint(second).unwrap();
     assert!(builder.bind().await.is_err());
@@ -119,7 +127,11 @@ async fn failure_of_required_endpoint_stops_and_joins_others() {
     let dropped = first.dropped.clone();
     let mut second = endpoint("second");
     second.fail_run = true;
-    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    let mut builder = ServerBuilder::new(
+        ToolRegistry::new(),
+        Limits::default(),
+        openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
+    );
     builder.register_endpoint(first).unwrap();
     builder.register_endpoint(second).unwrap();
     let running = builder.bind().await.unwrap();
@@ -129,7 +141,11 @@ async fn failure_of_required_endpoint_stops_and_joins_others() {
 
 #[test]
 fn duplicate_ids_and_wildcard_bindings_are_rejected() {
-    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    let mut builder = ServerBuilder::new(
+        ToolRegistry::new(),
+        Limits::default(),
+        openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
+    );
     let mut first = endpoint("first");
     first.address = "0.0.0.0:8080".parse().unwrap();
     builder.register_endpoint(first).unwrap();
@@ -198,7 +214,11 @@ async fn worker_failure_stops_endpoints_and_joins_other_workers() {
     let dropped = first.dropped.clone();
     let completed = Arc::new(AtomicBool::new(false));
     let worker_completed = completed.clone();
-    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    let mut builder = ServerBuilder::new(
+        ToolRegistry::new(),
+        Limits::default(),
+        openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
+    );
     builder.register_endpoint(first).unwrap();
     builder
         .register_worker("owned", move |shutdown| async move {
@@ -232,7 +252,11 @@ async fn failed_binding_never_starts_application_worker() {
     failed.fail_bind = true;
     let started = Arc::new(AtomicBool::new(false));
     let worker_started = started.clone();
-    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    let mut builder = ServerBuilder::new(
+        ToolRegistry::new(),
+        Limits::default(),
+        openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
+    );
     builder.register_endpoint(failed).unwrap();
     builder
         .register_worker("worker", move |_| {
@@ -289,7 +313,15 @@ fn static_resources_reject_duplicates_mismatch_and_unknown_tool_references() {
             |_, _| async { Ok(ToolOutput::new(Output { value: 1 })) },
         )
         .unwrap();
-    assert!(McpHandler::with_resources(registry, resources, Arc::new(Limits::default())).is_err());
+    assert!(
+        McpHandler::with_resources(
+            registry,
+            resources,
+            Arc::new(Limits::default()),
+            openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap()
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -308,6 +340,7 @@ async fn worker_shutdown_deadline_aborts_and_drops_owned_future() {
             shutdown_timeout_secs: 1,
             ..Default::default()
         },
+        openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
     );
     builder.register_endpoint(endpoint("http")).unwrap();
     builder
@@ -362,5 +395,13 @@ fn static_resource_serialized_size_is_checked_against_server_limits() {
         max_message_bytes: 4096,
         ..Default::default()
     });
-    assert!(McpHandler::with_resources(ToolRegistry::new(), resources, limits).is_err());
+    assert!(
+        McpHandler::with_resources(
+            ToolRegistry::new(),
+            resources,
+            limits,
+            openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap()
+        )
+        .is_err()
+    );
 }

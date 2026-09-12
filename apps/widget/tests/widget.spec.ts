@@ -1,4 +1,6 @@
 import { test, expect } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
+const sourceUrl = 'https://source.example/release?name="widget"&part=server';
 test('host bridge searches, paginates, changes source, and opens escaped details', async ({ page }) => {
   const external: string[] = [];
   page.on('request', request => { if (!request.url().startsWith('http://127.0.0.1:4173/')) external.push(request.url()); });
@@ -63,3 +65,59 @@ test('oversized UTF-8 search reports a local error without calling the host', as
   await expect(widget.getByRole('alert')).toContainText('256 UTF-8 bytes');
   expect(JSON.parse(await page.locator('#calls').textContent() || '[]')).toEqual([]);
 });
+
+test('visible source offer retains escaped URL, full license, and click-only host navigation', async ({ page }) => {
+  const external: string[] = [];
+  page.on('request', request => { if (!request.url().startsWith('http://127.0.0.1:4173/')) external.push(request.url()); });
+  await page.goto('/');
+  const widget = page.frameLocator('iframe');
+  const source = widget.getByRole('region', { name: 'Corresponding source' });
+  await expect(source.getByRole('button', { name: 'Get source code' })).toBeEnabled();
+  await expect(source.getByLabel('Source code URL')).toHaveValue(sourceUrl);
+  await expect(widget.getByText('Copyright © 2026 PiQuark6046.', { exact: false })).toBeVisible();
+  await expect(widget.getByText('This program comes with no warranty.', { exact: false })).toBeVisible();
+  await expect(widget.locator('#license-text')).not.toBeVisible();
+  await widget.getByText('Read the full GNU AGPLv3 license', { exact: true }).click();
+  await expect(widget.locator('#license-text')).toBeVisible();
+  expect(await widget.locator('#license-text').textContent()).toBe(await readFile('../../LICENSE', 'utf8'));
+  expect(await widget.locator('meta[name="openlegal-source-url"]').getAttribute('content')).toBe(sourceUrl);
+  expect(await widget.locator('meta[name="openlegal-source-url"]').evaluate(element => element.attributes.length)).toBe(2);
+  expect(JSON.parse(await page.locator('#links').textContent() || '[]')).toEqual([]);
+  await source.getByRole('button', { name: 'Get source code' }).click();
+  await expect(source.getByText('Source link sent to the host.')).toBeVisible();
+  expect(JSON.parse(await page.locator('#links').textContent() || '[]')).toEqual([sourceUrl]);
+  expect(external).toEqual([]);
+});
+
+for (const mode of ['unsupported', 'disconnected', 'denied', 'throws']) {
+  test(`source URL stays selectable when host is ${mode}`, async ({ page }) => {
+    await page.goto(`/?${mode}`);
+    const widget = page.frameLocator('iframe');
+    const source = widget.getByRole('region', { name: 'Corresponding source' });
+    const button = source.getByRole('button', { name: 'Get source code' });
+    if (mode === 'unsupported' || mode === 'disconnected') {
+      if (mode === 'unsupported') await expect(widget.getByRole('button', { name: 'Search', exact: true })).toBeEnabled();
+      await expect(button).toBeDisabled();
+      expect(JSON.parse(await page.locator('#links').textContent() || '[]')).toEqual([]);
+    } else {
+      await button.click();
+      await expect(source.getByText(mode === 'denied' ? 'The host declined to open the source. Copy the URL below.' : 'The source link could not be opened. Copy the URL below.')).toBeVisible();
+      expect(JSON.parse(await page.locator('#links').textContent() || '[]')).toEqual([sourceUrl]);
+    }
+    const input = source.getByLabel('Source code URL');
+    await expect(input).toHaveValue(sourceUrl);
+    await input.focus();
+    expect(await input.evaluate((element: HTMLInputElement) => element.value.substring(element.selectionStart ?? 0, element.selectionEnd ?? 0))).toBe(sourceUrl);
+    await expect(widget.getByText('Read the full GNU AGPLv3 license', { exact: true })).toBeVisible();
+  });
+}
+
+for (const mode of ['invalid-source', 'duplicate-source']) {
+  test(`${mode} metadata prevents navigation`, async ({ page }) => {
+    await page.goto(`/?${mode}`);
+    const widget = page.frameLocator('iframe');
+    await expect(widget.getByText('The source URL is unavailable or invalid. Ask the operator for the corresponding source.')).toBeVisible();
+    await expect(widget.getByRole('button', { name: 'Get source code' })).toHaveCount(0);
+    expect(JSON.parse(await page.locator('#links').textContent() || '[]')).toEqual([]);
+  });
+}

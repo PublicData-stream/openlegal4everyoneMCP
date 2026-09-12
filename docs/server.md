@@ -17,6 +17,10 @@ a configured loopback mock and bounded local widget HTML; absence preserves ordi
 server behavior. The example demo uses a 4 MiB message budget for its UI resource.
 
 ```toml
+[source]
+# Placeholder: replace with free corresponding source for the running version.
+url = "https://example.org/openlegal/source"
+
 [http]
 bind = "127.0.0.1:8080"
 allowed_hosts = ["127.0.0.1:8080"]
@@ -53,10 +57,49 @@ The result must identify the server foundation without claiming legal retrieval.
 No plugin directory submission or deployment is automated here. The
 [demo guide](demo.md) adds the synthetic workflow and widget acceptance procedure.
 
+## Source offers and migration
+
+The September 12, 2026 AGPL-3.0-only migration requires `[source].url` in every
+configuration, including servers without the demo. Old configurations must add
+this table before upgrading; there is no implicit link to upstream `main`.
+The example URLs are isolated placeholders, not working source offers.
+
+`SourceOffer` validates an absolute HTTPS URL with a hostname, no credentials,
+leading/trailing whitespace, control characters or backslashes, and at most 2,048 bytes before and
+after normalization. The shared handler also requires its source metadata to fit
+the configured tool-result budget; an incompatible small budget fails startup.
+Validation happens before listeners bind. The URL is public metadata: do not put
+tokens or other secrets in it. The server does not fetch the URL, inspect an
+archive, or establish source availability by validating its syntax.
+
+Provide a public page or download giving free access to the corresponding source
+for the exact running server and widget, including local modifications and the
+source and scripts needed to generate, install, run and modify them. An immutable
+revision/archive is preferable to a moving branch. A repository link is sufficient
+only when it actually provides that corresponding source. Operators must maintain
+availability and include necessary dependency source as required by the license;
+the built-in link is not a completeness or compliance certification. See
+[AGPLv3 sections 1, 6 and 13](https://www.gnu.org/licenses/agpl-3.0.html).
+
+The existing `server_info` tool retains its identity fields and adds `license`
+(`AGPL-3.0-only`), `licenseUrl` (the GNU license text), and `sourceUrl` (the validated
+operator URL). Legacy initialization and modern `server/discover` instructions
+advertise the same offer through the shared handler on both transports. This adds
+public metadata without adding a source-download endpoint.
+
+Pass the same `SourceOffer` to `server_info_registry`, `ServerBuilder`, and widget
+loading. Direct `McpHandler` constructors also require it. Rebuild the widget when
+upgrading: its HTML must contain exactly one `__OPENLEGAL_SOURCE_URL__` placeholder
+in the `openlegal-source-url` metadata attribute. Startup replaces it with an
+attribute-escaped URL and checks the resulting resource size. Missing or duplicate
+markers fail startup. The widget embeds the full license and offers host-mediated
+source navigation with a selectable URL fallback; see the [demo guide](demo.md).
+
 ## Rust extension API
 
 Construct `ToolRegistry`, register modules implementing `ToolModule`, and pass it
-to `ServerBuilder::new(registry, limits)`. Modules call
+to `ServerBuilder::new(registry, limits, source)`, where `source` is a validated
+`SourceOffer`. Modules call
 `ToolRegistry::register::<Input, _, _>(name, description, handler)` where `Input`
 implements Serde deserialization and Schemars JSON Schema. The asynchronous handler
 receives typed input and `ToolContext`, returning `Result<Value, ToolError>`.

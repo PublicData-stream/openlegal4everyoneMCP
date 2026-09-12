@@ -7,6 +7,11 @@ record's freshness snapshot when returned, never a continuously updated current
 freshness claim. Detail views expose bounded source reference, payload digest,
 processor version, and retrieval/validation timestamps in a collapsed section. Tool errors are sanitized and malformed results rejected.
 
+First-party widget code is licensed under **AGPL-3.0-only**. Persistent notices
+state copyright, redistribution terms, and absence of warranty; an accessible
+collapsed panel includes the complete root license. Dependency notices remain
+in the bundled JavaScript.
+
 ## Build and checks
 
 Use Node 24.x (verified with 24.21.0) and the package-manager pin in `package.json`.
@@ -28,11 +33,22 @@ this asset once during explicitly configured demo startup; ordinary Rust builds
 do not invoke frontend tools. See the repository demo configuration for its asset
 path. Do not publish the offline test harness as the widget resource.
 
+Rebuild the widget when adopting source offers. The build contains exactly one
+inert `openlegal-source-url` metadata placeholder. Server startup substitutes its
+required `[source] url` using HTML attribute escaping and enforces the resource
+size limit after substitution. Old builds without the placeholder fail startup.
+Operators must keep that HTTPS URL available without charge and supply the
+corresponding source for the running server and widget, including modifications
+and necessary build instructions. The widget does not host or fetch source archives.
+
 `pnpm --dir apps/widget harness` serves a deterministic, local-only simulated host
 at `http://127.0.0.1:4173`. Build first. It uses the real SDK `AppBridge`, a sandboxed
 iframe, and in-memory synthetic responses, with no MCP server or credentials.
 Browser tests cover bridge requests, source selection, pagination, keyboard detail
-navigation, text rendering, freshness, malformed data, errors, and loading.
+navigation, text rendering, freshness, malformed data, errors, loading, licensing,
+and source offers with successful, unsupported, disconnected, and refusing hosts.
+The harness inserts a fictional HTTPS source URL and records navigation requests
+without following them.
 The harness does not establish live ChatGPT compatibility.
 
 ## Contract
@@ -50,6 +66,11 @@ Initial host results from `demo_show_records` contain
 individual freshness. Only this render tool advertises the versioned `ui://`
 resource through `_meta.ui.resourceUri`; the MIME type is
 `text/html;profile=mcp-app`. CSP resource and connection allowlists stay empty.
+The source button uses `App.openLink` only after a user click and only when the
+host advertises `openLinks`. The widget revalidates the HTTPS source metadata
+before display or navigation and always provides a selectable URL, including
+when the bridge is unavailable or navigation is refused. No direct navigation
+or network request is performed by the widget.
 See [official OpenAI UI documentation](https://developers.openai.com/plugins/build/chatgpt-ui)
 for the MCP Apps bridge contract and the separate manual host acceptance step.
 

@@ -25,7 +25,9 @@ Leave the mock running, then in another terminal:
 cargo run --locked -p openlegal-server -- deploy/demo/server.toml
 ```
 
-The existing server configuration without `[demo]` still exposes only its
+Every configuration requires `[source].url`; replace the example placeholder with
+the actual source offer before hosting. See [source offers](server.md#source-offers-and-migration).
+The server configuration without `[demo]` still exposes only its
 registered foundation tools. The demo additionally requires its bounded local
 widget asset before listeners bind. Paths in the example are relative to the
 repository root. Generated HTML, keys, and certificates are disposable and ignored.
@@ -52,6 +54,18 @@ The widget resource is `ui://openlegal-demo/records-v1.html`, with MIME type
 The server lists and reads immutable registered resources; resource URIs never
 become filesystem paths or outbound requests. The resource includes its JavaScript
 and styles and declares no external network/resource/frame origins.
+
+Its persistent license notice identifies AGPL-3.0-only, copyright, redistribution
+terms and absence of warranty. An accessible collapsed panel contains the full
+license text. The source button requests that the MCP Apps host open the configured
+corresponding-source URL only when clicked; there is no automatic navigation or
+direct source fetch. A selectable URL remains available if the host is disconnected,
+lacks navigation support, or rejects the request. Source availability must cover
+both the server and the widget actually served, including modifications.
+
+After upgrading from the Apache-2.0 version, rebuild the widget as well as adding
+`[source]` to server configuration. Startup requires the new HTML source metadata
+placeholder and inserts the escaped operator URL before validating resource bounds.
 
 ## Progress and lifecycle
 

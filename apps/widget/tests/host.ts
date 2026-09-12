@@ -3,7 +3,14 @@ const iframe = document.querySelector('iframe')!;
 const records = Array.from({ length: 7 }, (_, index) => ({ source: 'layout_a', id: `demo-${index + 1}`, title: `Synthetic record ${index + 1}`, body: `Synthetic body ${index + 1}. <b>Plain source text</b>`, synthetic: true }));
 function envelope(data: unknown, stale = false) { return { data, provenance: { provider: 'synthetic', dataset: 'records', source_reference: 'synthetic:fixture', payload_sha256: 'a'.repeat(64), processor_version: '1.0.0', retrieved_at: 100, validated_at: 100 }, freshness: { state: stale ? 'stale' : 'fresh', age_seconds: stale ? 70 : 0 }, synthetic: true }; }
 const params = new URLSearchParams(location.search);
-const bridge = new AppBridge(null, { name: 'Offline test host', version: '1.0.0' }, { serverTools: {} });
+const bridge = new AppBridge(null, { name: 'Offline test host', version: '1.0.0' }, { serverTools: {}, ...(params.has('unsupported') ? {} : { openLinks: {} }) });
+if (!params.has('unsupported')) bridge.onopenlink = async ({ url }) => {
+  const links = JSON.parse(document.getElementById('links')!.textContent || '[]');
+  links.push(url);
+  document.getElementById('links')!.textContent = JSON.stringify(links);
+  if (params.has('throws')) throw new Error('Synthetic host navigation failure');
+  return { isError: params.has('denied') };
+};
 bridge.oncalltool = async ({ name, arguments: args }) => {
   const input = args ?? {};
   const calls = JSON.parse(document.getElementById('calls')!.textContent || '[]');
@@ -27,5 +34,5 @@ bridge.oninitialized = async () => {
   await bridge.sendToolInput({ arguments: { records: [] } });
   await bridge.sendToolResult({ content: [], structuredContent: params.has('malformed') ? { synthetic: true, records: [null] } : { synthetic: true, records: params.has('initial') ? [envelope(records[0], true), envelope({ ...records[0], source: 'layout_b' })] : [] } });
 };
-await bridge.connect(new PostMessageTransport(iframe.contentWindow!, iframe.contentWindow!));
-iframe.src = '/widget';
+if (!params.has('disconnected')) await bridge.connect(new PostMessageTransport(iframe.contentWindow!, iframe.contentWindow!));
+iframe.src = `/widget${params.has('invalid-source') ? '?invalid-source' : params.has('duplicate-source') ? '?duplicate-source' : ''}`;

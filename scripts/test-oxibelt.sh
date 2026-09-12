@@ -74,7 +74,7 @@ cp deploy/oxibelt/backend.toml scripts/http_smoke.py "$scratch/fixture/"
 if [[ -n ${DEMO_WIDGET_HTML:-} ]]; then
     cp "$DEMO_WIDGET_HTML" "$scratch/fixture/widget.html"
 else
-    printf '%s\n' '<html><body>Synthetic transport resource fixture</body></html>' > "$scratch/fixture/widget.html"
+    printf '%s\n' '<html><head><meta name="openlegal-source-url" content="__OPENLEGAL_SOURCE_URL__"></head><body>Synthetic transport resource fixture</body></html>' > "$scratch/fixture/widget.html"
 fi
 cat >> "$scratch/fixture/backend.toml" <<'TOML'
 

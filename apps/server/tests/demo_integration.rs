@@ -112,7 +112,10 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
                 .unwrap();
         });
         let service = openlegal_server::demo::service(&source_url).unwrap();
-        let mut registry = openlegal_server::registry::server_info_registry().unwrap();
+        let mut registry = openlegal_server::registry::server_info_registry(
+            openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
+        )
+        .unwrap();
         registry
             .register_module(DemoTools {
                 service: service.clone(),
@@ -131,9 +134,10 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
             .local_addr()
             .unwrap()
             .port();
-        let mut builder = ServerBuilder::new(registry, Limits::default()).with_resources(
+        let mut builder = ServerBuilder::new(registry, Limits::default(), openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap()).with_resources(
             openlegal_server::demo::widget_resources(
-                "<html>synthetic widget fixture</html>".into(),
+                "<html><meta name=\"openlegal-source-url\" content=\"__OPENLEGAL_SOURCE_URL__\">synthetic widget fixture</html>".into(),
+                &openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
             )
             .unwrap(),
         );
@@ -206,19 +210,42 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
             Duration::from_secs(5),
             Duration::from_secs(5),
         );
-        if version == "2025-11-25" {
-            let initialize = json!({"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"test","version":"1"}});
-            http(&http_url, version, "initialize", initialize.clone()).await;
-            write_json(
-                &mut tx,
-                &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":initialize}),
-                1024 * 1024,
-                &budget,
-                Duration::from_secs(5),
+        let (discovery_method, discovery_params) = if version == "2025-11-25" {
+            (
+                "initialize",
+                json!({"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"test","version":"1"}}),
             )
-            .await
+        } else {
+            ("server/discover", params(version, "discovery", json!({})))
+        };
+        let http_discovery = http(
+            &http_url,
+            version,
+            discovery_method,
+            discovery_params.clone(),
+        )
+        .await;
+        write_json(
+            &mut tx,
+            &json!({"jsonrpc":"2.0","id":1,"method":discovery_method,"params":discovery_params}),
+            1024 * 1024,
+            &budget,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let wt_discovery = wt_reply(&mut rx, 1).await;
+        let instructions = http_discovery.last().unwrap()["result"]["instructions"]
+            .as_str()
             .unwrap();
-            wt_reply(&mut rx, 1).await;
+        assert_eq!(
+            wt_discovery.last().unwrap()["result"]["instructions"],
+            instructions
+        );
+        assert!(instructions.contains("AGPL-3.0-only"));
+        assert!(instructions.contains("https://www.gnu.org/licenses/agpl-3.0.html"));
+        assert!(instructions.contains("https://source.test/running"));
+        if version == "2025-11-25" {
             write_json(
                 &mut tx,
                 &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
@@ -229,6 +256,38 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
             .await
             .unwrap();
         }
+        let info_params = params(
+            version,
+            "source-info",
+            json!({"name":"server_info", "arguments":{}}),
+        );
+        let http_info = http(&http_url, version, "tools/call", info_params.clone()).await;
+        write_json(
+            &mut tx,
+            &json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":info_params}),
+            1024 * 1024,
+            &budget,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let wt_info = wt_reply(&mut rx, 12).await;
+        let info = &http_info.last().unwrap()["result"]["structuredContent"];
+        assert_eq!(
+            &wt_info.last().unwrap()["result"]["structuredContent"],
+            info
+        );
+        assert_eq!(info["license"], "AGPL-3.0-only");
+        assert_eq!(
+            info["licenseUrl"],
+            "https://www.gnu.org/licenses/agpl-3.0.html"
+        );
+        assert_eq!(info["sourceUrl"], "https://source.test/running");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "source offers must not fetch upstream data"
+        );
         let input = json!({"name":"demo_search_records","arguments":{"source":"layout_a","query":"","page":0,"page_size":5}});
         let http_future = http(
             &http_url,
@@ -279,6 +338,18 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
         assert_eq!(
             read.last().unwrap()["result"]["contents"][0]["mimeType"],
             "text/html;profile=mcp-app"
+        );
+        let widget_html = read.last().unwrap()["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(widget_html.contains("content=\"https://source.test/running\""));
+        assert!(!widget_html.contains("__OPENLEGAL_SOURCE_URL__"));
+        write_json(&mut tx, &json!({"jsonrpc":"2.0","id":13,"method":"resources/read","params":params(version,"wt-resource",json!({"uri":WIDGET_URI}))}),
+            1024 * 1024, &budget, Duration::from_secs(5)).await.unwrap();
+        let wt_resource = wt_reply(&mut rx, 13).await;
+        assert_eq!(
+            wt_resource.last().unwrap()["result"]["contents"][0]["text"],
+            widget_html
         );
         let show=http(&http_url,version,"tools/call",params(version,"show",json!({"name":"demo_show_records","arguments":{"records":[{"source":"layout_a","id":"001"}]}}))).await;
         assert_eq!(

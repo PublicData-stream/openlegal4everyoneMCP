@@ -2,6 +2,7 @@
 
 use crate::{
     ServerError,
+    config::SourceOffer,
     progress::ProgressStage,
     registry::{
         ToolError, ToolExecutionContext, ToolModule, ToolOptions, ToolOutput, ToolRegistry,
@@ -265,7 +266,10 @@ fn map_error(error: RetrievalError) -> ToolError {
 }
 
 /// Read an operator-selected local asset once, with a bound even if it grows while read.
-pub async fn load_widget(path: &Path) -> Result<ResourceRegistry, ServerError> {
+pub async fn load_widget(
+    path: &Path,
+    source: &SourceOffer,
+) -> Result<ResourceRegistry, ServerError> {
     let file = tokio::fs::File::open(path).await?;
     if !file.metadata().await?.is_file() {
         return Err("widget asset must be a regular file".into());
@@ -275,10 +279,29 @@ pub async fn load_widget(path: &Path) -> Result<ResourceRegistry, ServerError> {
     if bytes.len() > 1024 * 1024 {
         return Err("widget asset exceeds 1 MiB".into());
     }
-    widget_resources(String::from_utf8(bytes)?)
+    widget_resources(String::from_utf8(bytes)?, source)
 }
 
-pub fn widget_resources(html: String) -> Result<ResourceRegistry, ServerError> {
+pub fn widget_resources(
+    html: String,
+    source: &SourceOffer,
+) -> Result<ResourceRegistry, ServerError> {
+    const MARKER: &str = "__OPENLEGAL_SOURCE_URL__";
+    const METADATA: &str =
+        "<meta name=\"openlegal-source-url\" content=\"__OPENLEGAL_SOURCE_URL__\">";
+    if html.matches(MARKER).count() != 1 || html.matches(METADATA).count() != 1 {
+        return Err("widget must contain exactly one source URL metadata placeholder".into());
+    }
+    let escaped = source
+        .url()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;");
+    let html = html.replacen(MARKER, &escaped, 1);
+    // Registration checks the expanded text and serialized resource; handler startup also
+    // checks the result against the configured message limit before binding listeners.
     let mut resources = ResourceRegistry::new();
     let metadata = MetaObject(serde_json::from_value(serde_json::json!({
         "ui": {"prefersBorder": true, "csp": {
@@ -294,4 +317,68 @@ pub fn widget_resources(html: String) -> Result<ResourceRegistry, ServerError> {
             .with_meta(metadata),
     )?;
     Ok(resources)
+}
+
+#[cfg(test)]
+mod widget_source_tests {
+    use super::*;
+
+    const META: &str = "<meta name=\"openlegal-source-url\" content=\"__OPENLEGAL_SOURCE_URL__\">";
+
+    #[test]
+    fn source_metadata_is_escaped_and_missing_duplicate_or_misplaced_markers_fail() {
+        let source = SourceOffer::new("https://source.test/path?q=1&v=2#'quoted'").unwrap();
+        let resources = widget_resources(format!("<html>{META}</html>"), &source).unwrap();
+        let resource = &resources.resources[WIDGET_URI];
+        let ResourceContents::TextResourceContents { text, .. } = &resource.result.contents[0]
+        else {
+            panic!("expected text")
+        };
+        assert!(text.contains("content=\"https://source.test/path?q=1&amp;v=2#&#39;quoted&#39;\""));
+        assert!(!text.contains("__OPENLEGAL_SOURCE_URL__"));
+        for html in [
+            "<html>missing</html>".to_owned(),
+            format!("{META}{META}"),
+            "<script>__OPENLEGAL_SOURCE_URL__</script>".to_owned(),
+            format!("{META}__OPENLEGAL_SOURCE_URL__"),
+        ] {
+            assert!(widget_resources(html, &source).is_err());
+        }
+    }
+
+    #[test]
+    fn expanded_widget_must_fit_raw_and_configured_serialized_limits() {
+        let source =
+            SourceOffer::new(&format!("https://source.test/?{}", "&".repeat(1800))).unwrap();
+        let near_raw_limit = format!("{META}{}", "a".repeat(1024 * 1024 - META.len()));
+        assert_eq!(near_raw_limit.len(), 1024 * 1024);
+        assert!(widget_resources(near_raw_limit, &source).is_err());
+        let small = SourceOffer::new("https://source.test/").unwrap();
+        let html = format!("{META}<p>synthetic</p>");
+        assert!(
+            widget_resources(html.clone(), &small)
+                .unwrap()
+                .validate_limits(4096)
+                .is_ok()
+        );
+        assert!(
+            widget_resources(html, &source)
+                .unwrap()
+                .validate_limits(4096)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_widget_loading_applies_required_source_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.html");
+        let source = SourceOffer::new("https://source.test/running").unwrap();
+        tokio::fs::write(&path, "<html>outdated build</html>")
+            .await
+            .unwrap();
+        assert!(load_widget(&path, &source).await.is_err());
+        tokio::fs::write(&path, META).await.unwrap();
+        assert!(load_widget(&path, &source).await.is_ok());
+    }
 }

@@ -2,7 +2,7 @@
 
 use crate::{
     ServerError,
-    config::Limits,
+    config::{Limits, SourceOffer},
     progress::{ProgressReporter, validate_progress_token},
     registry::{
         ToolContext, ToolError, ToolExecutionContext, ToolRegistry, ensure_serialized_limit,
@@ -29,6 +29,7 @@ pub struct Counters {
 #[derive(Clone)]
 pub struct McpHandler {
     registry: Arc<ToolRegistry>,
+    source: SourceOffer,
     resources: Arc<ResourceRegistry>,
     limits: Arc<Limits>,
     calls: Arc<Semaphore>,
@@ -36,8 +37,12 @@ pub struct McpHandler {
 }
 
 impl McpHandler {
-    pub fn new(registry: ToolRegistry, limits: Arc<Limits>) -> Result<Self, ServerError> {
-        Self::with_resources(registry, ResourceRegistry::new(), limits)
+    pub fn new(
+        registry: ToolRegistry,
+        limits: Arc<Limits>,
+        source: SourceOffer,
+    ) -> Result<Self, ServerError> {
+        Self::with_resources(registry, ResourceRegistry::new(), limits, source)
     }
 
     /// Construct one handler sharing an immutable tool and static resource registry.
@@ -45,8 +50,14 @@ impl McpHandler {
         registry: ToolRegistry,
         resources: ResourceRegistry,
         limits: Arc<Limits>,
+        source: SourceOffer,
     ) -> Result<Self, ServerError> {
         limits.validate()?;
+        ensure_serialized_limit(
+            &crate::registry::server_info(&source),
+            limits.max_message_bytes / 8,
+        )
+        .map_err(|_| "source offer exceeds configured tool result budget")?;
         resources.validate_limits(limits.max_message_bytes)?;
         for tool in registry.tools.values() {
             if let Some(meta) = &tool.definition.meta {
@@ -74,6 +85,7 @@ impl McpHandler {
         ensure_serialized_limit(&tools, limits.max_message_bytes / 2)?;
         Ok(Self {
             registry: Arc::new(registry),
+            source,
             resources: Arc::new(resources),
             calls: Arc::new(Semaphore::new(limits.max_in_flight)),
             limits,
@@ -102,8 +114,13 @@ impl ServerHandler for McpHandler {
         };
         info.server_info =
             Implementation::new("openlegal4everyone.stream", env!("CARGO_PKG_VERSION"));
-        info.instructions =
-            Some("Public read-only server foundation. No legal-data provider is connected.".into());
+        info.instructions = Some(format!(
+            "Public read-only server foundation. No legal-data provider is connected. \
+             Licensed under {} ({}). Corresponding source for this running server and widget: {}",
+            SourceOffer::LICENSE,
+            SourceOffer::LICENSE_URL,
+            self.source.url()
+        ));
         info
     }
 
@@ -274,5 +291,24 @@ impl ServerHandler for McpHandler {
                 Err(error)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn source_offer_must_fit_the_configured_tool_result_budget_before_binding() {
+        let source =
+            SourceOffer::new(&format!("https://source.test/{}", "a".repeat(1900))).unwrap();
+        let registry = crate::registry::server_info_registry(source.clone()).unwrap();
+        let limits = Arc::new(Limits {
+            max_message_bytes: 4096,
+            ..Default::default()
+        });
+        assert!(McpHandler::new(registry, limits, source.clone()).is_err());
+        let registry = crate::registry::server_info_registry(source.clone()).unwrap();
+        assert!(McpHandler::new(registry, Arc::new(Limits::default()), source).is_ok());
     }
 }

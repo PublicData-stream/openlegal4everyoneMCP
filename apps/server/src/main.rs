@@ -16,7 +16,7 @@ async fn main() -> Result<(), ServerError> {
         .nth(1)
         .ok_or("usage: openlegal-server CONFIG.toml")?;
     let config: Config = toml::from_str(&tokio::fs::read_to_string(path).await?)?;
-    let mut registry = openlegal_server::registry::server_info_registry()?;
+    let mut registry = openlegal_server::registry::server_info_registry(config.source.url.clone())?;
     let demo_service = config
         .demo
         .as_ref()
@@ -27,10 +27,11 @@ async fn main() -> Result<(), ServerError> {
             service: service.clone(),
         })?;
     }
-    let mut builder = ServerBuilder::new(registry, config.limits);
+    let mut builder = ServerBuilder::new(registry, config.limits, config.source.url.clone());
     if let Some(demo) = &config.demo {
-        builder =
-            builder.with_resources(openlegal_server::demo::load_widget(&demo.widget_html).await?);
+        builder = builder.with_resources(
+            openlegal_server::demo::load_widget(&demo.widget_html, &config.source.url).await?,
+        );
     }
     if let Some(service) = &demo_service {
         let service = service.clone();

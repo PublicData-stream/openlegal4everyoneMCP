@@ -64,8 +64,8 @@ async fn main() -> Result<(), ServerError> {
         Duration::from_secs(10),
         Duration::from_secs(10),
     );
-    if revision == "2025-11-25" {
-        exchange(&mut send, &mut reader, &budget, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":revision,"capabilities":{},"clientInfo":{"name":"openlegal-wt-client","version":"1"}}})).await?;
+    let discovery = if revision == "2025-11-25" {
+        let response = exchange(&mut send, &mut reader, &budget, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":revision,"capabilities":{},"clientInfo":{"name":"openlegal-wt-client","version":"1"}}})).await?;
         write_json(
             &mut send,
             &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
@@ -74,7 +74,13 @@ async fn main() -> Result<(), ServerError> {
             Duration::from_secs(10),
         )
         .await?;
-    }
+        response
+    } else {
+        exchange(&mut send, &mut reader, &budget, json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":revision,"io.modelcontextprotocol/clientInfo":{"name":"openlegal-wt-client","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}})).await?
+    };
+    let instructions = discovery["result"]["instructions"]
+        .as_str()
+        .ok_or("license/source instructions missing")?;
     if demo {
         for (id, method, mut params) in [
             (
@@ -148,6 +154,19 @@ async fn main() -> Result<(), ServerError> {
                 .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "server_info"))
         {
             return Err(io::Error::other("server_info tool missing").into());
+        }
+        if method == "tools/call" {
+            let info = &response["result"]["structuredContent"];
+            let source = info["sourceUrl"].as_str().ok_or("source offer missing")?;
+            openlegal_server::config::SourceOffer::new(source)?;
+            if info["license"] != openlegal_server::config::SourceOffer::LICENSE
+                || info["licenseUrl"] != openlegal_server::config::SourceOffer::LICENSE_URL
+                || !instructions.contains(source)
+                || !instructions.contains(openlegal_server::config::SourceOffer::LICENSE)
+                || !instructions.contains(openlegal_server::config::SourceOffer::LICENSE_URL)
+            {
+                return Err("license/source metadata disagrees with server instructions".into());
+            }
         }
         println!("{response}");
     }

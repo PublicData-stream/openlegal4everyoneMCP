@@ -299,11 +299,25 @@ pub(crate) fn ensure_serialized_limit(
 #[serde(deny_unknown_fields)]
 struct EmptyInput {}
 
-pub fn server_info_registry() -> Result<ToolRegistry, ServerError> {
+/// Register identity and the operator-configured corresponding-source offer.
+pub fn server_info_registry(
+    source: crate::config::SourceOffer,
+) -> Result<ToolRegistry, ServerError> {
     let mut registry = ToolRegistry::new();
-    registry.register::<EmptyInput, _, _>("server_info", "Read server identity and supported protocols; does not retrieve legal data.", |_, _| async {
-        Ok(serde_json::json!({"product":"openlegal4everyone.stream", "version":env!("CARGO_PKG_VERSION"),
-            "transports":["streamable-http", "webtransport-v1"], "protocolVersions":["2026-07-28", "2025-11-25"]}))
+    registry.register::<EmptyInput, _, _>("server_info", "Read server identity, license, corresponding source and supported protocols; does not retrieve legal data.", move |_, _| {
+        let source = source.clone();
+        async move {
+            Ok(server_info(&source))
+        }
     })?;
     Ok(registry)
+}
+
+/// Canonical source metadata also used to verify configured response budgets at startup.
+pub(crate) fn server_info(source: &crate::config::SourceOffer) -> Value {
+    serde_json::json!({"product":"openlegal4everyone.stream", "version":env!("CARGO_PKG_VERSION"),
+                "license": crate::config::SourceOffer::LICENSE,
+                "licenseUrl": crate::config::SourceOffer::LICENSE_URL,
+                "sourceUrl": source.url(),
+                "transports":["streamable-http", "webtransport-v1"], "protocolVersions":["2026-07-28", "2025-11-25"]})
 }

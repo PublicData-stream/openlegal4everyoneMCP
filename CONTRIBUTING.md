@@ -51,6 +51,11 @@ repository root unless a different directory is explicitly stated. Keep local
 session aliases, absolute host paths, credentials, and disposable artifacts out
 of commit messages and PR evidence.
 
+First-party contributions intentionally submitted for inclusion are licensed under
+the repository's [GNU AGPL version 3 only](LICENSE) (`AGPL-3.0-only`). Submit only
+material you have authority to contribute under these terms. Preserve separately
+licensed third-party notices and record meaningful provenance.
+
 ## Commit messages
 
 Use lightweight Conventional Commits:
@@ -307,5 +312,8 @@ Reference snapshot: `72564d165dfd05cb29a64aeebd19fccd7944ea6f`:
 This is an adaptation, not a synchronized import. OxiBelt's proxy/WAF, TLS
 termination, HTTP/3, Person Proof, deployment, release, directory, and model-alias
 policies do not apply here. Later reuse should record meaningful provenance without
-copying unrelated obligations. The repository's [Apache-2.0 license](LICENSE)
-remains unchanged; upstream data reuse is handled in provider profiles.
+copying unrelated obligations. The maintainer authorized relicensing the adapted
+first-party documentation under the repository's [GNU AGPL version 3 only](LICENSE)
+as part of the September 12, 2026 migration. This does not change OxiBelt's license
+or the referenced historical snapshot; upstream data reuse is handled in provider
+profiles.

@@ -120,6 +120,7 @@ impl Server {
                 max_message_bytes,
                 ..Default::default()
             },
+            openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
         )
         .with_resources(resources);
         builder

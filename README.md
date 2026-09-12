@@ -59,7 +59,24 @@ Node or a widget build.
 
 ## License
 
-Project contributions are covered by [Apache-2.0](LICENSE). Upstream legal data
-has its own provenance and applicable reuse conditions; the software license does
-not replace them. Documentation adaptation from the maintainer's OxiBelt project
-is recorded in [Contributing](CONTRIBUTING.md#oxibelt-provenance).
+Copyright 2026 PiQuark6046 as a contributor of openlegal4everyoneMCP.
+
+First-party code and documentation are licensed under the
+[GNU Affero General Public License, version 3 only](LICENSE)
+(`AGPL-3.0-only`). You may redistribute and modify this work under version 3 of
+that license. It is provided without warranty, including implied warranties of
+merchantability or fitness for a particular purpose. The license's appendix is
+illustrative; this project's grant does not include later versions.
+
+The September 12, 2026 migration applies from its commit onward. Earlier versions
+remain available under their original Apache-2.0 terms; previously granted rights
+are not revoked. Third-party dependencies retain their licenses and notices.
+Upstream legal data has its own provenance and applicable reuse conditions; the
+software license does not replace them. Documentation adaptation from the
+maintainer's OxiBelt project is recorded in
+[Contributing](CONTRIBUTING.md#oxibelt-provenance).
+
+Every server configuration requires a public HTTPS corresponding-source URL for
+the running server and widget. MCP clients and widget users can discover this
+offer; operators must maintain the matching source and its availability. See
+[source offers and migration](docs/server.md#source-offers-and-migration).

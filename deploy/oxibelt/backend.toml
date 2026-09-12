@@ -1,4 +1,8 @@
 # Both transport listeners are reachable only on the private container network.
+# Isolated fixture only; a deployment must supply its actual corresponding source.
+[source]
+url = "https://example.org/openlegal/source"
+
 [http]
 bind = "0.0.0.0:8080"
 allowed_hosts = ["backend:8080"]

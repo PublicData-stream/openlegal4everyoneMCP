@@ -11,6 +11,15 @@ confidence-threshold = 0.93
 # Selected from the resolved graph; see docs/dependencies.md.
 allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
          "MIT-0", "Unicode-3.0", "Zlib"]
+# First-party licensing only; do not admit AGPL dependencies globally.
+# Owner: PiQuark6046. Review by 2026-12-12 and whenever package versions change.
+exceptions = [
+    { crate = "openlegal-server@0.1.0", allow = ["AGPL-3.0-only"] },
+    { crate = "openlegal-domain@0.1.0", allow = ["AGPL-3.0-only"] },
+    { crate = "openlegal-normalization@0.1.0", allow = ["AGPL-3.0-only"] },
+    { crate = "openlegal-application@0.1.0", allow = ["AGPL-3.0-only"] },
+    { crate = "openlegal-adapters@0.1.0", allow = ["AGPL-3.0-only"] },
+]
 
 [bans]
 multiple-versions = "warn"

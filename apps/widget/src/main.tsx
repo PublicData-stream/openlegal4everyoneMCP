@@ -3,8 +3,34 @@ import { createRoot } from 'react-dom/client';
 import { App } from '@modelcontextprotocol/ext-apps';
 import { ResponseError, freshLabel, parseDetail, parseInitial, parseSearch, type DisplayRecord, type RecordPage, type Source } from './model.ts';
 import './style.css';
+import { readSourceUrl } from './source-offer.ts';
 
 const bridge = new App({ name: 'Synthetic record browser', version: '0.1.0' }, {});
+const sourceUrl = readSourceUrl(document);
+function SourceOffer({ ready }: { ready: boolean }) {
+  const [message, setMessage] = useState('');
+  const [opening, setOpening] = useState(false);
+  const supported = ready && Boolean(bridge.getHostCapabilities()?.openLinks);
+  async function openSource() {
+    if (!sourceUrl || !supported || opening) return;
+    setOpening(true);
+    setMessage('');
+    try {
+      const result = await bridge.openLink({ url: sourceUrl }, { timeout: 10000 });
+      setMessage(result.isError ? 'The host declined to open the source. Copy the URL below.' : 'Source link sent to the host.');
+    } catch { setMessage('The source link could not be opened. Copy the URL below.'); }
+    finally { setOpening(false); }
+  }
+  return <section className="source-offer" aria-label="Corresponding source">
+    <h2>Corresponding source</h2>
+    {sourceUrl ? <>
+      <p>Get the source code for this running server and widget.</p>
+      <button type="button" disabled={!supported || opening} onClick={() => void openSource()}>Get source code</button>
+      <label>Source code URL<input readOnly value={sourceUrl} onFocus={event => event.currentTarget.select()} /></label>
+      <p className="metadata">{message || (!supported ? 'Copy the URL to open it when your host cannot open links.' : 'Your host controls opening this link.')}</p>
+    </> : <p>The source URL is unavailable or invalid. Ask the operator for the corresponding source.</p>}
+  </section>;
+}
 function Browser() {
   const [ready, setReady] = useState(false);
   const [query, setQuery] = useState('');
@@ -29,6 +55,7 @@ function Browser() {
       try { setRecords(parseInitial(result)); } catch (error) { setRecords([]); setError((error as Error).message); }
     };
     bridge.ontoolcancelled = () => { serial.current++; setLoading(false); setError('The request was cancelled.'); };
+    bridge.onclose = () => { if (alive) setReady(false); };
     bridge.connect(undefined, { timeout: 10000 }).then(() => { if (alive) setReady(true); }).catch(() => {
       if (alive) setError('Connect this record browser through an MCP Apps host to search.');
     });
@@ -94,6 +121,7 @@ function Browser() {
       </li>)}</ul>
       {page && <nav aria-label="Results pages"><button disabled={loading || page.page === 0} onClick={() => void search(page.page - 1)}>Previous</button><span>Page {page.page + 1} · {page.total} records</span><button disabled={loading || (page.page + 1) * page.pageSize >= page.total} onClick={() => void search(page.page + 1)}>Next</button></nav>}
     </section>}
+    <SourceOffer ready={ready} />
   </main>;
 }
 const root = document.getElementById('root');

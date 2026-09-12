@@ -1,9 +1,13 @@
 import { build } from 'esbuild';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 const result = await build({ entryPoints: ['src/main.tsx'], bundle: true, minify: true, write: false, outdir: 'dist', target: 'es2022', format: 'iife', legalComments: 'inline', define: { 'process.env.NODE_ENV': '"production"' } });
 const js = result.outputFiles.find(file => file.path.endsWith('.js')).text.replaceAll('</script', '<\\/script');
 const css = result.outputFiles.find(file => file.path.endsWith('.css')).text;
-const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Synthetic record browser</title><style>${css}</style></head><body><div id="root"></div><script>${js}</script></body></html>`;
+const license = await readFile('../../LICENSE', 'utf8');
+const escapedLicense = license.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+const marker = '__OPENLEGAL_SOURCE_URL__';
+const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="openlegal-source-url" content="${marker}"><title>Synthetic record browser</title><style>${css}</style></head><body><div id="root"></div><footer aria-label="Software license"><p>Copyright © 2026 PiQuark6046. Licensed under GNU AGPL version 3 only (AGPL-3.0-only).</p><p>This program comes with no warranty. You may redistribute it under the terms of this license.</p><details><summary>Read the full GNU AGPLv3 license</summary><pre id="license-text">${escapedLicense}</pre></details></footer><script>${js}</script></body></html>`;
+if (html.split(marker).length !== 2) throw new Error('Widget requires exactly one source URL placeholder');
 if (Buffer.byteLength(html) > 1024 * 1024) throw new Error('Widget exceeds the 1 MiB resource limit');
 await mkdir('dist', { recursive: true });
 await writeFile('dist/index.html', html);

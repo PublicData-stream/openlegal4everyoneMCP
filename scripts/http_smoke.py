@@ -12,6 +12,7 @@ MODERN = "2026-07-28"
 LEGACY = "2025-11-25"
 MAX_BODY = 4 * 1024 * 1024
 MAX_PROGRESS = 5
+SOURCE_URL = "https://example.org/openlegal/source"
 
 
 def exchange(body, revision=MODERN, session=None, origin=None, path="/mcp", host=None, timeout=10):
@@ -104,6 +105,8 @@ def smoke():
             assert result["resultType"] == "complete", result
             assert set(result["supportedVersions"]) == {MODERN, LEGACY}, result
             assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "openlegal4everyone.stream", result
+        assert SOURCE_URL in result["instructions"], result
+        assert "AGPL-3.0-only" in result["instructions"], result
         _, result = success(request("tools/list", revision, 2), revision, session)
         assert any(tool["name"] == "server_info" for tool in result["tools"]), result
         for origin in (None, "https://example.test"):
@@ -111,6 +114,10 @@ def smoke():
                                 revision, session, origin)
             assert not result.get("isError", False), result
             assert result.get("content"), result
+            info = result.get("structuredContent") or json.loads(result["content"][0]["text"])
+            assert info["license"] == "AGPL-3.0-only", info
+            assert info["sourceUrl"] == SOURCE_URL, info
+            assert info["licenseUrl"] == "https://www.gnu.org/licenses/agpl-3.0.html", info
         print(f"HTTP {revision}: discovery, tools/list, server_info, Origin accepted", flush=True)
         for ident, tool, arguments in (
             (4, "demo_search_records", {"source": "layout_a"}),
@@ -125,6 +132,8 @@ def smoke():
                                     uri="ui://openlegal-demo/records-v1.html"), revision, session)
         assert result["contents"][0]["mimeType"] == "text/html;profile=mcp-app", result
         assert "Synthetic" in result["contents"][0]["text"] or "synthetic" in result["contents"][0]["text"]
+        assert SOURCE_URL in result["contents"][0]["text"]
+        assert "__OPENLEGAL_SOURCE_URL__" not in result["contents"][0]["text"]
         print(f"HTTP {revision}: synthetic search/detail/render, progress, resource read", flush=True)
     probe = request("tools/list", MODERN)
     assert exchange(probe, origin="https://rejected.test")[0] == 403

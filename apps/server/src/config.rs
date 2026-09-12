@@ -144,6 +144,7 @@ pub struct HealthConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub source: SourceConfig,
     pub http: HttpConfig,
     pub webtransport: WebTransportConfig,
     pub health: HealthConfig,
@@ -161,4 +162,134 @@ pub struct DemoConfig {
     pub upstream: String,
     /// Locally built, trusted HTML loaded once before serving.
     pub widget_html: PathBuf,
+}
+
+/// Operator-advertised corresponding source; validation never fetches the URL.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct SourceOffer(String);
+
+impl SourceOffer {
+    pub const MAX_URL_BYTES: usize = 2048;
+    pub const LICENSE: &str = "AGPL-3.0-only";
+    pub const LICENSE_URL: &str = "https://www.gnu.org/licenses/agpl-3.0.html";
+
+    /// Require an explicit absolute HTTPS destination without embedded credentials.
+    /// Both input and normalized output are bounded, including percent-encoding expansion.
+    pub fn new(value: &str) -> Result<Self, ServerError> {
+        if value.len() > Self::MAX_URL_BYTES
+            || value.chars().any(char::is_control)
+            || value.trim() != value
+            || value.contains('\\')
+        {
+            return Err("source URL exceeds its limit or contains control characters".into());
+        }
+        let (scheme, rest) = value
+            .split_once("://")
+            .ok_or("source URL must be absolute HTTPS")?;
+        let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
+        let parsed = url::Url::parse(value).map_err(|_| "invalid source URL")?;
+        if !scheme.eq_ignore_ascii_case("https")
+            || parsed.scheme() != "https"
+            || authority.is_empty()
+            || authority.contains('@')
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.as_str().len() > Self::MAX_URL_BYTES
+        {
+            return Err("source URL must be absolute HTTPS with a host and no credentials".into());
+        }
+        Ok(Self(parsed.into()))
+    }
+
+    pub fn url(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for SourceOffer {
+    type Error = ServerError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceConfig {
+    pub url: SourceOffer,
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn source_offer_validates_and_normalizes_without_fetching() {
+        assert_eq!(
+            SourceOffer::new("HTTPS://Example.test:443/source?q=1&v=2")
+                .unwrap()
+                .url(),
+            "https://example.test/source?q=1&v=2"
+        );
+        for invalid in [
+            "",
+            "/source",
+            "http://example.test/source",
+            "https:example.test",
+            "https:///example.test",
+            "https://user:secret@example.test",
+            "https://@example.test",
+            "https://example.test/\nsource",
+            "https://example.test/\u{7f}",
+            "https://example.test/?a=\\b",
+            "https://example.test/#a\\b",
+            "https://example.test/path ",
+            " https://example.test",
+        ] {
+            assert!(SourceOffer::new(invalid).is_err(), "{invalid:?}");
+        }
+        let prefix = "https://example.test/";
+        let at_limit = format!(
+            "{prefix}{}",
+            "a".repeat(SourceOffer::MAX_URL_BYTES - prefix.len())
+        );
+        assert!(SourceOffer::new(&at_limit).is_ok());
+        assert!(SourceOffer::new(&(at_limit + "a")).is_err());
+        // Unicode input fits but percent-encoding expansion must also fit.
+        assert!(SourceOffer::new(&format!("{prefix}{}", "é".repeat(500))).is_err());
+    }
+
+    #[test]
+    fn config_requires_valid_source_before_startup() {
+        let base = r#"
+[http]
+bind = "127.0.0.1:8080"
+allowed_hosts = ["example.test"]
+allowed_origins = []
+[webtransport]
+bind = "127.0.0.1:8081"
+certificate = "missing.pem"
+private_key = "missing.key"
+allowed_hosts = ["example.test"]
+allowed_origins = []
+[health]
+bind = "127.0.0.1:8082"
+"#;
+        assert!(toml::from_str::<Config>(base).is_err());
+        for source in [
+            "",
+            "url = 'http://example.test'",
+            "url = 'https://secret@example.test'",
+        ] {
+            assert!(toml::from_str::<Config>(&format!("{base}\n[source]\n{source}")).is_err());
+        }
+        let config: Config = toml::from_str(&format!(
+            "{base}\n[source]\nurl = 'https://example.test/source'"
+        ))
+        .unwrap();
+        assert_eq!(config.source.url.url(), "https://example.test/source");
+    }
 }
