@@ -316,6 +316,24 @@ pub struct HealthEndpoint {
     pub bind: SocketAddr,
 }
 
+/// A private health listener with a trusted, bounded application metrics callback.
+pub struct MetricsHealthEndpoint {
+    endpoint: HealthEndpoint,
+    metrics: Arc<dyn Fn() -> String + Send + Sync>,
+}
+
+impl HealthEndpoint {
+    pub fn with_metrics(
+        self,
+        metrics: impl Fn() -> String + Send + Sync + 'static,
+    ) -> MetricsHealthEndpoint {
+        MetricsHealthEndpoint {
+            endpoint: self,
+            metrics: Arc::new(metrics),
+        }
+    }
+}
+
 impl Endpoint for HealthEndpoint {
     fn id(&self) -> &str {
         "health"
@@ -327,41 +345,69 @@ impl Endpoint for HealthEndpoint {
         }]
     }
     async fn bind(self, context: EndpointContext) -> Result<BoundEndpoint, ServerError> {
-        let listener = tokio::net::TcpListener::bind(self.bind).await?;
-        let address = listener.local_addr()?;
-        let app = Router::new()
-            .route("/live", get(|| async { "live" }))
-            .route(
-                "/ready",
-                get(|State(context): State<EndpointContext>| async move {
-                    if context.ready.load(Ordering::Acquire) {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    }
-                }),
-            )
-            .route(
-                "/metrics",
-                get(|State(context): State<EndpointContext>| async move {
-                    format!(
+        bind_health(self.bind, context, Arc::new(String::new)).await
+    }
+}
+
+impl Endpoint for MetricsHealthEndpoint {
+    fn id(&self) -> &str {
+        "health"
+    }
+    fn bindings(&self) -> Vec<Binding> {
+        self.endpoint.bindings()
+    }
+    async fn bind(self, context: EndpointContext) -> Result<BoundEndpoint, ServerError> {
+        bind_health(self.endpoint.bind, context, self.metrics).await
+    }
+}
+
+async fn bind_health(
+    bind: SocketAddr,
+    context: EndpointContext,
+    metrics: Arc<dyn Fn() -> String + Send + Sync>,
+) -> Result<BoundEndpoint, ServerError> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let address = listener.local_addr()?;
+    let app = Router::new()
+        .route("/live", get(|| async { "live" }))
+        .route(
+            "/ready",
+            get(|State(context): State<EndpointContext>| async move {
+                if context.ready.load(Ordering::Acquire) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move |State(context): State<EndpointContext>| {
+                let metrics = metrics.clone();
+                async move {
+                    let mut output = format!(
                         "openlegal_tool_calls_total {}\nopenlegal_tool_failures_total {}\n",
                         context.handler.counters.calls.load(Ordering::Relaxed),
                         context.handler.counters.failures.load(Ordering::Relaxed)
-                    )
-                }),
-            )
-            .with_state(context.clone());
-        Ok(BoundEndpoint {
-            id: "health".into(),
-            addresses: vec![address],
-            run: async move {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(context.shutdown.cancelled_owned())
-                    .await?;
-                Ok(())
-            }
-            .boxed(),
-        })
-    }
+                    );
+                    let extra = metrics();
+                    if extra.len() <= 16 * 1024 {
+                        output.push_str(&extra);
+                    }
+                    output
+                }
+            }),
+        )
+        .with_state(context.clone());
+    Ok(BoundEndpoint {
+        id: "health".into(),
+        addresses: vec![address],
+        run: async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(context.shutdown.cancelled_owned())
+                .await?;
+            Ok(())
+        }
+        .boxed(),
+    })
 }

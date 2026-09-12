@@ -4,11 +4,14 @@
 //! Legal retrieval policy belongs in application services, not transport adapters.
 
 pub mod config;
+pub mod demo;
 pub mod endpoint;
 pub mod framing;
 pub mod handler;
 pub mod http;
+pub mod progress;
 pub mod registry;
+pub mod resources;
 mod timed_io;
 pub mod webtransport;
 

@@ -191,3 +191,176 @@ fn empty_origin_policy_rejects_present_origins_and_limits_validate() {
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn worker_failure_stops_endpoints_and_joins_other_workers() {
+    let first = endpoint("http");
+    let dropped = first.dropped.clone();
+    let completed = Arc::new(AtomicBool::new(false));
+    let worker_completed = completed.clone();
+    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    builder.register_endpoint(first).unwrap();
+    builder
+        .register_worker("owned", move |shutdown| async move {
+            shutdown.cancelled().await;
+            tokio::task::yield_now().await;
+            worker_completed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+    builder
+        .register_worker("failing", |_| async {
+            Err("synthetic worker failure".into())
+        })
+        .unwrap();
+    assert!(
+        builder
+            .bind()
+            .await
+            .unwrap()
+            .run(CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(completed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn failed_binding_never_starts_application_worker() {
+    let mut failed = endpoint("failed");
+    failed.fail_bind = true;
+    let started = Arc::new(AtomicBool::new(false));
+    let worker_started = started.clone();
+    let mut builder = ServerBuilder::new(ToolRegistry::new(), Limits::default());
+    builder.register_endpoint(failed).unwrap();
+    builder
+        .register_worker("worker", move |_| {
+            worker_started.store(true, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .unwrap();
+    assert!(builder.bind().await.is_err());
+    assert!(!started.load(Ordering::SeqCst));
+}
+
+#[test]
+fn static_resources_reject_duplicates_mismatch_and_unknown_tool_references() {
+    use openlegal_server::{
+        handler::McpHandler,
+        registry::{ToolOptions, ToolOutput},
+        resources::ResourceRegistry,
+    };
+    use rmcp::model::{MetaObject, Resource, ResourceContents};
+    let descriptor = Resource::new("ui://demo/widget.html", "widget").with_mime_type("text/html");
+    let content =
+        ResourceContents::text("<p>Demo</p>", "ui://demo/widget.html").with_mime_type("text/html");
+    let mut resources = ResourceRegistry::new();
+    resources
+        .register(descriptor.clone(), content.clone())
+        .unwrap();
+    assert!(resources.register(descriptor.clone(), content).is_err());
+    assert!(
+        ResourceRegistry::new()
+            .register(
+                descriptor,
+                ResourceContents::text("wrong", "ui://other/widget.html")
+            )
+            .is_err()
+    );
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Output {
+        value: u32,
+    }
+    let mut registry = ToolRegistry::new();
+    registry
+        .register_typed::<Input, Output, _, _>(
+            "widget",
+            "Widget fixture",
+            ToolOptions {
+                meta: Some(MetaObject(
+                    serde_json::json!({"ui":{"resourceUri":"ui://missing/widget.html"}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )),
+                ..Default::default()
+            },
+            |_, _| async { Ok(ToolOutput::new(Output { value: 1 })) },
+        )
+        .unwrap();
+    assert!(McpHandler::with_resources(registry, resources, Arc::new(Limits::default())).is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn worker_shutdown_deadline_aborts_and_drops_owned_future() {
+    struct Dropped(Arc<AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = Dropped(dropped.clone());
+    let mut builder = ServerBuilder::new(
+        ToolRegistry::new(),
+        Limits {
+            shutdown_timeout_secs: 1,
+            ..Default::default()
+        },
+    );
+    builder.register_endpoint(endpoint("http")).unwrap();
+    builder
+        .register_worker("stuck", |_| async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Ok(())
+        })
+        .unwrap();
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    assert!(builder.bind().await.unwrap().run(shutdown).await.is_err());
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn typed_registration_rejects_nonobject_output_without_leaving_a_tool() {
+    use openlegal_server::registry::{ToolOptions, ToolOutput};
+    let mut registry = ToolRegistry::new();
+    assert!(
+        registry
+            .register_typed::<Input, String, _, _>(
+                "typed",
+                "Invalid output",
+                ToolOptions::default(),
+                |_, _| async { Ok(ToolOutput::new("value".into())) }
+            )
+            .is_err()
+    );
+    registry
+        .register::<Input, _, _>(
+            "typed",
+            "Available after failed registration",
+            |_, _| async { Ok(serde_json::json!({})) },
+        )
+        .unwrap();
+}
+
+#[test]
+fn static_resource_serialized_size_is_checked_against_server_limits() {
+    use openlegal_server::{handler::McpHandler, resources::ResourceRegistry};
+    use rmcp::model::{Resource, ResourceContents};
+    let mut resources = ResourceRegistry::new();
+    resources
+        .register(
+            Resource::new("ui://demo/large.html", "large").with_mime_type("text/html"),
+            ResourceContents::text("x".repeat(5000), "ui://demo/large.html")
+                .with_mime_type("text/html"),
+        )
+        .unwrap();
+    let limits = Arc::new(Limits {
+        max_message_bytes: 4096,
+        ..Default::default()
+    });
+    assert!(McpHandler::with_resources(ToolRegistry::new(), resources, limits).is_err());
+}

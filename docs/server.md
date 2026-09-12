@@ -2,14 +2,19 @@
 
 The implemented foundation is one `apps/server` library/binary package. It serves
 anonymous read-only MCP tools over Streamable HTTP and WebTransport. Both adapters
-are required by the production binary. No provider, database, legal record, user
-account, or ChatGPT widget is implemented.
+are required by the production binary. An explicitly configured synthetic provider,
+shared memory retrieval cache, progress notifications, and React MCP Apps widget
+extend this foundation. No real legal provider, user account, or deployment is implemented.
 
 ## Configure and run
 
 The binary accepts one TOML configuration path. All tables below are required
 except `limits`; unknown fields are rejected. Generate certificates only for local
 fixtures, or supply operator-managed certificates for hosting.
+
+The optional `[demo]` table is documented in the [demo guide](demo.md). It requires
+a configured loopback mock and bounded local widget HTML; absence preserves ordinary
+server behavior. The example demo uses a 4 MiB message budget for its UI resource.
 
 ```toml
 [http]
@@ -35,16 +40,18 @@ cargo run --locked -p openlegal-server -- server.toml
 HTTP `/mcp` is private plaintext behind the TLS edge. WebTransport `/mcp-wt/v1`
 always uses TLS/QUIC. Both must bind successfully before readiness becomes true.
 Keep health `/live`, `/ready`, and `/metrics` private; they have no authentication.
-`/metrics` exposes aggregate tool call/failure counts, not request payloads.
+`/metrics` exposes aggregate tool call/failure counts and, when configured, bounded
+application retrieval metrics, not request payloads.
 SIGINT/SIGTERM stop admission and drain the server. An unexpected required endpoint
 failure also stops the server. Shutdown deadline exhaustion is an error.
 
 The actual proxied configuration and reproducible native-client acceptance gate
-are in [OxiBelt integration](oxibelt.md). Browser and live ChatGPT behavior are
-unverified. To test ChatGPT manually, configure a developer-mode connection to a
+are in [OxiBelt integration](oxibelt.md). A simulated browser host is tested; live
+ChatGPT behavior remains unverified. To test ChatGPT manually, configure a developer-mode connection to a
 deployed HTTPS `/mcp` endpoint, inspect the listed `server_info` tool, and call it.
 The result must identify the server foundation without claiming legal retrieval.
-No plugin directory submission or deployment is automated here.
+No plugin directory submission or deployment is automated here. The
+[demo guide](demo.md) adds the synthetic workflow and widget acceptance procedure.
 
 ## Rust extension API
 
@@ -75,11 +82,40 @@ SDK transport trait object. Tests in `apps/server/tests/extensions.rs` exercise
 downstream endpoint implementations, conflicts and startup rollback.
 
 The registry is immutable once the server starts; no tool-list change events are
-advertised. Additional MCP resources, prompts, tasks, subscriptions, sampling and
-elicitation are not advertised. New Rust modules require rebuilding. Modules are
+advertised. Registered static resources enable discovery/read; prompts, tasks,
+subscriptions, sampling and elicitation remain unsupported. New Rust modules require rebuilding. Modules are
 trusted code: they must bound result construction, cooperate with cancellation,
 avoid detached tasks, and use shared application services for future legal-data
 operations. They cannot be sandboxed by a Rust trait or a serialized-byte limit.
+
+### Typed results, resources and workers
+
+`register_typed<I, O, _, _>` adds a typed output schema, `ToolOptions` descriptor
+metadata, and `ToolOutput<O>` structured data with optional text and metadata.
+Both schemas are validated without remote/file resolution. Successful output must
+match its declared object schema. Existing `Value` registration remains supported.
+Combined result text/metadata/structured content remain centrally bounded; `_meta`
+is client-visible information, never a place for secrets.
+
+Typed handlers receive `ToolExecutionContext`, containing the original cancellation
+context, absolute deadline, and a restricted `ProgressReporter`. Progress is
+optional, monotonic, capped at five coarse stages and one-quarter of the message
+budget including framing allowance. Slow sends can drop updates after 100 ms.
+The final result remains authoritative; progress never extends a call deadline.
+
+`ResourceRegistry` accepts up to 32 trusted text resources with exact `ui://` URIs.
+The raw text limit is 1 MiB, serialized resource limit 2 MiB, additionally bounded
+by half the configured message allowance. Duplicate registrations, bad MIME/URI
+matches, dangling tool UI references, and excessive discovery/results fail startup.
+`with_resources` enables static `resources/list` and `resources/read`; no caller URI
+causes filesystem or network I/O. Registered resources use modern public cache scope
+with zero TTL so clients revalidate rather than reuse a stale UI template.
+
+`register_worker` adds a required application worker to the endpoint supervisor.
+The server starts registered worker futures after successful listener binding;
+unexpected completion fails readiness and triggers shared shutdown/drain. The
+retrieval service owns its maintenance/refresh tasks and its `run` monitor propagates
+internal failure to this worker. No request handler detaches refresh work.
 
 ## Protocol compatibility
 
@@ -107,6 +143,12 @@ reconnect, with at most `max_in_flight` tombstones, preventing late response/ID 
 ambiguity. Malformed framing, duplicate active/canceled IDs, overload, extra streams
 and exhausted tombstone capacity close the connection. Reconnect after closure;
 automatic request replay is not implemented.
+
+WebTransport progress tokens have the same 128-byte string bound as request IDs.
+Active or canceled token reuse is rejected; canceled token tombstones remain
+bounded with request admission. Queued progress is suppressed after cancellation
+or completion. HTTP progress uses the original request's SSE stream; stateless
+HTTP cancellation closes that response rather than correlating a separate POST.
 
 ```sh
 cargo run --locked -p openlegal-server --example wt_client -- \

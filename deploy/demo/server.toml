@@ -1,0 +1,22 @@
+# Run from the repository root after building apps/widget and starting mock_upstream.
+[http]
+bind = "127.0.0.1:8080"
+allowed_hosts = ["127.0.0.1:8080", "localhost:8080"]
+allowed_origins = []
+
+[webtransport]
+bind = "127.0.0.1:4433"
+certificate = "target/demo/cert.pem"
+private_key = "target/demo/key.pem"
+allowed_hosts = ["127.0.0.1:4433", "localhost:4433"]
+allowed_origins = []
+
+[health]
+bind = "127.0.0.1:9090"
+
+[limits]
+max_message_bytes = 4194304
+
+[demo]
+upstream = "http://127.0.0.1:8081"
+widget_html = "apps/widget/dist/index.html"

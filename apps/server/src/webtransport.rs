@@ -13,8 +13,9 @@ use std::{
 use rmcp::{
     RoleServer, ServiceExt,
     model::{
-        ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorData, GetMeta,
-        ProtocolVersion, RequestId, ServerInfo, ServerJsonRpcMessage, ServerResult,
+        ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorData, GetMeta, ProgressToken,
+        ProtocolVersion, RequestId, ServerInfo, ServerJsonRpcMessage, ServerNotification,
+        ServerResult,
     },
     service::{NotificationContext, RequestContext, Service},
     transport::Transport,
@@ -237,6 +238,7 @@ struct Admission {
     permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
     cancelled: bool,
     completed: bool,
+    progress_token: Option<ProgressToken>,
     _retired: Option<OwnedSemaphorePermit>,
 }
 impl Admission {
@@ -282,6 +284,17 @@ impl BoundedTransport {
                     if matches!(&request.id, RequestId::String(id) if id.len() > 128) {
                         return Err(io::Error::other("request ID exceeds limit"));
                     }
+                    let meta = request.request.get_meta();
+                    let progress_token = meta.get_progress_token();
+                    if meta.contains_key("progressToken") && progress_token.is_none() {
+                        return Err(io::Error::other("invalid progress token"));
+                    }
+                    if progress_token
+                        .as_ref()
+                        .is_some_and(|token| !crate::progress::validate_progress_token(token))
+                    {
+                        return Err(io::Error::other("progress token exceeds limit"));
+                    }
                     let initialize = matches!(request.request, ClientRequest::InitializeRequest(_));
                     let version = request.request.get_meta().protocol_version();
                     if initialize && version.is_some() {
@@ -316,6 +329,11 @@ impl BoundedTransport {
                     // Cancelled IDs remain bounded tombstones, preventing old queued replies
                     // from being mistaken for a newly reused request ID.
                     if ledger.contains_key(&request.id)
+                        || progress_token.as_ref().is_some_and(|token| {
+                            ledger
+                                .values()
+                                .any(|entry| entry.progress_token.as_ref() == Some(token))
+                        })
                         || ledger.len() >= self.context.limits.max_in_flight
                         || active >= self.context.limits.max_calls_per_connection
                     {
@@ -333,6 +351,7 @@ impl BoundedTransport {
                             permits: Some((request_permit, frame.permit)),
                             cancelled: false,
                             completed: false,
+                            progress_token,
                             _retired: None,
                         },
                     );
@@ -392,9 +411,32 @@ impl Transport<RoleServer> for BoundedTransport {
                 ServerJsonRpcMessage::Error(error) => error.id.clone(),
                 _ => None,
             };
+            let progress_token = match &message {
+                ServerJsonRpcMessage::Notification(notification) => {
+                    match &notification.notification {
+                        ServerNotification::ProgressNotification(progress) => {
+                            Some(&progress.params.progress_token)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
             let mut writer = tokio::select! { () = cancel.cancelled() => return Ok(()), writer = writer.lock() => writer };
             if cancel.is_cancelled() {
                 return Ok(());
+            }
+            if let Some(token) = progress_token {
+                let ledger = ledger
+                    .lock()
+                    .map_err(|_| io::Error::other("request ledger unavailable"))?;
+                if !ledger.values().any(|entry| {
+                    entry.progress_token.as_ref() == Some(token)
+                        && !entry.cancelled
+                        && !entry.completed
+                }) {
+                    return Ok(());
+                }
             }
             if let Some(id) = &id {
                 let suppress = ledger

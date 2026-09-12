@@ -16,10 +16,29 @@ async fn main() -> Result<(), ServerError> {
         .nth(1)
         .ok_or("usage: openlegal-server CONFIG.toml")?;
     let config: Config = toml::from_str(&tokio::fs::read_to_string(path).await?)?;
-    let mut builder = ServerBuilder::new(
-        openlegal_server::registry::server_info_registry()?,
-        config.limits,
-    );
+    let mut registry = openlegal_server::registry::server_info_registry()?;
+    let demo_service = config
+        .demo
+        .as_ref()
+        .map(|demo| openlegal_server::demo::service(&demo.upstream))
+        .transpose()?;
+    if let Some(service) = &demo_service {
+        registry.register_module(openlegal_server::demo::DemoTools {
+            service: service.clone(),
+        })?;
+    }
+    let mut builder = ServerBuilder::new(registry, config.limits);
+    if let Some(demo) = &config.demo {
+        builder =
+            builder.with_resources(openlegal_server::demo::load_widget(&demo.widget_html).await?);
+    }
+    if let Some(service) = &demo_service {
+        let service = service.clone();
+        builder.register_worker("retrieval", move |shutdown| async move {
+            service.run(shutdown).await?;
+            Ok(())
+        })?;
+    }
     builder.register_endpoint(HttpEndpoint {
         bind: config.http.bind,
         access: AccessPolicy {
@@ -36,9 +55,14 @@ async fn main() -> Result<(), ServerError> {
             allowed_origins: config.webtransport.allowed_origins,
         },
     })?;
-    builder.register_endpoint(HealthEndpoint {
+    let health = HealthEndpoint {
         bind: config.health.bind,
-    })?;
+    };
+    if let Some(service) = demo_service {
+        builder.register_endpoint(health.with_metrics(move || service.metrics_prometheus()))?;
+    } else {
+        builder.register_endpoint(health)?;
+    }
     let server = builder.bind().await?;
     for (id, addresses) in server.addresses() {
         tracing::info!(endpoint = id, ?addresses, "listener bound");

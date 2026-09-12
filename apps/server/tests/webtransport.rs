@@ -3,7 +3,9 @@ use openlegal_server::{
     endpoint::{Endpoint, EndpointContext},
     framing::{FrameReader, write_json},
     handler::McpHandler,
-    registry::{ToolError, ToolRegistry},
+    progress::ProgressStage,
+    registry::{ToolError, ToolOptions, ToolOutput, ToolRegistry},
+    resources::ResourceRegistry,
     webtransport::{PATH, WebTransportEndpoint},
 };
 use schemars::JsonSchema;
@@ -46,8 +48,22 @@ struct FailureInput {
     kind: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProgressInput {
+    wait: bool,
+}
+#[derive(serde::Serialize, JsonSchema)]
+struct ProgressOutput {
+    synthetic: bool,
+}
+
 impl Server {
     async fn start() -> Self {
+        Self::start_with_extensions(false).await
+    }
+
+    async fn start_with_extensions(extensions: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
@@ -106,9 +122,60 @@ impl Server {
                 },
             )
             .unwrap();
+        let mut resources = ResourceRegistry::new();
+        if extensions {
+            use rmcp::model::{MetaObject, Resource, ResourceContents};
+            resources
+                .register(
+                    Resource::new("ui://demo/widget.html", "demo")
+                        .with_mime_type("text/html;profile=mcp-app"),
+                    ResourceContents::text("<p>Synthetic widget</p>", "ui://demo/widget.html")
+                        .with_mime_type("text/html;profile=mcp-app"),
+                )
+                .unwrap();
+            let plugin_counter = active_plugins.clone();
+            registry
+                .register_typed::<ProgressInput, ProgressOutput, _, _>(
+                    "progress",
+                    "Synthetic progress",
+                    ToolOptions {
+                        meta: Some(MetaObject(
+                            json!({"ui":{"resourceUri":"ui://demo/widget.html"}})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        )),
+                        ..Default::default()
+                    },
+                    move |input, context| {
+                        let active = plugin_counter.clone();
+                        async move {
+                            active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let _guard = PluginGuard(active);
+                            context
+                                .progress
+                                .report(ProgressStage::CheckingCache)
+                                .await?;
+                            context.progress.report(ProgressStage::Processing).await?;
+                            if input.wait {
+                                context.request.cancellation.cancelled().await;
+                            }
+                            context.progress.report(ProgressStage::Complete).await?;
+                            Ok(ToolOutput {
+                                structured: ProgressOutput { synthetic: true },
+                                text: Some("Synthetic result".into()),
+                                meta: Some(MetaObject(
+                                    json!({"synthetic":true}).as_object().unwrap().clone(),
+                                )),
+                            })
+                        }
+                    },
+                )
+                .unwrap();
+        }
         let shutdown = CancellationToken::new();
         let context = EndpointContext {
-            handler: McpHandler::new(registry, limits.clone()).unwrap(),
+            handler: McpHandler::with_resources(registry, resources, limits.clone()).unwrap(),
             limits: limits.clone(),
             shutdown: shutdown.clone(),
             buffers: Arc::new(Semaphore::new(limits.max_buffer_bytes)),
@@ -626,5 +693,133 @@ async fn terminal_peer_events_join_handlers_before_releasing_the_session() {
         .await
         .unwrap();
         server.assert_cleanup_complete();
+    }
+}
+
+fn progress_call(id: u64, token: &str, wait: bool) -> Value {
+    let mut call = modern(
+        id,
+        "tools/call",
+        json!({"name":"progress","arguments":{"wait":wait}}),
+    );
+    call["params"]["_meta"]["progressToken"] = json!(token);
+    call
+}
+
+#[tokio::test]
+async fn typed_results_progress_and_static_resources_share_both_wt_lifecycles() {
+    let server = Server::start_with_extensions(true).await;
+    for legacy in [false, true] {
+        let client = server.client(true);
+        let connection = client.connect(server.url(PATH)).await.unwrap();
+        let (mut tx, rx) = connection.open_bi().await.unwrap().await.unwrap();
+        let mut rx = reader(rx);
+        if legacy {
+            send(&mut tx, &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}})).await;
+            assert_eq!(
+                response(&mut rx).await["result"]["capabilities"]["resources"],
+                json!({})
+            );
+            send(
+                &mut tx,
+                &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            )
+            .await;
+        }
+        let mut call = progress_call(2, "progress-test", false);
+        if legacy {
+            call["params"]["_meta"] = json!({"progressToken":"progress-test"});
+        }
+        send(&mut tx, &call).await;
+        for expected in [1.0, 4.0, 5.0] {
+            let progress = response(&mut rx).await;
+            assert_eq!(progress["method"], "notifications/progress");
+            assert_eq!(progress["params"]["progressToken"], "progress-test");
+            assert_eq!(progress["params"]["progress"].as_f64(), Some(expected));
+        }
+        let result = response(&mut rx).await;
+        assert_eq!(result["id"], 2);
+        assert_eq!(result["result"]["structuredContent"]["synthetic"], true);
+        assert_eq!(result["result"]["_meta"]["synthetic"], true);
+        let mut read = modern(3, "resources/read", json!({"uri":"ui://demo/widget.html"}));
+        if legacy {
+            read["params"].as_object_mut().unwrap().remove("_meta");
+        }
+        send(&mut tx, &read).await;
+        let result = response(&mut rx).await;
+        assert_eq!(
+            result["result"]["contents"][0]["mimeType"],
+            "text/html;profile=mcp-app"
+        );
+        assert_eq!(
+            result["result"]["contents"][0]["text"],
+            "<p>Synthetic widget</p>"
+        );
+        connection.close(0_u32.into(), b"done");
+    }
+}
+
+#[tokio::test]
+async fn progress_cancellation_suppresses_late_output_and_retires_token() {
+    let server = Server::start_with_extensions(true).await;
+    let client = server.client(true);
+    let connection = client.connect(server.url(PATH)).await.unwrap();
+    let (mut tx, rx) = connection.open_bi().await.unwrap().await.unwrap();
+    let mut rx = reader(rx);
+    send(&mut tx, &progress_call(2, "cancel-token", true)).await;
+    assert_eq!(
+        response(&mut rx).await["params"]["progress"].as_f64(),
+        Some(1.0)
+    );
+    assert_eq!(
+        response(&mut rx).await["params"]["progress"].as_f64(),
+        Some(4.0)
+    );
+    send(
+        &mut tx,
+        &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}),
+    )
+    .await;
+    send(&mut tx, &modern(3, "tools/list", json!({}))).await;
+    assert_eq!(
+        response(&mut rx).await["id"],
+        3,
+        "no late progress or result may precede the next response"
+    );
+    timeout(Duration::from_secs(2), async {
+        while server
+            .active_plugins
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    send(&mut tx, &progress_call(4, "cancel-token", false)).await;
+    timeout(Duration::from_secs(2), connection.closed())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rejects_duplicate_active_and_oversized_wt_progress_tokens() {
+    let server = Server::start_with_extensions(true).await;
+    for duplicate in [false, true] {
+        let client = server.client(true);
+        let connection = client.connect(server.url(PATH)).await.unwrap();
+        let (mut tx, rx) = connection.open_bi().await.unwrap().await.unwrap();
+        let mut rx = reader(rx);
+        if duplicate {
+            send(&mut tx, &progress_call(2, "active-token", true)).await;
+            assert_eq!(response(&mut rx).await["method"], "notifications/progress");
+            send(&mut tx, &progress_call(3, "active-token", false)).await;
+        } else {
+            send(&mut tx, &progress_call(2, &"x".repeat(129), false)).await;
+        }
+        timeout(Duration::from_secs(2), connection.closed())
+            .await
+            .unwrap();
     }
 }

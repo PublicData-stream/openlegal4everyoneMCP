@@ -1,8 +1,8 @@
 //! Startup-only registration of trusted, read-only tool implementations.
 
-use crate::ServerError;
+use crate::{ServerError, progress::ProgressReporter};
 use futures::{FutureExt, future::BoxFuture};
-use rmcp::model::{Tool, ToolAnnotations};
+use rmcp::model::{MetaObject, Tool, ToolAnnotations};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -22,6 +22,10 @@ pub enum ToolError {
     NotFound,
     Unavailable,
     RateLimited,
+    Ambiguous,
+    FreshnessUnavailable,
+    NormalizationFailed,
+    ResourceLimit,
     Internal,
 }
 
@@ -30,12 +34,66 @@ pub trait ToolModule {
     fn register(self, registry: &mut ToolRegistry) -> Result<(), ServerError>;
 }
 
-type Invoke =
-    dyn Fn(Value, ToolContext) -> BoxFuture<'static, Result<Value, ToolError>> + Send + Sync;
+/// Rich output for typed tools. Result metadata reaches clients and must contain no secrets.
+#[derive(serde::Serialize)]
+pub struct ToolOutput<T> {
+    pub structured: T,
+    pub text: Option<String>,
+    pub meta: Option<MetaObject>,
+}
+impl<T> ToolOutput<T> {
+    pub fn new(structured: T) -> Self {
+        Self {
+            structured,
+            text: None,
+            meta: None,
+        }
+    }
+}
+
+/// Descriptor annotations and static client metadata for a typed read-only tool.
+pub struct ToolOptions {
+    pub annotations: ToolAnnotations,
+    pub meta: Option<MetaObject>,
+}
+impl Default for ToolOptions {
+    fn default() -> Self {
+        Self {
+            annotations: ToolAnnotations::from_raw(
+                None,
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(true),
+            ),
+            meta: None,
+        }
+    }
+}
+
+/// Extended context for typed tools; the original ToolContext remains source compatible.
+#[derive(Clone)]
+pub struct ToolExecutionContext {
+    pub request: ToolContext,
+    pub deadline: tokio::time::Instant,
+    pub progress: ProgressReporter,
+    pub(crate) result_limit: usize,
+}
+
+pub(crate) struct InvocationOutput {
+    pub structured: Value,
+    pub text: Option<String>,
+    pub meta: Option<MetaObject>,
+}
+
+type Invoke = dyn Fn(Value, ToolExecutionContext) -> BoxFuture<'static, Result<InvocationOutput, ToolError>>
+    + Send
+    + Sync;
 
 pub(crate) struct RegisteredTool {
     pub definition: Tool,
     pub validator: jsonschema::Validator,
+    pub output_validator: Option<jsonschema::Validator>,
     pub invoke: Arc<Invoke>,
 }
 
@@ -115,11 +173,17 @@ impl ToolRegistry {
         let definition = Tool::new(name.to_owned(), description.to_owned(), Arc::new(object))
             .with_annotations(annotations);
         let handler = Arc::new(handler);
-        let invoke = Arc::new(move |value: Value, context: ToolContext| {
+        let invoke = Arc::new(move |value: Value, context: ToolExecutionContext| {
             let handler = handler.clone();
             async move {
                 let input = serde_json::from_value(value).map_err(|_| ToolError::InvalidInput)?;
-                handler(input, context).await
+                handler(input, context.request)
+                    .await
+                    .map(|structured| InvocationOutput {
+                        structured,
+                        text: None,
+                        meta: None,
+                    })
             }
             .boxed()
         });
@@ -128,9 +192,77 @@ impl ToolRegistry {
             RegisteredTool {
                 definition,
                 validator,
+                output_validator: None,
                 invoke,
             },
         );
+        Ok(())
+    }
+
+    /// Register a tool with a runtime-enforced object output schema and optional UI metadata.
+    pub fn register_typed<I, O, F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        options: ToolOptions,
+        handler: F,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: serde::Serialize + JsonSchema + Send + 'static,
+        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
+    {
+        // Validate every fallible addition before registration so failed startup registration
+        // does not leave a partially configured tool behind.
+        let schema = serde_json::to_value(schemars::schema_for!(O))?;
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err("MCP tool output must be an object".into());
+        }
+        ensure_serialized_limit(&schema, 64 * 1024)?;
+        ensure_serialized_limit(&options.meta, 16 * 1024)?;
+        let output_validator = jsonschema::validator_for(&schema)
+            .map_err(|_| "invalid or unresolved tool output schema")?;
+        let object = schema
+            .as_object()
+            .ok_or("output schema must be an object")?
+            .clone();
+        let handler = Arc::new(handler);
+        let invoke = Arc::new(move |value: Value, context: ToolExecutionContext| {
+            let handler = handler.clone();
+            async move {
+                let input = serde_json::from_value(value).map_err(|_| ToolError::InvalidInput)?;
+                let limit = context.result_limit;
+                let output: ToolOutput<O> = handler(input, context).await?;
+                ensure_serialized_limit(&output, limit).map_err(|_| ToolError::ResourceLimit)?;
+                Ok(InvocationOutput {
+                    structured: serde_json::to_value(output.structured)
+                        .map_err(|_| ToolError::Internal)?,
+                    text: output.text,
+                    meta: output.meta,
+                })
+            }
+            .boxed()
+        });
+        self.register_with_annotations::<I, _, _>(
+            name,
+            description,
+            options.annotations,
+            |_, _| async { Err(ToolError::Internal) },
+        )?;
+        let tool = self
+            .tools
+            .get_mut(name)
+            .ok_or("registered tool disappeared")?;
+        tool.definition = tool
+            .definition
+            .clone()
+            .with_raw_output_schema(Arc::new(object));
+        if let Some(meta) = options.meta {
+            tool.definition = tool.definition.clone().with_meta(meta);
+        }
+        tool.output_validator = Some(output_validator);
+        tool.invoke = invoke;
         Ok(())
     }
 

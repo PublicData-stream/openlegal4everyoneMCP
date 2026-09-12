@@ -149,4 +149,16 @@ pub struct Config {
     pub health: HealthConfig,
     #[serde(default)]
     pub limits: Limits,
+    /// Explicit, isolated synthetic workflow. Absent in ordinary server configurations.
+    #[serde(default)]
+    pub demo: Option<DemoConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemoConfig {
+    /// Loopback HTTP mock only; never an arbitrary caller-provided URL.
+    pub upstream: String,
+    /// Locally built, trusted HTML loaded once before serving.
+    pub widget_html: PathBuf,
 }

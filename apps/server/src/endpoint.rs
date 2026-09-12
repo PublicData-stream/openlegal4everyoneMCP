@@ -1,6 +1,9 @@
 //! Startup registration and structured supervision of required endpoint adapters.
 
-use crate::{ServerError, config::Limits, handler::McpHandler, registry::ToolRegistry};
+use crate::{
+    ServerError, config::Limits, handler::McpHandler, registry::ToolRegistry,
+    resources::ResourceRegistry,
+};
 use futures::{FutureExt, future::BoxFuture};
 use std::{
     collections::HashSet,
@@ -59,8 +62,13 @@ type Binder = Box<
     dyn FnOnce(EndpointContext) -> BoxFuture<'static, Result<BoundEndpoint, ServerError>> + Send,
 >;
 
+type WorkerFactory =
+    Box<dyn FnOnce(CancellationToken) -> BoxFuture<'static, Result<(), ServerError>> + Send>;
+
 pub struct ServerBuilder {
     registry: ToolRegistry,
+    resources: ResourceRegistry,
+    workers: Vec<WorkerFactory>,
     limits: Limits,
     ids: HashSet<String>,
     bindings: Vec<Binding>,
@@ -71,11 +79,34 @@ impl ServerBuilder {
     pub fn new(registry: ToolRegistry, limits: Limits) -> Self {
         Self {
             registry,
+            resources: ResourceRegistry::new(),
+            workers: Vec::new(),
             limits,
             ids: HashSet::new(),
             bindings: Vec::new(),
             endpoints: Vec::new(),
         }
+    }
+
+    /// Add immutable resources before listener binding. An empty registry is the default.
+    pub fn with_resources(mut self, resources: ResourceRegistry) -> Self {
+        self.resources = resources;
+        self
+    }
+
+    /// Register an owned application supervisor. The factory is not called until all
+    /// listeners bind. Its future must join its own jobs when shutdown is canceled.
+    pub fn register_worker<F, Fut>(&mut self, name: &str, worker: F) -> Result<(), ServerError>
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), ServerError>> + Send + 'static,
+    {
+        if name.is_empty() || name.len() > 128 || !self.ids.insert(name.to_owned()) {
+            return Err("duplicate or invalid worker identifier".into());
+        }
+        self.workers
+            .push(Box::new(move |shutdown| worker(shutdown).boxed()));
+        Ok(())
     }
 
     pub fn register_endpoint(&mut self, endpoint: impl Endpoint) -> Result<(), ServerError> {
@@ -107,7 +138,7 @@ impl ServerBuilder {
         }
         let limits = Arc::new(self.limits);
         let context = EndpointContext {
-            handler: McpHandler::new(self.registry, limits.clone())?,
+            handler: McpHandler::with_resources(self.registry, self.resources, limits.clone())?,
             buffers: Arc::new(Semaphore::new(limits.max_buffer_bytes)),
             requests: Arc::new(Semaphore::new(limits.max_in_flight)),
             connections: Arc::new(Semaphore::new(limits.max_connections)),
@@ -125,7 +156,11 @@ impl ServerBuilder {
                 }
             }
         }
-        Ok(RunningServer { context, endpoints })
+        Ok(RunningServer {
+            context,
+            endpoints,
+            workers: self.workers,
+        })
     }
 }
 
@@ -141,6 +176,7 @@ fn bindings_conflict(a: Binding, b: Binding) -> bool {
 pub struct RunningServer {
     context: EndpointContext,
     endpoints: Vec<BoundEndpoint>,
+    workers: Vec<WorkerFactory>,
 }
 
 impl RunningServer {
@@ -160,6 +196,9 @@ impl RunningServer {
         for endpoint in self.endpoints {
             tasks.spawn(endpoint.run);
         }
+        for worker in self.workers {
+            tasks.spawn(worker(self.context.shutdown.clone()));
+        }
         self.context.ready.store(true, Ordering::Release);
         let failure: Result<(), ServerError> = tokio::select! {
             biased;
@@ -168,7 +207,7 @@ impl RunningServer {
             result = tasks.join_next() => match result {
                 Some(Ok(Err(error))) => Err(error),
                 Some(Err(error)) => Err(error.into()),
-                _ => Err("required endpoint stopped unexpectedly".into()),
+                _ => Err("required endpoint or worker stopped unexpectedly".into()),
             }
         };
         self.context.ready.store(false, Ordering::Release);
