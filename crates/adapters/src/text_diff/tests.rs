@@ -1,3 +1,4 @@
+static PROCESS_FIXTURE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 use super::*;
 use openlegal_application::text_diff::DiffSide;
 
@@ -68,7 +69,7 @@ fn annotations_follow_whole_replacement_across_line_boundaries() {
 
 #[tokio::test]
 async fn missing_executable_and_randomness_are_checked() {
-    let _fixture_gate = crate::persistent::PROCESS_FIXTURE_GATE.lock().await;
+    let _fixture_gate = PROCESS_FIXTURE_GATE.lock().await;
     assert!(
         SimilarDiffEngine::new(Path::new("/nonexistent/openlegal-worker"))
             .await
@@ -98,7 +99,7 @@ fn fake_worker_script(directory: &Path, body: &str) -> SimilarDiffEngine {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancellation_and_deadline_reap_worker() {
-    let _fixture_gate = crate::persistent::PROCESS_FIXTURE_GATE.lock().await;
+    let _fixture_gate = PROCESS_FIXTURE_GATE.lock().await;
     for cancel in [true, false] {
         let fixture = tempfile::tempdir().unwrap();
         let engine = fake_worker(fixture.path(), "/bin/sleep 60");
@@ -134,7 +135,7 @@ async fn cancellation_and_deadline_reap_worker() {
 #[cfg(unix)]
 #[tokio::test]
 async fn invalid_output_stderr_overflow_and_crash_reap_worker() {
-    let _fixture_gate = crate::persistent::PROCESS_FIXTURE_GATE.lock().await;
+    let _fixture_gate = PROCESS_FIXTURE_GATE.lock().await;
     for (command, expected) in [
         ("/usr/bin/yes x", TextDiffError::Unavailable),
         ("/usr/bin/yes x 3>&1 >&2", TextDiffError::ResourceLimit),
@@ -193,7 +194,7 @@ fn repeated_lines_and_multihunk_source_indexes_are_stable() {
 #[cfg(unix)]
 #[tokio::test]
 async fn oversized_framed_sections_kill_and_reap_running_workers() {
-    let _fixture_gate = crate::persistent::PROCESS_FIXTURE_GATE.lock().await;
+    let _fixture_gate = PROCESS_FIXTURE_GATE.lock().await;
     for length_offset in [12, 16] {
         // Declare one byte beyond a section's 8 MiB cap, then remain alive with
         // both pipes open. Rejection must use the header without reading a body.

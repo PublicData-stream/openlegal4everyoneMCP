@@ -1,5 +1,8 @@
 use super::*;
-use crate::persistence::{CommitAuthorization, RetentionPolicy, StorageMetrics};
+use crate::persistence::{
+    LookupResult, ObservationToken, PublicationOutcome, PublicationRequest, RetentionPolicy,
+    StorageMetrics, StorageStatus,
+};
 use crate::{FetchedPayload, Upstream};
 use futures::future::BoxFuture;
 use openlegal_domain::history::{SnapshotReference, SnapshotSummary};
@@ -33,6 +36,7 @@ impl Clock for ClockValue {
 struct UpstreamMock {
     calls: Arc<AtomicUsize>,
     unavailable: Arc<AtomicBool>,
+    storage: Arc<StorageState>,
 }
 impl Upstream for UpstreamMock {
     fn fetch(
@@ -42,8 +46,13 @@ impl Upstream for UpstreamMock {
     ) -> BoxFuture<'static, Result<FetchedPayload, RetrievalError>> {
         let calls = self.calls.clone();
         let unavailable = self.unavailable.clone();
+        let storage = self.storage.clone();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
+            if storage.mode.load(Ordering::SeqCst) == 13 {
+                storage.upstream_started.notify_one();
+                storage.upstream_release.notified().await;
+            }
             if unavailable.load(Ordering::SeqCst) {
                 return Err(RetrievalError::Unavailable);
             }
@@ -65,22 +74,31 @@ impl Upstream for UpstreamMock {
     }
 }
 #[derive(Default)]
-struct DiskState {
+struct StorageState {
     values: Mutex<HashMap<PersistentKey, Arc<StoredPayload>>>,
     epoch: AtomicU64,
+    recovery_epoch: AtomicU64,
     mode: AtomicUsize,
     lookups: AtomicUsize,
     writes: AtomicUsize,
     closed: AtomicBool,
+    revision: AtomicU64,
+    publication_started: tokio::sync::Notify,
+    publication_release: tokio::sync::Notify,
+    upstream_started: tokio::sync::Notify,
+    upstream_release: tokio::sync::Notify,
+    health_calls: AtomicU64,
+    maintenance_calls: AtomicU64,
+    list_clock: Mutex<Option<Arc<ClockValue>>>,
 }
-struct Disk(Arc<DiskState>);
-impl PersistentStore for Disk {
+struct Storage(Arc<StorageState>);
+impl PersistentStore for Storage {
     fn lookup(
         &self,
         key: PersistentKey,
         _: u64,
         cancellation: CancellationToken,
-    ) -> BoxFuture<'static, Result<Option<StoredResult>, RetrievalError>> {
+    ) -> BoxFuture<'static, Result<LookupResult, RetrievalError>> {
         let state = self.0.clone();
         Box::pin(async move {
             state.lookups.fetch_add(1, Ordering::SeqCst);
@@ -98,25 +116,67 @@ impl PersistentStore for Disk {
             if state.mode.load(Ordering::SeqCst) == 3 {
                 state.epoch.fetch_add(1, Ordering::SeqCst);
             }
-            Ok(state
+            let value = state
                 .values
                 .lock()
                 .unwrap()
                 .get(&key)
                 .cloned()
-                .map(|payload| StoredResult { payload, epoch }))
+                .map(|payload| StoredResult { payload, epoch });
+            Ok(LookupResult {
+                observation: ObservationToken {
+                    query_id: value.as_ref().map(|_| "mock-query-uuid".into()),
+                    revision: state.revision.load(Ordering::SeqCst),
+                },
+                value,
+            })
         })
     }
     fn publish(
         &self,
-        key: PersistentKey,
-        value: Arc<StoredPayload>,
-        now: u64,
-        authorize: CommitAuthorization,
-        cancellation: CancellationToken,
-    ) -> BoxFuture<'static, Result<StoredResult, RetrievalError>> {
+        request: PublicationRequest,
+    ) -> BoxFuture<'static, Result<PublicationOutcome, RetrievalError>> {
         let state = self.0.clone();
         Box::pin(async move {
+            let PublicationRequest {
+                key,
+                value,
+                expected,
+                now,
+                authorize,
+                cancellation,
+            } = request;
+            let mode = state.mode.load(Ordering::SeqCst);
+            if mode == 10 {
+                state.publication_started.notify_one();
+                state.publication_release.notified().await;
+            }
+            if mode == 7 {
+                let mut values = state.values.lock().unwrap();
+                let old = values.get(&key).unwrap();
+                let mut provenance = old.provenance.clone();
+                provenance.validated_at = now;
+                values.insert(
+                    key,
+                    Arc::new(StoredPayload {
+                        data: value.data.clone(),
+                        provenance,
+                        raw: value.raw.clone(),
+                        bytes: value.bytes,
+                        snapshot: value.snapshot.clone().or_else(|| {
+                            Some(SnapshotReference {
+                                snapshot_id: "b".repeat(64),
+                                captured_at: now,
+                            })
+                        }),
+                    }),
+                );
+                state.revision.fetch_add(1, Ordering::SeqCst);
+                return Ok(PublicationOutcome::Conflict);
+            }
+            if matches!(mode, 8 | 9) || expected.revision != state.revision.load(Ordering::SeqCst) {
+                return Ok(PublicationOutcome::Conflict);
+            }
             if state.mode.load(Ordering::SeqCst) == 2 {
                 return Err(RetrievalError::StorageCapacity);
             }
@@ -135,10 +195,11 @@ impl PersistentStore for Disk {
                 }),
             });
             state.values.lock().unwrap().insert(key, value.clone());
-            Ok(StoredResult {
+            state.revision.fetch_add(1, Ordering::SeqCst);
+            Ok(PublicationOutcome::Accepted(StoredResult {
                 payload: value,
                 epoch: state.epoch.load(Ordering::SeqCst),
-            })
+            }))
         })
     }
     fn list(
@@ -151,6 +212,10 @@ impl PersistentStore for Disk {
     ) -> BoxFuture<'static, Result<SnapshotPage, RetrievalError>> {
         let state = self.0.clone();
         Box::pin(async move {
+            let next_cursor = state.list_clock.lock().unwrap().as_ref().map(|clock| {
+                clock.0.store(1000 + 30 * 86400, Ordering::SeqCst);
+                "fixed-high-water-cursor".to_owned()
+            });
             Ok(SnapshotPage {
                 snapshots: state
                     .values
@@ -160,7 +225,7 @@ impl PersistentStore for Disk {
                     .filter(|(k, _)| k.history == key)
                     .map(|(_, v)| summary(v))
                     .collect(),
-                next_cursor: None,
+                next_cursor,
                 synthetic: true,
             })
         })
@@ -192,7 +257,19 @@ impl PersistentStore for Disk {
         })
     }
     fn maintain(&self, _: u64) -> BoxFuture<'static, Result<(), RetrievalError>> {
+        self.0.maintenance_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
+    }
+    fn health(&self, _: u64) -> BoxFuture<'static, Result<(), RetrievalError>> {
+        let state = self.0.clone();
+        Box::pin(async move {
+            state.health_calls.fetch_add(1, Ordering::SeqCst);
+            if state.mode.load(Ordering::SeqCst) == 14 {
+                state.epoch.fetch_add(1, Ordering::SeqCst);
+                state.mode.store(0, Ordering::SeqCst);
+            }
+            Ok(())
+        })
     }
     fn close(&self) -> BoxFuture<'static, Result<(), RetrievalError>> {
         self.0.closed.store(true, Ordering::SeqCst);
@@ -201,8 +278,19 @@ impl PersistentStore for Disk {
     fn epoch(&self) -> u64 {
         self.0.epoch.load(Ordering::SeqCst)
     }
+    fn recovery_epoch(&self) -> u64 {
+        self.0.recovery_epoch.load(Ordering::SeqCst)
+    }
     fn healthy(&self) -> bool {
-        self.0.mode.load(Ordering::SeqCst) != 6
+        !matches!(self.0.mode.load(Ordering::SeqCst), 6 | 11 | 12 | 14)
+    }
+    fn status(&self) -> StorageStatus {
+        match self.0.mode.load(Ordering::SeqCst) {
+            6 | 14 => StorageStatus::Recovering,
+            11 => StorageStatus::IntegrityBlocked,
+            12 => StorageStatus::Maintaining,
+            _ => StorageStatus::Ready,
+        }
     }
     fn policy(&self) -> RetentionPolicy {
         RetentionPolicy::default()
@@ -224,13 +312,13 @@ fn summary(value: &StoredPayload) -> SnapshotSummary {
 }
 struct Fixture {
     service: Arc<RetrievalService>,
-    disk: Arc<DiskState>,
+    storage: Arc<StorageState>,
     clock: Arc<ClockValue>,
     calls: Arc<AtomicUsize>,
     unavailable: Arc<AtomicBool>,
 }
 fn build(
-    disk: Arc<DiskState>,
+    storage: Arc<StorageState>,
     clock: Arc<ClockValue>,
     calls: Arc<AtomicUsize>,
     unavailable: Arc<AtomicBool>,
@@ -241,29 +329,33 @@ fn build(
             provider: "test".into(),
             dataset: "fiction".into(),
             processor_version: "1".into(),
-            upstream: Arc::new(UpstreamMock { calls, unavailable }),
+            upstream: Arc::new(UpstreamMock {
+                calls,
+                unavailable,
+                storage: storage.clone(),
+            }),
         }],
         clock,
         Box::<Cache>::default(),
-        Arc::new(Disk(disk)),
+        Arc::new(Storage(storage)),
         "namespace".into(),
     )
     .unwrap()
 }
 fn fixture() -> Fixture {
-    let disk = Arc::new(DiskState::default());
+    let storage = Arc::new(StorageState::default());
     let clock = Arc::new(ClockValue(AtomicU64::new(1000)));
     let calls = Arc::new(AtomicUsize::new(0));
     let unavailable = Arc::new(AtomicBool::new(false));
     let service = build(
-        disk.clone(),
+        storage.clone(),
         clock.clone(),
         calls.clone(),
         unavailable.clone(),
     );
     Fixture {
         service,
-        disk,
+        storage,
         clock,
         calls,
         unavailable,
@@ -289,13 +381,13 @@ async fn get(
 }
 
 #[tokio::test]
-async fn restart_reuses_disk_without_upstream_and_history_never_fetches() {
+async fn restart_reuses_persistence_without_upstream_and_history_never_fetches() {
     let f = fixture();
     let first = get(&f.service).await.unwrap();
     assert!(first.snapshot.is_some());
     f.service.shutdown().await.unwrap();
     let restarted = build(
-        f.disk.clone(),
+        f.storage.clone(),
         f.clock.clone(),
         f.calls.clone(),
         f.unavailable.clone(),
@@ -325,49 +417,49 @@ async fn equivalent_l2_misses_coalesce_and_durable_write_precedes_l1() {
     let f = fixture();
     let (a, b) = tokio::join!(get(&f.service), get(&f.service));
     assert_eq!(a.unwrap(), b.unwrap());
-    assert_eq!(f.disk.lookups.load(Ordering::SeqCst), 1);
-    assert_eq!(f.disk.writes.load(Ordering::SeqCst), 1);
+    assert_eq!(f.storage.lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(f.storage.writes.load(Ordering::SeqCst), 1);
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     assert_eq!(f.service.metrics().cache_entries, 1);
     f.service.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn disk_error_is_not_a_miss_and_failed_commit_never_populates_l1() {
+async fn storage_error_is_not_a_miss_and_failed_commit_never_populates_l1() {
     for (mode, error, expected_calls) in [
         (1, RetrievalError::StorageUnavailable, 0),
         (2, RetrievalError::StorageCapacity, 1),
     ] {
         let f = fixture();
-        f.disk.mode.store(mode, Ordering::SeqCst);
+        f.storage.mode.store(mode, Ordering::SeqCst);
         assert_eq!(get(&f.service).await, Err(error));
         assert_eq!(f.calls.load(Ordering::SeqCst), expected_calls);
         assert_eq!(f.service.metrics().cache_entries, 0);
-        assert_eq!(f.disk.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(f.storage.writes.load(Ordering::SeqCst), 0);
         f.service.shutdown().await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn changed_epoch_invalidates_l1_and_rejects_an_obsolete_disk_result() {
+async fn changed_epoch_invalidates_l1_and_rejects_an_obsolete_storage_result() {
     let f = fixture();
     get(&f.service).await.unwrap();
-    f.disk.epoch.fetch_add(1, Ordering::SeqCst);
-    f.disk.mode.store(3, Ordering::SeqCst);
+    f.storage.epoch.fetch_add(1, Ordering::SeqCst);
+    f.storage.mode.store(3, Ordering::SeqCst);
     assert_eq!(
         get(&f.service).await,
         Err(RetrievalError::StorageUnavailable)
     );
     assert_eq!(f.service.metrics().cache_entries, 0);
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-    f.disk.mode.store(0, Ordering::SeqCst);
+    f.storage.mode.store(0, Ordering::SeqCst);
     get(&f.service).await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     f.service.shutdown().await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
-async fn disk_stale_fallback_preserves_fresh_only_and_storage_errors_are_not_stale() {
+async fn storage_stale_fallback_preserves_fresh_only_and_storage_errors_are_not_stale() {
     let f = fixture();
     get(&f.service).await.unwrap();
     f.clock.0.store(1060, Ordering::SeqCst);
@@ -387,7 +479,7 @@ async fn disk_stale_fallback_preserves_fresh_only_and_storage_errors_are_not_sta
             .await,
         Err(RetrievalError::FreshnessUnavailable)
     );
-    f.disk.mode.store(1, Ordering::SeqCst);
+    f.storage.mode.store(1, Ordering::SeqCst);
     assert_eq!(
         get(&f.service).await,
         Err(RetrievalError::StorageUnavailable)
@@ -396,9 +488,9 @@ async fn disk_stale_fallback_preserves_fresh_only_and_storage_errors_are_not_sta
 }
 
 #[tokio::test(start_paused = true)]
-async fn cancelled_disk_flight_stays_registered_until_reconciliation() {
+async fn cancelled_storage_flight_stays_registered_until_reconciliation() {
     let f = fixture();
-    f.disk.mode.store(4, Ordering::SeqCst);
+    f.storage.mode.store(4, Ordering::SeqCst);
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
     let service = f.service.clone();
@@ -407,7 +499,7 @@ async fn cancelled_disk_flight_stays_registered_until_reconciliation() {
             .retrieve(query(), FreshnessRequirement::AllowStale, token, None)
             .await
     });
-    while f.disk.lookups.load(Ordering::SeqCst) == 0 {
+    while f.storage.lookups.load(Ordering::SeqCst) == 0 {
         tokio::task::yield_now().await;
     }
     cancellation.cancel();
@@ -448,7 +540,7 @@ async fn capture_retention_prevents_recently_validated_old_l1_head() {
     let now = 1000 + 30 * 86400;
     f.clock.0.store(now, Ordering::SeqCst);
     {
-        let mut values = f.disk.values.lock().unwrap();
+        let mut values = f.storage.values.lock().unwrap();
         let value = values.values_mut().next().unwrap();
         let old = &**value;
         let mut provenance = old.provenance.clone();
@@ -461,7 +553,7 @@ async fn capture_retention_prevents_recently_validated_old_l1_head() {
             provenance,
         });
     }
-    f.disk.epoch.fetch_add(1, Ordering::SeqCst);
+    f.storage.epoch.fetch_add(1, Ordering::SeqCst);
     let fresh = get(&f.service).await.unwrap();
     assert_eq!(fresh.snapshot.unwrap().captured_at, now);
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
@@ -472,13 +564,13 @@ async fn capture_retention_prevents_recently_validated_old_l1_head() {
 async fn fresh_l2_hit_does_not_require_an_upstream_permit() {
     let f = fixture();
     get(&f.service).await.unwrap();
-    f.disk.epoch.fetch_add(1, Ordering::SeqCst);
+    f.storage.epoch.fetch_add(1, Ordering::SeqCst);
     let semaphore = f.service.providers.get("test").unwrap().active.clone();
     let _first = semaphore.clone().try_acquire_owned().unwrap();
     let _second = semaphore.try_acquire_owned().unwrap();
     get(&f.service).await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(f.disk.lookups.load(Ordering::SeqCst), 2);
+    assert_eq!(f.storage.lookups.load(Ordering::SeqCst), 2);
     f.service.shutdown().await.unwrap();
 }
 
@@ -486,12 +578,203 @@ async fn fresh_l2_hit_does_not_require_an_upstream_permit() {
 async fn unhealthy_store_rejects_l1_and_fails_service_readiness() {
     let f = fixture();
     get(&f.service).await.unwrap();
-    f.disk.mode.store(6, Ordering::SeqCst);
+    f.storage.mode.store(6, Ordering::SeqCst);
     assert_eq!(
         get(&f.service).await,
         Err(RetrievalError::StorageUnavailable)
     );
-    assert!(f.service.shutdown.is_cancelled());
+    assert!(!f.service.shutdown.is_cancelled());
+    assert!(!f.service.storage_ready());
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(f.service.shutdown().await, Err(RetrievalError::Internal));
+    f.storage.epoch.fetch_add(1, Ordering::SeqCst);
+    f.storage.mode.store(0, Ordering::SeqCst);
+    assert!(f.service.storage_ready());
+    get(&f.service).await.unwrap();
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    f.service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_publication_rereads_winner_once_without_replaying_or_refetching() {
+    let f = fixture();
+    get(&f.service).await.unwrap();
+    f.clock.0.store(1060, Ordering::SeqCst);
+    f.storage.mode.store(7, Ordering::SeqCst);
+    let winner = get(&f.service).await.unwrap();
+    assert_eq!(winner.provenance.validated_at, 1060);
+    assert_eq!(winner.snapshot.unwrap().snapshot_id, "b".repeat(64));
+    assert_eq!(f.storage.lookups.load(Ordering::SeqCst), 3);
+    assert_eq!(f.storage.writes.load(Ordering::SeqCst), 1);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    f.service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn conflict_with_absent_or_stale_head_is_not_an_upstream_retry_or_stale_fallback() {
+    let absent = fixture();
+    absent.storage.mode.store(8, Ordering::SeqCst);
+    assert_eq!(get(&absent.service).await, Err(RetrievalError::Busy));
+    assert_eq!(absent.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(absent.storage.lookups.load(Ordering::SeqCst), 2);
+    assert_eq!(absent.service.metrics().cache_entries, 0);
+    absent.service.shutdown().await.unwrap();
+
+    let stale = fixture();
+    get(&stale.service).await.unwrap();
+    stale.clock.0.store(1060, Ordering::SeqCst);
+    stale.storage.mode.store(9, Ordering::SeqCst);
+    assert_eq!(
+        get(&stale.service).await,
+        Err(RetrievalError::FreshnessUnavailable)
+    );
+    assert_eq!(stale.calls.load(Ordering::SeqCst), 2);
+    stale.service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_at_publication_fence_drains_without_l1_or_durable_success() {
+    let f = fixture();
+    f.storage.mode.store(10, Ordering::SeqCst);
+    let cancellation = CancellationToken::new();
+    let token = cancellation.clone();
+    let service = f.service.clone();
+    let request = tokio::spawn(async move {
+        service
+            .retrieve(query(), FreshnessRequirement::AllowStale, token, None)
+            .await
+    });
+    f.storage.publication_started.notified().await;
+    cancellation.cancel();
+    assert_eq!(request.await.unwrap(), Err(RetrievalError::Cancelled));
+    assert_eq!(get(&f.service).await, Err(RetrievalError::Busy));
+    f.storage.publication_release.notify_one();
+    f.service.shutdown().await.unwrap();
+    assert_eq!(f.storage.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(f.service.metrics().cache_entries, 0);
+}
+
+#[tokio::test]
+async fn integrity_and_maintenance_gate_history_and_l1_without_supervisor_shutdown() {
+    let f = fixture();
+    let first = get(&f.service).await.unwrap();
+    for (mode, error) in [
+        (11, RetrievalError::StorageCorrupt),
+        (12, RetrievalError::Busy),
+    ] {
+        f.storage.mode.store(mode, Ordering::SeqCst);
+        assert_eq!(get(&f.service).await, Err(error));
+        assert_eq!(
+            f.service
+                .list_snapshots(query(), None, 10, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            error
+        );
+        assert_eq!(
+            f.service
+                .get_snapshot(
+                    query(),
+                    first.snapshot.as_ref().unwrap().snapshot_id.clone(),
+                    CancellationToken::new()
+                )
+                .await
+                .unwrap_err(),
+            error
+        );
+        assert!(!f.service.storage_ready());
+        assert!(!f.service.shutdown.is_cancelled());
+    }
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    f.storage.mode.store(0, Ordering::SeqCst);
+    f.service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovered_storage_rejects_a_pre_outage_publication_generation() {
+    let f = fixture();
+    f.storage.mode.store(10, Ordering::SeqCst);
+    let service = f.service.clone();
+    let request = tokio::spawn(async move { get(&service).await });
+    f.storage.publication_started.notified().await;
+    f.storage.epoch.fetch_add(1, Ordering::SeqCst);
+    f.storage.mode.store(6, Ordering::SeqCst);
+    assert_eq!(
+        get(&f.service).await,
+        Err(RetrievalError::StorageUnavailable)
+    );
+    assert!(!f.service.shutdown.is_cancelled());
+    f.storage.mode.store(0, Ordering::SeqCst);
+    f.storage.epoch.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(get(&f.service).await, Err(RetrievalError::Busy));
+    f.storage.publication_release.notify_one();
+    assert_eq!(request.await.unwrap(), Err(RetrievalError::Cancelled));
+    assert_eq!(f.storage.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(f.service.metrics().cache_entries, 0);
+    get(&f.service).await.unwrap();
+    assert_eq!(f.storage.writes.load(Ordering::SeqCst), 1);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    f.service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn fast_recovery_during_upstream_work_is_fenced_without_observing_nonready_status() {
+    let f = fixture();
+    f.storage.mode.store(13, Ordering::SeqCst);
+    let service = f.service.clone();
+    let request = tokio::spawn(async move { get(&service).await });
+    f.storage.upstream_started.notified().await;
+    // Recovery completed while this flight was fetching; no request or periodic
+    // monitor saw the intermediate outage. Ordinary retention has a separate epoch.
+    f.storage.recovery_epoch.fetch_add(1, Ordering::SeqCst);
+    f.storage.epoch.fetch_add(2, Ordering::SeqCst);
+    f.storage.mode.store(0, Ordering::SeqCst);
+    f.storage.upstream_release.notify_one();
+    assert_eq!(
+        request.await.unwrap(),
+        Err(RetrievalError::StorageUnavailable)
+    );
+    assert_eq!(f.storage.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(f.service.metrics().cache_entries, 0);
+    assert!(f.service.storage_ready());
+    get(&f.service).await.unwrap();
+    assert_eq!(f.storage.writes.load(Ordering::SeqCst), 1);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    f.service.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_health_probe_recovers_before_retention_maintenance_is_due() {
+    let f = fixture();
+    get(&f.service).await.unwrap();
+    f.storage.mode.store(14, Ordering::SeqCst);
+    f.storage.recovery_epoch.fetch_add(1, Ordering::SeqCst);
+    f.storage.epoch.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(
+        get(&f.service).await,
+        Err(RetrievalError::StorageUnavailable)
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    assert!(f.service.storage_ready());
+    assert_eq!(f.storage.health_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.storage.maintenance_calls.load(Ordering::SeqCst), 0);
+    get(&f.service).await.unwrap();
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    f.service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn history_expiring_while_awaited_returns_busy_without_malformed_continuation() {
+    let f = fixture();
+    get(&f.service).await.unwrap();
+    *f.storage.list_clock.lock().unwrap() = Some(f.clock.clone());
+    assert_eq!(
+        f.service
+            .list_snapshots(query(), None, 10, CancellationToken::new())
+            .await
+            .unwrap_err(),
+        RetrievalError::Busy
+    );
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    f.service.shutdown().await.unwrap();
 }

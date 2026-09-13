@@ -26,11 +26,24 @@ max_buffer_bytes = 268435456
 upstream = "http://127.0.0.1:8081"
 widget_html = "apps/widget/dist/index.html"
 
-[cache.filesystem]
-path = "target/demo/cache"
+[cache]
+mode = "persistent"
 retention_days = 30
-max_bytes = 1073741824
+max_blob_bytes = 1073741824
 max_snapshots_per_query = 100
+max_snapshots = 10000
+max_queries = 4096
+
+[cache.postgres]
+url_env = "OPENLEGAL_DATABASE_URL"
+migration_url_env = "OPENLEGAL_MIGRATION_DATABASE_URL"
+max_connections = 16
+# Explicitly isolated local demonstration; production defaults to verify-full.
+tls_mode = "plaintext"
+
+[cache.blob]
+kind = "filesystem"
+path = "target/demo/blobs"
 
 [text_diff]
 widget_html = "apps/widget/dist/text-diff.html"

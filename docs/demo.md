@@ -19,15 +19,22 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
 cargo run --locked -p openlegal-adapters --example mock_upstream -- 127.0.0.1:8081
 ```
 
-Leave the mock running, then in another terminal:
+Leave the mock running. Start a dedicated PostgreSQL 18.x instance, create a runtime
+role and a separate migration role for the same database, and supply their connection
+URLs through `OPENLEGAL_DATABASE_URL` and `OPENLEGAL_MIGRATION_DATABASE_URL` in your
+shell or service secret environment. Do not write passwords into TOML. The example
+explicitly permits plaintext for this isolated local demonstration; production uses
+verified TLS as described in the [persistence setup](persistence.md#configuration-and-startup).
+Then, in another terminal:
 
 ```sh
+cargo run --locked -p openlegal-server -- --migrate deploy/demo/server.toml
 cargo run --locked -p openlegal-server -- deploy/demo/server.toml
 ```
 
 Every configuration requires `[source].url`; replace the example placeholder with
 the actual source offer before hosting. See [source offers](server.md#source-offers-and-migration).
-Remove both `[demo]` and `[cache.filesystem]` to disable synthetic retrieval.
+Remove both `[demo]` and `[cache]` to disable synthetic retrieval.
 The independent `[text_diff]` feature remains enabled until its section is also
 removed; without either feature only registered foundation tools remain. The demo
 additionally requires its bounded local widget asset before listeners bind. Paths
@@ -103,11 +110,13 @@ progress, and resource retrieval using isolated synthetic fixtures.
 
 ## Persistent history
 
-The combined demo configuration enables [filesystem L2](filesystem-cache.md) and
+The combined demo configuration enables [PostgreSQL 18 + BlobStore persistence](persistence.md) and
 text comparison. The record browser can list and view captured record/search-page
 history and compare two retained versions of the same record. Rebuild both widget
 assets after updating. History is demand-captured; it does not crawl the mock or
-create a snapshot every time a fresh memory result is read. The example store is
-`target/demo/cache`; use a durable directory outside build artifacts when hosting.
-Remove `[cache.filesystem]` for memory-only behavior. Without `[text_diff]`, history
+create a snapshot every time a fresh memory result is read. The example blob directory is
+`target/demo/blobs`; use a durable directory outside build artifacts when hosting,
+and operate PostgreSQL data storage independently.
+Replace `[cache]` and its subsections with `[cache]` plus `mode = "memory"`
+for explicitly non-persistent behavior. Without `[text_diff]`, history
 browsing remains available and comparison controls are disabled.

@@ -31,7 +31,8 @@ const MAX_WAITERS_PER_KEY: usize = 16;
 const MAX_WAITERS: usize = 64;
 const REFRESH_DEADLINE: Duration = Duration::from_secs(10);
 const ATTEMPT_DEADLINE: Duration = Duration::from_secs(5);
-const FILESYSTEM_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const PERSISTENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const PERSISTENT_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
@@ -93,6 +94,7 @@ struct State {
     generation: u64,
     stopping: bool,
     storage_epoch: u64,
+    storage_recovery_epoch: u64,
 }
 struct Rate {
     tokens: f64,
@@ -136,7 +138,7 @@ pub struct MetricsSnapshot {
     pub cache_bytes: usize,
     pub in_flight: usize,
     pub waiters: usize,
-    pub filesystem: StorageMetrics,
+    pub persistent: StorageMetrics,
 }
 
 pub struct RetrievalService {
@@ -237,6 +239,9 @@ impl RetrievalService {
                 generation: 0,
                 stopping: false,
                 storage_epoch: persistence.as_ref().map_or(0, |store| store.epoch()),
+                storage_recovery_epoch: persistence
+                    .as_ref()
+                    .map_or(0, |store| store.recovery_epoch()),
             }),
             jobs: Mutex::new(JoinSet::new()),
             shutdown: CancellationToken::new(),
@@ -249,7 +254,7 @@ impl RetrievalService {
         let token = service.shutdown.clone();
         service.jobs.lock().map_err(|_| RetrievalError::Internal)?.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
-            let mut filesystem_maintenance_at = Instant::now() + FILESYSTEM_MAINTENANCE_INTERVAL;
+            let mut persistent_maintenance_at = Instant::now() + PERSISTENT_MAINTENANCE_INTERVAL;
             loop {
                 tokio::select! {
                     biased;
@@ -257,11 +262,10 @@ impl RetrievalService {
                     _ = interval.tick() => {
                         let Some(service) = weak.upgrade() else { break };
                         if let Some(store) = &service.persistence
-                            && Instant::now() >= filesystem_maintenance_at {
-                            filesystem_maintenance_at = Instant::now() + FILESYSTEM_MAINTENANCE_INTERVAL;
+                            && Instant::now() >= persistent_maintenance_at {
+                            persistent_maintenance_at = Instant::now() + PERSISTENT_MAINTENANCE_INTERVAL;
                             // The storage port owns bounded cleanup; never drop its active future.
-                            let result = store.maintain(service.clock.now()).await;
-                            if result.is_err() && !store.healthy() { service.fail_storage(); }
+                            let _result = store.maintain(service.clock.now()).await;
                         }
                         if let Ok(mut state) = service.state.lock() { service.sync_epoch(&mut state); expire(&mut state, service.clock.now()); }
                         if let Ok(mut jobs) = service.jobs.lock() {
@@ -273,6 +277,39 @@ impl RetrievalService {
                 }
             }
         });
+        if service.persistence.is_some() {
+            let weak = Arc::downgrade(&service);
+            let token = service.shutdown.clone();
+            service
+                .jobs
+                .lock()
+                .map_err(|_| RetrievalError::Internal)?
+                .spawn(async move {
+                    let mut interval = tokio::time::interval_at(
+                        Instant::now() + PERSISTENT_HEALTH_INTERVAL,
+                        PERSISTENT_HEALTH_INTERVAL,
+                    );
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => break,
+                            _ = interval.tick() => {
+                                let Some(service) = weak.upgrade() else { break };
+                                if let Some(store) = &service.persistence {
+                                    // The adapter bounds and owns active recovery work.
+                                    // Drain it on cancellation instead of dropping a
+                                    // possible database reconciliation operation.
+                                    let _result = store.health(service.clock.now()).await;
+                                }
+                                if let Ok(mut state) = service.state.lock() {
+                                    service.sync_epoch(&mut state);
+                                }
+                            }
+                        }
+                    }
+                });
+        }
         Ok(service)
     }
 
@@ -304,8 +341,8 @@ impl RetrievalService {
                 return Err(RetrievalError::Shutdown);
             }
             self.sync_epoch(&mut state);
-            if !self.storage_healthy() {
-                return Err(RetrievalError::StorageUnavailable);
+            if let Some(error) = self.storage_error() {
+                return Err(error);
             }
             expire(&mut state, self.clock.now());
             let cached = state.cache.get(&key);
@@ -453,6 +490,9 @@ impl RetrievalService {
                 }
             }
         };
+        if let Some(error) = self.storage_error() {
+            return Err(error);
+        }
         let value = match outcome {
             Ok((value, epoch)) => {
                 if let Some(expected) = epoch {
@@ -474,8 +514,8 @@ impl RetrievalService {
                 let stale = {
                     let mut state = self.state.lock().map_err(|_| RetrievalError::Internal)?;
                     self.sync_epoch(&mut state);
-                    if !self.storage_healthy() {
-                        return Err(RetrievalError::StorageUnavailable);
+                    if let Some(error) = self.storage_error() {
+                        return Err(error);
                     }
                     expire(&mut state, self.clock.now());
                     state.cache.get(&key)
@@ -726,6 +766,7 @@ impl RetrievalService {
             self.shutdown.cancel();
             return;
         };
+        self.sync_epoch(&mut state);
         let Some(flight) = state.flights.get(&key) else {
             return;
         };
@@ -735,13 +776,18 @@ impl RetrievalService {
         if flight.cancellation.is_cancelled() || state.stopping {
             if let Some(flight) = state.flights.remove(&key) {
                 state.waiters -= flight.waiters;
-                flight
-                    .outcome
-                    .send_replace(Some(Err(RetrievalError::Cancelled)));
+                let error = match &outcome {
+                    Err(
+                        error @ (RetrievalError::StorageUnavailable
+                        | RetrievalError::StorageCorrupt
+                        | RetrievalError::StorageCapacity),
+                    ) => *error,
+                    _ => self.storage_error().unwrap_or(RetrievalError::Cancelled),
+                };
+                flight.outcome.send_replace(Some(Err(error)));
             }
             return;
         }
-        self.sync_epoch(&mut state);
         if let Ok((_, Some(epoch))) = &outcome
             && (*epoch != state.storage_epoch || !self.storage_healthy())
         {
@@ -818,7 +864,7 @@ impl RetrievalService {
             retries: counters.retries.load(Ordering::Relaxed),
             throttled: counters.throttled.load(Ordering::Relaxed),
             saturation: counters.saturated.load(Ordering::Relaxed),
-            filesystem: self
+            persistent: self
                 .persistence
                 .as_ref()
                 .map_or_else(StorageMetrics::default, |store| store.metrics()),
@@ -853,8 +899,44 @@ impl RetrievalService {
             m.waiters
         );
         if self.persistence.is_some() {
-            let fs = m.filesystem;
-            output.push_str(&format!("openlegal_filesystem_hits_total {}\nopenlegal_filesystem_misses_total {}\nopenlegal_filesystem_writes_total {}\nopenlegal_filesystem_evictions_total {}\nopenlegal_filesystem_corruptions_total {}\nopenlegal_filesystem_recoveries_total {}\nopenlegal_filesystem_saturation_total {}\nopenlegal_filesystem_bytes {}\nopenlegal_filesystem_snapshots {}\n", fs.hits, fs.misses, fs.writes, fs.evictions, fs.corruptions, fs.recoveries, fs.saturation, fs.bytes, fs.snapshots));
+            let storage = m.persistent;
+            for (name, value) in [
+                ("openlegal_persistent_hits_total", storage.hits),
+                ("openlegal_persistent_misses_total", storage.misses),
+                ("openlegal_snapshot_publications_total", storage.writes),
+                (
+                    "openlegal_unchanged_validations_total",
+                    storage.unchanged_validations,
+                ),
+                ("openlegal_retention_evictions_total", storage.evictions),
+                ("openlegal_storage_corruptions_total", storage.corruptions),
+                ("openlegal_storage_failures_total", storage.failures),
+                ("openlegal_storage_recoveries_total", storage.recoveries),
+                ("openlegal_storage_saturation_total", storage.saturation),
+                ("openlegal_referenced_blob_bytes", storage.bytes),
+                ("openlegal_retained_snapshots", storage.snapshots as u64),
+                ("openlegal_retained_queries", storage.queries as u64),
+                ("openlegal_blob_reads_total", storage.blob_reads),
+                ("openlegal_blob_writes_total", storage.blob_writes),
+                (
+                    "openlegal_blob_deduplicated_puts_total",
+                    storage.deduplicated_puts,
+                ),
+                ("openlegal_orphan_cleanups_total", storage.orphan_cleanups),
+                (
+                    "openlegal_postgres_pool_connections",
+                    storage.pool_connections,
+                ),
+                ("openlegal_postgres_pool_idle", storage.pool_idle),
+                ("openlegal_blob_staging_bytes", storage.staging_bytes),
+                ("openlegal_blob_deletion_queue", storage.deletion_queue),
+                (
+                    "openlegal_persistent_ready",
+                    u64::from(self.storage_ready()),
+                ),
+            ] {
+                output.push_str(&format!("{name} {value}\n"));
+            }
         }
         output
     }

@@ -248,19 +248,35 @@ misbehaving plugin detached no external work; that remains a module contract.
 Host allowlists are explicit. Native clients may omit Origin; an empty Origin
 allowlist rejects every present Origin. Forwarded headers do not establish identity.
 The server suppresses SDK payload logs, including when `RUST_LOG` is configured,
-and logs only bounded operational events. Public read-only tools need no secrets.
+and logs only bounded operational events. Database credentials belong only in operator-provided environment variables;
+public read-only MCP inputs never accept them.
 
-## Optional filesystem L2
+## Explicit persistence mode
 
-`[cache.filesystem]` supplies `path`, `retention_days` (30), `max_bytes` (1 GiB),
-and `max_snapshots_per_query` (100). It requires a registered retrieval source.
-The [filesystem contract](filesystem-cache.md) defines isolated worker startup,
-exclusive ownership, recovery, current-cache behavior and history interfaces.
-Startup validates the configured root before listeners admit traffic. Memory-only
-configurations remain supported. New sanitized tool errors are `storage_unavailable`,
-`storage_corrupt`, `storage_capacity`, and `snapshot_unavailable`.
+A configured retrieval source requires `[cache].mode = "memory"` or `"persistent"`.
+Memory mode is explicitly non-persistent. Persistent mode requires PostgreSQL 18.x
+and an immutable BlobStore; there is no alternate persistent backend. The
+[persistence contract](persistence.md) defines configuration, environment secrets,
+SQL migrations, retention and the storage failure/recovery lifecycle.
 
-L2 enables `demo_list_snapshots` and `demo_get_snapshot`; adding `[text_diff]` also
+Run `openlegal-server --migrate CONFIG.toml` with the separately configured migration
+credential before serving. Ordinary startup uses only the runtime credential and
+rejects unsupported PostgreSQL versions or missing, pending or changed migrations.
+Run `openlegal-server --maintain CONFIG.toml` for explicit bounded retention pruning,
+including after lowering limits below retained totals. Both commands finish without
+opening listeners or initializing retrieval, widgets or text-comparison workers.
+There is intentionally no conversion of old filesystem cache data.
+
+Startup verifies PostgreSQL and blob health before listener admission. A runtime
+storage outage makes `/ready` return 503 and rejects persistent retrieval, including
+L1 hits, and history tools without upstream fallback. Bounded background probes
+allow availability recovery. `/live`, metrics, supplied-text comparison and existing
+transient comparison handles remain available while the process is healthy.
+Actual endpoint/worker failure still triggers shared shutdown and drain. Database
+and blob errors are translated to sanitized `storage_unavailable`, `storage_corrupt`,
+`storage_capacity`, and `snapshot_unavailable` outcomes.
+
+Persistent mode enables `demo_list_snapshots` and `demo_get_snapshot`; adding `[text_diff]` also
 enables `demo_compare_record_snapshots`. Current result envelopes optionally include
 `snapshot`; historical responses use a separate envelope. Demo render results
 advertise history/comparison capability flags and source processor versions.

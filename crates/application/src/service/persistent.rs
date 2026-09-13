@@ -1,6 +1,8 @@
-//! L2 orchestration. The adapter owns filesystem work; this service owns policy.
+//! Persistent resolution. The service owns freshness, admission and cancellation.
 use super::*;
-use crate::persistence::{HistoryKey, PersistentKey, StoredResult};
+use crate::persistence::{
+    HistoryKey, PersistentKey, PublicationOutcome, PublicationRequest, StorageStatus, StoredResult,
+};
 use openlegal_domain::history::{SnapshotEnvelope, SnapshotPage, valid_snapshot_id};
 
 const RESOLUTION_DEADLINE: Duration = Duration::from_secs(20);
@@ -10,29 +12,48 @@ impl RetrievalService {
         self.persistence.is_some()
     }
 
-    pub(super) fn storage_healthy(&self) -> bool {
-        self.persistence
-            .as_ref()
-            .is_none_or(|store| store.healthy())
+    pub fn storage_ready(&self) -> bool {
+        !self.shutdown.is_cancelled() && self.storage_error().is_none()
     }
 
-    pub(super) fn fail_storage(&self) {
-        if self.shutdown.is_cancelled() {
-            return;
-        }
-        self.failed.store(true, Ordering::Relaxed);
-        self.shutdown.cancel();
+    pub(super) fn storage_error(&self) -> Option<RetrievalError> {
+        self.persistence.as_ref().and_then(|store| {
+            store
+                .status()
+                .error()
+                .or_else(|| (!store.healthy()).then_some(RetrievalError::StorageUnavailable))
+        })
+    }
+
+    pub(super) fn storage_healthy(&self) -> bool {
+        self.storage_error().is_none()
     }
 
     pub(super) fn sync_epoch(&self, state: &mut State) {
         if let Some(store) = &self.persistence {
             let epoch = store.epoch();
+            let recovery_epoch = store.recovery_epoch();
+            if recovery_epoch != state.storage_recovery_epoch {
+                state.storage_recovery_epoch = recovery_epoch;
+                state.cache.clear();
+                for flight in state.flights.values() {
+                    flight.cancellation.cancel();
+                }
+            }
             if state.storage_epoch != epoch {
                 state.cache.clear();
                 state.storage_epoch = epoch;
             }
-            if !store.healthy() {
-                self.fail_storage();
+            if !store.healthy() || store.status() != StorageStatus::Ready {
+                state.cache.clear();
+                // Availability recovery must not stop the supervisor. Cancel
+                // owned generations and let them drain before admitting replacements.
+                // Retention barriers gate promotion but do not cancel their own publisher.
+                if store.status() != StorageStatus::Maintaining {
+                    for flight in state.flights.values() {
+                        flight.cancellation.cancel();
+                    }
+                }
             }
         }
     }
@@ -69,6 +90,9 @@ impl RetrievalService {
         if self.shutdown.is_cancelled() {
             return Err(RetrievalError::Shutdown);
         }
+        if let Some(error) = self.storage_error() {
+            return Err(error);
+        }
         let source = self
             .sources
             .get(query.source())
@@ -96,24 +120,32 @@ impl RetrievalService {
         if cancellation.is_cancelled() {
             return Err(RetrievalError::Cancelled);
         }
+        let epoch = store.epoch();
         let operation_cancel = cancellation.child_token();
         let _cancel_on_drop = operation_cancel.clone().drop_guard();
         let result = store
             .list(key, cursor, limit, self.clock.now(), operation_cancel)
             .await;
-        if !store.healthy() {
-            self.fail_storage();
-            return Err(RetrievalError::StorageUnavailable);
+        if let Some(error) = self.storage_error() {
+            return Err(error);
+        }
+        if store.epoch() != epoch {
+            return Err(RetrievalError::Busy);
         }
         if cancellation.is_cancelled() {
             return Err(RetrievalError::Cancelled);
         }
-        let mut page = result?;
-        page.snapshots.retain(|snapshot| {
-            store
-                .policy()
-                .retains(snapshot.captured_at, self.clock.now())
-        });
+        let page = result?;
+        let now = self.clock.now();
+        if page
+            .snapshots
+            .iter()
+            .any(|snapshot| !store.policy().retains(snapshot.captured_at, now))
+        {
+            // Expiry during the storage operation must not produce an empty or
+            // truncated page carrying a continuation cursor for different rows.
+            return Err(RetrievalError::Busy);
+        }
         Ok(page)
     }
 
@@ -134,12 +166,15 @@ impl RetrievalService {
         if cancellation.is_cancelled() {
             return Err(RetrievalError::Cancelled);
         }
+        let epoch = store.epoch();
         let operation_cancel = cancellation.child_token();
         let _cancel_on_drop = operation_cancel.clone().drop_guard();
         let result = store.get(key, id, self.clock.now(), operation_cancel).await;
-        if !store.healthy() {
-            self.fail_storage();
-            return Err(RetrievalError::StorageUnavailable);
+        if let Some(error) = self.storage_error() {
+            return Err(error);
+        }
+        if store.epoch() != epoch {
+            return Err(RetrievalError::Busy);
         }
         if cancellation.is_cancelled() {
             return Err(RetrievalError::Cancelled);
@@ -164,7 +199,7 @@ impl RetrievalService {
         cancellation: &CancellationToken,
         generation: u64,
     ) -> PublishedOutcome {
-        let work = self.resolve_disk_then_upstream(
+        let work = self.resolve_storage_then_upstream(
             source,
             provider,
             &key,
@@ -176,7 +211,7 @@ impl RetrievalService {
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
-                // Await cancellation/reconciliation instead of dropping active disk I/O.
+                // Drain owned storage work instead of dropping an uncertain transaction.
                 let _ = work.await;
                 Err(RetrievalError::Cancelled)
             },
@@ -187,13 +222,13 @@ impl RetrievalService {
                 Err(RetrievalError::StorageUnavailable)
             },
         };
-        if !self.storage_healthy() {
-            self.fail_storage();
+        if let Ok(mut state) = self.state.lock() {
+            self.sync_epoch(&mut state);
         }
         result
     }
 
-    async fn resolve_disk_then_upstream(
+    async fn resolve_storage_then_upstream(
         self: &Arc<Self>,
         source: &Source,
         provider: &Provider,
@@ -203,20 +238,21 @@ impl RetrievalService {
         generation: u64,
     ) -> PublishedOutcome {
         let store = self.persistence.as_ref().ok_or(RetrievalError::Internal)?;
+        let recovery_epoch = store.recovery_epoch();
         if cancellation.is_cancelled() {
             return Err(RetrievalError::Cancelled);
         }
-        let disk_key = self.persistent_key(key);
-        if let Some(found) = store
-            .lookup(disk_key.clone(), self.clock.now(), cancellation.clone())
-            .await?
-        {
+        let storage_key = self.persistent_key(key);
+        let lookup = store
+            .lookup(storage_key.clone(), self.clock.now(), cancellation.clone())
+            .await?;
+        if let Some(found) = lookup.value {
             if cancellation.is_cancelled() {
                 return Err(RetrievalError::Cancelled);
             }
             let age = self.usable_age(&found.payload);
             if age.is_some_and(|age| age <= RETENTION_SECONDS) {
-                self.promote_disk(key, generation, &found)?;
+                self.promote_persistent(key, generation, &found)?;
                 if age.is_some_and(|age| age < FRESH_SECONDS) {
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok((found.payload, Some(found.epoch)));
@@ -228,8 +264,8 @@ impl RetrievalService {
         }
         // A corrupt/unavailable store is never interpreted as a miss. Only a
         // successful lookup can reach upstream admission.
-        if !store.healthy() {
-            return Err(RetrievalError::StorageUnavailable);
+        if let Some(error) = self.storage_error() {
+            return Err(error);
         }
         let permit = provider
             .active
@@ -245,6 +281,12 @@ impl RetrievalService {
             }
         };
         drop(permit);
+        if store.recovery_epoch() != recovery_epoch {
+            return Err(RetrievalError::StorageUnavailable);
+        }
+        if let Some(error) = self.storage_error() {
+            return Err(error);
+        }
         let weak = Arc::downgrade(self);
         let auth_key = key.clone();
         let authorize = Arc::new(move || {
@@ -256,23 +298,49 @@ impl RetrievalService {
             };
             !state.stopping
                 && !service.shutdown.is_cancelled()
+                && service.persistence.as_ref().is_some_and(|store| {
+                    store.recovery_epoch() == recovery_epoch
+                        && matches!(
+                            store.status(),
+                            StorageStatus::Ready | StorageStatus::Maintaining
+                        )
+                })
                 && state.flights.get(&auth_key).is_some_and(|flight| {
                     flight.generation == generation
                         && flight.waiters > 0
                         && !flight.cancellation.is_cancelled()
                 })
         });
-        let committed = store
-            .publish(
-                disk_key,
-                candidate,
-                self.clock.now(),
+        let committed = match store
+            .publish(PublicationRequest {
+                key: storage_key.clone(),
+                value: candidate,
+                expected: lookup.observation,
+                now: self.clock.now(),
                 authorize,
-                cancellation.clone(),
-            )
-            .await?;
+                cancellation: cancellation.clone(),
+            })
+            .await?
+        {
+            PublicationOutcome::Accepted(committed) => committed,
+            PublicationOutcome::Conflict => {
+                if cancellation.is_cancelled() {
+                    return Err(RetrievalError::Cancelled);
+                }
+                // A competing accepted observation wins. Never rebase and replay
+                // our older candidate or create a second upstream refresh.
+                store
+                    .lookup(storage_key, self.clock.now(), cancellation.clone())
+                    .await?
+                    .value
+                    .ok_or(RetrievalError::Busy)?
+            }
+        };
         if cancellation.is_cancelled() {
             return Err(RetrievalError::Cancelled);
+        }
+        if store.recovery_epoch() != recovery_epoch {
+            return Err(RetrievalError::StorageUnavailable);
         }
         if !self
             .usable_age(&committed.payload)
@@ -283,7 +351,7 @@ impl RetrievalService {
         Ok((committed.payload, Some(committed.epoch)))
     }
 
-    fn promote_disk(
+    fn promote_persistent(
         &self,
         key: &CacheKey,
         generation: u64,

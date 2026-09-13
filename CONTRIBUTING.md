@@ -138,7 +138,13 @@ Install `cargo-audit` 0.22.2 and `cargo-deny` 0.20.2 using the locked commands i
 [dependency admission](docs/dependencies.md). Both require current advisory-data
 access; unavailable/stale advisory data is not a successful current check.
 The separate `scripts/test-oxibelt.sh` Docker gate verifies both transports through
-the pinned edge and runs in CI. Ordinary Rust tests do not require Docker.
+the pinned edge and runs in CI. `scripts/test-postgres.sh` provisions the pinned
+PostgreSQL 18 image and explicitly executes the ignored real-database persistence,
+history and transport tests. Both gates are required for persistence changes and
+run in CI. An unavailable Docker/database environment is an incomplete gate, not a
+passed or silently skipped check. Ordinary Rust tests and compilation require
+neither Docker nor `DATABASE_URL`; tests requiring PostgreSQL are clearly marked
+and run by the dedicated gate.
 
 Use focused tests while developing, then run the applicable workspace baseline
 before a Rust change is ready. Bootstrap must enumerate supported feature

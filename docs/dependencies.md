@@ -137,18 +137,36 @@ notices are bundled locally; the source-offer marker and existing asset ceilings
 remain enforced. The frozen graph receives current advisory/license checks, and
 only esbuild's installation script remains enabled.
 
-## Filesystem persistence additions
+## PostgreSQL and blob persistence additions
 
-`rustix` 1.1.4, already in the lockfile, becomes a direct adapter dependency with
-its filesystem and process APIs (including effective-user ownership checks).
-Safe directory-relative descriptors, nofollow opens and
-atomic rename support avoid a first-party unsafe wrapper or race-prone path checks.
-Source: crates.io / Bytecode Alliance; license choice MIT or Apache-2.0. Its build
-script selects platform configuration; Linux syscall implementations contain
-upstream unsafe code, without introducing a first-party exception. This filesystem
-boundary requires independent review and failure-injection tests in addition to
-current advisory/license admission. The alternatives were raw libc bindings or a
-larger capability-filesystem abstraction. Existing Serde and SHA-256 dependencies
-also support bounded metadata and envelope integrity; the raw payload remains a
-binary section to avoid JSON byte-array expansion. SHA-256 provides evidence
-linkage/corruption detection, not source authentication.
+`sqlx` 0.9.0 supplies one async PostgreSQL stack: Tokio runtime, Rustls with
+ring and native certificate roots, PostgreSQL, UUID, JSON, and migrations; default features are disabled.
+Runtime parameterized queries avoid a build-time database and query-macro metadata.
+Checked-in SQL is embedded with `include_str!`; migrations use SQLx's migration
+ledger/checksums and locking. The alternative `tokio-postgres` plus a separate
+pool/migration stack would add composition without a present capability benefit.
+SQLx is MIT OR Apache-2.0, from crates.io. Its PostgreSQL framing, authentication,
+TLS, pooling and cancellation are security boundaries. Native certificate roots reuse the existing workspace trust-store stack rather
+than introducing the differently licensed bundled webpki root dataset. Explicit
+operator CA files remain supported. Exact transitive versions are in Cargo.lock; inactive optional SQLx drivers may appear in the lockfile but
+are not compiled into the admitted PostgreSQL feature graph. No MySQL or SQLite
+persistent backend is implemented.
+
+`uuid` 1 is used for typed database UUID decoding/encoding only (std, no generator
+features). PostgreSQL 18 generates relational IDs through native `uuidv7()`;
+cryptographic public aliases/comparison handles continue to use `getrandom`.
+The UUID crate is MIT OR Apache-2.0, from crates.io.
+
+`rustix` 1.1.4 remains the safe Linux filesystem/process boundary for immutable
+blob directory-relative nofollow operations, ownership checks and no-replace
+publication. Its MIT OR Apache-2.0 syscall implementation may contain dependency
+unsafe code; first-party unsafe remains denied. File and parent-directory sync,
+including concurrent deduplication, receive independent review and deterministic
+failure tests. There is no filesystem database, worker protocol, manifest index,
+or format migration remaining. Blocking object jobs retain bounded admission
+through actual completion; SQL owns references and retention.
+
+Admission evidence must include current cargo-audit and cargo-deny results,
+features/source review, real PostgreSQL 18 tests, and focused independent reviews.
+See [persistence](persistence.md) for credentials, verified TLS, bounded pooling,
+and the explicit distinction between digest integrity and source authentication.

@@ -1,36 +1,124 @@
 use openlegal_server::{
     ServerBuilder, ServerError,
-    config::{AccessPolicy, Config},
+    config::{AccessPolicy, BlobConfig, CacheConfig, Config},
     http::{HealthEndpoint, HttpEndpoint},
     webtransport::WebTransportEndpoint,
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Command {
+    Serve,
+    Migrate,
+    Maintain,
+}
+
 fn main() -> Result<(), ServerError> {
     let mut args = std::env::args_os().skip(1);
-    let path = args.next().ok_or("usage: openlegal-server CONFIG.toml")?;
-    if args.next().is_some() {
-        return Err("usage: openlegal-server CONFIG.toml".into());
-    }
-    if path == "--text-diff-worker" {
+    let first = args
+        .next()
+        .ok_or("usage: openlegal-server [--migrate|--maintain] CONFIG.toml")?;
+    if first == "--text-diff-worker" {
+        if args.next().is_some() {
+            return Err("text-diff worker takes no arguments".into());
+        }
         openlegal_adapters::text_diff::run_worker()?;
         return Ok(());
     }
-    if path == "--cache-worker" {
-        openlegal_adapters::persistent::run_worker()?;
-        return Ok(());
+    let (command, path) = if first == "--migrate" || first == "--maintain" {
+        let command = if first == "--migrate" {
+            Command::Migrate
+        } else {
+            Command::Maintain
+        };
+        (
+            command,
+            args.next()
+                .ok_or("storage administration requires CONFIG.toml")?,
+        )
+    } else {
+        if first.to_string_lossy().starts_with("--") {
+            return Err("unknown server command".into());
+        }
+        (Command::Serve, first)
+    };
+    if args.next().is_some() {
+        return Err("usage: openlegal-server [--migrate|--maintain] CONFIG.toml".into());
     }
-    run_server(path)
+    run_server(path, command)
+}
+
+fn now() -> u64 {
+    use openlegal_application::Clock;
+    openlegal_application::SystemClock::default().now()
+}
+
+async fn open_storage(
+    cache: &CacheConfig,
+    mode: openlegal_adapters::postgres::StartupMode,
+) -> Result<std::sync::Arc<openlegal_adapters::postgres::PostgresStore>, ServerError> {
+    use openlegal_application::blob::BlobStore;
+    let CacheConfig::Persistent { postgres, blob, .. } = cache else {
+        return Err("storage administration requires cache mode persistent".into());
+    };
+    let options = postgres.options()?;
+    let url = postgres.connection_url(false)?;
+    let policy = cache.policy()?;
+    let BlobConfig::Filesystem { path } = blob;
+    let blobs = openlegal_adapters::blob::FsBlobStore::open(&std::path::absolute(path)?).await?;
+    match openlegal_adapters::postgres::PostgresStore::open(
+        &url,
+        options,
+        blobs.clone(),
+        policy,
+        now(),
+        mode,
+    )
+    .await
+    {
+        Ok(store) => Ok(store),
+        Err(error) => {
+            let _ = blobs.close().await;
+            Err(error.into())
+        }
+    }
 }
 
 #[tokio::main]
-async fn run_server(path: std::ffi::OsString) -> Result<(), ServerError> {
-    // SDK diagnostics can include caller payloads even at info/warn; never enable them here.
+async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), ServerError> {
+    // SDK/driver diagnostics can contain secrets or payloads; filtering below is mandatory.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     logging_subscriber(filter, std::io::stdout).init();
     let config: Config = toml::from_str(&tokio::fs::read_to_string(path).await?)?;
+    if command != Command::Serve {
+        let cache = config
+            .cache
+            .as_ref()
+            .ok_or("storage administration requires cache mode persistent")?;
+        let CacheConfig::Persistent { postgres, .. } = cache else {
+            return Err("storage administration requires cache mode persistent".into());
+        };
+        if command == Command::Migrate {
+            // This branch never reads runtime credentials, opens blobs, or initializes serving.
+            openlegal_adapters::postgres::PostgresStore::migrate(
+                &postgres.connection_url(true)?,
+                postgres.options()?,
+            )
+            .await?;
+        } else {
+            use openlegal_application::persistence::PersistentStore;
+            let store =
+                open_storage(cache, openlegal_adapters::postgres::StartupMode::Maintain).await?;
+            let result = store.prune(now()).await;
+            let closed = store.close().await;
+            result?;
+            closed?;
+        }
+        return Ok(());
+    }
     config.limits.validate()?;
+    config.validate_storage()?;
     if let Some(diff) = &config.text_diff {
         diff.validate(&config.limits)?;
     }
@@ -45,20 +133,11 @@ async fn run_server(path: std::ffi::OsString) -> Result<(), ServerError> {
             service: service.clone(),
         })?;
     }
-    let persistent = if let Some(cache) = &config.cache {
-        if config.demo.is_none() {
-            return Err("filesystem cache requires a registered retrieval source".into());
+    let persistent = match &config.cache {
+        Some(cache @ CacheConfig::Persistent { .. }) => {
+            Some(open_storage(cache, openlegal_adapters::postgres::StartupMode::Serve).await?)
         }
-        Some(
-            openlegal_adapters::persistent::FsCache::open(
-                &std::env::current_exe()?,
-                &std::path::absolute(&cache.filesystem.path)?,
-                cache.filesystem.policy()?,
-            )
-            .await?,
-        )
-    } else {
-        None
+        _ => None,
     };
     let result: Result<(), ServerError> = async {
         let demo_service = config
@@ -125,6 +204,7 @@ async fn run_server(path: std::ffi::OsString) -> Result<(), ServerError> {
             bind: config.health.bind,
         };
         if demo_service.is_some() || diff_service.is_some() {
+            let readiness_service = demo_service.clone();
             builder.register_endpoint(health.with_metrics(move || {
                 let mut metrics = String::new();
                 if let Some(service) = &demo_service {
@@ -134,7 +214,7 @@ async fn run_server(path: std::ffi::OsString) -> Result<(), ServerError> {
                     metrics.push_str(&service.metrics_prometheus());
                 }
                 metrics
-            }))?;
+            }).with_readiness(move || readiness_service.as_ref().is_none_or(|service| service.storage_ready())))?;
         } else {
             builder.register_endpoint(health)?;
         }
@@ -162,7 +242,7 @@ async fn run_server(path: std::ffi::OsString) -> Result<(), ServerError> {
         result
     }
     .await;
-    // Every startup and serving exit owns child cleanup, including bind/widget errors.
+    // Every startup and serving exit owns persistence cleanup, including bind/widget errors.
     if let Some(store) = persistent {
         use openlegal_application::persistence::PersistentStore;
         let closed = store.close().await;
@@ -182,7 +262,11 @@ where
             .with_writer(writer)
             .with_filter(filter)
             .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
-                metadata.target() != "rmcp" && !metadata.target().starts_with("rmcp::")
+                metadata.target() != "rmcp"
+                    && !metadata.target().starts_with("rmcp::")
+                    && metadata.target() != "sqlx"
+                    && !metadata.target().starts_with("sqlx::")
+                    && !metadata.target().starts_with("sqlx_")
             })),
     )
 }
@@ -213,14 +297,19 @@ mod tests {
     #[test]
     fn specific_runtime_directives_cannot_enable_sdk_payload_logs() {
         let capture = Capture(Default::default());
-        let subscriber =
-            logging_subscriber(EnvFilter::new("trace,rmcp::service=trace"), capture.clone());
+        let subscriber = logging_subscriber(
+            EnvFilter::new("trace,rmcp::service=trace,sqlx=trace"),
+            capture.clone(),
+        );
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(target:"rmcp::service","synthetic private input");
+            tracing::warn!(target:"sqlx_postgres::options::parse", "synthetic private input");
+            tracing::warn!(target:"sqlx::query","synthetic private database input");
             tracing::info!(target:"openlegal_server","listener ready");
         });
         let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(!output.contains("synthetic private input"));
+        assert!(!output.contains("synthetic private database input"));
         assert!(output.contains("listener ready"));
     }
 }

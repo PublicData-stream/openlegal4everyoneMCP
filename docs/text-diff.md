@@ -188,9 +188,9 @@ No deployment or publication is included.
 
 ## Comparisons from retained snapshots
 
-With filesystem L2 enabled, the record history tool can resolve two retained
+With PostgreSQL + BlobStore persistence enabled, the record history tool can resolve two retained
 snapshots of the same record and call the existing comparison service. The exact
-projection is title, two LF bytes, then body. See the [history contract](filesystem-cache.md).
+projection is title, two LF bytes, then body. See the [history contract](persistence.md#history-and-comparisons).
 The optional summary `origin` is server-derived and retained with the transient
 comparison. `compare_texts` does not accept this field. Editing creates a supplied-
 text comparison without a verified historical association. Original source payloads

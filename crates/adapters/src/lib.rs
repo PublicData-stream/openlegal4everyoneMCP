@@ -1,7 +1,11 @@
 //! Bounded HTTP mechanics. Retry, cache and refresh policy belong to application.
 
+#[cfg(test)]
+extern crate self as openlegal_adapters;
+
+pub mod blob;
 mod cache;
-pub mod persistent;
+pub mod postgres;
 pub mod text_diff;
 pub use cache::MemoryCache;
 

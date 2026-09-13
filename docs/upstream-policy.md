@@ -31,12 +31,14 @@ The [Korean profile](providers/kr-law-go-kr.md) is the initial example.
 
 ## Cache identity and storage
 
-Use backend-local reusable caching; choose memory/persistence technology during
-implementation. Document restart behavior and keep cold starts within the same
-request budget. Persistence may reduce repeated retrieval, but a particular
-database or a permanent archive is not mandated. The optional
-[filesystem L2](filesystem-cache.md) implements bounded immutable local captures,
-with separate current-serving freshness and historical retention.
+Retrieval uses a process-local L1 cache and an explicit storage mode. The only
+persistent architecture is [PostgreSQL 18 plus BlobStore](persistence.md). PostgreSQL
+owns query identity, compatible current heads, immutable observed occurrences and
+retention metadata. Blob storage owns content-addressed source bytes. Explicit
+memory mode is non-persistent and is suitable for isolated demonstrations/tests.
+Cold starts and persistent misses remain within the same upstream request budget.
+A retained capture is an observation, not an authoritative legal revision or a
+promise of permanent archival storage.
 
 Keys must distinguish all dimensions affecting the result: provider, dataset,
 record or query identity, revision/date selector, language/representation,

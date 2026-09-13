@@ -1,4 +1,6 @@
-//! Synthetic durable observations through real cache/comparison child processes.
+//! Synthetic durable observations through PostgreSQL 18, blobs and comparison workers.
+#[path = "../../../test-support/postgres.rs"]
+mod postgres;
 use futures::future::BoxFuture;
 use openlegal_application::{Clock, FetchedPayload, RetrievalService, Source, Upstream};
 use openlegal_domain::{FreshnessRequirement, Query, Record, RetrievalData, RetrievalError};
@@ -78,16 +80,11 @@ async fn call(url: &str, name: &str, arguments: Value) -> Value {
 }
 
 #[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh PostgreSQL 18 environment"]
 async fn changes_reversions_exact_history_and_comparison_preserve_capture_origin() {
-    let dir = tempfile::tempdir().unwrap();
+    let database = postgres::TestDatabase::new().await;
     let exe = Path::new(env!("CARGO_BIN_EXE_openlegal-server"));
-    let store = openlegal_adapters::persistent::FsCache::open(
-        exe,
-        &dir.path().join("cache"),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let store = database.open(1000).await;
     let time = Arc::new(Time(AtomicU64::new(1000)));
     let revision = Arc::new(AtomicUsize::new(1));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -262,24 +259,33 @@ async fn changes_reversions_exact_history_and_comparison_preserve_capture_origin
 }
 
 #[tokio::test]
-async fn startup_widget_failure_reaps_cache_worker_and_releases_root() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("cache");
+#[ignore = "requires scripts/test-postgres.sh PostgreSQL 18 environment"]
+async fn startup_widget_failure_closes_persistence_without_damaging_storage() {
+    let database = postgres::TestDatabase::new().await;
+    let root = database.directory.path().join("blobs");
     let mut config: toml::Value =
         toml::from_str(include_str!("../../../deploy/demo/server.toml")).unwrap();
     config.as_table_mut().unwrap().remove("text_diff");
-    config["cache"]["filesystem"]["path"] = toml::Value::String(root.to_str().unwrap().into());
-    config["demo"]["widget_html"] =
-        toml::Value::String(dir.path().join("missing.html").to_str().unwrap().into());
-    let path = dir.path().join("server.toml");
+    config["cache"]["blob"]["path"] = toml::Value::String(root.to_str().unwrap().into());
+    config["demo"]["widget_html"] = toml::Value::String(
+        database
+            .directory
+            .path()
+            .join("missing.html")
+            .to_str()
+            .unwrap()
+            .into(),
+    );
+    let path = database.directory.path().join("server.toml");
     tokio::fs::write(&path, toml::to_string(&config).unwrap())
         .await
         .unwrap();
-    let exe = Path::new(env!("CARGO_BIN_EXE_openlegal-server"));
     let output = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new(exe)
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_openlegal-server"))
             .arg(path)
+            .env("OPENLEGAL_DATABASE_URL", &database.url)
+            .env_remove("OPENLEGAL_MIGRATION_DATABASE_URL")
             .kill_on_drop(true)
             .output(),
     )
@@ -287,28 +293,18 @@ async fn startup_widget_failure_reaps_cache_worker_and_releases_root() {
     .unwrap()
     .unwrap();
     assert!(!output.status.success());
-    assert!(
-        root.join("FORMAT").exists(),
-        "failure occurred after opening persistent store"
-    );
-    let reopened = openlegal_adapters::persistent::FsCache::open(exe, &root, Default::default())
-        .await
-        .unwrap();
+    assert!(root.is_dir(), "failure occurred after opening blob storage");
+    let reopened = database.open(1000).await;
     openlegal_application::persistence::PersistentStore::close(reopened.as_ref())
         .await
         .unwrap();
 }
 
 #[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh PostgreSQL 18 environment"]
 async fn unrelated_concurrent_publications_keep_both_memory_entries() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = openlegal_adapters::persistent::FsCache::open(
-        Path::new(env!("CARGO_BIN_EXE_openlegal-server")),
-        &dir.path().join("cache"),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let database = postgres::TestDatabase::new().await;
+    let store = database.open(1000).await;
     let calls = Arc::new(AtomicUsize::new(0));
     let service = RetrievalService::with_persistence(
         vec![Source {
@@ -348,7 +344,7 @@ async fn unrelated_concurrent_publications_keep_both_memory_entries() {
     assert!(a.is_ok(), "{a:?}");
     assert!(b.is_ok(), "{b:?}");
     assert_eq!(service.metrics().cache_entries, 2);
-    let disk_hits = service.metrics().filesystem.hits;
+    let disk_hits = service.metrics().persistent.hits;
     service
         .retrieve(
             query("001"),
@@ -369,7 +365,7 @@ async fn unrelated_concurrent_publications_keep_both_memory_entries() {
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
-        service.metrics().filesystem.hits,
+        service.metrics().persistent.hits,
         disk_hits,
         "unrelated writes preserve L1"
     );
@@ -377,21 +373,18 @@ async fn unrelated_concurrent_publications_keep_both_memory_entries() {
 }
 
 #[tokio::test]
-async fn cancellation_at_prepare_returns_only_after_owned_recovery() {
+#[ignore = "requires scripts/test-postgres.sh PostgreSQL 18 environment"]
+async fn cancelled_publication_does_not_install_a_head_and_storage_remains_usable() {
     use openlegal_application::{
         StoredPayload,
-        persistence::{HistoryKey, PersistentKey, PersistentStore},
+        persistence::{
+            HistoryKey, PersistentKey, PersistentStore, PublicationOutcome, PublicationRequest,
+        },
     };
     use openlegal_domain::Provenance;
     use sha2::{Digest, Sha256};
-    let dir = tempfile::tempdir().unwrap();
-    let store = openlegal_adapters::persistent::FsCache::open(
-        Path::new(env!("CARGO_BIN_EXE_openlegal-server")),
-        &dir.path().join("cache"),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let database = postgres::TestDatabase::new().await;
+    let store = database.open(1000).await;
     let key = PersistentKey {
         history: HistoryKey {
             namespace: "c".repeat(64),
@@ -434,17 +427,23 @@ async fn cancellation_at_prepare_returns_only_after_owned_recovery() {
     });
     let token = CancellationToken::new();
     let cancel = token.clone();
+    let expected = store
+        .lookup(key.clone(), 1000, CancellationToken::new())
+        .await
+        .unwrap()
+        .observation;
     let result = store
-        .publish(
-            key.clone(),
-            value.clone(),
-            1000,
-            Arc::new(move || {
+        .publish(PublicationRequest {
+            key: key.clone(),
+            value: value.clone(),
+            expected,
+            now: 1000,
+            authorize: Arc::new(move || {
                 cancel.cancel();
                 false
             }),
-            token,
-        )
+            cancellation: token,
+        })
         .await;
     assert!(matches!(result, Err(RetrievalError::Cancelled)));
     assert!(store.healthy());
@@ -453,19 +452,72 @@ async fn cancellation_at_prepare_returns_only_after_owned_recovery() {
             .lookup(key.clone(), 1000, CancellationToken::new())
             .await
             .unwrap()
+            .value
             .is_none(),
-        "completion waits for usable recovered worker"
+        "cancelled publication leaves no committed head"
     );
+    let expected = store
+        .lookup(key.clone(), 1000, CancellationToken::new())
+        .await
+        .unwrap()
+        .observation;
     let accepted = store
-        .publish(
+        .publish(PublicationRequest {
             key,
             value,
-            1000,
-            Arc::new(|| true),
-            CancellationToken::new(),
-        )
+            expected,
+            now: 1000,
+            authorize: Arc::new(|| true),
+            cancellation: CancellationToken::new(),
+        })
         .await
         .unwrap();
+    let PublicationOutcome::Accepted(accepted) = accepted else {
+        panic!("uncontended publication conflicted");
+    };
     assert!(accepted.payload.snapshot.is_some());
     store.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh PostgreSQL 18 environment"]
+async fn migration_uses_only_admin_secret_and_never_initializes_serving() {
+    let database = postgres::TestDatabase::new().await;
+    let root = database.directory.path().join("never-opened-blobs");
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config: toml::Value =
+        toml::from_str(include_str!("../../../deploy/demo/server.toml")).unwrap();
+    config["http"]["bind"] = toml::Value::String(occupied.local_addr().unwrap().to_string());
+    config["cache"]["blob"]["path"] = toml::Value::String(root.to_str().unwrap().into());
+    config["demo"]["widget_html"] = toml::Value::String("missing-record-widget.html".into());
+    config["text_diff"]["widget_html"] =
+        toml::Value::String("missing-comparison-widget.html".into());
+    let path = database.directory.path().join("migrate.toml");
+    tokio::fs::write(&path, toml::to_string(&config).unwrap())
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_openlegal-server"))
+            .arg("--migrate")
+            .arg(path)
+            .env(
+                "OPENLEGAL_DATABASE_URL",
+                "invalid-runtime-url-must-not-be-read",
+            )
+            .env("OPENLEGAL_MIGRATION_DATABASE_URL", &database.url)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "migration command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.exists(), "migration must not initialize blob storage");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(&database.url));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(&database.url));
 }

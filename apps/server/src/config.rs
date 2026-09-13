@@ -160,23 +160,56 @@ pub struct Config {
     pub cache: Option<CacheConfig>,
 }
 
+/// Persistence is an explicit operator decision whenever retrieval is enabled.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CacheConfig {
-    pub filesystem: FilesystemCacheConfig,
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CacheConfig {
+    Memory {},
+    Persistent {
+        #[serde(default = "default_retention_days")]
+        retention_days: u64,
+        #[serde(default = "default_cache_bytes")]
+        max_blob_bytes: u64,
+        #[serde(default = "default_snapshot_count")]
+        max_snapshots_per_query: usize,
+        #[serde(default = "default_global_snapshot_count")]
+        max_snapshots: usize,
+        #[serde(default = "default_query_count")]
+        max_queries: usize,
+        postgres: PostgresConfig,
+        blob: BlobConfig,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FilesystemCacheConfig {
-    pub path: PathBuf,
-    #[serde(default = "default_retention_days")]
-    pub retention_days: u64,
-    #[serde(default = "default_cache_bytes")]
-    pub max_bytes: u64,
-    #[serde(default = "default_snapshot_count")]
-    pub max_snapshots_per_query: usize,
+pub struct PostgresConfig {
+    #[serde(default = "default_url_env")]
+    pub url_env: String,
+    #[serde(default = "default_migration_url_env")]
+    pub migration_url_env: String,
+    #[serde(default = "default_pool_connections")]
+    pub max_connections: u32,
+    #[serde(default)]
+    pub tls_mode: PostgresTlsConfig,
+    pub ca_file: Option<PathBuf>,
 }
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PostgresTlsConfig {
+    #[default]
+    VerifyFull,
+    /// Explicit opt-in for isolated demonstrations or operator-protected connections.
+    Plaintext,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BlobConfig {
+    Filesystem { path: PathBuf },
+}
+
 fn default_retention_days() -> u64 {
     30
 }
@@ -186,20 +219,136 @@ fn default_cache_bytes() -> u64 {
 fn default_snapshot_count() -> usize {
     100
 }
-impl FilesystemCacheConfig {
+fn default_global_snapshot_count() -> usize {
+    10_000
+}
+fn default_query_count() -> usize {
+    4096
+}
+fn default_pool_connections() -> u32 {
+    16
+}
+fn default_url_env() -> String {
+    "OPENLEGAL_DATABASE_URL".into()
+}
+fn default_migration_url_env() -> String {
+    "OPENLEGAL_MIGRATION_DATABASE_URL".into()
+}
+
+impl CacheConfig {
     pub fn policy(
         &self,
     ) -> Result<openlegal_application::persistence::RetentionPolicy, ServerError> {
-        if self.path.as_os_str().is_empty() {
-            return Err("filesystem cache requires a path".into());
-        }
+        let Self::Persistent {
+            retention_days,
+            max_blob_bytes,
+            max_snapshots_per_query,
+            max_snapshots,
+            max_queries,
+            ..
+        } = self
+        else {
+            return Err("memory cache has no persistent retention policy".into());
+        };
         let policy = openlegal_application::persistence::RetentionPolicy {
-            retention_days: self.retention_days,
-            max_bytes: self.max_bytes,
-            max_snapshots_per_query: self.max_snapshots_per_query,
+            retention_days: *retention_days,
+            max_blob_bytes: *max_blob_bytes,
+            max_snapshots_per_query: *max_snapshots_per_query,
+            max_snapshots: *max_snapshots,
+            max_queries: *max_queries,
         };
         policy.validate()?;
         Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), ServerError> {
+        if let Self::Persistent { postgres, blob, .. } = self {
+            self.policy()?;
+            postgres.options()?;
+            match blob {
+                BlobConfig::Filesystem { path } if path.as_os_str().is_empty() => {
+                    return Err("blob store requires a dedicated path".into());
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PostgresConfig {
+    pub fn options(&self) -> Result<openlegal_adapters::postgres::PostgresOptions, ServerError> {
+        fn valid_env(value: &str) -> bool {
+            let mut bytes = value.bytes();
+            value.len() <= 128
+                && bytes
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        }
+        if !valid_env(&self.url_env)
+            || !valid_env(&self.migration_url_env)
+            || self.url_env == self.migration_url_env
+        {
+            return Err("configure distinct valid runtime and migration environment names".into());
+        }
+        if !(2..=64).contains(&self.max_connections) {
+            return Err("PostgreSQL max_connections must be between 2 and 64".into());
+        }
+        if self
+            .ca_file
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err("PostgreSQL CA file path cannot be empty".into());
+        }
+        let tls = match self.tls_mode {
+            PostgresTlsConfig::VerifyFull => {
+                openlegal_adapters::postgres::PostgresTls::VerifyFull {
+                    ca_file: self.ca_file.clone(),
+                }
+            }
+            PostgresTlsConfig::Plaintext if self.ca_file.is_none() => {
+                openlegal_adapters::postgres::PostgresTls::Plaintext
+            }
+            PostgresTlsConfig::Plaintext => {
+                return Err("plaintext PostgreSQL cannot configure a TLS CA file".into());
+            }
+        };
+        Ok(openlegal_adapters::postgres::PostgresOptions {
+            max_connections: self.max_connections,
+            tls,
+        })
+    }
+
+    /// Resolve exactly the required secret; never put its value in errors or logs.
+    pub fn connection_url(&self, migration: bool) -> Result<String, ServerError> {
+        let name = if migration {
+            &self.migration_url_env
+        } else {
+            &self.url_env
+        };
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty() && value.len() <= 8192)
+            .ok_or_else(|| {
+                "required PostgreSQL connection environment value is missing or invalid".into()
+            })
+    }
+}
+
+impl Config {
+    pub fn validate_storage(&self) -> Result<(), ServerError> {
+        if self.demo.is_some() && self.cache.is_none() {
+            return Err("retrieval requires an explicit [cache] mode: memory or persistent".into());
+        }
+        if self.demo.is_none() && self.cache.is_some() {
+            return Err("cache configuration requires a registered retrieval source".into());
+        }
+        if let Some(cache) = &self.cache {
+            cache.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -395,30 +544,86 @@ mod text_diff_config_tests {
 mod cache_config_tests {
     use super::*;
 
+    fn persistent(extra: &str) -> String {
+        format!(
+            "mode = 'persistent'\n{extra}\n[postgres]\n[blob]\nkind = 'filesystem'\npath = 'blobs'\n"
+        )
+    }
+
     #[test]
-    fn filesystem_limits_are_explicit_bounded_and_existing_configuration_is_optional() {
-        let config: FilesystemCacheConfig = toml::from_str("path = 'cache'").unwrap();
+    fn storage_mode_and_persistent_limits_are_explicit() {
+        let config: CacheConfig = toml::from_str(&persistent("")).unwrap();
         let policy = config.policy().unwrap();
         assert_eq!(policy.retention_days, 30);
-        assert_eq!(policy.max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(policy.max_blob_bytes, 1024 * 1024 * 1024);
         assert_eq!(policy.max_snapshots_per_query, 100);
+        assert_eq!(policy.max_snapshots, 10_000);
+        config.validate().unwrap();
+        toml::from_str::<CacheConfig>("mode = 'memory'")
+            .unwrap()
+            .validate()
+            .unwrap();
         for bad in [
-            "path = ''",
-            "path = 'cache'\nretention_days = 0",
-            "path = 'cache'\nmax_bytes = 1",
-            "path = 'cache'\nmax_snapshots_per_query = 1001",
+            "",
+            "[filesystem]\npath='cache'",
+            "mode='memory'\nmax_blob_bytes=123",
+            "mode='persistent'",
+            "mode='memory'\n[postgres]\n",
+        ] {
+            assert!(toml::from_str::<CacheConfig>(bad).is_err(), "{bad}");
+        }
+        for bad in [
+            "retention_days=0",
+            "max_blob_bytes=1",
+            "max_snapshots_per_query=1001",
+            "max_snapshots=0",
         ] {
             assert!(
-                toml::from_str::<FilesystemCacheConfig>(bad)
+                toml::from_str::<CacheConfig>(&persistent(bad))
                     .unwrap()
-                    .policy()
+                    .validate()
                     .is_err()
             );
         }
-        assert!(toml::from_str::<FilesystemCacheConfig>("path = 'cache'\nshared = true").is_err());
         let demo: Config =
             toml::from_str(include_str!("../../../deploy/demo/server.toml")).unwrap();
-        demo.cache.unwrap().filesystem.policy().unwrap();
+        demo.validate_storage().unwrap();
+        let mut missing_mode = demo.clone();
+        missing_mode.cache = None;
+        assert!(missing_mode.validate_storage().is_err());
+        missing_mode.cache = Some(CacheConfig::Memory {});
+        missing_mode.validate_storage().unwrap();
+        missing_mode.demo = None;
+        assert!(missing_mode.validate_storage().is_err());
         demo.text_diff.unwrap().validate(&demo.limits).unwrap();
+    }
+
+    #[test]
+    fn postgres_defaults_use_distinct_secrets_and_verified_tls() {
+        let config: PostgresConfig = toml::from_str("").unwrap();
+        assert_eq!(config.url_env, "OPENLEGAL_DATABASE_URL");
+        assert_eq!(config.migration_url_env, "OPENLEGAL_MIGRATION_DATABASE_URL");
+        assert!(matches!(config.tls_mode, PostgresTlsConfig::VerifyFull));
+        config.options().unwrap();
+        for bad in [
+            "url_env='secret://user:password'",
+            "url_env='SAME'\nmigration_url_env='SAME'",
+            "max_connections=0",
+            "max_connections=1",
+            "max_connections=65",
+            "tls_mode='plaintext'\nca_file='ca.pem'",
+            "ca_file=''",
+            "url_env=''",
+            "url_env='9INVALID'",
+        ] {
+            assert!(
+                toml::from_str::<PostgresConfig>(bad)
+                    .unwrap()
+                    .options()
+                    .is_err()
+            );
+        }
+        assert!(toml::from_str::<PostgresConfig>("url='postgres://secret'").is_err());
+        assert!(toml::from_str::<PostgresConfig>("tls_mode='prefer'").is_err());
     }
 }

@@ -405,3 +405,64 @@ fn static_resource_serialized_size_is_checked_against_server_limits() {
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn dependency_readiness_recovers_without_stopping_live_endpoint() {
+    use openlegal_server::http::HealthEndpoint;
+    let healthy = Arc::new(AtomicBool::new(true));
+    let readiness = healthy.clone();
+    let mut builder = ServerBuilder::new(
+        ToolRegistry::new(),
+        Limits::default(),
+        openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
+    );
+    builder
+        .register_endpoint(
+            HealthEndpoint {
+                bind: "127.0.0.1:0".parse().unwrap(),
+            }
+            .with_metrics(|| "openlegal_test_dependency 1\n".into())
+            .with_readiness(move || readiness.load(Ordering::Acquire)),
+        )
+        .unwrap();
+    let server = builder.bind().await.unwrap();
+    let address = server.addresses()[0].1[0];
+    let shutdown = CancellationToken::new();
+    let run = tokio::spawn(server.run(shutdown.clone()));
+    let client = reqwest::Client::new();
+    for expected in [true, false, true] {
+        healthy.store(expected, Ordering::Release);
+        let response = client
+            .get(format!("http://{address}/ready"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), if expected { 200 } else { 503 });
+        assert_eq!(
+            client
+                .get(format!("http://{address}/live"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert!(
+            client
+                .get(format!("http://{address}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+                .contains("openlegal_test_dependency 1")
+        );
+        assert!(
+            !run.is_finished(),
+            "dependency failure must not complete an endpoint"
+        );
+    }
+    shutdown.cancel();
+    run.await.unwrap().unwrap();
+}

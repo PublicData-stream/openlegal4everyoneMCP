@@ -1,6 +1,8 @@
 //! Cross-transport acceptance with a real isolated HTTP upstream and no legal data.
 #[path = "../../../crates/adapters/examples/support/mod.rs"]
 mod mock;
+#[path = "../../../test-support/postgres.rs"]
+mod postgres;
 use openlegal_server::{
     ServerBuilder,
     config::{AccessPolicy, Limits},
@@ -87,6 +89,7 @@ fn assert_progress(messages: &[Value]) {
 }
 
 #[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh PostgreSQL 18 environment"]
 async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
     for version in ["2026-07-28", "2025-11-25"] {
         let count = Arc::new(AtomicUsize::new(0));
@@ -112,13 +115,13 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
                 .unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
-        let store = openlegal_adapters::persistent::FsCache::open(
-            std::path::Path::new(env!("CARGO_BIN_EXE_openlegal-server")),
-            &dir.path().join("cache"),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        let database = postgres::TestDatabase::new().await;
+        let store = database
+            .open({
+                use openlegal_application::Clock;
+                openlegal_application::SystemClock::default().now()
+            })
+            .await;
         let service = openlegal_server::demo::service_with_store(&source_url, store).unwrap();
         let mut registry = openlegal_server::registry::server_info_registry(
             openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
@@ -418,13 +421,12 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
         client.close(0u32.into(), b"done");
         shutdown.cancel();
         running.await.unwrap().unwrap();
-        let reopened = openlegal_adapters::persistent::FsCache::open(
-            std::path::Path::new(env!("CARGO_BIN_EXE_openlegal-server")),
-            &dir.path().join("cache"),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        let reopened = database
+            .open({
+                use openlegal_application::Clock;
+                openlegal_application::SystemClock::default().now()
+            })
+            .await;
         let restarted = openlegal_server::demo::service_with_store(&source_url, reopened).unwrap();
         let disk_hit = restarted
             .retrieve(

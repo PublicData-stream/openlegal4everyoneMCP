@@ -320,6 +320,7 @@ pub struct HealthEndpoint {
 pub struct MetricsHealthEndpoint {
     endpoint: HealthEndpoint,
     metrics: Arc<dyn Fn() -> String + Send + Sync>,
+    readiness: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl HealthEndpoint {
@@ -330,7 +331,16 @@ impl HealthEndpoint {
         MetricsHealthEndpoint {
             endpoint: self,
             metrics: Arc::new(metrics),
+            readiness: Arc::new(|| true),
         }
+    }
+}
+
+impl MetricsHealthEndpoint {
+    /// Read already-observed dependency health without performing I/O in a probe.
+    pub fn with_readiness(mut self, readiness: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.readiness = Arc::new(readiness);
+        self
     }
 }
 
@@ -345,7 +355,7 @@ impl Endpoint for HealthEndpoint {
         }]
     }
     async fn bind(self, context: EndpointContext) -> Result<BoundEndpoint, ServerError> {
-        bind_health(self.bind, context, Arc::new(String::new)).await
+        bind_health(self.bind, context, Arc::new(String::new), Arc::new(|| true)).await
     }
 }
 
@@ -357,7 +367,7 @@ impl Endpoint for MetricsHealthEndpoint {
         self.endpoint.bindings()
     }
     async fn bind(self, context: EndpointContext) -> Result<BoundEndpoint, ServerError> {
-        bind_health(self.endpoint.bind, context, self.metrics).await
+        bind_health(self.endpoint.bind, context, self.metrics, self.readiness).await
     }
 }
 
@@ -365,6 +375,7 @@ async fn bind_health(
     bind: SocketAddr,
     context: EndpointContext,
     metrics: Arc<dyn Fn() -> String + Send + Sync>,
+    readiness: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<BoundEndpoint, ServerError> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let address = listener.local_addr()?;
@@ -372,11 +383,14 @@ async fn bind_health(
         .route("/live", get(|| async { "live" }))
         .route(
             "/ready",
-            get(|State(context): State<EndpointContext>| async move {
-                if context.ready.load(Ordering::Acquire) {
-                    StatusCode::OK
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
+            get(move |State(context): State<EndpointContext>| {
+                let readiness = readiness.clone();
+                async move {
+                    if context.ready.load(Ordering::Acquire) && readiness() {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
                 }
             }),
         )

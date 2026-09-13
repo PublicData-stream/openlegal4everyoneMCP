@@ -84,7 +84,7 @@ the running server and widget. MCP clients and widget users can discover this
 offer; operators must maintain the matching source and its availability. See
 [source offers and migration](docs/server.md#source-offers-and-migration).
 
-Optional [persistent filesystem caching and snapshot history](docs/filesystem-cache.md)
+Optional [PostgreSQL 18 + BlobStore persistence and snapshot history](docs/persistence.md)
 adds restart reuse, bounded captured history, MCP history tools, and record-widget
 snapshot comparison. The [combined synthetic demo](docs/demo.md) enables L2 and
 comparison together; all source data remains fictional.

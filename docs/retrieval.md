@@ -18,8 +18,9 @@ to each accepted result by its payload digest.
 and publication. `Upstream` supplies a narrow fetch operation. Concrete HTTP
 adapters implement that operation and invoke pure processing. `CacheStore` owns
 L1 mechanics without deciding freshness. The asynchronous `PersistentStore` port
-provides optional filesystem L2 and immutable captured history; see the
-[filesystem contract](filesystem-cache.md). Source registrations bind the
+provides PostgreSQL-backed current state and immutable captured history, while
+the `BlobStore` port retains exact source bytes; see the
+[persistence contract](persistence.md). Source registrations bind the
 source, provider, dataset, processor version, and adapter before serving.
 
 MCP tools invoke one shared service across HTTP and WebTransport. Widget requests
@@ -66,13 +67,15 @@ explicitly marked, and a fresh-only call never silently accepts it.
 Each waiter owns its cancellation and deadline. One waiter leaving does not cancel
 others; the last waiter cancels the operation. A refresh has its own ten-second
 deadline. Generation checks prevent obsolete work from publishing. With L2, cancellation
-before commit authorization prevents publication; an authorized disk transaction
-may survive a cancelled caller and be reconciled during recovery.
+before commit authorization prevents publication; an authorized PostgreSQL transaction
+may survive a cancelled caller. Publication completion must be reconciled before
+its result can enter L1. Blob writes happen before the short transaction and may
+leave safe unreferenced objects.
 Shutdown stops admission and joins owned jobs before completing.
 
-The memory cache is process-local and empty after restart. Optional L2 lazily
-repopulates it from validated retained captures; its separate retention and worker
-lifecycle are documented in the [filesystem contract](filesystem-cache.md). In memory-only mode raw evidence expires
+The memory cache is process-local and empty after restart. Persistent mode lazily
+repopulates it from validated retained captures; its separate retention and storage
+lifecycle are documented in the [persistence contract](persistence.md). In memory-only mode raw evidence expires
 with its entry; a digest is not a substitute for retained bytes or a permanent
 archive. Multiple processes must not be enabled without the deployment-wide
 coordination required by the upstream policy.

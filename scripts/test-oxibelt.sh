@@ -8,6 +8,9 @@ run_id="openlegal-edge-$$"
 image="$run_id:local"
 network="$run_id"
 fixture_volume="$run_id-fixture"
+blob_volume="$run_id-blobs"
+postgres="$run_id-postgres"
+postgres_image=postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a
 backend="$run_id-backend"
 edge="$run_id-edge"
 cleanup() {
@@ -17,9 +20,9 @@ cleanup() {
         docker logs "$backend" >&2 2>/dev/null || true
         docker logs "$edge" >&2 2>/dev/null || true
     fi
-    docker rm -f "$edge" "$backend" >/dev/null 2>&1 || true
+    docker rm -fv "$edge" "$backend" "$postgres" >/dev/null 2>&1 || true
     docker network rm "$network" >/dev/null 2>&1 || true
-    docker volume rm "$fixture_volume" >/dev/null 2>&1 || true
+    docker volume rm "$fixture_volume" "$blob_volume" >/dev/null 2>&1 || true
     docker image rm "$image" >/dev/null 2>&1 || true
     rm -rf -- "$scratch"
     exit "$status"
@@ -100,8 +103,15 @@ widget_html = "/fixture/widget.html"
 [text_diff]
 widget_html = "/fixture/text-diff.html"
 
-[cache.filesystem]
-path = "/tmp/openlegal-cache"
+[cache]
+mode = "persistent"
+
+[cache.postgres]
+tls_mode = "plaintext"
+
+[cache.blob]
+kind = "filesystem"
+path = "/blobs"
 TOML
 cp deploy/oxibelt/oxibelt.toml "$scratch/fixture/config/"
 cp deploy/oxibelt/Dockerfile.harness "$scratch/Dockerfile"
@@ -135,6 +145,7 @@ PY
 docker build -t "$image" "$scratch"
 docker network create --internal "$network" >/dev/null
 docker volume create "$fixture_volume" >/dev/null
+docker volume create "$blob_volume" >/dev/null
 # Stream fixtures into a volume; Docker never receives private keys as build input.
 # The initializer is container-root on the rootless daemon; serving mounts are read-only.
 tar -c -C "$scratch/fixture" . | docker run --rm -i --network none --user 0:0 \
@@ -142,7 +153,25 @@ tar -c -C "$scratch/fixture" . | docker run --rm -i --network none --user 0:0 \
     --entrypoint tar "$image" -x -C /fixture
 hardening=(--mount "type=volume,source=$fixture_volume,target=/fixture,readonly" --network "$network" --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs "/tmp:rw,noexec,nosuid,size=16m")
 docker run --rm "${hardening[@]}" --entrypoint /usr/local/bin/oxibelt "$image" --config /fixture/config/oxibelt.toml --check
-docker run -d --name "$backend" --network-alias backend "${hardening[@]}" --memory 1g "$image" >/dev/null
+# The database and immutable blobs are separate disposable persistence components.
+password=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
+docker run -d --name "$postgres" --network "$network" --network-alias postgres \
+    --memory 512m -e POSTGRES_PASSWORD="$password" -e POSTGRES_DB=openlegal \
+    "$postgres_image" -c log_statement=none -c log_min_error_statement=panic >/dev/null
+for attempt in {1..60}; do
+    if docker exec "$postgres" pg_isready -U postgres -d openlegal >/dev/null 2>&1; then break; fi
+    if (( attempt == 60 )); then echo 'PostgreSQL 18 did not become ready' >&2; exit 1; fi
+    sleep 1
+done
+database_url="postgresql://postgres:$password@postgres:5432/openlegal"
+docker run --rm "${hardening[@]}" -e OPENLEGAL_MIGRATION_DATABASE_URL="$database_url" \
+    "$image" --migrate /fixture/backend.toml
+# Initializer is root only within the rootless daemon; serving owns a private blob root.
+docker run --rm --network none --user 0:0 --mount "type=volume,source=$blob_volume,target=/blobs" \
+    --entrypoint /bin/sh "$image" -c 'chown 65532:65532 /blobs && chmod 700 /blobs'
+docker run -d --name "$backend" --network-alias backend "${hardening[@]}" --memory 1g \
+    --mount "type=volume,source=$blob_volume,target=/blobs" \
+    -e OPENLEGAL_DATABASE_URL="$database_url" "$image" >/dev/null
 docker exec -d "$backend" /usr/local/bin/mock_upstream 127.0.0.1:8081
 start_edge() {
     docker run -d --name "$edge" --network-alias edge "${hardening[@]}" --memory 1g --ulimit stack=67108864:67108864 \
