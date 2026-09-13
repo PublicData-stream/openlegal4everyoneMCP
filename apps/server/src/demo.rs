@@ -16,11 +16,11 @@ use openlegal_domain::{
     RetrievalError,
 };
 use openlegal_normalization::{LayoutAProcessor, LayoutBProcessor, PayloadProcessor};
-use rmcp::model::{MetaObject, Resource, ResourceContents};
+use rmcp::model::MetaObject;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
-use tokio::{io::AsyncReadExt, sync::watch};
+use tokio::sync::watch;
 
 pub const WIDGET_URI: &str = "ui://openlegal-demo/records-v1.html";
 pub const WIDGET_MIME: &str = "text/html;profile=mcp-app";
@@ -265,63 +265,25 @@ fn map_error(error: RetrievalError) -> ToolError {
     }
 }
 
-/// Read an operator-selected local asset once, with a bound even if it grows while read.
+/// Load the existing synthetic browser with its original 1 MiB cap.
 pub async fn load_widget(
     path: &Path,
     source: &SourceOffer,
 ) -> Result<ResourceRegistry, ServerError> {
-    let file = tokio::fs::File::open(path).await?;
-    if !file.metadata().await?.is_file() {
-        return Err("widget asset must be a regular file".into());
-    }
-    let mut bytes = Vec::new();
-    file.take(1024 * 1024 + 1).read_to_end(&mut bytes).await?;
-    if bytes.len() > 1024 * 1024 {
-        return Err("widget asset exceeds 1 MiB".into());
-    }
-    widget_resources(String::from_utf8(bytes)?, source)
+    crate::widget::load_widget(path, source, crate::widget::WidgetKind::Records).await
 }
 
 pub fn widget_resources(
     html: String,
     source: &SourceOffer,
 ) -> Result<ResourceRegistry, ServerError> {
-    const MARKER: &str = "__OPENLEGAL_SOURCE_URL__";
-    const METADATA: &str =
-        "<meta name=\"openlegal-source-url\" content=\"__OPENLEGAL_SOURCE_URL__\">";
-    if html.matches(MARKER).count() != 1 || html.matches(METADATA).count() != 1 {
-        return Err("widget must contain exactly one source URL metadata placeholder".into());
-    }
-    let escaped = source
-        .url()
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;");
-    let html = html.replacen(MARKER, &escaped, 1);
-    // Registration checks the expanded text and serialized resource; handler startup also
-    // checks the result against the configured message limit before binding listeners.
-    let mut resources = ResourceRegistry::new();
-    let metadata = MetaObject(serde_json::from_value(serde_json::json!({
-        "ui": {"prefersBorder": true, "csp": {
-            "connectDomains": [], "resourceDomains": [], "frameDomains": []
-        }}
-    }))?);
-    resources.register(
-        Resource::new(WIDGET_URI, "Synthetic record browser")
-            .with_mime_type(WIDGET_MIME)
-            .with_meta(metadata.clone()),
-        ResourceContents::text(html, WIDGET_URI)
-            .with_mime_type(WIDGET_MIME)
-            .with_meta(metadata),
-    )?;
-    Ok(resources)
+    crate::widget::widget_resources(html, source, crate::widget::WidgetKind::Records)
 }
 
 #[cfg(test)]
 mod widget_source_tests {
     use super::*;
+    use rmcp::model::ResourceContents;
 
     const META: &str = "<meta name=\"openlegal-source-url\" content=\"__OPENLEGAL_SOURCE_URL__\">";
 

@@ -82,6 +82,9 @@ name = "mcp-http"
 hosts = ["edge"]
 upstream = "mcp-http"
 compression = "off"
+[routes.limits]
+# Two 1 MiB texts can occupy approximately 12 MiB after JSON escaping.
+max_request_body_bytes = 16777216
 [routes.match.path]
 exact = "/mcp"
 

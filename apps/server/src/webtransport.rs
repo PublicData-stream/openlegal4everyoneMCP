@@ -60,15 +60,19 @@ impl Endpoint for WebTransportEndpoint {
         self.access.validate()?;
         context.limits.validate()?;
         let identity = Identity::load_pemfiles(&self.certificate, &self.private_key).await?;
+        // Flow-control credit bounds transport reassembly, not complete JSON frames.
+        // A large frame streams through FrameReader; granting its full size here
+        // causes unnecessary bursts and excessive buffering through a QUIC proxy.
+        let stream_window = context.limits.max_message_bytes.min(256 * 1024) as u32;
         let mut transport_config = wtransport::quinn::TransportConfig::default();
         transport_config
             // CONNECT, one application stream, and one extra to reject promptly.
             .max_concurrent_bidi_streams(3_u32.into())
             // HTTP/3 control and QPACK streams, plus one rejectable app stream.
             .max_concurrent_uni_streams(4_u32.into())
-            .stream_receive_window((context.limits.max_message_bytes as u32).into())
-            .receive_window((context.limits.max_message_bytes as u32 * 2).into())
-            .send_window(context.limits.max_message_bytes as u64 * 2)
+            .stream_receive_window(stream_window.into())
+            .receive_window((stream_window * 2).into())
+            .send_window(u64::from(stream_window) * 2)
             .datagram_receive_buffer_size(Some(4096))
             .datagram_send_buffer_size(4096);
         let mut config = ServerConfig::builder()

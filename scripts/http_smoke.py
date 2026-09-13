@@ -10,7 +10,7 @@ CA = sys.argv[1] if len(sys.argv) > 1 else "/fixture/cert/ca.pem"
 CONTEXT = ssl.create_default_context(cafile=CA)
 MODERN = "2026-07-28"
 LEGACY = "2025-11-25"
-MAX_BODY = 4 * 1024 * 1024
+MAX_BODY = 16 * 1024 * 1024
 MAX_PROGRESS = 5
 SOURCE_URL = "https://example.org/openlegal/source"
 
@@ -90,6 +90,68 @@ def success(body, revision, session=None, origin=None):
     return headers, reply["result"]
 
 
+
+def text_diff_smoke(revision, session, tools):
+    by_name = {tool["name"]: tool for tool in tools}
+    for name in ("compare_texts", "show_text_diff", "get_text_diff_page", "delete_text_diff"):
+        assert name in by_name, f"{name} missing"
+    deletion = by_name["delete_text_diff"]["annotations"]
+    assert deletion["readOnlyHint"] is False, deletion
+    assert deletion["destructiveHint"] is True, deletion
+    assert deletion["idempotentHint"] is True, deletion
+
+    def call(name, **arguments):
+        _, result = success(request("tools/call", revision, 20, name=name, arguments=arguments),
+                            revision, session)
+        assert not result.get("isError", False), result
+        value = result["structuredContent"]
+        assert value["schema_version"] == 1, value
+        return value
+
+    blank = call("show_text_diff")
+    assert blank["comparison"] is None, blank
+    summary = call("compare_texts", before="first\nold\n", after="first\nnew\n",
+                   before_label="Before", after_label="After")
+    assert summary["equal"] is False and summary["additions"] == summary["deletions"] == 1, summary
+    handle = summary["comparison_id"]
+    shown = call("show_text_diff", comparison_id=handle)
+    assert shown["comparison"]["comparison_id"] == handle, shown
+    for view in ("changes", "before", "after"):
+        page = call("get_text_diff_page", comparison_id=handle, view=view, page=0)
+        assert page["comparison_id"] == handle and page["view"] == view, page
+        assert page["page"] == 0 and page["total_pages"] == 1, page
+        if view == "changes":
+            assert page["fragments"] and "-old" in page["fragments"][0]["patch"], page
+            assert "+new" in page["fragments"][0]["patch"], page
+        else:
+            assert page["text"] == ("first\nold\n" if view == "before" else "first\nnew\n"), page
+        assert len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode()) <= 256 * 1024
+    for _ in range(2):
+        assert call("delete_text_diff", comparison_id=handle)["deleted"] is True
+    _, missing = success(request("tools/call", revision, 21, name="get_text_diff_page",
+                                arguments={"comparison_id": handle, "view": "changes", "page": 0}),
+                         revision, session)
+    assert missing.get("isError") is True, missing
+
+    # Each input is exactly 1 MiB, within line limits. Control-character JSON
+    # escaping exercises nearly 12 MiB of request body without oversized lines.
+    large = ("\x01" * 1023 + "\n") * 1024
+    assert len(large.encode()) == 1024 * 1024
+    maximum = call("compare_texts", before=large, after=large)
+    assert maximum["equal"] is True, maximum
+    assert maximum["before"]["bytes"] == maximum["after"]["bytes"] == 1024 * 1024
+    assert maximum["additions"] == maximum["deletions"] == 0, maximum
+    assert call("delete_text_diff", comparison_id=maximum["comparison_id"])["deleted"] is True
+
+    _, resource = success(request("resources/read", revision, 22,
+                                  uri="ui://openlegal/text-diff-v1.html"), revision, session)
+    contents = resource["contents"][0]
+    assert contents["mimeType"] == "text/html;profile=mcp-app", contents["mimeType"]
+    assert SOURCE_URL in contents["text"]
+    assert "__OPENLEGAL_SOURCE_URL__" not in contents["text"]
+    print(f"HTTP {revision}: text comparison lifecycle, 1 MiB inputs, resource read", flush=True)
+
+
 def smoke():
     for revision in (MODERN, LEGACY):
         session = None
@@ -109,6 +171,7 @@ def smoke():
         assert "AGPL-3.0-only" in result["instructions"], result
         _, result = success(request("tools/list", revision, 2), revision, session)
         assert any(tool["name"] == "server_info" for tool in result["tools"]), result
+        text_diff_smoke(revision, session, result["tools"])
         for origin in (None, "https://example.test"):
             _, result = success(request("tools/call", revision, 3, name="server_info", arguments={}),
                                 revision, session, origin)

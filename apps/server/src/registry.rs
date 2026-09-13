@@ -141,8 +141,26 @@ impl ToolRegistry {
         F: Fn(I, ToolContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value, ToolError>> + Send + 'static,
     {
-        if annotations.read_only_hint != Some(true) {
-            return Err("anonymous tools must be read-only".into());
+        self.register_internal(name, description, annotations, handler, false)
+    }
+
+    fn register_internal<I, F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        annotations: ToolAnnotations,
+        handler: F,
+        ephemeral_delete: bool,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        F: Fn(I, ToolContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value, ToolError>> + Send + 'static,
+    {
+        if annotations.read_only_hint != Some(true)
+            && !(ephemeral_delete && name == "delete_text_diff")
+        {
+            return Err("anonymous extension tools must be read-only".into());
         }
         if name.is_empty()
             || name.len() > 64
@@ -213,6 +231,47 @@ impl ToolRegistry {
         F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
     {
+        self.register_typed_internal(name, description, options, handler, false)
+    }
+
+    /// The sole mutation exception: deletion of a bearer-authorized transient comparison.
+    /// Kept crate-private so ordinary extension registration cannot opt into writes.
+    pub(crate) fn register_text_diff_delete<I, O, F, Fut>(
+        &mut self,
+        handler: F,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: serde::Serialize + JsonSchema + Send + 'static,
+        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
+    {
+        self.register_typed_internal(
+            "delete_text_diff",
+            "Delete a temporary comparison using its bearer handle. This also removes access for anyone sharing the handle. Repeated deletion succeeds.",
+            ToolOptions {
+                annotations: ToolAnnotations::from_raw(None, Some(false), Some(true), Some(true), Some(false)),
+                meta: None,
+            },
+            handler,
+            true,
+        )
+    }
+
+    fn register_typed_internal<I, O, F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        options: ToolOptions,
+        handler: F,
+        ephemeral_delete: bool,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: serde::Serialize + JsonSchema + Send + 'static,
+        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
+    {
         // Validate every fallible addition before registration so failed startup registration
         // does not leave a partially configured tool behind.
         let schema = serde_json::to_value(schemars::schema_for!(O))?;
@@ -244,11 +303,12 @@ impl ToolRegistry {
             }
             .boxed()
         });
-        self.register_with_annotations::<I, _, _>(
+        self.register_internal::<I, _, _>(
             name,
             description,
             options.annotations,
             |_, _| async { Err(ToolError::Internal) },
+            ephemeral_delete,
         )?;
         let tool = self
             .tools

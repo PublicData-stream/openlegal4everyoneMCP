@@ -16,7 +16,21 @@ async fn main() -> Result<(), ServerError> {
         .nth(1)
         .ok_or("usage: openlegal-server CONFIG.toml")?;
     let config: Config = toml::from_str(&tokio::fs::read_to_string(path).await?)?;
+    config.limits.validate()?;
+    if let Some(diff) = &config.text_diff {
+        diff.validate(&config.limits)?;
+    }
     let mut registry = openlegal_server::registry::server_info_registry(config.source.url.clone())?;
+    let diff_service = if let Some(diff) = &config.text_diff {
+        Some(openlegal_server::text_diff::service(&diff.git_path).await?)
+    } else {
+        None
+    };
+    if let Some(service) = &diff_service {
+        registry.register_module(openlegal_server::text_diff::TextDiffTools {
+            service: service.clone(),
+        })?;
+    }
     let demo_service = config
         .demo
         .as_ref()
@@ -27,11 +41,25 @@ async fn main() -> Result<(), ServerError> {
             service: service.clone(),
         })?;
     }
-    let mut builder = ServerBuilder::new(registry, config.limits, config.source.url.clone());
+    let mut resources = openlegal_server::resources::ResourceRegistry::new();
     if let Some(demo) = &config.demo {
-        builder = builder.with_resources(
+        resources.extend(
             openlegal_server::demo::load_widget(&demo.widget_html, &config.source.url).await?,
-        );
+        )?;
+    }
+    if let Some(diff) = &config.text_diff {
+        resources.extend(
+            openlegal_server::text_diff::load_widget(&diff.widget_html, &config.source.url).await?,
+        )?;
+    }
+    let mut builder = ServerBuilder::new(registry, config.limits, config.source.url.clone())
+        .with_resources(resources);
+    if let Some(service) = &diff_service {
+        let service = service.clone();
+        builder.register_worker("text_diff", move |shutdown| async move {
+            service.run(shutdown).await?;
+            Ok(())
+        })?;
     }
     if let Some(service) = &demo_service {
         let service = service.clone();
@@ -59,8 +87,17 @@ async fn main() -> Result<(), ServerError> {
     let health = HealthEndpoint {
         bind: config.health.bind,
     };
-    if let Some(service) = demo_service {
-        builder.register_endpoint(health.with_metrics(move || service.metrics_prometheus()))?;
+    if demo_service.is_some() || diff_service.is_some() {
+        builder.register_endpoint(health.with_metrics(move || {
+            let mut metrics = String::new();
+            if let Some(service) = &demo_service {
+                metrics.push_str(&service.metrics_prometheus());
+            }
+            if let Some(service) = &diff_service {
+                metrics.push_str(&service.metrics_prometheus());
+            }
+            metrics
+        }))?;
     } else {
         builder.register_endpoint(health)?;
     }

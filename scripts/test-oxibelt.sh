@@ -76,14 +76,30 @@ if [[ -n ${DEMO_WIDGET_HTML:-} ]]; then
 else
     printf '%s\n' '<html><head><meta name="openlegal-source-url" content="__OPENLEGAL_SOURCE_URL__"></head><body>Synthetic transport resource fixture</body></html>' > "$scratch/fixture/widget.html"
 fi
+if [[ -n ${TEXT_DIFF_WIDGET_HTML:-} ]]; then
+    cp "$TEXT_DIFF_WIDGET_HTML" "$scratch/fixture/text-diff.html"
+else
+    printf '%s\n' '<html><head><meta name="openlegal-source-url" content="__OPENLEGAL_SOURCE_URL__"></head><body>Text comparison transport resource fixture</body></html>' > "$scratch/fixture/text-diff.html"
+fi
+# Both supplied artifacts and transport-only fixtures obey their individual caps.
+python3 - "$scratch/fixture/widget.html" "$scratch/fixture/text-diff.html" <<'PYBOUND'
+import pathlib, sys
+for name, maximum in zip(sys.argv[1:], (1024 * 1024, 3 * 1024 * 1024), strict=True):
+    assert pathlib.Path(name).stat().st_size <= maximum, f"widget exceeds raw HTML limit: {name}"
+PYBOUND
 cat >> "$scratch/fixture/backend.toml" <<'TOML'
 
 [limits]
-max_message_bytes = 4194304
+max_message_bytes = 16777216
+max_buffer_bytes = 268435456
 
 [demo]
 upstream = "http://127.0.0.1:8081"
 widget_html = "/fixture/widget.html"
+
+[text_diff]
+git_path = "/usr/bin/git"
+widget_html = "/fixture/text-diff.html"
 TOML
 cp deploy/oxibelt/oxibelt.toml "$scratch/fixture/config/"
 cp deploy/oxibelt/Dockerfile.harness "$scratch/Dockerfile"
@@ -124,7 +140,7 @@ tar -c -C "$scratch/fixture" . | docker run --rm -i --network none --user 0:0 \
     --entrypoint tar "$image" -x -C /fixture
 hardening=(--mount "type=volume,source=$fixture_volume,target=/fixture,readonly" --network "$network" --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs "/tmp:rw,noexec,nosuid,size=16m")
 docker run --rm "${hardening[@]}" --entrypoint /usr/local/bin/oxibelt "$image" --config /fixture/config/oxibelt.toml --check
-docker run -d --name "$backend" --network-alias backend "${hardening[@]}" --memory 512m "$image" >/dev/null
+docker run -d --name "$backend" --network-alias backend "${hardening[@]}" --memory 1g "$image" >/dev/null
 docker exec -d "$backend" /usr/local/bin/mock_upstream 127.0.0.1:8081
 start_edge() {
     docker run -d --name "$edge" --network-alias edge "${hardening[@]}" --memory 1g --ulimit stack=67108864:67108864 \
@@ -143,7 +159,7 @@ reject_client() {
 start_edge /fixture/config/oxibelt.toml
 docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/http_smoke.py /fixture/cert/ca.pem
 for protocol in 2026-07-28 2025-11-25; do
-    client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$protocol" --demo
+    client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$protocol" --demo --text-diff
     # A fresh process creates a fresh QUIC connection, checking reconnection too.
     client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$protocol" https://example.test
 done

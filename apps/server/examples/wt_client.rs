@@ -1,4 +1,4 @@
-//! Native reference client: wt_client URL CA_PATH REVISION [ORIGIN] [--demo].
+//! Native reference client: wt_client URL CA_PATH REVISION [ORIGIN] [--demo] [--text-diff].
 
 use openlegal_server::{
     ServerError,
@@ -16,14 +16,14 @@ use wtransport::{
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let demo = args.last().is_some_and(|arg| arg == "--demo");
-    if demo {
-        args.pop();
-    }
+    let demo = args.iter().any(|arg| arg == "--demo");
+    let text_diff = args.iter().any(|arg| arg == "--text-diff");
+    args.retain(|arg| arg != "--demo" && arg != "--text-diff");
     if !(3..=4).contains(&args.len()) {
-        return Err(
-            io::Error::other("usage: wt_client URL CA_PATH REVISION [ORIGIN] [--demo]").into(),
-        );
+        return Err(io::Error::other(
+            "usage: wt_client URL CA_PATH REVISION [ORIGIN] [--demo] [--text-diff]",
+        )
+        .into());
     }
     let revision = &args[2];
     if revision != "2025-11-25" && revision != "2026-07-28" {
@@ -56,10 +56,10 @@ async fn main() -> Result<(), ServerError> {
         Ok::<_, ServerError>(connection.open_bi().await?.await?)
     })
     .await??;
-    let budget = Arc::new(Semaphore::new(16 * 1024 * 1024));
+    let budget = Arc::new(Semaphore::new(256 * 1024 * 1024));
     let mut reader = FrameReader::new(
         recv,
-        4 * 1024 * 1024,
+        MAX_MESSAGE_BYTES,
         budget.clone(),
         Duration::from_secs(10),
         Duration::from_secs(10),
@@ -168,11 +168,233 @@ async fn main() -> Result<(), ServerError> {
                 return Err("license/source metadata disagrees with server instructions".into());
             }
         }
-        println!("{response}");
+        println!("WebTransport {revision}: {method} verified");
+    }
+    if text_diff {
+        text_diff_smoke(&mut send, &mut reader, &budget, revision).await?;
     }
     connection.close(0_u32.into(), b"reference client complete");
     endpoint.close(0_u32.into(), b"reference client complete");
     timeout(Duration::from_secs(2), endpoint.wait_idle()).await?;
+    Ok(())
+}
+
+// This reference client can exercise the opt-in comparison profile; server
+// defaults stay unchanged. Resource JSON and escaped maximum inputs fit here.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+async fn rpc(
+    send: &mut wtransport::SendStream,
+    reader: &mut FrameReader<wtransport::RecvStream>,
+    budget: &Arc<Semaphore>,
+    revision: &str,
+    method: &str,
+    mut params: Value,
+) -> Result<Value, ServerError> {
+    if revision == "2026-07-28" {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion":revision,
+            "io.modelcontextprotocol/clientInfo":{"name":"openlegal-wt-client","version":"1"},
+            "io.modelcontextprotocol/clientCapabilities":{}
+        });
+    }
+    // Only fixed operation names are logged; supplied texts and bearer handles
+    // must never enter reference-client diagnostics.
+    let operation = params.get("name").and_then(Value::as_str).unwrap_or(method);
+    println!("WebTransport {revision}: text comparison operation {operation}");
+    // Calls are sequential, so this ID has no active predecessor.
+    let response = exchange(
+        send,
+        reader,
+        budget,
+        json!({"jsonrpc":"2.0","id":20,"method":method,"params":params}),
+    )
+    .await?;
+    Ok(response["result"].clone())
+}
+
+async fn text_diff_smoke(
+    send: &mut wtransport::SendStream,
+    reader: &mut FrameReader<wtransport::RecvStream>,
+    budget: &Arc<Semaphore>,
+    revision: &str,
+) -> Result<(), ServerError> {
+    let listed = rpc(send, reader, budget, revision, "tools/list", json!({})).await?;
+    let tools = listed["tools"].as_array().ok_or("tool discovery missing")?;
+    for name in [
+        "compare_texts",
+        "show_text_diff",
+        "get_text_diff_page",
+        "delete_text_diff",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .ok_or("comparison tool missing")?;
+        if name == "delete_text_diff"
+            && (tool["annotations"]["readOnlyHint"] != false
+                || tool["annotations"]["destructiveHint"] != true
+                || tool["annotations"]["idempotentHint"] != true)
+        {
+            return Err("deletion annotations disagree with behavior".into());
+        }
+    }
+    let blank = rpc(
+        send,
+        reader,
+        budget,
+        revision,
+        "tools/call",
+        json!({"name":"show_text_diff","arguments":{}}),
+    )
+    .await?;
+    if !blank["structuredContent"]["comparison"].is_null() {
+        return Err("blank comparison editor missing".into());
+    }
+    let compared = rpc(send, reader, budget, revision, "tools/call",
+        json!({"name":"compare_texts","arguments":{"before":"first\nold\n","after":"first\nnew\n"}})).await?;
+    let summary = &compared["structuredContent"];
+    if summary["schema_version"] != 1
+        || summary["equal"] != false
+        || summary["additions"] != 1
+        || summary["deletions"] != 1
+    {
+        return Err("comparison summary mismatch".into());
+    }
+    let handle = summary["comparison_id"]
+        .as_str()
+        .ok_or("comparison handle missing")?;
+    let shown = rpc(
+        send,
+        reader,
+        budget,
+        revision,
+        "tools/call",
+        json!({"name":"show_text_diff","arguments":{"comparison_id":handle}}),
+    )
+    .await?;
+    if shown["structuredContent"]["comparison"]["comparison_id"] != handle {
+        return Err("existing comparison editor mismatch".into());
+    }
+    for view in ["changes", "before", "after"] {
+        let result = rpc(send, reader, budget, revision, "tools/call",
+            json!({"name":"get_text_diff_page","arguments":{"comparison_id":handle,"view":view,"page":0}})).await?;
+        let page = &result["structuredContent"];
+        if page["schema_version"] != 1
+            || page["comparison_id"] != handle
+            || page["view"] != view
+            || page["page"] != 0
+            || page["total_pages"] != 1
+            || serde_json::to_vec(page)?.len() > 256 * 1024
+        {
+            return Err("comparison page mismatch or overflow".into());
+        }
+        if view == "changes" {
+            let patch = page["fragments"][0]["patch"]
+                .as_str()
+                .ok_or("change fragment missing")?;
+            if !patch.contains("-old") || !patch.contains("+new") {
+                return Err("change fragment content mismatch".into());
+            }
+        } else if page["text"]
+            != if view == "before" {
+                "first\nold\n"
+            } else {
+                "first\nnew\n"
+            }
+        {
+            return Err("original text page mismatch".into());
+        }
+    }
+    for _ in 0..2 {
+        let deleted = rpc(
+            send,
+            reader,
+            budget,
+            revision,
+            "tools/call",
+            json!({"name":"delete_text_diff","arguments":{"comparison_id":handle}}),
+        )
+        .await?;
+        if deleted["structuredContent"]["schema_version"] != 1
+            || deleted["structuredContent"]["deleted"] != true
+        {
+            return Err("idempotent deletion failed".into());
+        }
+    }
+    println!("WebTransport {revision}: comparing maximum-size supplied texts");
+    // 1 MiB per input, including line terminators; JSON escapes nearly 12 MiB.
+    let large = format!("{}\n", "\u{1}".repeat(1023)).repeat(1024);
+    let maximum = rpc(
+        send,
+        reader,
+        budget,
+        revision,
+        "tools/call",
+        json!({"name":"compare_texts","arguments":{"before":large,"after":large}}),
+    )
+    .await?;
+    let summary = &maximum["structuredContent"];
+    if summary["equal"] != true
+        || summary["before"]["bytes"] != 1024 * 1024
+        || summary["after"]["bytes"] != 1024 * 1024
+        || summary["additions"] != 0
+        || summary["deletions"] != 0
+    {
+        return Err("maximum input comparison mismatch".into());
+    }
+    let deleted = rpc(
+        send,
+        reader,
+        budget,
+        revision,
+        "tools/call",
+        json!({"name":"delete_text_diff","arguments":{"comparison_id":summary["comparison_id"]}}),
+    )
+    .await?;
+    if deleted["structuredContent"]["deleted"] != true {
+        return Err("maximum input result deletion failed".into());
+    }
+    let server_info = rpc(
+        send,
+        reader,
+        budget,
+        revision,
+        "tools/call",
+        json!({"name":"server_info","arguments":{}}),
+    )
+    .await?;
+    let source_url = server_info["structuredContent"]["sourceUrl"]
+        .as_str()
+        .ok_or("source offer missing")?;
+    println!("WebTransport {revision}: reading comparison widget resource");
+    let resource = rpc(
+        send,
+        reader,
+        budget,
+        revision,
+        "resources/read",
+        json!({"uri":"ui://openlegal/text-diff-v1.html"}),
+    )
+    .await?;
+    let contents = &resource["contents"][0];
+    let html = contents["text"]
+        .as_str()
+        .ok_or("comparison resource missing")?;
+    if contents["mimeType"] != "text/html;profile=mcp-app"
+        || !html.contains(
+            &source_url
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&#39;"),
+        )
+        || html.contains("__OPENLEGAL_SOURCE_URL__")
+    {
+        return Err("comparison resource metadata mismatch".into());
+    }
+    println!("WebTransport {revision}: comparison lifecycle, maximum inputs and resource verified");
     Ok(())
 }
 
@@ -182,7 +404,14 @@ async fn exchange(
     budget: &Arc<Semaphore>,
     request: Value,
 ) -> Result<Value, ServerError> {
-    write_json(send, &request, 1024 * 1024, budget, Duration::from_secs(10)).await?;
+    write_json(
+        send,
+        &request,
+        MAX_MESSAGE_BYTES,
+        budget,
+        Duration::from_secs(10),
+    )
+    .await?;
     let mut notifications = 0;
     let mut total_bytes = 0;
     let mut last_progress = 0.0;
@@ -192,7 +421,7 @@ async fn exchange(
             .await?
             .ok_or_else(|| io::Error::other("server closed before response"))?;
         total_bytes += frame.bytes.len();
-        if total_bytes > 4 * 1024 * 1024 {
+        if total_bytes > MAX_MESSAGE_BYTES {
             return Err("response stream exceeds limit".into());
         }
         let response: Value = serde_json::from_slice(&frame.bytes)?;

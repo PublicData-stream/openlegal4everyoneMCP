@@ -1,7 +1,9 @@
 # Server and extension contract
 
 The implemented foundation is one `apps/server` library/binary package. It serves
-anonymous read-only MCP tools over Streamable HTTP and WebTransport. Both adapters
+anonymous MCP tools over Streamable HTTP and WebTransport. Extension tools are
+read-only; the built-in text comparison feature additionally permits deletion of
+a temporary result using its bearer handle. Both adapters
 are required by the production binary. An explicitly configured synthetic provider,
 shared memory retrieval cache, progress notifications, and React MCP Apps widget
 extend this foundation. No real legal provider, user account, or deployment is implemented.
@@ -11,6 +13,10 @@ extend this foundation. No real legal provider, user account, or deployment is i
 The binary accepts one TOML configuration path. All tables below are required
 except `limits`; unknown fields are rejected. Generate certificates only for local
 fixtures, or supply operator-managed certificates for hosting.
+
+The optional `[text_diff]` table enables [Git text comparison](text-diff.md) without
+a synthetic upstream. It requires a Git executable, its separately built widget,
+16 MiB messages and at least 256 MiB transport buffering.
 
 The optional `[demo]` table is documented in the [demo guide](demo.md). It requires
 a configured loopback mock and bounded local widget HTML; absence preserves ordinary
@@ -103,8 +109,11 @@ to `ServerBuilder::new(registry, limits, source)`, where `source` is a validated
 `ToolRegistry::register::<Input, _, _>(name, description, handler)` where `Input`
 implements Serde deserialization and Schemars JSON Schema. The asynchronous handler
 receives typed input and `ToolContext`, returning `Result<Value, ToolError>`.
-`register_with_annotations` supplies accurate MCP annotations; only read-only
-modules are accepted by this anonymous foundation. Annotations are descriptive,
+`register_with_annotations` supplies accurate MCP annotations; public registration
+accepts only read-only modules. A crate-private registration path permits only the
+built-in `delete_text_diff` operation, marked read-only false, destructive true,
+idempotent true and open-world false. Possession of a valid comparison handle
+authorizes reading and deletion; this exception does not enable arbitrary writes. Annotations are descriptive,
 not a sandbox or authorization mechanism.
 
 Registration validates object input schemas, names, descriptions, duplicate names,
@@ -147,7 +156,8 @@ budget including framing allowance. Slow sends can drop updates after 100 ms.
 The final result remains authoritative; progress never extends a call deadline.
 
 `ResourceRegistry` accepts up to 32 trusted text resources with exact `ui://` URIs.
-The raw text limit is 1 MiB, serialized resource limit 2 MiB, additionally bounded
+The default raw text limit is 1 MiB and serialized resource limit 2 MiB. Only the
+built-in comparison widget has a 3 MiB raw / 6 MiB serialized allowance, additionally bounded
 by half the configured message allowance. Duplicate registrations, bad MIME/URI
 matches, dangling tool UI references, and excessive discovery/results fail startup.
 `with_resources` enables static `resources/list` and `resources/read`; no caller URI
@@ -216,8 +226,12 @@ lists tools and calls `server_info`; never disable certificate verification.
 | `shutdown_timeout_secs` | 15 |
 
 Budgets are process-local and shared by both data transports. The buffering budget
-accounts for admitted application frames/bodies, with conservative HTTP copy
-reservations; it is not a bound on process RSS or arbitrary plugin allocations.
+is distinct from QUIC flow control: stream receive credit is at most 256 KiB and
+connection receive/send windows are twice that (smaller frame limits reduce both).
+Large JSON frames stream through these windows into the separately charged frame
+allocation, preventing a larger message allowance from creating a large QUIC burst.
+The buffering budget accounts for admitted application frames/bodies, with
+conservative HTTP copy reservations; it is not a bound on process RSS or arbitrary plugin allocations.
 TLS/QUIC, HTTP/2 and kernel buffers have separate finite limits. Registry discovery
 must fit in half a message. Tool output is preflighted before SDK serialization;
 structured values must fit one-eighth of a message, leaving room for its text copy,

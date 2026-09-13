@@ -45,7 +45,13 @@ is not cryptographic provenance. `SERVER_BINARY`, `WT_CLIENT_BINARY`, and
 `MOCK_UPSTREAM_BINARY` select prebuilt executables; set all three to skip their build.
 The mock runs on loopback inside the backend container. By default the resource
 is a small synthetic HTML fixture; set `DEMO_WIDGET_HTML=apps/widget/dist/index.html`
-after the widget build to test the complete bundled resource, as CI does.
+and `TEXT_DIFF_WIDGET_HTML=apps/widget/dist/text-diff.html` after the widget build
+to test both complete bundled resources, as CI does. The text-comparison fixture
+installs Git, enables 16 MiB messages and 256 MiB transport buffering, and gives
+the backend a 1 GiB container limit. Both revisions/transports exercise exact
+1 MiB inputs, paged results, widget resources and bearer-authorized deletion.
+The `/mcp` route explicitly allows a 16 MiB request body to match the backend;
+the edge's inherited 10 MiB default cannot carry the largest escaped text pair.
 
 All service containers share an internal Docker network. No host port is
 published and no legal-data provider is contacted. The test generates a

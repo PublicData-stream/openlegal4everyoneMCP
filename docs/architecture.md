@@ -6,7 +6,8 @@ The server foundation is implemented in `apps/server` as one library/binary pack
 It provides a startup tool registry and endpoint supervisor shared by Streamable HTTP
 and WebTransport adapters. The production binary requires both, plus a private
 health listener. Shared retrieval, memory caching, two pure synthetic processors,
-and a React MCP Apps widget are implemented. Real legal-data models and providers
+and React MCP Apps widgets are implemented. Supplied-text comparison uses a bounded
+Git adapter and a separate transient result store. Real legal-data models and providers
 remain planned. The [server contract](server.md) owns the
 implemented extension interfaces and transport configuration.
 
@@ -26,10 +27,10 @@ preempt future evidence-backed legal mappings. The CLI remains planned.
 
 | Component | Responsibility | Project dependencies |
 | --- | --- | --- |
-| `crates/domain` | Synthetic record/query types, provenance, freshness and errors; legal models remain future work | No other project layer |
+| `crates/domain` | Synthetic record/query types, supplied-text comparison contracts, provenance, freshness and errors; legal models remain future work | No other project layer |
 | `crates/normalization` | Pure parsing and provider-specific normalization modules | Domain |
-| `crates/application` | Retrieval use cases, freshness decisions, refresh orchestration, coalescing and budgets; upstream/storage interfaces | Domain |
-| `crates/adapters` | Separate modules for upstream HTTP clients and cache-storage implementations | Application interfaces, domain, normalization |
+| `crates/application` | Retrieval use cases and supplied-text comparisons; freshness, refresh, coalescing, retention and budgets; operation interfaces | Domain |
+| `crates/adapters` | Separate modules for upstream HTTP, cache storage, and bounded Git execution | Application interfaces, domain, normalization |
 | `apps/server` | Configuration, immutable tool/resource registries, worker/endpoint supervision, HTTP/WebTransport and private health | Application/adapters/normalization through demo composition; domain for typed tool results |
 | `apps/widget` | React presentation and MCP Apps host bridge; no source fetching or cache policy | MCP wire contracts |
 | `apps/cli` | Future CLI/admin commands and composition | Application and adapters; not server routing |
@@ -53,6 +54,13 @@ Concrete adapters implement those interfaces; application code does not import t
 adapters crate. Put operation policy in application services and mechanics in
 adapters. In particular, storage does not decide legal freshness, and transport
 does not create an independent retry loop outside the shared request budget.
+
+The text-comparison service owns admission, transient result retention and paging.
+Its adapter writes private temporary inputs and executes Git; it is not a
+normalizer or retrieval-cache implementation. Callers cannot supply repository
+paths or Git options. The sole public mutation deletes a temporary comparison
+using its bearer handle; generic module registration remains read-only. See the
+[text comparison contract](text-diff.md) for bounds and lifecycle.
 
 The composition entrypoint loads configuration, constructs adapters and shared
 state, and connects them to application services. Explicitly supply time and other

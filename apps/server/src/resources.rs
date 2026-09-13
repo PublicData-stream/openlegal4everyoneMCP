@@ -26,6 +26,40 @@ impl ResourceRegistry {
         definition: Resource,
         content: ResourceContents,
     ) -> Result<(), ServerError> {
+        self.register_bounded(definition, content, 1024 * 1024)
+    }
+
+    pub(crate) fn register_comparison_widget(
+        &mut self,
+        definition: Resource,
+        content: ResourceContents,
+    ) -> Result<(), ServerError> {
+        if definition.uri != crate::text_diff::WIDGET_URI {
+            return Err("larger resource allowance is reserved for the comparison widget".into());
+        }
+        self.register_bounded(definition, content, 3 * 1024 * 1024)
+    }
+
+    /// Merge startup registries atomically; duplicate URIs remain an error.
+    pub fn extend(&mut self, other: Self) -> Result<(), ServerError> {
+        if self.resources.len() + other.resources.len() > 32
+            || other
+                .resources
+                .keys()
+                .any(|uri| self.resources.contains_key(uri))
+        {
+            return Err("duplicate or excessive static resource registration".into());
+        }
+        self.resources.extend(other.resources);
+        Ok(())
+    }
+
+    fn register_bounded(
+        &mut self,
+        definition: Resource,
+        content: ResourceContents,
+        max_bytes: usize,
+    ) -> Result<(), ServerError> {
         let uri = &definition.uri;
         let parsed = url::Url::parse(uri).map_err(|_| "invalid resource URI")?;
         if uri.len() > 512
@@ -56,7 +90,7 @@ impl ResourceRegistry {
                 .as_ref()
                 .is_none_or(|mime| mime.is_empty() || mime.len() > 128)
             || mime_type != &definition.mime_type
-            || text.len() > 1024 * 1024
+            || text.len() > max_bytes
         {
             return Err("resource content URI and MIME must match its descriptor".into());
         }
@@ -64,7 +98,7 @@ impl ResourceRegistry {
         let result = ReadResourceResult::new(vec![content])
             .with_ttl_ms(0)
             .with_cache_scope(CacheScope::Public);
-        ensure_serialized_limit(&result, 2 * 1024 * 1024)?;
+        ensure_serialized_limit(&result, max_bytes * 2)?;
         self.resources
             .insert(uri.clone(), StaticResource { definition, result });
         Ok(())
