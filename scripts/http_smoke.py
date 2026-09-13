@@ -195,6 +195,25 @@ def smoke():
                                         arguments=arguments, _meta={"progressToken": f"http-{ident}"}), revision, session)
             assert not result.get("isError", False), result
             assert result["structuredContent"]["synthetic"] is True, result
+        history_query = {"operation": "get", "source": "layout_b", "id": "001"}
+        def history_call(name, **arguments):
+            _, result = success(request("tools/call", revision, 24, name=name,
+                arguments=arguments, _meta={"progressToken": "history"}), revision, session)
+            assert not result.get("isError", False), result
+            return result["structuredContent"]
+        history = history_call("demo_list_snapshots", query=history_query)
+        capture = history["snapshots"][0]["snapshot_id"]
+        exact = history_call("demo_get_snapshot", query=history_query, snapshot_id=capture)
+        assert exact["historical"] is True and "freshness" not in exact
+        assert exact["data"]["id"] == "001"
+        compared = history_call("demo_compare_record_snapshots", source="layout_b", id="001",
+            before_snapshot_id=capture, after_snapshot_id=capture)
+        assert compared["equal"] is True
+        assert compared["origin"]["before"]["snapshot_id"] == capture
+        _, removed = success(request("tools/call", revision, 25, name="delete_text_diff",
+            arguments={"comparison_id": compared["comparison_id"]}), revision, session)
+        assert removed["structuredContent"]["deleted"] is True
+        print(f"HTTP {revision}: exact retained history and snapshot comparison verified", flush=True)
         _, result = success(request("resources/read", revision, 7,
                                     uri="ui://openlegal-demo/records-v1.html"), revision, session)
         assert result["contents"][0]["mimeType"] == "text/html;profile=mcp-app", result

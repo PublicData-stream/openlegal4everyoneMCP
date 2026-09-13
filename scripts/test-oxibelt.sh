@@ -99,6 +99,9 @@ widget_html = "/fixture/widget.html"
 
 [text_diff]
 widget_html = "/fixture/text-diff.html"
+
+[cache.filesystem]
+path = "/tmp/openlegal-cache"
 TOML
 cp deploy/oxibelt/oxibelt.toml "$scratch/fixture/config/"
 cp deploy/oxibelt/Dockerfile.harness "$scratch/Dockerfile"

@@ -170,6 +170,9 @@ async fn main() -> Result<(), ServerError> {
         }
         println!("WebTransport {revision}: {method} verified");
     }
+    if demo && text_diff {
+        history_smoke(&mut send, &mut reader, &budget, revision).await?;
+    }
     if text_diff {
         text_diff_smoke(&mut send, &mut reader, &budget, revision).await?;
     }
@@ -192,11 +195,18 @@ async fn rpc(
     mut params: Value,
 ) -> Result<Value, ServerError> {
     if revision == "2026-07-28" {
+        let progress_token = params
+            .get("_meta")
+            .and_then(|m| m.get("progressToken"))
+            .cloned();
         params["_meta"] = json!({
             "io.modelcontextprotocol/protocolVersion":revision,
             "io.modelcontextprotocol/clientInfo":{"name":"openlegal-wt-client","version":"1"},
             "io.modelcontextprotocol/clientCapabilities":{}
         });
+        if let Some(token) = progress_token {
+            params["_meta"]["progressToken"] = token;
+        }
     }
     // Only fixed operation names are logged; supplied texts and bearer handles
     // must never enter reference-client diagnostics.
@@ -464,4 +474,49 @@ async fn exchange(
         return Err("successful token-bearing tool call emitted no progress".into());
     }
     Ok(response)
+}
+
+async fn history_smoke(
+    send: &mut wtransport::SendStream,
+    reader: &mut FrameReader<wtransport::RecvStream>,
+    budget: &Arc<Semaphore>,
+    revision: &str,
+) -> Result<(), ServerError> {
+    let tools = rpc(send, reader, budget, revision, "tools/list", json!({})).await?;
+    if !tools["tools"]
+        .as_array()
+        .is_some_and(|tools| tools.iter().any(|t| t["name"] == "demo_list_snapshots"))
+    {
+        return Ok(());
+    }
+    let query = json!({"operation":"get","source":"layout_a","id":"001"});
+    let listed = rpc(send, reader, budget, revision, "tools/call", json!({"name":"demo_list_snapshots","arguments":{"query":query},"_meta":{"progressToken":"history-list"}})).await?;
+    let snapshot = listed["structuredContent"]["snapshots"][0]["snapshot_id"]
+        .as_str()
+        .ok_or("history snapshot missing")?;
+    let exact = rpc(send, reader, budget, revision, "tools/call", json!({"name":"demo_get_snapshot","arguments":{"query":query,"snapshot_id":snapshot},"_meta":{"progressToken":"history-get"}})).await?;
+    if exact["structuredContent"]["historical"] != true
+        || exact["structuredContent"].get("freshness").is_some()
+    {
+        return Err("historical envelope invalid".into());
+    }
+    let compared = rpc(send, reader, budget, revision, "tools/call", json!({"name":"demo_compare_record_snapshots","arguments":{"source":"layout_a","id":"001","before_snapshot_id":snapshot,"after_snapshot_id":snapshot},"_meta":{"progressToken":"history-compare"}})).await?;
+    let summary = &compared["structuredContent"];
+    if summary["equal"] != true || summary["origin"]["before"]["snapshot_id"] != snapshot {
+        return Err("snapshot comparison origin invalid".into());
+    }
+    let deleted = rpc(
+        send,
+        reader,
+        budget,
+        revision,
+        "tools/call",
+        json!({"name":"delete_text_diff","arguments":{"comparison_id":summary["comparison_id"]}}),
+    )
+    .await?;
+    if deleted["structuredContent"]["deleted"] != true {
+        return Err("snapshot comparison cleanup failed".into());
+    }
+    println!("WebTransport {revision}: exact history and snapshot comparison verified");
+    Ok(())
 }
