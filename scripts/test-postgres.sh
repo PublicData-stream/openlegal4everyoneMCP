@@ -21,7 +21,7 @@ trap 'exit 143' TERM
 for command in docker cargo python3 timeout openssl; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
-docker network create --internal "$network" >/dev/null
+network_options=()
 publish=(-p 127.0.0.1::5432)
 # A host-rootless daemon's published localhost is not the devcontainer's localhost.
 # Join only this disposable internal network; retain the existing default route.
@@ -31,10 +31,41 @@ if [[ -e /.dockerenv ]]; then
         echo 'The development container must be visible to the configured Docker daemon.' >&2
         exit 1
     fi
-    docker network connect "$network" "$candidate"
-    runner_container=$candidate
+    network_options=(--internal)
     publish=()
 fi
+docker network create "${network_options[@]}" "$network" >/dev/null
+if [[ ${#publish[@]} == 0 ]]; then
+    docker network connect "$network" "$candidate"
+    runner_container=$candidate
+fi
+
+# Inspect only endpoint metadata: a full inspection would include the password.
+database_endpoint() {
+    local database=$1 endpoint
+    if [[ -n $runner_container ]]; then
+        if ! endpoint=$(docker inspect --format "{{with index .NetworkSettings.Networks \"$network\"}}{{.IPAddress}}{{end}}" "$database" 2>/dev/null); then
+            echo "Cannot inspect database endpoint for $database" >&2
+            return 1
+        fi
+        if ! python3 -c 'import ipaddress, sys; ipaddress.IPv4Address(sys.argv[1])' "$endpoint" 2>/dev/null; then
+            echo "Missing or invalid database address on the test network for $database" >&2
+            return 1
+        fi
+        printf '%s:5432\n' "$endpoint"
+    else
+        if ! endpoint=$(docker port "$database" 5432/tcp 2>/dev/null); then
+            echo "Cannot discover published database port for $database" >&2
+            return 1
+        fi
+        if [[ ! $endpoint =~ ^127\.0\.0\.1:([0-9]{1,5})$ ]] ||
+            (( 10#${BASH_REMATCH[1]} < 1 || 10#${BASH_REMATCH[1]} > 65535 )); then
+            echo "Missing or invalid localhost database port for $database" >&2
+            return 1
+        fi
+        printf '%s\n' "$endpoint"
+    fi
+}
 password=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
 docker run -d --name "$container" --memory 512m --cpus 2 \
     --network "$network" "${publish[@]}" -e POSTGRES_PASSWORD="$password" \
@@ -44,13 +75,7 @@ for attempt in {1..60}; do
     if (( attempt == 60 )); then echo 'PostgreSQL 18 did not become ready within 60 seconds' >&2; exit 1; fi
     sleep 1
 done
-if [[ -n $runner_container ]]; then
-    address=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$container")
-    port=5432
-else
-    address=127.0.0.1
-    port=$(docker port "$container" 5432/tcp | python3 -c 'import sys; print(sys.stdin.read().strip().rsplit(":", 1)[1])')
-fi
+endpoint=$(database_endpoint "$container")
 docker run -d --name "$unsupported_container" --memory 512m --cpus 2 \
     --network "$network" "${publish[@]}" -e POSTGRES_PASSWORD="$password" \
     "$unsupported_image" -c log_statement=none -c log_min_error_statement=panic >/dev/null
@@ -59,16 +84,10 @@ for attempt in {1..60}; do
     if (( attempt == 60 )); then echo 'Unsupported-version test database did not become ready' >&2; exit 1; fi
     sleep 1
 done
-if [[ -n $runner_container ]]; then
-    unsupported_address=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$unsupported_container")
-    unsupported_port=5432
-else
-    unsupported_address=127.0.0.1
-    unsupported_port=$(docker port "$unsupported_container" 5432/tcp | python3 -c 'import sys; print(sys.stdin.read().strip().rsplit(":", 1)[1])')
-fi
-export OPENLEGAL_TEST_UNSUPPORTED_DATABASE_URL="postgresql://postgres:$password@$unsupported_address:$unsupported_port/postgres"
+unsupported_endpoint=$(database_endpoint "$unsupported_container")
+export OPENLEGAL_TEST_UNSUPPORTED_DATABASE_URL="postgresql://postgres:$password@$unsupported_endpoint/postgres"
 export OPENLEGAL_TEST_POSTGRES_CONTAINER="$container"
-export OPENLEGAL_TEST_DATABASE_URL="postgresql://postgres:$password@$address:$port/postgres"
+export OPENLEGAL_TEST_DATABASE_URL="postgresql://postgres:$password@$endpoint/postgres"
 cd "$repo"
 # All ignored tests are explicitly invoked here, never silently skipped for a missing URL.
 if (( $# )); then

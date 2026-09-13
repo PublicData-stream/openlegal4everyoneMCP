@@ -146,6 +146,14 @@ passed or silently skipped check. Ordinary Rust tests and compilation require
 neither Docker nor `DATABASE_URL`; tests requiring PostgreSQL are clearly marked
 and run by the dedicated gate.
 
+The PostgreSQL gate uses a disposable bridge with dynamically allocated
+localhost-only database ports on host runners; those fixture containers can make
+outbound connections. Inside a Docker development container, it instead joins the
+daemon-visible runner to a disposable internal network and uses database IPs without
+publishing ports, preserving the runner's existing network connections. Both modes
+remove their fixture containers, volumes and network on exit. A devcontainer run
+does not by itself validate the host runner's port-publication path.
+
 Use focused tests while developing, then run the applicable workspace baseline
 before a Rust change is ready. Bootstrap must enumerate supported feature
 combinations and add explicit checks for them. Use `--all-features` only when all
