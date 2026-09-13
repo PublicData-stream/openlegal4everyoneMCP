@@ -19,7 +19,9 @@ Rust reference client; ChatGPT uses the HTTPS Streamable HTTP endpoint.
 
 The workspace includes tests, dependency checks, CI, and a pinned OxiBelt integration
 harness. A shared retrieval/cache framework, two synthetic JSON processors, and
-an opt-in React MCP Apps browser now demonstrate upstream extensions. Real legal
+an opt-in React MCP Apps browser now demonstrate upstream extensions. A separate
+[Git text comparison widget](docs/text-diff.md) compares supplied text with bounded
+paging and temporary results that users can delete. Real legal
 providers and user accounts remain planned. Local browser tests use a simulated
 host; the product domain does not imply deployment or verified live ChatGPT access.
 
@@ -50,6 +52,7 @@ Node or a widget build.
 - [Server contract](docs/server.md): configuration, extension API and transport behavior.
 - [Dependencies](docs/dependencies.md): admission rationale and check tooling.
 - [Retrieval framework](docs/retrieval.md): processors, caching, evidence and resource limits.
+- [Text comparison](docs/text-diff.md): Git engine, input limits, paging, retention and editable widget.
 - [Synthetic browser](docs/demo.md): local setup, tools, progress and ChatGPT manual checks.
 - [Retrieval validation](docs/retrieval-review.md): independent reviews, checks and remaining limits.
 - [Legal-data policy](docs/legal-data-policy.md): identity, dates, normalization, and citations.

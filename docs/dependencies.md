@@ -13,13 +13,13 @@ come from crates.io; unreviewed Git dependencies and registries fail `cargo deny
 | rmcp 3.3.0 | Official MCP Rust SDK; handles both chosen revisions and HTTP protocol translation. Prefer its maintained protocol implementation over a new JSON-RPC stack. Public input reaches this code; host-level admission, strict Origin checks and bounded framing supplement its defaults. Disable its payload logging in the binary. Apache-2.0. |
 | wtransport 0.7.2 | Native WebTransport endpoint over Quinn/Rustls. Enables `ring` and `quinn` for TLS and explicit QUIC bounds; default self-signed and dangerous-configuration features remain off. Alternative lower-level H3/Quinn wiring would duplicate session mechanics. Upstream still cautions about production readiness; the pinned OxiBelt interoperability gate and independent boundary review are required, and broader deployment validation remains operator work. MIT OR Apache-2.0. |
 | Axum, Hyper, hyper-util | HTTP routing and serving. Hyper's connection APIs are used explicitly for header, stream and connection limits; the socket wrapper adds write deadlines. Axum-only defaults do not provide all required limits. MIT. |
-| Tokio, tokio-util, futures | Shared asynchronous runtime, cancellation, supervised tasks and stream adapters; mixing another executor would complicate task lifetimes. No Tokio process-spawning API is enabled by this application. MIT / Apache-2.0 alternatives in their manifests. |
+| Tokio, tokio-util, futures | Shared asynchronous runtime, cancellation, supervised tasks and stream adapters; mixing another executor would complicate task lifetimes. The text-diff adapter enables Tokio process spawning with bounded pipes and supervised cancellation/reaping. MIT / Apache-2.0 alternatives in their manifests. |
 | Serde, serde_json, Schemars | Typed parameters, bounded serialization and schemas; handwritten schema copies risk drift. Derive macros execute only at build time. JSON nesting uses the parser's finite default recursion limit. MIT OR Apache-2.0. |
 | jsonschema 0.56 | Validate complete input constraints beyond Rust field types. HTTP/file reference resolution and TLS features are disabled; schemas are compiled once from trusted modules, never fetched from callers. Invalid/unresolved schemas fail startup. A limited handwritten validator would misrepresent JSON Schema support. MIT. |
 | http | HTTP vocabulary shared with the SDK stack; avoids incompatible representations and extra protocol conversions. MIT. |
 | TOML, url | Strict operator configuration and origin parsing. The URL parser normalizes origin tuples; raw string/prefix matching would be incorrect. MIT OR Apache-2.0. |
 | tracing, tracing-subscriber | Operational events and filtering; SDK payload logs are disabled regardless of the normal runtime log setting. MIT. |
-| rcgen, tempfile, reqwest test features | Isolated TLS fixtures, cleanup and native HTTP tests. rcgen and tempfile are development-only. Certificate generation uses ring; reqwest disables default features and uses Rustls. Production reqwest admission is described below. No production test certificates or live provider traffic. MIT / Apache-2.0 alternatives. |
+| rcgen, tempfile, reqwest test features | Isolated TLS fixtures, cleanup and native HTTP tests. rcgen remains development-only; tempfile is also used by the production Git adapter. Certificate generation uses ring; reqwest disables default features and uses Rustls. Production reqwest admission is described below. No production test certificates or live provider traffic. MIT / Apache-2.0 alternatives. |
 
 The listed versions are baseline anchors; exact versions and checksums for all
 dependencies live in the lockfile. Source review covered relevant installed SDK
@@ -106,3 +106,28 @@ Both advisory checks require access to the current RustSec advisory database.
 Unavailable or stale advisory data is not a passing current-advisory check.
 CI performs these on pushes, pull requests and a weekly schedule. Check commands
 and readiness requirements remain owned by [Contributing](../CONTRIBUTING.md).
+
+## Text comparison additions
+
+The operator supplies an absolute path to a maintained system Git executable.
+The isolated integration image installs its distribution Git package. Git is used
+through a subprocess, not linked into Rust; preserve its GPL-2.0 notices and
+distribution obligations in runtime images. The alternative libgit2 would change
+the explicitly selected Git CLI engine and add a native library dependency.
+Startup probes the executable; request execution uses fixed no-index comparison
+options, isolated configuration and private temporary input files.
+
+`tempfile` 3 (MIT OR Apache-2.0, crates.io) provides private temporary directories
+and cleanup instead of hand-rolled name generation. `getrandom` supplies operating
+system randomness for 256-bit comparison handles; failure prevents publication.
+The lockfile owns exact admitted versions. Tokio's `process`, `fs` and `io-util`
+features support bounded I/O and process reaping. No first-party unsafe exception
+is introduced. These boundaries require independent Security review.
+
+The widget pins MIT-licensed `@git-diff-view/react` 0.1.7 from npm. Its ordinary
+imports include the upstream syntax-language set even with highlighting disabled;
+a production feasibility bundle measured 2,112,375 bytes including the license.
+The explicitly registered comparison resource therefore permits 3 MiB, while the
+record browser retains 1 MiB. No CDN, worker, remote highlighter, package patch or
+bundler alias is used. The frozen graph receives the existing advisory/license
+checks; only esbuild's installation script remains enabled.

@@ -57,6 +57,7 @@ jobs:
         run: scripts/test-oxibelt.sh
         env:
           DEMO_WIDGET_HTML: apps/widget/dist/index.html
+          TEXT_DIFF_WIDGET_HTML: apps/widget/dist/text-diff.html
   widget:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

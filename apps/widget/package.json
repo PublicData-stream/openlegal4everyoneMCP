@@ -11,12 +11,13 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test tests/model.test.ts tests/source-offer.test.ts",
+    "test": "node --experimental-strip-types --test tests/model.test.ts tests/source-offer.test.ts tests/text-diff-model.test.ts",
     "test:browser": "playwright test",
     "harness": "node scripts/harness.mjs",
     "check:dependencies": "pnpm audit --audit-level=low && node scripts/check-dependencies.mjs"
   },
   "dependencies": {
+    "@git-diff-view/react": "0.1.7",
     "@modelcontextprotocol/ext-apps": "2.0.0",
     "react": "19.3.0",
     "react-dom": "19.3.0"

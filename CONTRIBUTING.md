@@ -171,7 +171,8 @@ The last command requires current npm advisory data and checks dependency licens
 Build output and browser artifacts are ignored. The local browser harness exercises
 the real MCP Apps bridge against synthetic responses; it is not a live ChatGPT test.
 For integrated widget/transport changes, set `DEMO_WIDGET_HTML=apps/widget/dist/index.html`
-when running the OxiBelt gate. Ordinary Rust tests remain independent of Node.
+and `TEXT_DIFF_WIDGET_HTML=apps/widget/dist/text-diff.html` when running the
+OxiBelt gate. Ordinary Rust tests remain independent of Node.
 
 ### Behavior and integration tests
 

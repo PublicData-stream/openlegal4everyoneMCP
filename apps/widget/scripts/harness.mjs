@@ -2,14 +2,19 @@
 import { build } from 'esbuild';
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
+await build({ entryPoints: ['tests/diff-host.ts'], bundle: true, outfile: '.harness/diff-host.js', platform: 'browser', format: 'esm', target: 'es2022' });
 await build({ entryPoints: ['tests/host.ts'], bundle: true, outfile: '.harness/host.js', platform: 'browser', format: 'esm', target: 'es2022' });
 const widget = await readFile('dist/index.html', 'utf8');
+const diffWidget = await readFile('dist/text-diff.html', 'utf8');
 const marker = '__OPENLEGAL_SOURCE_URL__';
 if (widget.split(marker).length !== 2) throw new Error('Expected exactly one source URL placeholder');
 // Fictional source location; host requests are recorded, never followed.
 const sourceUrl = 'https://source.example/release?name="widget"&part=server';
 const escapedSourceUrl = sourceUrl.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll("'", '&#39;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const resources = new Map([
+  ['/diff-widget', ['text/html', diffWidget.replace('__OPENLEGAL_SOURCE_URL__', 'https://source.example/release')]],
+  ['/diff-host.js', ['application/javascript', await readFile('.harness/diff-host.js')]],
+  ['/diff', ['text/html', '<!doctype html><html lang="en"><title>Offline comparison host</title><body><iframe title="Text comparison" sandbox="allow-scripts" style="width:100%;height:1600px;border:0"></iframe><pre id="calls" hidden>[]</pre><pre id="links" hidden>[]</pre><script type="module" src="/diff-host.js"></script></body></html>']],
   ['/widget', ['text/html', widget.replace(marker, escapedSourceUrl)]],
   ['/host.js', ['application/javascript', await readFile('.harness/host.js')]],
   ['/', ['text/html', '<!doctype html><html lang="en"><title>Offline MCP Apps test host</title><body><iframe title="Record browser" sandbox="allow-scripts" style="width:100%;height:900px;border:0"></iframe><pre id="calls" hidden>[]</pre><pre id="links" hidden>[]</pre><script type="module" src="/host.js"></script></body></html>']],
