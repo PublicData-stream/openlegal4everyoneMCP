@@ -14,7 +14,9 @@ openlegal-normalization = { version = "0.1.0", path = "../normalization" }
 openlegal-application = { version = "0.1.0", path = "../application" }
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
-tokio = { version = "1", features = ["net", "time"] }
+tokio = { version = "1", features = ["net", "time", "process", "fs", "io-util"] }
+tempfile = "3"
+getrandom = "0.4"
 tokio-util = { version = "0.7", features = ["rt"] }
 url = "2"
 httpdate = "1"

@@ -4,6 +4,7 @@
 //! deployment-wide coordination design. Adapters never add their own retry loops.
 
 mod service;
+pub mod text_diff;
 pub use service::{CacheKey, CacheStore, MetricsSnapshot, RetrievalService, StoredPayload};
 
 use futures::future::BoxFuture;

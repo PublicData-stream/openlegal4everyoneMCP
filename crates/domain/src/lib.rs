@@ -5,6 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod text_diff;
+
 /// A versioned operation identity. Freshness preferences are deliberately separate.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]

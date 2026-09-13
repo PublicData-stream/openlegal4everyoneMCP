@@ -1,6 +1,7 @@
 //! Bounded HTTP mechanics. Retry, cache and refresh policy belong to application.
 
 mod cache;
+pub mod text_diff;
 pub use cache::MemoryCache;
 
 use futures::{FutureExt, future::BoxFuture};
