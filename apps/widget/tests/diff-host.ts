@@ -31,6 +31,7 @@ bridge.oncalltool = async ({ name, arguments: args }) => {
     const summary = retain(String(input.before), String(input.after));
     summary.before.label = String(input.before_label ?? 'Before');
     summary.after.label = String(input.after_label ?? 'After');
+    if (params.has('injectorigin')) summary.origin = { source: 'layout_a', record_id: 'forged-history', projection: 'title_lf_lf_body_v1', before: { snapshot_id: 'a'.repeat(64), sequence: 1, captured_at: 100, processor_version: '0.9.0', schema_version: 1, payload_sha256: 'c'.repeat(64) }, after: { snapshot_id: 'b'.repeat(64), sequence: 2, captured_at: 200, processor_version: '1.0.0', schema_version: 1, payload_sha256: 'd'.repeat(64) } };
     return result(input.before === 'malformed' ? { schema_version: 9 } : summary);
   }
   if (name === 'delete_text_diff') {
@@ -73,6 +74,7 @@ bridge.oninitialized = async () => {
     const before = params.has('highlights') ? '😀가e\u0301漢字A\r\n' : params.has('pair') ? '<b>before</b>\n' : sourceBefore;
     const after = params.has('highlights') ? '😀나e\u0301漢語B' : params.has('pair') ? '<img src="https://evil.example/x">\n' : sourceAfter;
     const summary = retain(before, after, fixtureId);
+    if (params.has('origin')) summary.origin = { source: 'layout_a', record_id: 'demo-1', projection: 'title_lf_lf_body_v1', before: { snapshot_id: 'a'.repeat(64), sequence: 1, captured_at: 100, processor_version: '0.9.0', schema_version: 1, payload_sha256: 'c'.repeat(64) }, after: { snapshot_id: 'b'.repeat(64), sequence: 2, captured_at: 200, processor_version: '1.0.0', schema_version: 1, payload_sha256: 'd'.repeat(64) } };
     if (params.has('pages')) { summary.before.lines = 100000; summary.after.lines = 100000; summary.before.bytes = 200000; summary.after.bytes = 200000; summary.change_pages = 2; }
     if (params.has('expired')) summary.expires_at = Math.floor(Date.now() / 1000) - 1;
     await bridge.sendToolInput({ arguments: params.has('pair') ? { before, after } : { comparison_id: fixtureId } });

@@ -2,3 +2,5 @@
 
 details{margin-top:20px;font-size:13px}summary{cursor:pointer;font-weight:600}dt{font-weight:600;margin-top:10px}dd{margin:0;overflow-wrap:anywhere}
 footer{max-width:850px;margin:auto;padding:0 24px 24px;font-size:13px}footer pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 monospace}.source-offer{border-top:1px solid light-dark(#d6dfd9,#395052);margin-top:24px;padding-top:12px}.source-offer h2{font-size:17px}.source-offer button{margin:8px 0}.source-offer input{font-weight:400;min-width:0;width:100%;user-select:text}
+
+.history:not(:empty){margin-top:28px;border-top:1px solid light-dark(#d6dfd9,#395052);padding-top:16px}.history ol{padding-left:24px}.snapshot-id,.snapshot-origin{overflow-wrap:anywhere}.historical-snapshot{border-left:3px solid light-dark(#87520a,#f5cd83);padding:12px;margin-top:20px}.snapshot-origin{font-size:13px}

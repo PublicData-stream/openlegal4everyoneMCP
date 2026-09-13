@@ -1,3 +1,4 @@
+import { parseSnapshotOrigin, type SnapshotOrigin } from './history-model.ts';
 /** Version 1 supplied-text wire contract. Text is never normalized implicitly. */
 export const MAX_TEXT_BYTES = 1024 * 1024;
 export const MAX_LINE_BYTES = 16 * 1024;
@@ -7,7 +8,7 @@ export const utf8Length = (value: string) => encoder.encode(value).byteLength;
 export class DiffResponseError extends Error {}
 const invalid = () => new DiffResponseError('The server returned an unsupported comparison response.');
 export interface TextInfo { label: string; bytes: number; lines: number; crlf: number; lf: number; bare_cr: number; bom: boolean; final_newline: boolean }
-export interface Comparison { schema_version: 1; comparison_id: string; expires_at: number; before: TextInfo; after: TextInfo; additions: number; deletions: number; equal: boolean; change_pages: number }
+export interface Comparison { origin?: SnapshotOrigin; schema_version: 1; comparison_id: string; expires_at: number; before: TextInfo; after: TextInfo; additions: number; deletions: number; equal: boolean; change_pages: number }
 export type ScalarRange = [number, number];
 export interface InlineChange { row_index: number; ranges: ScalarRange[] }
 export interface Fragment { inline_changes: InlineChange[]; patch: string; before_start: number; before_count: number; after_start: number; after_count: number }
@@ -51,6 +52,9 @@ export function parseSummary(value: unknown): Comparison {
   if (summary.schema_version !== 1) throw invalid();
   const result: Comparison = { schema_version: 1, comparison_id: identity(summary.comparison_id), expires_at: integer(summary.expires_at, 253402300799), before: textInfo(summary.before), after: textInfo(summary.after), additions: integer(summary.additions, MAX_LINES), deletions: integer(summary.deletions, MAX_LINES), equal: boolean(summary.equal), change_pages: integer(summary.change_pages, MAX_LINES * 2) };
   if (result.additions > result.after.lines || result.deletions > result.before.lines || (result.equal && (result.additions || result.deletions || result.change_pages)) || (!result.equal && result.change_pages === 0)) throw invalid();
+  if (summary.origin !== undefined && summary.origin !== null) {
+    try { result.origin = parseSnapshotOrigin(summary.origin); } catch { throw invalid(); }
+  }
   return result;
 }
 export function parseCompare(result: unknown): Comparison { return parseSummary(data(result)); }

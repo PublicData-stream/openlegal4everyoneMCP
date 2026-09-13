@@ -177,3 +177,49 @@ test('missing or invalid server highlights fail visibly without rendering a fall
     await expect(widget.locator('.diff-fragment')).toHaveCount(0);
   }
 });
+
+test('opening a snapshot handle shows its origin and supplied-text recomparison drops it', async ({ page }) => {
+  const widget = await open(page, '?initial&origin');
+  const origin = widget.getByRole('complementary', { name: 'Retained snapshot comparison' });
+  await expect(origin).toContainText('layout_a / demo-1');
+  await expect(origin).toContainText('a'.repeat(64));
+  await widget.getByRole('button', { name: 'Load original texts for editing' }).click();
+  await widget.getByRole('button', { name: 'Compare', exact: true }).click();
+  await expect(origin).toHaveCount(0);
+  const invoked = await calls(page);
+  expect(invoked.find(call => call.name === 'compare_texts')?.arguments).not.toHaveProperty('origin');
+  expect(invoked.filter(call => call.name === 'delete_text_diff')).toHaveLength(1);
+});
+
+for (const deletionFails of [false, true]) {
+  test(`supplied-text responses cannot inject history origin${deletionFails ? ' when cleanup needs retry' : ''}`, async ({ page }) => {
+    const widget = await open(page, `?injectorigin${deletionFails ? '&deletefail' : ''}`);
+    await widget.getByLabel('Before text', { exact: true }).fill('User edited before');
+    await widget.getByLabel('After text', { exact: true }).fill('User edited after');
+    await widget.getByRole('button', { name: 'Compare', exact: true }).click();
+    await expect(widget.getByRole('alert')).toContainText('unexpected historical metadata');
+    await expect(widget.getByRole('region', { name: 'Comparison result', exact: true })).toHaveCount(0);
+    await expect(widget.getByRole('complementary', { name: 'Retained snapshot comparison' })).toHaveCount(0);
+    await expect(widget.getByText('forged-history', { exact: false })).toHaveCount(0);
+    if (deletionFails) {
+      await expect(widget.getByRole('alert')).toContainText('Retry Clear');
+      await widget.getByRole('button', { name: 'Clear', exact: true }).click();
+      await expect(widget.getByRole('alert')).toHaveCount(0);
+    }
+    await expect.poll(async () => (await calls(page)).filter(call => call.name === 'delete_text_diff').length).toBe(deletionFails ? 2 : 1);
+    const invoked = await calls(page);
+    expect(invoked.some(call => call.name === 'get_text_diff_page')).toBe(false);
+  });
+}
+
+test('initial supplied pairs cannot claim historical origin and retain only cleanup authority', async ({ page }) => {
+  const widget = await open(page, '?pair&origin');
+  await expect(widget.getByRole('alert')).toContainText('unexpected historical metadata');
+  await expect(widget.getByRole('complementary', { name: 'Retained snapshot comparison' })).toHaveCount(0);
+  await expect(widget.getByRole('region', { name: 'Comparison result', exact: true })).toHaveCount(0);
+  await widget.getByRole('button', { name: 'Clear', exact: true }).click();
+  await expect(widget.getByRole('alert')).toHaveCount(0);
+  await expect.poll(async () => (await calls(page)).filter(call => call.name === 'delete_text_diff').length).toBe(1);
+  const invoked = await calls(page);
+  expect(invoked.some(call => call.name === 'get_text_diff_page')).toBe(false);
+});

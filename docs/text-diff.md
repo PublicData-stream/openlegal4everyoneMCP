@@ -185,3 +185,14 @@ Fixtures are synthetic or supplied text; routine tests never contact legal provi
 Browser tests use a local MCP Apps host. Passing these gates does not establish live
 ChatGPT rendering or a particular host's support for maximum-size tool arguments.
 No deployment or publication is included.
+
+## Comparisons from retained snapshots
+
+With filesystem L2 enabled, the record history tool can resolve two retained
+snapshots of the same record and call the existing comparison service. The exact
+projection is title, two LF bytes, then body. See the [history contract](filesystem-cache.md).
+The optional summary `origin` is server-derived and retained with the transient
+comparison. `compare_texts` does not accept this field. Editing creates a supplied-
+text comparison without a verified historical association. Original source payloads
+remain governed by L2 retention; comparison text and metadata expire after ten
+minutes even if the source snapshots are already evicted.

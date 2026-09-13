@@ -27,9 +27,11 @@ cargo run --locked -p openlegal-server -- deploy/demo/server.toml
 
 Every configuration requires `[source].url`; replace the example placeholder with
 the actual source offer before hosting. See [source offers](server.md#source-offers-and-migration).
-The server configuration without `[demo]` still exposes only its
-registered foundation tools. The demo additionally requires its bounded local
-widget asset before listeners bind. Paths in the example are relative to the
+Remove both `[demo]` and `[cache.filesystem]` to disable synthetic retrieval.
+The independent `[text_diff]` feature remains enabled until its section is also
+removed; without either feature only registered foundation tools remain. The demo
+additionally requires its bounded local widget asset before listeners bind. Paths
+in the example are relative to the
 repository root. Generated HTML, keys, and certificates are disposable and ignored.
 
 ## Tools and display
@@ -98,3 +100,14 @@ This change does not deploy a service, configure account authentication, submit 
 plugin, or run a live ChatGPT connection. Local browser tests exercise a simulated
 MCP Apps host. The pinned OxiBelt gate exercises both native transports, new tools,
 progress, and resource retrieval using isolated synthetic fixtures.
+
+## Persistent history
+
+The combined demo configuration enables [filesystem L2](filesystem-cache.md) and
+text comparison. The record browser can list and view captured record/search-page
+history and compare two retained versions of the same record. Rebuild both widget
+assets after updating. History is demand-captured; it does not crawl the mock or
+create a snapshot every time a fresh memory result is read. The example store is
+`target/demo/cache`; use a durable directory outside build artifacts when hosting.
+Remove `[cache.filesystem]` for memory-only behavior. Without `[text_diff]`, history
+browsing remains available and comparison controls are disabled.

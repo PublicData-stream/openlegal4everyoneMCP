@@ -1,40 +1,15 @@
-import React, { Component, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from '@modelcontextprotocol/ext-apps';
 import { SourceOffer } from './SourceOffer.tsx';
-import { decodeFile, DiffResponseError, editAsLf, fragmentRows, scalarSegments, splitRows, MAX_TEXT_BYTES, metadata, parseCompare, parseDelete, parsePage, parsePair, parseShow, sourceRange, utf8Length, validateLabel, validateText, type DiffRow, type Comparison, type DiffPage, type Fragment, type PageView, type TextPair } from './text-diff-model.ts';
+import { decodeFile, DiffResponseError, editAsLf, MAX_TEXT_BYTES, parseCompare, parseDelete, parsePage, parsePair, parseShow, utf8Length, validateLabel, validateText, type Comparison, type DiffPage, type PageView, type TextPair } from './text-diff-model.ts';
 import './style.css';
 import './text-diff.css';
+import { ComparisonView } from './ComparisonView.tsx';
 
 const bridge = new App({ name: 'Text comparison', version: '0.1.0' }, {});
 const blank = (): TextPair => ({ before: '', after: '', before_label: 'Before', after_label: 'After' });
 const message = (error: unknown, fallback: string) => error instanceof DiffResponseError ? error.message : fallback;
-class RenderBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
-  state = { failed: false };
-  static getDerivedStateFromError() { return { failed: true }; }
-  render() { return this.state.failed ? <p role="alert">This fragment could not be displayed. The original texts remain available in the Before and After views.</p> : this.props.children; }
-}
-function RowText({ row }: { row: DiffRow }) {
-  return <><code>{scalarSegments(row.text, row.ranges).map((segment, index) => {
-    // Newline symbols describe the exact original bytes; unchanged LF is implicit.
-    const content = segment.text.split(/([\r\n])/).map((part, offset) => part === '\r' ? <span key={offset} className="line-ending" title="Carriage return (CR)">␍</span> : part === '\n' ? (segment.changed ? <span key={offset} className="line-ending" title="Line feed (LF)">␊</span> : null) : part);
-    return segment.changed ? <mark className="inline-change" key={index}>{content}</mark> : <React.Fragment key={index}>{content}</React.Fragment>;
-  })}</code>{row.noFinalNewline && <span className="no-final-newline">\ No newline at end of file</span>}</>;
-}
-function SplitCells({ row, side }: { row?: DiffRow; side: 'before' | 'after' }) {
-  const kind = row?.kind === '-' ? 'removed' : row?.kind === '+' ? 'added' : 'context';
-  return <><td className={`line-number ${kind}`} data-line-num={row?.[side]}>{row?.[side]}</td><td className={`diff-content ${kind}`}>{row && <><span className="diff-sign" aria-hidden="true">{row.kind}</span><RowText row={row} /></>}</td></>;
-}
-function FragmentView({ fragment, mode, dark }: { fragment: Fragment; mode: 'split' | 'unified'; dark: boolean }) {
-  const rows = useMemo(() => fragmentRows(fragment), [fragment]);
-  return <section className="diff-fragment" aria-label="Change fragment" data-theme={dark ? 'dark' : 'light'}>
-    <p className="metadata">Source lines: before {sourceRange(fragment.before_start, fragment.before_count)} · after {sourceRange(fragment.after_start, fragment.after_count)}. Gutter numbers start again within this fragment.</p>
-    <table className={`${mode}-diff-view`} aria-label={`${mode === 'split' ? 'Split' : 'Unified'} changes`}>
-      <thead>{mode === 'split' ? <tr><th colSpan={2}>Before</th><th colSpan={2}>After</th></tr> : <tr><th>Before</th><th>After</th><th>Text</th></tr>}</thead>
-      <tbody>{mode === 'split' ? splitRows(rows).map((pair, index) => <tr key={index}><SplitCells row={pair.before} side="before" /><SplitCells row={pair.after} side="after" /></tr>) : rows.map((row, index) => <tr key={index} className={row.kind === '-' ? 'removed' : row.kind === '+' ? 'added' : 'context'}><td className="line-number" data-line-num={row.before}>{row.before}</td><td className="line-number" data-line-num={row.after}>{row.after}</td><td className="diff-content"><span className="diff-sign" aria-hidden="true">{row.kind}</span><RowText row={row} /></td></tr>)}</tbody>
-    </table>
-  </section>;
-}
 function TextComparison() {
   const [ready, setReady] = useState(false);
   const [pair, setPair] = useState<TextPair | null>(blank);
@@ -60,12 +35,12 @@ function TextComparison() {
   busyRef.current = busy;
   const fileSerial = useRef({ before: 0, after: 0 });
   const suppliedPair = useRef(false);
+  const initialHandle = useRef<string | null>(null);
   // A cancelled RPC may still create a server handle. Keep Clear blocked until
   // its response is consumed and any late handle is deleted or retained for retry.
   const creation = useRef<{ cancelled: boolean } | null>(null);
   const pendingDeletion = useRef(new Map<string, Comparison>());
   const expired = comparison !== null && now >= comparison.expires_at * 1000;
-  const mode = layout === 'split' || (layout === 'auto' && wide) ? 'split' : 'unified';
   useEffect(() => {
     const width = matchMedia('(min-width: 900px)');
     const theme = matchMedia('(prefers-color-scheme: dark)');
@@ -79,10 +54,13 @@ function TextComparison() {
     live.current = true;
     bridge.ontoolinput = input => {
       serial.current++; fileSerial.current.before++; fileSerial.current.after++;
+      initialHandle.current = null;
       if (!creation.current) setBusy(null); setPageBusy(false); setPage(null); setComparison(null); setError('');
       try {
         const parsed = parsePair(input.arguments ?? {});
         suppliedPair.current = parsed !== null;
+        const handle = input.arguments?.comparison_id;
+        if (!parsed && typeof handle === 'string' && /^[0-9a-f]{64}$/.test(handle)) initialHandle.current = handle;
         setPair(parsed ? { ...blank(), ...parsed } : (Object.hasOwn(input.arguments ?? {}, 'comparison_id') ? null : blank()));
         setDirty(false);
       } catch (error) { setError(error instanceof Error ? error.message : 'The supplied texts could not be opened.'); }
@@ -92,6 +70,10 @@ function TextComparison() {
       if (!creation.current) setBusy(null); setPageBusy(false); setPage(null); setView('changes'); setPageIndex(0); setError('');
       try {
         const summary = parseShow(result);
+        if (summary?.origin && initialHandle.current !== summary.comparison_id) {
+          pendingDeletion.current.set(summary.comparison_id, summary);
+          throw new DiffResponseError('The supplied-text response contained unexpected historical metadata. Use Clear to delete its retained result.');
+        }
         setComparison(summary); setDirty(false); setNow(Date.now());
         if (!summary) setPair(blank());
         else if (!suppliedPair.current) setPair(null);
@@ -163,6 +145,19 @@ function TextComparison() {
       const result = await bridge.callServerTool({ name: 'compare_texts', arguments: { ...input } }, { timeout: 30000 });
       if (!live.current) return;
       const summary = parseCompare(result);
+      // A newly supplied pair cannot acquire a server-history association. Keep
+      // the validated handle only for cleanup; never render the claimed origin.
+      if (summary.origin) {
+        pendingDeletion.current.set(summary.comparison_id, summary);
+        try {
+          const deletion = await bridge.callServerTool({ name: 'delete_text_diff', arguments: { comparison_id: summary.comparison_id } }, { timeout: 15000 });
+          parseDelete(deletion);
+          pendingDeletion.current.delete(summary.comparison_id);
+        } catch {
+          throw new DiffResponseError('The supplied-text response contained unexpected historical metadata. Retry Clear to delete its retained result.');
+        }
+        throw new DiffResponseError('The supplied-text response contained unexpected historical metadata. Its retained result was deleted.');
+      }
       if (operation.cancelled || request !== serial.current) {
         pendingDeletion.current.set(summary.comparison_id, summary);
         try {
@@ -252,20 +247,7 @@ function TextComparison() {
     <div className="diff-actions"><button className="submit" disabled={!ready || !!busy || !pair} onClick={() => void compare()}>Compare</button><button disabled={!!busy} onClick={() => void clear()}>Clear</button></div>
     <div role="status" aria-live="polite">{busy === 'compare' ? 'Comparing texts…' : busy === 'delete' ? 'Deleting retained comparison…' : busy === 'load' ? 'Loading original texts…' : pageBusy ? 'Loading comparison page…' : !ready && !error ? 'Connecting to host…' : ''}</div>
     {error && <p role="alert" className="error">{error}</p>}
-    {comparison && <section className="comparison-result" aria-label="Comparison result" aria-busy={!!busy || pageBusy}>
-      <h2>{dirty ? 'Previous comparison' : 'Comparison result'}</h2>
-      {dirty && <p>Inputs have changed. Compare again to update these results.</p>}
-      <p>{comparison.equal ? 'The supplied texts are identical.' : `${comparison.additions} added lines · ${comparison.deletions} deleted lines`}</p>
-      <p className="metadata">{expired ? 'This comparison has expired. Compare again to create a new result.' : `Expires at ${new Date(comparison.expires_at * 1000).toISOString()}. Clear deletes the retained result.`}</p>
-      <dl className="text-metadata"><dt>{comparison.before.label}</dt><dd>{metadata(comparison.before)}</dd><dt>{comparison.after.label}</dt><dd>{metadata(comparison.after)}</dd></dl>
-      {!expired && <>
-        <div className="diff-actions"><label>View<select aria-label="View" disabled={!!busy || pageBusy} value={view} onChange={event => changeView(event.target.value as PageView)}><option value="changes">Changes</option><option value="before">Before text</option><option value="after">After text</option></select></label><label>Layout<select aria-label="Layout" value={layout} onChange={event => setLayout(event.target.value)}><option value="auto">Automatic</option><option value="split">Split</option><option value="unified">Unified</option></select></label></div>
-        {page && view === 'changes' && <RenderBoundary key={`${comparison.comparison_id}:${page.page}`}>{page.fragments.map((fragment, index) => <FragmentView key={index} fragment={fragment} mode={mode} dark={dark} />)}</RenderBoundary>}
-        {page && view !== 'changes' && <><p className="metadata">Exact source chunk {page.page + 1} of {page.total_pages}. Chunks may divide a line.</p><pre className="source-chunk">{page.text}</pre></>}
-        {page && <nav aria-label="Comparison pages"><button disabled={!!busy || pageBusy || page.page === 0} onClick={() => setPageIndex(page.page - 1)}>Previous page</button><span>Page {page.page + 1} of {page.total_pages}</span><button disabled={!!busy || pageBusy || page.page + 1 >= page.total_pages} onClick={() => setPageIndex(page.page + 1)}>Next page</button></nav>}
-        {!page && !pageBusy && error && <button disabled={!!busy} onClick={() => { setError(''); setComparison({ ...comparison }); }}>Retry page</button>}
-      </>}
-    </section>}
+    {comparison && <ComparisonView comparison={comparison} page={page} expired={expired} busy={!!busy} pageBusy={pageBusy} dirty={dirty} view={view} layout={layout} wide={wide} dark={dark} error={error} onView={changeView} onLayout={setLayout} onPage={setPageIndex} onRetry={() => { setError(''); setComparison({ ...comparison }); }} />}
     <SourceOffer ready={ready} bridge={bridge} />
   </main>;
 }

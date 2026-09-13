@@ -121,3 +121,134 @@ for (const mode of ['invalid-source', 'duplicate-source']) {
     expect(JSON.parse(await page.locator('#links').textContent() || '[]')).toEqual([]);
   });
 }
+
+test('history keeps exact search-page identity and opens embedded records without current retrieval', async ({ page }) => {
+  await page.goto('/?history');
+  const widget = page.frameLocator('iframe');
+  await widget.getByLabel('Search records', { exact: true }).fill(' exact ');
+  await widget.getByRole('button', { name: 'Search', exact: true }).click();
+  await widget.getByRole('button', { name: 'Next', exact: true }).click();
+  await widget.getByLabel('Search records', { exact: true }).fill('changed form');
+  await widget.getByRole('button', { name: 'Browse exact search page history' }).click();
+  const history = widget.getByRole('region', { name: 'Retained history', exact: true });
+  await history.getByRole('button', { name: /Observation 2 ·/ }).click();
+  const historical = history.getByRole('region', { name: 'Historical snapshot', exact: true });
+  await expect(historical.getByText(/Previous processor 0.9.0/)).toBeVisible();
+  await historical.getByRole('button', { name: 'Historical title 2', exact: true }).click();
+  await expect(historical.getByText('Snapshot body 2. <b>Exact text</b>')).toBeVisible();
+  await expect(historical.locator('b')).toHaveCount(0);
+  let calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  expect(calls.find((call: { name: string }) => call.name === 'demo_list_snapshots').arguments.query).toEqual({ operation: 'search', source: 'layout_a', query: ' exact ', page: 1, page_size: 5 });
+  expect(calls.filter((call: { name: string }) => call.name === 'demo_get_record')).toHaveLength(0);
+  await historical.getByRole('button', { name: 'Open current record' }).click();
+  await expect(widget.getByRole('heading', { name: 'Synthetic record 1' })).toBeVisible();
+  calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  expect(calls.at(-1)).toEqual({ name: 'demo_get_record', arguments: { source: 'layout_a', id: 'demo-1', fresh_only: false } });
+});
+
+async function openRecordHistory(page: import('@playwright/test').Page, flags = '') {
+  await page.goto(`/?history&initial${flags}`);
+  const widget = page.frameLocator('iframe');
+  await widget.getByRole('button', { name: 'Synthetic record 1', exact: true }).first().click();
+  await widget.getByRole('button', { name: 'Browse record history' }).click();
+  await widget.getByRole('button', { name: 'Use observation 3 as after' }).click();
+  await widget.getByRole('button', { name: 'Use observation 2 as before' }).click();
+  return widget;
+}
+
+test('compares selections across history pages with full origin and shared Rust diff rendering', async ({ page }) => {
+  const widget = await openRecordHistory(page);
+  await widget.getByRole('button', { name: 'Older observations' }).click();
+  await widget.getByRole('button', { name: 'Use observation 1 as before' }).click();
+  await widget.getByRole('button', { name: 'Compare snapshots' }).click();
+  const comparison = widget.getByRole('region', { name: 'Comparison result', exact: true });
+  await expect(comparison.getByRole('table', { name: /changes/ })).toBeVisible();
+  await expect(comparison.getByText('1'.repeat(64), { exact: true })).toHaveCount(2);
+  await expect(comparison.getByText('3'.repeat(64), { exact: true })).toHaveCount(2);
+  await expect(comparison.getByText('Compared text: title, two LF characters, then body. No normalization.')).toBeVisible();
+  await comparison.getByLabel('View', { exact: true }).selectOption('before');
+  await expect(comparison.locator('.source-chunk')).toHaveText('Historical title 1\n\nSnapshot body 1. <b>Exact text</b>');
+  const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  expect(calls.find((call: { name: string }) => call.name === 'demo_compare_record_snapshots').arguments).toEqual({ source: 'layout_a', id: 'demo-1', before_snapshot_id: '1'.repeat(64), after_snapshot_id: '3'.repeat(64) });
+  expect(calls.some((call: { name: string }) => call.name === 'compare_texts')).toBe(false);
+  await widget.getByRole('button', { name: 'Clear comparison', exact: true }).click();
+  await expect(comparison).toHaveCount(0);
+  await expect(widget.getByRole('button', { name: 'Use observation 1 as before' })).toBeVisible();
+});
+
+test('cancelled snapshot creation waits for its late handle and deletes it', async ({ page }) => {
+  const widget = await openRecordHistory(page, '&slowcompare');
+  await widget.getByRole('button', { name: 'Compare snapshots' }).click();
+  await expect(widget.getByRole('button', { name: 'Clear comparison', exact: true })).toBeDisabled();
+  await page.evaluate(() => window.dispatchEvent(new Event('cancel-history')));
+  await expect(widget.getByText('The cancelled comparison was deleted.')).toBeVisible();
+  await expect(widget.getByRole('region', { name: 'Comparison result', exact: true })).toHaveCount(0);
+  const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  expect(calls.filter((call: { name: string }) => call.name === 'delete_text_diff')).toHaveLength(1);
+});
+
+test('comparison deletion failure retains its handle for Clear retry', async ({ page }) => {
+  const widget = await openRecordHistory(page, '&deletefail');
+  await widget.getByRole('button', { name: 'Compare snapshots' }).click();
+  await expect(widget.getByRole('region', { name: 'Comparison result', exact: true })).toBeVisible();
+  await widget.getByRole('button', { name: 'Clear comparison', exact: true }).click();
+  await expect(widget.getByText('Clear has not completed. Retry Clear to delete the retained comparison.')).toBeVisible();
+  await widget.getByRole('button', { name: 'Clear comparison', exact: true }).click();
+  await expect(widget.getByRole('region', { name: 'Comparison result', exact: true })).toHaveCount(0);
+});
+
+test('wrong snapshot origin cannot be displayed and its handle can be cleared', async ({ page }) => {
+  const widget = await openRecordHistory(page, '&badorigin');
+  await widget.getByRole('button', { name: 'Compare snapshots' }).click();
+  await expect(widget.getByText('The retained comparison could not be opened or deleted. Retry Clear to delete it.')).toBeVisible();
+  await expect(widget.getByRole('region', { name: 'Comparison result', exact: true })).toHaveCount(0);
+  await widget.getByRole('button', { name: 'Clear comparison', exact: true }).click();
+  await expect(widget.getByRole('button', { name: 'Clear comparison', exact: true })).toHaveCount(0);
+});
+
+test('history capabilities and exact snapshot errors remain bounded and explicit', async ({ page }) => {
+  await page.goto('/?initial');
+  const widget = page.frameLocator('iframe');
+  await widget.getByRole('button', { name: 'Synthetic record 1', exact: true }).first().click();
+  await expect(widget.getByRole('button', { name: 'Browse record history' })).toHaveCount(0);
+  await page.goto('/?history&initial&nocompare&badhistory');
+  await widget.getByRole('button', { name: 'Synthetic record 1', exact: true }).first().click();
+  await widget.getByRole('button', { name: 'Browse record history' }).click();
+  await widget.getByRole('button', { name: /Observation 3 ·/ }).click();
+  await expect(widget.getByText('This retained snapshot could not be opened. Select it again to retry.')).toBeVisible();
+  await expect(widget.getByRole('button', { name: 'Compare snapshots' })).toHaveCount(0);
+});
+
+test('expired historical comparisons expose no page reads and can be recreated', async ({ page }) => {
+  const widget = await openRecordHistory(page, '&expiredcompare');
+  await widget.getByRole('button', { name: 'Compare snapshots' }).click();
+  await expect(widget.getByText('This comparison has expired. Compare again to create a new result.')).toBeVisible();
+  const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  expect(calls.some((call: { name: string }) => call.name === 'get_text_diff_page')).toBe(false);
+  await expect(widget.getByRole('button', { name: 'Compare snapshots' })).toBeEnabled();
+});
+
+test('reloading history and cancellation discard late list responses', async ({ page }) => {
+  await page.goto('/?history&initial&slowhistory');
+  const widget = page.frameLocator('iframe');
+  await widget.getByRole('button', { name: 'Synthetic record 1', exact: true }).first().click();
+  await widget.getByRole('button', { name: 'Browse record history' }).click();
+  await expect(widget.getByText('Loading retained history…')).toBeVisible();
+  await page.evaluate(() => window.dispatchEvent(new Event('cancel-history')));
+  await expect(widget.getByRole('button', { name: 'Reload history' })).toBeEnabled();
+  // The server has completed its delayed response, yet cancelled data must stay hidden.
+  await page.waitForTimeout(450);
+  await expect(widget.getByRole('button', { name: 'Use observation 3 as after' })).toHaveCount(0);
+  await widget.getByRole('button', { name: 'Reload history' }).click();
+  await expect(widget.getByRole('button', { name: 'Use observation 3 as after' })).toBeVisible();
+});
+
+test('Clear invalidates an in-flight historical comparison page', async ({ page }) => {
+  const widget = await openRecordHistory(page, '&slowpage');
+  await widget.getByRole('button', { name: 'Compare snapshots' }).click();
+  await expect(widget.getByText('Loading comparison page…')).toBeVisible();
+  await widget.getByRole('button', { name: 'Clear comparison', exact: true }).click();
+  await expect(widget.getByRole('region', { name: 'Comparison result', exact: true })).toHaveCount(0);
+  await page.waitForTimeout(350);
+  await expect(widget.getByRole('region', { name: 'Comparison result', exact: true })).toHaveCount(0);
+});
