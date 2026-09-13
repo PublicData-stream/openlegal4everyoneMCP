@@ -5,6 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod history;
 pub mod text_diff;
 
 /// A versioned operation identity. Freshness preferences are deliberately separate.
@@ -134,6 +135,8 @@ pub struct RetrievalEnvelope<T> {
     pub provenance: Provenance,
     pub freshness: Freshness,
     pub synthetic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<history::SnapshotReference>,
 }
 
 /// Monotonic, finite progress stages; no payloads, URLs or user input are carried.
@@ -151,6 +154,10 @@ pub enum ProgressStage {
 /// Sanitized outcomes. Temporary failure never establishes source absence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetrievalError {
+    StorageUnavailable,
+    StorageCorrupt,
+    StorageCapacity,
+    SnapshotUnavailable,
     InvalidInput,
     UnknownSource,
     NotFound,
@@ -179,6 +186,10 @@ impl RetrievalError {
 impl fmt::Display for RetrievalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::StorageUnavailable => "persistent storage unavailable",
+            Self::StorageCorrupt => "retained data failed integrity checks",
+            Self::StorageCapacity => "persistent storage capacity exhausted",
+            Self::SnapshotUnavailable => "snapshot is not retained",
             Self::InvalidInput => "invalid retrieval input",
             Self::UnknownSource => "unknown source",
             Self::NotFound => "record not found",

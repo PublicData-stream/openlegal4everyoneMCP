@@ -140,6 +140,56 @@ impl TextDiffService {
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<ComparisonSummary, TextDiffError> {
+        self.compare_inner(input, None, cancellation, deadline)
+            .await
+    }
+
+    /// Compare exact retained records. Only the history use case supplies these
+    /// envelopes; public supplied-text input cannot assert a snapshot origin.
+    pub async fn compare_snapshots(
+        self: &Arc<Self>,
+        before: openlegal_domain::history::SnapshotEnvelope,
+        after: openlegal_domain::history::SnapshotEnvelope,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<ComparisonSummary, TextDiffError> {
+        use openlegal_domain::{Query, RetrievalData, history::SnapshotComparisonOrigin};
+        let Query::Get { source, id } = &before.query else {
+            return Err(TextDiffError::InvalidInput);
+        };
+        if before.query != after.query || !before.synthetic || !after.synthetic {
+            return Err(TextDiffError::InvalidInput);
+        }
+        let (RetrievalData::Get(a), RetrievalData::Get(b)) = (&before.data, &after.data) else {
+            return Err(TextDiffError::InvalidInput);
+        };
+        if &a.source != source || &a.id != id || a.source != b.source || a.id != b.id {
+            return Err(TextDiffError::InvalidInput);
+        }
+        let origin = SnapshotComparisonOrigin {
+            source: source.clone(),
+            record_id: id.clone(),
+            before: before.snapshot,
+            after: after.snapshot,
+            projection: "title_lf_lf_body_v1".into(),
+        };
+        let input = CompareInput {
+            before: format!("{}\n\n{}", a.title, a.body),
+            after: format!("{}\n\n{}", b.title, b.body),
+            before_label: Some(format!("Snapshot {}", origin.before.snapshot_id)),
+            after_label: Some(format!("Snapshot {}", origin.after.snapshot_id)),
+        };
+        self.compare_inner(input, Some(origin), cancellation, deadline)
+            .await
+    }
+
+    async fn compare_inner(
+        self: &Arc<Self>,
+        input: CompareInput,
+        origin: Option<openlegal_domain::history::SnapshotComparisonOrigin>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<ComparisonSummary, TextDiffError> {
         let before_info = text_info(
             &input.before,
             input.before_label.as_deref().unwrap_or("Before"),
@@ -249,8 +299,13 @@ impl TextDiffService {
                         deletions,
                         equal,
                         change_pages: changes.len(),
+                        origin,
                     };
-                    let bytes = retained_bytes(&before, &after, &changes, changes.capacity())?;
+                    let origin_bytes = serde_json::to_vec(&summary.origin)
+                        .map_err(|_| TextDiffError::Internal)?
+                        .len();
+                    let bytes = retained_bytes(&before, &after, &changes, changes.capacity())?
+                        + origin_bytes;
                     if bytes > JOB_RESERVATION {
                         return Err(TextDiffError::ResourceLimit);
                     }

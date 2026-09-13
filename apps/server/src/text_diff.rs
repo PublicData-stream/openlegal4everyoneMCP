@@ -142,7 +142,7 @@ async fn compare(
     Ok(summary)
 }
 
-fn map_error(error: TextDiffError) -> ToolError {
+pub(crate) fn map_error(error: TextDiffError) -> ToolError {
     match error {
         TextDiffError::InvalidInput => ToolError::InvalidInput,
         TextDiffError::NotFound => ToolError::NotFound,

@@ -3,6 +3,7 @@
 //! One service is intended for one backend process. Replicas require a separate
 //! deployment-wide coordination design. Adapters never add their own retry loops.
 
+pub mod persistence;
 mod service;
 pub mod text_diff;
 pub use service::{CacheKey, CacheStore, MetricsSnapshot, RetrievalService, StoredPayload};

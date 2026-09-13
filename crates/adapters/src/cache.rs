@@ -117,6 +117,7 @@ mod tests {
     }
     fn payload(bytes: usize, at: u64) -> Arc<StoredPayload> {
         Arc::new(StoredPayload {
+            snapshot: None,
             data: RetrievalData::Get(Record {
                 source: "layout_a".into(),
                 id: "001".into(),

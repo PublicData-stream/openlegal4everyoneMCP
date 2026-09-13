@@ -17,7 +17,9 @@ to each accepted result by its payload digest.
 `RetrievalService` owns cache decisions, shared refreshes, retries, provider limits,
 and publication. `Upstream` supplies a narrow fetch operation. Concrete HTTP
 adapters implement that operation and invoke pure processing. `CacheStore` owns
-storage mechanics without deciding freshness. Source registrations bind the
+L1 mechanics without deciding freshness. The asynchronous `PersistentStore` port
+provides optional filesystem L2 and immutable captured history; see the
+[filesystem contract](filesystem-cache.md). Source registrations bind the
 source, provider, dataset, processor version, and adapter before serving.
 
 MCP tools invoke one shared service across HTTP and WebTransport. Widget requests
@@ -35,7 +37,7 @@ quotas. A real source must choose and review its own policy before onboarding.
 | Fresh age | Less than 60 seconds since successful validation |
 | Stale fallback | Only after transient refresh failure, at most 300 seconds since validation |
 | Memory cache | 256 entries or 32 MiB, including retained source bodies |
-| Evidence retention | Evict source and processed data together after 300 seconds or LRU pressure |
+| L1 evidence retention | Evict source and processed data together after 300 seconds or LRU pressure; optional L2 retention is separate |
 | Provider concurrency | Two requests |
 | Request starts | Two per second, burst two; all retries included |
 | Refresh deadline | Ten seconds total; five seconds per attempt; at most two attempts |
@@ -49,8 +51,10 @@ rate token only within its deadline. A bounded provider cooldown honors
 `Retry-After`; it is not a cached claim of absence. There is no background crawler,
 negative cache, conditional revalidation, incremental feed, or attachment fetch.
 An unrepresentable `Retry-After` pauses that provider until reconstruction instead
-of retrying early. Maintenance sweeps expired evidence once per second; lookup
-never serves beyond the 300-second limit. In-flight payloads have separate bounded
+of retrying early. L1 maintenance sweeps expired evidence once per second; ordinary
+current retrieval never serves beyond the 300-second validation-age limit. Optional
+L2 maintenance runs every 60 seconds, with capture retention enforced on reads;
+explicit historical retrieval can return captures older than 300 seconds. In-flight payloads have separate bounded
 request lifetimes and are not part of the cache-capacity gauge.
 
 Keys distinguish source/provider, dataset, operation, every selector and page,
@@ -61,10 +65,14 @@ explicitly marked, and a fresh-only call never silently accepts it.
 
 Each waiter owns its cancellation and deadline. One waiter leaving does not cancel
 others; the last waiter cancels the operation. A refresh has its own ten-second
-deadline. Generation checks prevent obsolete or canceled work from publishing.
+deadline. Generation checks prevent obsolete work from publishing. With L2, cancellation
+before commit authorization prevents publication; an authorized disk transaction
+may survive a cancelled caller and be reconciled during recovery.
 Shutdown stops admission and joins owned jobs before completing.
 
-The memory cache is process-local and empty after restart. Raw evidence expires
+The memory cache is process-local and empty after restart. Optional L2 lazily
+repopulates it from validated retained captures; its separate retention and worker
+lifecycle are documented in the [filesystem contract](filesystem-cache.md). In memory-only mode raw evidence expires
 with its entry; a digest is not a substitute for retained bytes or a permanent
 archive. Multiple processes must not be enabled without the deployment-wide
 coordination required by the upstream policy.

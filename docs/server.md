@@ -249,3 +249,21 @@ Host allowlists are explicit. Native clients may omit Origin; an empty Origin
 allowlist rejects every present Origin. Forwarded headers do not establish identity.
 The server suppresses SDK payload logs, including when `RUST_LOG` is configured,
 and logs only bounded operational events. Public read-only tools need no secrets.
+
+## Optional filesystem L2
+
+`[cache.filesystem]` supplies `path`, `retention_days` (30), `max_bytes` (1 GiB),
+and `max_snapshots_per_query` (100). It requires a registered retrieval source.
+The [filesystem contract](filesystem-cache.md) defines isolated worker startup,
+exclusive ownership, recovery, current-cache behavior and history interfaces.
+Startup validates the configured root before listeners admit traffic. Memory-only
+configurations remain supported. New sanitized tool errors are `storage_unavailable`,
+`storage_corrupt`, `storage_capacity`, and `snapshot_unavailable`.
+
+L2 enables `demo_list_snapshots` and `demo_get_snapshot`; adding `[text_diff]` also
+enables `demo_compare_record_snapshots`. Current result envelopes optionally include
+`snapshot`; historical responses use a separate envelope. Demo render results
+advertise history/comparison capability flags and source processor versions.
+Comparison summaries optionally carry server-derived `origin` metadata. These
+additions apply equally to both transports. Existing widget resources and source
+metadata requirements remain unchanged.

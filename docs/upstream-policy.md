@@ -34,7 +34,9 @@ The [Korean profile](providers/kr-law-go-kr.md) is the initial example.
 Use backend-local reusable caching; choose memory/persistence technology during
 implementation. Document restart behavior and keep cold starts within the same
 request budget. Persistence may reduce repeated retrieval, but a particular
-database or a permanent archive is not mandated.
+database or a permanent archive is not mandated. The optional
+[filesystem L2](filesystem-cache.md) implements bounded immutable local captures,
+with separate current-serving freshness and historical retention.
 
 Keys must distinguish all dimensions affecting the result: provider, dataset,
 record or query identity, revision/date selector, language/representation,

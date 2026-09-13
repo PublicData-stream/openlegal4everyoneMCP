@@ -111,17 +111,25 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
                 .await
                 .unwrap();
         });
-        let service = openlegal_server::demo::service(&source_url).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = openlegal_adapters::persistent::FsCache::open(
+            std::path::Path::new(env!("CARGO_BIN_EXE_openlegal-server")),
+            &dir.path().join("cache"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let service = openlegal_server::demo::service_with_store(&source_url, store).unwrap();
         let mut registry = openlegal_server::registry::server_info_registry(
             openlegal_server::config::SourceOffer::new("https://source.test/running").unwrap(),
         )
         .unwrap();
         registry
             .register_module(DemoTools {
+                comparison: None,
                 service: service.clone(),
             })
             .unwrap();
-        let dir = tempfile::tempdir().unwrap();
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
                 .unwrap();
@@ -356,10 +364,89 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
             show.last().unwrap()["result"]["structuredContent"]["records"][0]["data"]["id"],
             "001"
         );
+        let snapshot_id = a["snapshot"]["snapshot_id"].as_str().unwrap();
+        let history_query =
+            json!({"operation":"search", "source":"layout_a", "query":"", "page":0, "page_size":5});
+        let before_history = count.load(Ordering::SeqCst);
+        let listing = http(
+            &http_url,
+            version,
+            "tools/call",
+            params(
+                version,
+                "history-list",
+                json!({"name":"demo_list_snapshots", "arguments":{"query":history_query}}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            listing.last().unwrap()["result"]["structuredContent"]["snapshots"][0]["snapshot_id"],
+            snapshot_id
+        );
+        let exact_params = params(
+            version,
+            "history-get",
+            json!({"name":"demo_get_snapshot", "arguments":{"query":history_query, "snapshot_id":snapshot_id}}),
+        );
+        let exact = http(&http_url, version, "tools/call", exact_params.clone()).await;
+        assert_progress(&exact);
+        let historical = &exact.last().unwrap()["result"]["structuredContent"];
+        assert_eq!(historical["historical"], true);
+        assert_eq!(historical["data"], a["data"]);
+        assert!(historical.get("freshness").is_none());
+        write_json(
+            &mut tx,
+            &json!({"jsonrpc":"2.0","id":14,"method":"tools/call","params":exact_params}),
+            1024 * 1024,
+            &budget,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let wt_history = wt_reply(&mut rx, 14).await;
+        assert_progress(&wt_history);
+        assert_eq!(
+            &wt_history.last().unwrap()["result"]["structuredContent"],
+            historical
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            before_history,
+            "history never fetches upstream"
+        );
         connection.close(0u32.into(), b"done");
         client.close(0u32.into(), b"done");
         shutdown.cancel();
         running.await.unwrap().unwrap();
+        let reopened = openlegal_adapters::persistent::FsCache::open(
+            std::path::Path::new(env!("CARGO_BIN_EXE_openlegal-server")),
+            &dir.path().join("cache"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let restarted = openlegal_server::demo::service_with_store(&source_url, reopened).unwrap();
+        let disk_hit = restarted
+            .retrieve(
+                openlegal_domain::Query::Search {
+                    source: "layout_a".into(),
+                    query: "".into(),
+                    page: 0,
+                    page_size: 5,
+                },
+                openlegal_domain::FreshnessRequirement::FreshOnly,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(disk_hit.snapshot.unwrap().snapshot_id, snapshot_id);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            before_history,
+            "restart reuses fresh durable capture"
+        );
+        restarted.shutdown().await.unwrap();
         stop.cancel();
         upstream.await.unwrap();
         assert!(

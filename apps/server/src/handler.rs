@@ -243,6 +243,10 @@ impl ServerHandler for McpHandler {
                     Ok(Err(error)) => {
                         self.counters.failures.fetch_add(1, Ordering::Relaxed);
                         let (code, message) = match error {
+                            ToolError::StorageUnavailable => ("storage_unavailable", "Persistent storage is temporarily unavailable."),
+                            ToolError::StorageCorrupt => ("storage_corrupt", "Retained data failed integrity checks."),
+                            ToolError::StorageCapacity => ("storage_capacity", "Persistent storage capacity is exhausted."),
+                            ToolError::SnapshotUnavailable => ("snapshot_unavailable", "The exact snapshot is not retained."),
                             ToolError::NotFound => ("not_found", "Requested data was not found."),
                             ToolError::Unavailable => ("unavailable", "Service is temporarily unavailable."),
                             ToolError::RateLimited => ("rate_limited", "Request rate limit exceeded."),

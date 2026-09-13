@@ -18,6 +18,10 @@ pub struct ToolContext {
 /// Public, sanitized failures. Keep provider errors and diagnostics inside the module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolError {
+    StorageUnavailable,
+    StorageCorrupt,
+    StorageCapacity,
+    SnapshotUnavailable,
     InvalidInput,
     NotFound,
     Unavailable,

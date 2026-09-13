@@ -56,6 +56,8 @@ pub struct ComparisonSummary {
     pub deletions: usize,
     pub equal: bool,
     pub change_pages: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::history::SnapshotComparisonOrigin>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]

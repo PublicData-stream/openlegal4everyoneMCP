@@ -91,7 +91,9 @@ They expose enough retrieval metadata for transports to honor the
 [freshness contract](upstream-policy.md#freshness-and-failure-behavior).
 
 The [retrieval contract](retrieval.md) documents implemented source registration,
-processing, memory storage, and service lifecycle. Crate boundaries separate
+processing, memory storage, and service lifecycle. Optional [filesystem L2](filesystem-cache.md)
+adds an asynchronous application storage port and a supervised child adapter; all
+filesystem work stays outside the parent runtime and application state lock. Crate boundaries separate
 processors from application and adapter dependencies; trusted implementations
 must obey the side-effect contract. HTTP/storage mechanics remain replaceable. Synthetic
 demonstrations do not introduce a second model of real law.

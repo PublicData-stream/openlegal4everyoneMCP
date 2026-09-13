@@ -17,6 +17,10 @@ fn main() -> Result<(), ServerError> {
         openlegal_adapters::text_diff::run_worker()?;
         return Ok(());
     }
+    if path == "--cache-worker" {
+        openlegal_adapters::persistent::run_worker()?;
+        return Ok(());
+    }
     run_server(path)
 }
 
@@ -41,97 +45,131 @@ async fn run_server(path: std::ffi::OsString) -> Result<(), ServerError> {
             service: service.clone(),
         })?;
     }
-    let demo_service = config
-        .demo
-        .as_ref()
-        .map(|demo| openlegal_server::demo::service(&demo.upstream))
-        .transpose()?;
-    if let Some(service) = &demo_service {
-        registry.register_module(openlegal_server::demo::DemoTools {
-            service: service.clone(),
-        })?;
-    }
-    let mut resources = openlegal_server::resources::ResourceRegistry::new();
-    if let Some(demo) = &config.demo {
-        resources.extend(
-            openlegal_server::demo::load_widget(&demo.widget_html, &config.source.url).await?,
-        )?;
-    }
-    if let Some(diff) = &config.text_diff {
-        resources.extend(
-            openlegal_server::text_diff::load_widget(&diff.widget_html, &config.source.url).await?,
-        )?;
-    }
-    let mut builder = ServerBuilder::new(registry, config.limits, config.source.url.clone())
-        .with_resources(resources);
-    if let Some(service) = &diff_service {
-        let service = service.clone();
-        builder.register_worker("text_diff", move |shutdown| async move {
-            service.run(shutdown).await?;
-            Ok(())
-        })?;
-    }
-    if let Some(service) = &demo_service {
-        let service = service.clone();
-        builder.register_worker("retrieval", move |shutdown| async move {
-            service.run(shutdown).await?;
-            Ok(())
-        })?;
-    }
-    builder.register_endpoint(HttpEndpoint {
-        bind: config.http.bind,
-        access: AccessPolicy {
-            allowed_hosts: config.http.allowed_hosts,
-            allowed_origins: config.http.allowed_origins,
-        },
-    })?;
-    builder.register_endpoint(WebTransportEndpoint {
-        bind: config.webtransport.bind,
-        certificate: config.webtransport.certificate,
-        private_key: config.webtransport.private_key,
-        access: AccessPolicy {
-            allowed_hosts: config.webtransport.allowed_hosts,
-            allowed_origins: config.webtransport.allowed_origins,
-        },
-    })?;
-    let health = HealthEndpoint {
-        bind: config.health.bind,
-    };
-    if demo_service.is_some() || diff_service.is_some() {
-        builder.register_endpoint(health.with_metrics(move || {
-            let mut metrics = String::new();
-            if let Some(service) = &demo_service {
-                metrics.push_str(&service.metrics_prometheus());
-            }
-            if let Some(service) = &diff_service {
-                metrics.push_str(&service.metrics_prometheus());
-            }
-            metrics
-        }))?;
-    } else {
-        builder.register_endpoint(health)?;
-    }
-    let server = builder.bind().await?;
-    for (id, addresses) in server.addresses() {
-        tracing::info!(endpoint = id, ?addresses, "listener bound");
-    }
-    let shutdown = CancellationToken::new();
-    let signal_token = shutdown.clone();
-    let signal_task = tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            tokio::select! { result = tokio::signal::ctrl_c() => result?, _ = terminate.recv() => {} }
+    let persistent = if let Some(cache) = &config.cache {
+        if config.demo.is_none() {
+            return Err("filesystem cache requires a registered retrieval source".into());
         }
-        #[cfg(not(unix))]
-        tokio::signal::ctrl_c().await?;
-        signal_token.cancel();
-        Ok::<_, std::io::Error>(())
-    });
-    let result = server.run(shutdown).await;
-    signal_task.abort();
-    let _ = signal_task.await;
+        Some(
+            openlegal_adapters::persistent::FsCache::open(
+                &std::env::current_exe()?,
+                &std::path::absolute(&cache.filesystem.path)?,
+                cache.filesystem.policy()?,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let result: Result<(), ServerError> = async {
+        let demo_service = config
+            .demo
+            .as_ref()
+            .map(|demo| {
+                if let Some(store) = &persistent {
+                    openlegal_server::demo::service_with_store(&demo.upstream, store.clone())
+                } else {
+                    openlegal_server::demo::service(&demo.upstream)
+                }
+            })
+            .transpose()?;
+        if let Some(service) = &demo_service {
+            registry.register_module(openlegal_server::demo::DemoTools {
+                service: service.clone(),
+                comparison: diff_service.clone(),
+            })?;
+        }
+        let mut resources = openlegal_server::resources::ResourceRegistry::new();
+        if let Some(demo) = &config.demo {
+            resources.extend(
+                openlegal_server::demo::load_widget(&demo.widget_html, &config.source.url).await?,
+            )?;
+        }
+        if let Some(diff) = &config.text_diff {
+            resources.extend(
+                openlegal_server::text_diff::load_widget(&diff.widget_html, &config.source.url).await?,
+            )?;
+        }
+        let mut builder = ServerBuilder::new(registry, config.limits, config.source.url.clone())
+            .with_resources(resources);
+        if let Some(service) = &diff_service {
+            let service = service.clone();
+            builder.register_worker("text_diff", move |shutdown| async move {
+                service.run(shutdown).await?;
+                Ok(())
+            })?;
+        }
+        if let Some(service) = &demo_service {
+            let service = service.clone();
+            builder.register_worker("retrieval", move |shutdown| async move {
+                service.run(shutdown).await?;
+                Ok(())
+            })?;
+        }
+        builder.register_endpoint(HttpEndpoint {
+            bind: config.http.bind,
+            access: AccessPolicy {
+                allowed_hosts: config.http.allowed_hosts,
+                allowed_origins: config.http.allowed_origins,
+            },
+        })?;
+        builder.register_endpoint(WebTransportEndpoint {
+            bind: config.webtransport.bind,
+            certificate: config.webtransport.certificate,
+            private_key: config.webtransport.private_key,
+            access: AccessPolicy {
+                allowed_hosts: config.webtransport.allowed_hosts,
+                allowed_origins: config.webtransport.allowed_origins,
+            },
+        })?;
+        let health = HealthEndpoint {
+            bind: config.health.bind,
+        };
+        if demo_service.is_some() || diff_service.is_some() {
+            builder.register_endpoint(health.with_metrics(move || {
+                let mut metrics = String::new();
+                if let Some(service) = &demo_service {
+                    metrics.push_str(&service.metrics_prometheus());
+                }
+                if let Some(service) = &diff_service {
+                    metrics.push_str(&service.metrics_prometheus());
+                }
+                metrics
+            }))?;
+        } else {
+            builder.register_endpoint(health)?;
+        }
+        let server = builder.bind().await?;
+        for (id, addresses) in server.addresses() {
+            tracing::info!(endpoint = id, ?addresses, "listener bound");
+        }
+        let shutdown = CancellationToken::new();
+        let signal_token = shutdown.clone();
+        let signal_task = tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                let mut terminate =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+                tokio::select! { result = tokio::signal::ctrl_c() => result?, _ = terminate.recv() => {} }
+            }
+            #[cfg(not(unix))]
+            tokio::signal::ctrl_c().await?;
+            signal_token.cancel();
+            Ok::<_, std::io::Error>(())
+        });
+        let result = server.run(shutdown).await;
+        signal_task.abort();
+        let _ = signal_task.await;
+        result
+    }
+    .await;
+    // Every startup and serving exit owns child cleanup, including bind/widget errors.
+    if let Some(store) = persistent {
+        use openlegal_application::persistence::PersistentStore;
+        let closed = store.close().await;
+        if result.is_ok() {
+            closed?;
+        }
+    }
     result
 }
 

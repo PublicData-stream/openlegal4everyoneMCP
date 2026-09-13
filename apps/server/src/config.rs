@@ -156,6 +156,51 @@ pub struct Config {
     /// Optional text comparison; independent of synthetic upstream configuration.
     #[serde(default)]
     pub text_diff: Option<TextDiffConfig>,
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    pub filesystem: FilesystemCacheConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemCacheConfig {
+    pub path: PathBuf,
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+    #[serde(default = "default_cache_bytes")]
+    pub max_bytes: u64,
+    #[serde(default = "default_snapshot_count")]
+    pub max_snapshots_per_query: usize,
+}
+fn default_retention_days() -> u64 {
+    30
+}
+fn default_cache_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_snapshot_count() -> usize {
+    100
+}
+impl FilesystemCacheConfig {
+    pub fn policy(
+        &self,
+    ) -> Result<openlegal_application::persistence::RetentionPolicy, ServerError> {
+        if self.path.as_os_str().is_empty() {
+            return Err("filesystem cache requires a path".into());
+        }
+        let policy = openlegal_application::persistence::RetentionPolicy {
+            retention_days: self.retention_days,
+            max_bytes: self.max_bytes,
+            max_snapshots_per_query: self.max_snapshots_per_query,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -343,5 +388,37 @@ mod text_diff_config_tests {
         );
         config.widget_html = "".into();
         assert!(config.validate(&limits).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cache_config_tests {
+    use super::*;
+
+    #[test]
+    fn filesystem_limits_are_explicit_bounded_and_existing_configuration_is_optional() {
+        let config: FilesystemCacheConfig = toml::from_str("path = 'cache'").unwrap();
+        let policy = config.policy().unwrap();
+        assert_eq!(policy.retention_days, 30);
+        assert_eq!(policy.max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(policy.max_snapshots_per_query, 100);
+        for bad in [
+            "path = ''",
+            "path = 'cache'\nretention_days = 0",
+            "path = 'cache'\nmax_bytes = 1",
+            "path = 'cache'\nmax_snapshots_per_query = 1001",
+        ] {
+            assert!(
+                toml::from_str::<FilesystemCacheConfig>(bad)
+                    .unwrap()
+                    .policy()
+                    .is_err()
+            );
+        }
+        assert!(toml::from_str::<FilesystemCacheConfig>("path = 'cache'\nshared = true").is_err());
+        let demo: Config =
+            toml::from_str(include_str!("../../../deploy/demo/server.toml")).unwrap();
+        demo.cache.unwrap().filesystem.policy().unwrap();
+        demo.text_diff.unwrap().validate(&demo.limits).unwrap();
     }
 }

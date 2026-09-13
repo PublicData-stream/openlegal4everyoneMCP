@@ -54,6 +54,7 @@ impl Server {
         if let Some(demo) = &demo_service {
             registry
                 .register_module(DemoTools {
+                    comparison: None,
                     service: demo.clone(),
                 })
                 .unwrap();

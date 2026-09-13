@@ -23,3 +23,5 @@ pub type ServerError = Box<dyn std::error::Error + Send + Sync>;
 
 pub use endpoint::ServerBuilder;
 pub use registry::{ToolModule, ToolRegistry};
+
+mod history;

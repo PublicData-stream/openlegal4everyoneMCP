@@ -136,3 +136,19 @@ associated exact BSD license exceptions are removed. Remaining third-party
 notices are bundled locally; the source-offer marker and existing asset ceilings
 remain enforced. The frozen graph receives current advisory/license checks, and
 only esbuild's installation script remains enabled.
+
+## Filesystem persistence additions
+
+`rustix` 1.1.4, already in the lockfile, becomes a direct adapter dependency with
+its filesystem and process APIs (including effective-user ownership checks).
+Safe directory-relative descriptors, nofollow opens and
+atomic rename support avoid a first-party unsafe wrapper or race-prone path checks.
+Source: crates.io / Bytecode Alliance; license choice MIT or Apache-2.0. Its build
+script selects platform configuration; Linux syscall implementations contain
+upstream unsafe code, without introducing a first-party exception. This filesystem
+boundary requires independent review and failure-injection tests in addition to
+current advisory/license admission. The alternatives were raw libc bindings or a
+larger capability-filesystem abstraction. Existing Serde and SHA-256 dependencies
+also support bounded metadata and envelope integrity; the raw payload remains a
+binary section to avoid JSON byte-array expansion. SHA-256 provides evidence
+linkage/corruption detection, not source authentication.

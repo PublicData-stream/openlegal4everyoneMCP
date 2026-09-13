@@ -26,7 +26,7 @@ pub const WIDGET_URI: &str = "ui://openlegal-demo/records-v1.html";
 pub const WIDGET_MIME: &str = "text/html;profile=mcp-app";
 
 /// Both layouts share provider budgets while retaining distinct source/cache identity.
-pub fn service(upstream: &str) -> Result<Arc<RetrievalService>, RetrievalError> {
+fn sources(upstream: &str) -> Result<Vec<Source>, RetrievalError> {
     let mut sources = Vec::new();
     for (id, processor) in [
         (
@@ -50,9 +50,34 @@ pub fn service(upstream: &str) -> Result<Arc<RetrievalService>, RetrievalError> 
             )?),
         });
     }
+    Ok(sources)
+}
+
+pub fn service(upstream: &str) -> Result<Arc<RetrievalService>, RetrievalError> {
     RetrievalService::new(
-        sources,
+        sources(upstream)?,
         Box::new(openlegal_adapters::MemoryCache::default()),
+    )
+}
+
+/// The configured origin participates in durable identity, independently of query text.
+pub fn service_with_store(
+    upstream: &str,
+    store: Arc<dyn openlegal_application::persistence::PersistentStore>,
+) -> Result<Arc<RetrievalService>, RetrievalError> {
+    use sha2::{Digest, Sha256};
+    let sources = sources(upstream)?;
+    let origin = url::Url::parse(upstream).map_err(|_| RetrievalError::InvalidInput)?;
+    let namespace = Sha256::digest(origin.as_str().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    RetrievalService::with_persistence(
+        sources,
+        Arc::new(openlegal_application::SystemClock::default()),
+        Box::new(openlegal_adapters::MemoryCache::default()),
+        store,
+        namespace,
     )
 }
 
@@ -122,6 +147,7 @@ struct ShowInput {
 
 #[derive(Serialize, JsonSchema)]
 struct ShowOutput {
+    capabilities: DemoCapabilities,
     records: Vec<RetrievalEnvelope<RetrievalData>>,
     synthetic: bool,
 }
@@ -129,10 +155,24 @@ struct ShowOutput {
 /// A compiled module; every operation uses the same application instance.
 pub struct DemoTools {
     pub service: Arc<RetrievalService>,
+    pub comparison: Option<Arc<openlegal_application::text_diff::TextDiffService>>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct DemoCapabilities {
+    history: bool,
+    comparison: bool,
+    processor_versions: std::collections::BTreeMap<String, String>,
 }
 
 impl ToolModule for DemoTools {
     fn register(self, registry: &mut ToolRegistry) -> Result<(), ServerError> {
+        let history_enabled = self.service.history_enabled();
+        let comparison_enabled = history_enabled && self.comparison.is_some();
+        let processor_versions = self.service.source_processor_versions();
+        if history_enabled {
+            super::history::register(registry, self.service.clone(), self.comparison)?;
+        }
         let search_service = self.service.clone();
         registry.register_typed::<SearchInput, RetrievalEnvelope<RetrievalData>, _, _>(
             "demo_search_records",
@@ -171,6 +211,7 @@ impl ToolModule for DemoTools {
             options,
             move |input, context| {
                 let service = self.service.clone();
+                let processor_versions = processor_versions.clone();
                 async move {
                     let queries: Vec<_> = input.records.into_iter().map(|record| Query::Get {
                         source: record.source.id(), id: record.id,
@@ -189,7 +230,10 @@ impl ToolModule for DemoTools {
                             .map_err(|_| ToolError::ResourceLimit)?;
                     }
                     context.progress.report(ProgressStage::Complete).await?;
-                    Ok(ToolOutput::new(ShowOutput { records, synthetic: true }))
+                    Ok(ToolOutput::new(ShowOutput { records, synthetic: true, capabilities: DemoCapabilities {
+                        history: history_enabled, comparison: comparison_enabled,
+                        processor_versions: processor_versions.clone(),
+                    } }))
                 }
             },
         )
@@ -247,8 +291,12 @@ async fn retrieve(
     }
 }
 
-fn map_error(error: RetrievalError) -> ToolError {
+pub(crate) fn map_error(error: RetrievalError) -> ToolError {
     match error {
+        RetrievalError::StorageUnavailable => ToolError::StorageUnavailable,
+        RetrievalError::StorageCorrupt => ToolError::StorageCorrupt,
+        RetrievalError::StorageCapacity => ToolError::StorageCapacity,
+        RetrievalError::SnapshotUnavailable => ToolError::SnapshotUnavailable,
         RetrievalError::InvalidInput | RetrievalError::UnknownSource => ToolError::InvalidInput,
         RetrievalError::NotFound => ToolError::NotFound,
         RetrievalError::Ambiguous => ToolError::Ambiguous,

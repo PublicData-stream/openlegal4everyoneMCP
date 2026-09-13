@@ -1,3 +1,4 @@
+use crate::persistence::{PersistentStore, StorageMetrics};
 use crate::{
     Clock, FRESH_SECONDS, FetchedPayload, MAX_PROCESSED_BYTES, MAX_RAW_BYTES, RETENTION_SECONDS,
     Source, SystemClock,
@@ -22,11 +23,15 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "service/persistent.rs"]
+mod persistent;
+
 const MAX_IN_FLIGHT: usize = 32;
 const MAX_WAITERS_PER_KEY: usize = 16;
 const MAX_WAITERS: usize = 64;
 const REFRESH_DEADLINE: Duration = Duration::from_secs(10);
 const ATTEMPT_DEADLINE: Duration = Duration::from_secs(5);
+const FILESYSTEM_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
@@ -60,6 +65,7 @@ pub struct StoredPayload {
     // Raw evidence lives and is evicted atomically with this result.
     pub raw: Vec<u8>,
     pub bytes: usize,
+    pub snapshot: Option<openlegal_domain::history::SnapshotReference>,
 }
 /// Storage mechanics only; freshness and retention cutoffs are supplied by the service.
 /// Implementations publish/evict the entire evidence/result envelope atomically,
@@ -72,11 +78,12 @@ pub trait CacheStore: Send + 'static {
     fn stats(&self) -> (usize, usize);
 }
 type Outcome = Result<Arc<StoredPayload>, RetrievalError>;
+type PublishedOutcome = Result<(Arc<StoredPayload>, Option<u64>), RetrievalError>;
 struct Flight {
     generation: u64,
     waiters: usize,
     cancellation: CancellationToken,
-    outcome: watch::Sender<Option<Outcome>>,
+    outcome: watch::Sender<Option<PublishedOutcome>>,
     progress: watch::Sender<ProgressStage>,
 }
 struct State {
@@ -85,6 +92,7 @@ struct State {
     waiters: usize,
     generation: u64,
     stopping: bool,
+    storage_epoch: u64,
 }
 struct Rate {
     tokens: f64,
@@ -128,6 +136,7 @@ pub struct MetricsSnapshot {
     pub cache_bytes: usize,
     pub in_flight: usize,
     pub waiters: usize,
+    pub filesystem: StorageMetrics,
 }
 
 pub struct RetrievalService {
@@ -139,9 +148,19 @@ pub struct RetrievalService {
     shutdown: CancellationToken,
     failed: AtomicBool,
     counters: Counters,
+    persistence: Option<Arc<dyn PersistentStore>>,
+    namespace: String,
 }
 
 impl RetrievalService {
+    /// Bounded startup registration metadata for capability descriptions.
+    pub fn source_processor_versions(&self) -> std::collections::BTreeMap<String, String> {
+        self.sources
+            .iter()
+            .map(|(id, source)| (id.clone(), source.processor_version.clone()))
+            .collect()
+    }
+
     pub fn new(
         sources: Vec<Source>,
         cache: Box<dyn CacheStore>,
@@ -153,6 +172,30 @@ impl RetrievalService {
         sources: Vec<Source>,
         clock: Arc<dyn Clock>,
         cache: Box<dyn CacheStore>,
+    ) -> Result<Arc<Self>, RetrievalError> {
+        Self::build(sources, clock, cache, None, String::new())
+    }
+
+    pub fn with_persistence(
+        sources: Vec<Source>,
+        clock: Arc<dyn Clock>,
+        cache: Box<dyn CacheStore>,
+        store: Arc<dyn PersistentStore>,
+        namespace: String,
+    ) -> Result<Arc<Self>, RetrievalError> {
+        if !valid_identifier(&namespace, 128) || !store.healthy() {
+            return Err(RetrievalError::InvalidInput);
+        }
+        store.policy().validate()?;
+        Self::build(sources, clock, cache, Some(store), namespace)
+    }
+
+    fn build(
+        sources: Vec<Source>,
+        clock: Arc<dyn Clock>,
+        cache: Box<dyn CacheStore>,
+        persistence: Option<Arc<dyn PersistentStore>>,
+        namespace: String,
     ) -> Result<Arc<Self>, RetrievalError> {
         if sources.is_empty() || sources.len() > 32 {
             return Err(RetrievalError::InvalidInput);
@@ -193,23 +236,34 @@ impl RetrievalService {
                 waiters: 0,
                 generation: 0,
                 stopping: false,
+                storage_epoch: persistence.as_ref().map_or(0, |store| store.epoch()),
             }),
             jobs: Mutex::new(JoinSet::new()),
             shutdown: CancellationToken::new(),
             failed: AtomicBool::new(false),
             counters: Counters::default(),
+            persistence,
+            namespace,
         });
         let weak = Arc::downgrade(&service);
         let token = service.shutdown.clone();
         service.jobs.lock().map_err(|_| RetrievalError::Internal)?.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let mut filesystem_maintenance_at = Instant::now() + FILESYSTEM_MAINTENANCE_INTERVAL;
             loop {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => break,
                     _ = interval.tick() => {
                         let Some(service) = weak.upgrade() else { break };
-                        if let Ok(mut state) = service.state.lock() { expire(&mut state, service.clock.now()); }
+                        if let Some(store) = &service.persistence
+                            && Instant::now() >= filesystem_maintenance_at {
+                            filesystem_maintenance_at = Instant::now() + FILESYSTEM_MAINTENANCE_INTERVAL;
+                            // The storage port owns bounded cleanup; never drop its active future.
+                            let result = store.maintain(service.clock.now()).await;
+                            if result.is_err() && !store.healthy() { service.fail_storage(); }
+                        }
+                        if let Ok(mut state) = service.state.lock() { service.sync_epoch(&mut state); expire(&mut state, service.clock.now()); }
                         if let Ok(mut jobs) = service.jobs.lock() {
                             while let Some(joined) = jobs.try_join_next() {
                                 if joined.is_err() { service.failed.store(true, Ordering::Relaxed); service.shutdown.cancel(); }
@@ -249,14 +303,16 @@ impl RetrievalService {
             if state.stopping || self.shutdown.is_cancelled() {
                 return Err(RetrievalError::Shutdown);
             }
+            self.sync_epoch(&mut state);
+            if !self.storage_healthy() {
+                return Err(RetrievalError::StorageUnavailable);
+            }
             expire(&mut state, self.clock.now());
             let cached = state.cache.get(&key);
             if let Some(value) = &cached
                 && self
-                    .clock
-                    .now()
-                    .saturating_sub(value.provenance.validated_at)
-                    < FRESH_SECONDS
+                    .usable_age(value)
+                    .is_some_and(|age| age < FRESH_SECONDS)
             {
                 self.counters.hits.fetch_add(1, Ordering::Relaxed);
                 if let Some(sender) = &progress {
@@ -270,6 +326,9 @@ impl RetrievalService {
             }
             let existing = state.flights.get_mut(&key);
             let (rx, stage, generation) = if let Some(flight) = existing {
+                if flight.cancellation.is_cancelled() {
+                    return Err(self.busy());
+                }
                 if flight.waiters >= MAX_WAITERS_PER_KEY {
                     return Err(self.busy());
                 }
@@ -289,13 +348,26 @@ impl RetrievalService {
                     .get(&source.provider)
                     .ok_or(RetrievalError::Internal)?
                     .clone();
-                let permit = provider
-                    .active
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| self.busy())?;
+                // Memory-only admission remains unchanged. L2 gets its own bounded
+                // flight before acquiring scarce upstream concurrency.
+                let permit = if self.persistence.is_none() {
+                    Some(
+                        provider
+                            .active
+                            .clone()
+                            .try_acquire_owned()
+                            .map_err(|_| self.busy())?,
+                    )
+                } else {
+                    None
+                };
                 let (outcome, rx) = watch::channel(None);
-                let (stage_sender, stage) = watch::channel(ProgressStage::Refreshing);
+                let initial_stage = if self.persistence.is_some() {
+                    ProgressStage::Accepted
+                } else {
+                    ProgressStage::Refreshing
+                };
+                let (stage_sender, stage) = watch::channel(initial_stage);
                 let token = self.shutdown.child_token();
                 state.generation = state.generation.wrapping_add(1);
                 let generation = state.generation;
@@ -323,6 +395,20 @@ impl RetrievalService {
                 }
                 jobs.spawn(async move {
                     let _permit = permit;
+                    if service.persistence.is_some() {
+                        let result = service
+                            .resolve_persistent(
+                                &source,
+                                &provider,
+                                refresh_key.clone(),
+                                query,
+                                &token,
+                                generation,
+                            )
+                            .await;
+                        service.publish(refresh_key, generation, result);
+                        return;
+                    }
                     let result = tokio::select! {
                         biased;
                         _ = token.cancelled() => Err(RetrievalError::Cancelled),
@@ -331,7 +417,7 @@ impl RetrievalService {
                             result.unwrap_or(Err(RetrievalError::Unavailable))
                         }
                     };
-                    service.publish(refresh_key, generation, result);
+                    service.publish(refresh_key, generation, result.map(|value| (value, None)));
                 });
                 (rx, stage, generation)
             };
@@ -368,19 +454,36 @@ impl RetrievalService {
             }
         };
         let value = match outcome {
-            Ok(value) => self.envelope(&value, FreshnessState::Fresh),
+            Ok((value, epoch)) => {
+                if let Some(expected) = epoch {
+                    let mut state = self.state.lock().map_err(|_| RetrievalError::Internal)?;
+                    self.sync_epoch(&mut state);
+                    if state.storage_epoch != expected || !self.storage_healthy() {
+                        return Err(RetrievalError::StorageUnavailable);
+                    }
+                }
+                if !self
+                    .usable_age(&value)
+                    .is_some_and(|age| age < FRESH_SECONDS)
+                {
+                    return Err(RetrievalError::FreshnessUnavailable);
+                }
+                self.envelope(&value, FreshnessState::Fresh)
+            }
             Err(error) if error.is_transient() && freshness == FreshnessRequirement::AllowStale => {
                 let stale = {
                     let mut state = self.state.lock().map_err(|_| RetrievalError::Internal)?;
+                    self.sync_epoch(&mut state);
+                    if !self.storage_healthy() {
+                        return Err(RetrievalError::StorageUnavailable);
+                    }
                     expire(&mut state, self.clock.now());
                     state.cache.get(&key)
                 };
                 if let Some(value) = stale
                     && self
-                        .clock
-                        .now()
-                        .saturating_sub(value.provenance.validated_at)
-                        <= RETENTION_SECONDS
+                        .usable_age(&value)
+                        .is_some_and(|age| age <= RETENTION_SECONDS)
                 {
                     let state = if self
                         .clock
@@ -422,6 +525,7 @@ impl RetrievalService {
         RetrievalEnvelope {
             data: value.data.clone(),
             provenance: value.provenance.clone(),
+            snapshot: value.snapshot.clone(),
             synthetic: true,
             freshness: Freshness {
                 state,
@@ -613,10 +717,11 @@ impl RetrievalService {
             },
             raw: payload.raw,
             bytes,
+            snapshot: None,
         }))
     }
 
-    fn publish(&self, key: CacheKey, generation: u64, outcome: Outcome) {
+    fn publish(&self, key: CacheKey, generation: u64, mut outcome: PublishedOutcome) {
         let Ok(mut state) = self.state.lock() else {
             self.shutdown.cancel();
             return;
@@ -624,10 +729,25 @@ impl RetrievalService {
         let Some(flight) = state.flights.get(&key) else {
             return;
         };
-        if flight.generation != generation || flight.cancellation.is_cancelled() || state.stopping {
+        if flight.generation != generation {
             return;
         }
-        if let Ok(value) = &outcome {
+        if flight.cancellation.is_cancelled() || state.stopping {
+            if let Some(flight) = state.flights.remove(&key) {
+                state.waiters -= flight.waiters;
+                flight
+                    .outcome
+                    .send_replace(Some(Err(RetrievalError::Cancelled)));
+            }
+            return;
+        }
+        self.sync_epoch(&mut state);
+        if let Ok((_, Some(epoch))) = &outcome
+            && (*epoch != state.storage_epoch || !self.storage_healthy())
+        {
+            outcome = Err(RetrievalError::StorageUnavailable);
+        }
+        if let Ok((value, _)) = &outcome {
             expire(&mut state, self.clock.now());
             state.cache.publish(key.clone(), value.clone());
         } else {
@@ -660,6 +780,11 @@ impl RetrievalService {
             std::mem::take(&mut *jobs)
         };
         let mut failed = false;
+        // Closing admission also interrupts maintenance/recovery before joining
+        // owned jobs; shutdown must not wait for a full recovery deadline.
+        if let Some(store) = &self.persistence {
+            failed |= store.close().await.is_err();
+        }
         while let Some(result) = jobs.join_next().await {
             failed |= result.is_err();
         }
@@ -693,6 +818,10 @@ impl RetrievalService {
             retries: counters.retries.load(Ordering::Relaxed),
             throttled: counters.throttled.load(Ordering::Relaxed),
             saturation: counters.saturated.load(Ordering::Relaxed),
+            filesystem: self
+                .persistence
+                .as_ref()
+                .map_or_else(StorageMetrics::default, |store| store.metrics()),
             ..Default::default()
         };
         if let Ok(state) = self.state.lock() {
@@ -707,7 +836,7 @@ impl RetrievalService {
 
     pub fn metrics_prometheus(&self) -> String {
         let m = self.metrics();
-        format!(
+        let mut output = format!(
             "openlegal_cache_hits_total {}\nopenlegal_cache_misses_total {}\nopenlegal_upstream_requests_total {}\nopenlegal_coalesced_total {}\nopenlegal_refresh_failures_total {}\nopenlegal_stale_responses_total {}\nopenlegal_retries_total {}\nopenlegal_throttled_total {}\nopenlegal_retrieval_saturation_total {}\nopenlegal_cache_entries {}\nopenlegal_cache_bytes {}\nopenlegal_refreshes {}\nopenlegal_waiters {}\n",
             m.cache_hits,
             m.cache_misses,
@@ -722,7 +851,12 @@ impl RetrievalService {
             m.cache_bytes,
             m.in_flight,
             m.waiters
-        )
+        );
+        if self.persistence.is_some() {
+            let fs = m.filesystem;
+            output.push_str(&format!("openlegal_filesystem_hits_total {}\nopenlegal_filesystem_misses_total {}\nopenlegal_filesystem_writes_total {}\nopenlegal_filesystem_evictions_total {}\nopenlegal_filesystem_corruptions_total {}\nopenlegal_filesystem_recoveries_total {}\nopenlegal_filesystem_saturation_total {}\nopenlegal_filesystem_bytes {}\nopenlegal_filesystem_snapshots {}\n", fs.hits, fs.misses, fs.writes, fs.evictions, fs.corruptions, fs.recoveries, fs.saturation, fs.bytes, fs.snapshots));
+        }
+        output
     }
 }
 
@@ -781,8 +915,16 @@ impl Drop for Waiter {
             flight.waiters -= 1;
             let last = flight.waiters == 0;
             state.waiters -= 1;
-            if last && let Some(flight) = state.flights.remove(&self.key) {
-                flight.cancellation.cancel();
+            if last {
+                if service.persistence.is_some() {
+                    // An active storage transaction must reconcile before the key
+                    // can admit a replacement generation.
+                    if let Some(flight) = state.flights.get(&self.key) {
+                        flight.cancellation.cancel();
+                    }
+                } else if let Some(flight) = state.flights.remove(&self.key) {
+                    flight.cancellation.cancel();
+                }
             }
         }
     }
