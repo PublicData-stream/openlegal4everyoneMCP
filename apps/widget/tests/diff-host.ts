@@ -51,6 +51,9 @@ bridge.oncalltool = async ({ name, arguments: args }) => {
         output.total_pages = 2;
         output.fragments = [fixtureFragment(`old ${page}\n`, `new ${page}\n`, page === 0 ? 99998 : 100000, page === 0 ? 99998 : 100000)];
       }
+      if (params.has('highlights')) output.fragments[0].inline_changes = [{ row_index: 0, ranges: [[0, 1], [7, 9]] }, { row_index: 1, ranges: [] }];
+      if (params.has('missinghighlights')) delete (output.fragments[0] as Partial<typeof output.fragments[0]>).inline_changes;
+      if (params.has('badhighlights')) output.fragments[0].inline_changes[0].ranges = [[0, 20000]];
       if (params.has('badpage')) output.comparison_id = 'c'.repeat(64);
     } else {
       const raw = record[view];
@@ -67,8 +70,8 @@ bridge.oncalltool = async ({ name, arguments: args }) => {
 };
 bridge.oninitialized = async () => {
   if (params.has('initial') || params.has('pair') || params.has('pages') || params.has('expired')) {
-    const before = params.has('pair') ? '<b>before</b>\n' : sourceBefore;
-    const after = params.has('pair') ? '<img src="https://evil.example/x">\n' : sourceAfter;
+    const before = params.has('highlights') ? '😀가e\u0301漢字A\r\n' : params.has('pair') ? '<b>before</b>\n' : sourceBefore;
+    const after = params.has('highlights') ? '😀나e\u0301漢語B' : params.has('pair') ? '<img src="https://evil.example/x">\n' : sourceAfter;
     const summary = retain(before, after, fixtureId);
     if (params.has('pages')) { summary.before.lines = 100000; summary.after.lines = 100000; summary.before.bytes = 200000; summary.after.bytes = 200000; summary.change_pages = 2; }
     if (params.has('expired')) summary.expires_at = Math.floor(Date.now() / 1000) - 1;

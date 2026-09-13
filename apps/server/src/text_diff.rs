@@ -19,9 +19,9 @@ use std::{path::Path, sync::Arc};
 
 pub const WIDGET_URI: &str = "ui://openlegal/text-diff-v1.html";
 
-/// Validate the operator executable before listeners bind, then share one service.
-pub async fn service(git_path: &Path) -> Result<Arc<TextDiffService>, ServerError> {
-    let engine = openlegal_adapters::text_diff::GitDiffEngine::new(git_path).await?;
+/// Probe the composition-selected server executable before listeners bind.
+pub async fn service(worker_path: &Path) -> Result<Arc<TextDiffService>, ServerError> {
+    let engine = openlegal_adapters::text_diff::SimilarDiffEngine::new(worker_path).await?;
     Ok(TextDiffService::new(
         Arc::new(engine),
         Arc::new(openlegal_adapters::text_diff::OsHandleGenerator),
@@ -71,7 +71,7 @@ impl ToolModule for TextDiffTools {
         let service = self.service.clone();
         registry.register_typed::<CompareInput, ComparisonSummary, _, _>(
             "compare_texts",
-            "Compare two supplied UTF-8 texts exactly using Git. Maximum per text: 1 MiB, 100000 lines, 16 KiB per line; no NUL. Returns a bearer handle for paged results retained for ten minutes. Use show_text_diff to display the handle; anyone with it can read or delete the result. Not a legal equivalence assessment.",
+            "Compare two supplied UTF-8 texts exactly using Rust line and Unicode scalar character diffs. Maximum per text: 1 MiB, 100000 lines, 16 KiB per line; no NUL. Returns a bearer handle for paged results retained for ten minutes. Use show_text_diff to display the handle; anyone with it can read or delete the result. Not a legal equivalence assessment.",
             ToolOptions::default(),
             move |input, context| { let service = service.clone(); async move {
                 compare(&service, input, context).await.map(ToolOutput::new)

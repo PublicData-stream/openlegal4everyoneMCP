@@ -4,6 +4,7 @@ mod paging;
 use crate::{Clock, SystemClock};
 use futures::future::BoxFuture;
 use openlegal_domain::text_diff::*;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     mem::size_of,
@@ -27,6 +28,32 @@ const MAX_ENTRIES: usize = 32;
 const MAX_STORE_BYTES: usize = 128 * 1024 * 1024;
 const JOB_RESERVATION: usize = 32 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+/// The source side used by engine annotations; independent of patch/page layout.
+pub enum DiffSide {
+    Before,
+    After,
+}
+
+/// Private engine annotations, mapped to fragment rows by application paging.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceLineHighlights {
+    pub side: DiffSide,
+    /// Zero-based LF-delimited line in the selected complete original text.
+    pub line_index: u32,
+    pub ranges: Vec<ScalarRange>,
+}
+
+/// Complete engine output. Application validation consumes every annotation
+/// exactly once and checks patch content against both originals before paging.
+#[derive(Clone, Debug, Default)]
+pub struct ComputedDiff {
+    pub patch: String,
+    pub inline_changes: Vec<SourceLineHighlights>,
+}
+
 /// An engine must kill and reap its child before returning on cancellation/deadline.
 /// The service owns its future even when the requesting caller disappears.
 pub trait DiffEngine: Send + Sync + 'static {
@@ -36,7 +63,7 @@ pub trait DiffEngine: Send + Sync + 'static {
         after: Arc<str>,
         cancellation: CancellationToken,
         deadline: Instant,
-    ) -> BoxFuture<'static, Result<String, TextDiffError>>;
+    ) -> BoxFuture<'static, Result<ComputedDiff, TextDiffError>>;
 }
 pub trait HandleGenerator: Send + Sync + 'static {
     fn generate(&self) -> Result<[u8; 32], TextDiffError>;
@@ -186,10 +213,10 @@ impl TextDiffService {
                     {
                         return Err(TextDiffError::Cancelled);
                     }
-                    if patch.len() > MAX_PATCH_BYTES {
+                    if patch.patch.len() > MAX_PATCH_BYTES {
                         return Err(TextDiffError::ResourceLimit);
                     }
-                    let (changes, additions, deletions) = paging::changes(&patch)?;
+                    let (changes, additions, deletions) = paging::changes(&patch, &before, &after)?;
                     let mut state = service.state.lock().map_err(|_| TextDiffError::Internal)?;
                     if state.stopping || token.is_cancelled() || Instant::now() >= deadline {
                         return Err(TextDiffError::Cancelled);
@@ -223,9 +250,7 @@ impl TextDiffService {
                         equal,
                         change_pages: changes.len(),
                     };
-                    let bytes = retained_bytes(&before, &after, &changes)
-                        + changes.capacity() * size_of::<Vec<DiffFragment>>()
-                        + 4096;
+                    let bytes = retained_bytes(&before, &after, &changes, changes.capacity())?;
                     if bytes > JOB_RESERVATION {
                         return Err(TextDiffError::ResourceLimit);
                     }
@@ -433,19 +458,40 @@ fn valid_handle(id: &str) -> Result<(), TextDiffError> {
         Err(TextDiffError::InvalidInput)
     }
 }
-fn retained_bytes(before: &str, after: &str, pages: &[Vec<DiffFragment>]) -> usize {
-    before.len()
-        + after.len()
-        + pages
-            .iter()
-            .map(|page| {
-                page.capacity() * size_of::<DiffFragment>()
-                    + page
-                        .iter()
-                        .map(|fragment| fragment.patch.capacity())
-                        .sum::<usize>()
-            })
-            .sum::<usize>()
+fn retained_bytes(
+    before: &str,
+    after: &str,
+    pages: &[Vec<DiffFragment>],
+    page_capacity: usize,
+) -> Result<usize, TextDiffError> {
+    let mut bytes = 4096usize;
+    let mut add = |count: usize, size: usize| -> Result<(), TextDiffError> {
+        bytes = bytes
+            .checked_add(
+                count
+                    .checked_mul(size)
+                    .ok_or(TextDiffError::ResourceLimit)?,
+            )
+            .ok_or(TextDiffError::ResourceLimit)?;
+        Ok(())
+    };
+    add(before.len(), 1)?;
+    add(after.len(), 1)?;
+    add(page_capacity, size_of::<Vec<DiffFragment>>())?;
+    for page in pages {
+        add(page.capacity(), size_of::<DiffFragment>())?;
+        for fragment in page {
+            add(fragment.patch.capacity(), 1)?;
+            add(
+                fragment.inline_changes.capacity(),
+                size_of::<InlineChange>(),
+            )?;
+            for change in &fragment.inline_changes {
+                add(change.ranges.capacity(), size_of::<ScalarRange>())?;
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 pub fn text_info(text: &str, label: &str) -> Result<TextInfo, TextDiffError> {
@@ -498,8 +544,8 @@ mod tests {
             _: Arc<str>,
             _: CancellationToken,
             _: Instant,
-        ) -> BoxFuture<'static, Result<String, TextDiffError>> {
-            async { Ok(String::new()) }.boxed()
+        ) -> BoxFuture<'static, Result<ComputedDiff, TextDiffError>> {
+            async { Ok(ComputedDiff::default()) }.boxed()
         }
     }
     fn service() -> Arc<TextDiffService> {
@@ -618,7 +664,7 @@ mod tests {
             _: Arc<str>,
             cancellation: CancellationToken,
             deadline: Instant,
-        ) -> BoxFuture<'static, Result<String, TextDiffError>> {
+        ) -> BoxFuture<'static, Result<ComputedDiff, TextDiffError>> {
             let started = self.started.clone();
             let finished = self.finished.clone();
             async move {
@@ -718,5 +764,34 @@ mod tests {
             (info.lines, info.crlf, info.lf, info.bare_cr, info.bom),
             (2, 1, 1, 1, true)
         );
+    }
+    #[test]
+    fn retained_accounting_includes_annotation_allocations() {
+        let mut fragment = DiffFragment {
+            patch: String::from("patch"),
+            before_start: 0,
+            after_start: 0,
+            before_count: 0,
+            after_count: 0,
+            inline_changes: Vec::with_capacity(8),
+        };
+        let mut ranges = Vec::with_capacity(32);
+        ranges.push([0, 1]);
+        fragment.inline_changes.push(InlineChange {
+            row_index: 0,
+            ranges,
+        });
+        let pages = vec![vec![fragment]];
+        let bytes = retained_bytes("old", "new", &pages, pages.capacity()).unwrap();
+        let fragment = &pages[0][0];
+        let expected = 4096
+            + 6
+            + pages.capacity() * size_of::<Vec<DiffFragment>>()
+            + pages[0].capacity() * size_of::<DiffFragment>()
+            + fragment.patch.capacity()
+            + fragment.inline_changes.capacity() * size_of::<InlineChange>()
+            + fragment.inline_changes[0].ranges.capacity() * size_of::<ScalarRange>();
+        assert_eq!(bytes, expected);
+        assert!(retained_bytes("", "", &[], usize::MAX).is_err());
     }
 }

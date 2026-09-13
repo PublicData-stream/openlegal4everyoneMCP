@@ -98,7 +98,6 @@ upstream = "http://127.0.0.1:8081"
 widget_html = "/fixture/widget.html"
 
 [text_diff]
-git_path = "/usr/bin/git"
 widget_html = "/fixture/text-diff.html"
 TOML
 cp deploy/oxibelt/oxibelt.toml "$scratch/fixture/config/"

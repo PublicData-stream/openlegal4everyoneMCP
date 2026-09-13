@@ -1,5 +1,5 @@
 # Run from the repository root after building apps/widget and preparing the demo TLS files.
-# Git must be installed; no mock upstream is needed.
+# The server executable must be available for its Rust worker; no mock upstream is needed.
 # Placeholder only: replace with free corresponding source for your running version.
 [source]
 url = "https://example.org/openlegal/source"
@@ -24,5 +24,4 @@ max_message_bytes = 16777216
 max_buffer_bytes = 268435456
 
 [text_diff]
-git_path = "/usr/bin/git"
 widget_html = "apps/widget/dist/text-diff.html"

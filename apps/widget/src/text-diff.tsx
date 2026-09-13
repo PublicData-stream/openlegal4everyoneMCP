@@ -1,15 +1,11 @@
 import React, { Component, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from '@modelcontextprotocol/ext-apps';
-import { DiffView, DiffModeEnum, disableCache } from '@git-diff-view/react';
-import '@git-diff-view/react/styles/diff-view-pure.css';
 import { SourceOffer } from './SourceOffer.tsx';
-import { decodeFile, DiffResponseError, editAsLf, localPatch, MAX_TEXT_BYTES, metadata, parseCompare, parseDelete, parsePage, parsePair, parseShow, sourceRange, utf8Length, validateLabel, validateText, type Comparison, type DiffPage, type Fragment, type PageView, type TextPair } from './text-diff-model.ts';
+import { decodeFile, DiffResponseError, editAsLf, fragmentRows, scalarSegments, splitRows, MAX_TEXT_BYTES, metadata, parseCompare, parseDelete, parsePage, parsePair, parseShow, sourceRange, utf8Length, validateLabel, validateText, type DiffRow, type Comparison, type DiffPage, type Fragment, type PageView, type TextPair } from './text-diff-model.ts';
 import './style.css';
 import './text-diff.css';
 
-// The renderer must not retain source fragments in its cross-instance cache after Clear.
-disableCache();
 const bridge = new App({ name: 'Text comparison', version: '0.1.0' }, {});
 const blank = (): TextPair => ({ before: '', after: '', before_label: 'Before', after_label: 'After' });
 const message = (error: unknown, fallback: string) => error instanceof DiffResponseError ? error.message : fallback;
@@ -18,11 +14,25 @@ class RenderBoundary extends Component<{ children: ReactNode }, { failed: boolea
   static getDerivedStateFromError() { return { failed: true }; }
   render() { return this.state.failed ? <p role="alert">This fragment could not be displayed. The original texts remain available in the Before and After views.</p> : this.props.children; }
 }
-function FragmentView({ fragment, mode, dark }: { fragment: Fragment; mode: DiffModeEnum; dark: boolean }) {
-  const data = useMemo(() => ({ oldFile: { fileName: 'before.txt', fileLang: 'txt' }, newFile: { fileName: 'after.txt', fileLang: 'txt' }, hunks: [localPatch(fragment)] }), [fragment]);
-  return <section className="diff-fragment" aria-label="Change fragment">
+function RowText({ row }: { row: DiffRow }) {
+  return <><code>{scalarSegments(row.text, row.ranges).map((segment, index) => {
+    // Newline symbols describe the exact original bytes; unchanged LF is implicit.
+    const content = segment.text.split(/([\r\n])/).map((part, offset) => part === '\r' ? <span key={offset} className="line-ending" title="Carriage return (CR)">␍</span> : part === '\n' ? (segment.changed ? <span key={offset} className="line-ending" title="Line feed (LF)">␊</span> : null) : part);
+    return segment.changed ? <mark className="inline-change" key={index}>{content}</mark> : <React.Fragment key={index}>{content}</React.Fragment>;
+  })}</code>{row.noFinalNewline && <span className="no-final-newline">\ No newline at end of file</span>}</>;
+}
+function SplitCells({ row, side }: { row?: DiffRow; side: 'before' | 'after' }) {
+  const kind = row?.kind === '-' ? 'removed' : row?.kind === '+' ? 'added' : 'context';
+  return <><td className={`line-number ${kind}`} data-line-num={row?.[side]}>{row?.[side]}</td><td className={`diff-content ${kind}`}>{row && <><span className="diff-sign" aria-hidden="true">{row.kind}</span><RowText row={row} /></>}</td></>;
+}
+function FragmentView({ fragment, mode, dark }: { fragment: Fragment; mode: 'split' | 'unified'; dark: boolean }) {
+  const rows = useMemo(() => fragmentRows(fragment), [fragment]);
+  return <section className="diff-fragment" aria-label="Change fragment" data-theme={dark ? 'dark' : 'light'}>
     <p className="metadata">Source lines: before {sourceRange(fragment.before_start, fragment.before_count)} · after {sourceRange(fragment.after_start, fragment.after_count)}. Gutter numbers start again within this fragment.</p>
-    <DiffView data={data} diffViewMode={mode} diffViewTheme={dark ? 'dark' : 'light'} diffViewHighlight={false} diffViewAddWidget={false} />
+    <table className={`${mode}-diff-view`} aria-label={`${mode === 'split' ? 'Split' : 'Unified'} changes`}>
+      <thead>{mode === 'split' ? <tr><th colSpan={2}>Before</th><th colSpan={2}>After</th></tr> : <tr><th>Before</th><th>After</th><th>Text</th></tr>}</thead>
+      <tbody>{mode === 'split' ? splitRows(rows).map((pair, index) => <tr key={index}><SplitCells row={pair.before} side="before" /><SplitCells row={pair.after} side="after" /></tr>) : rows.map((row, index) => <tr key={index} className={row.kind === '-' ? 'removed' : row.kind === '+' ? 'added' : 'context'}><td className="line-number" data-line-num={row.before}>{row.before}</td><td className="line-number" data-line-num={row.after}>{row.after}</td><td className="diff-content"><span className="diff-sign" aria-hidden="true">{row.kind}</span><RowText row={row} /></td></tr>)}</tbody>
+    </table>
   </section>;
 }
 function TextComparison() {
@@ -55,7 +65,7 @@ function TextComparison() {
   const creation = useRef<{ cancelled: boolean } | null>(null);
   const pendingDeletion = useRef(new Map<string, Comparison>());
   const expired = comparison !== null && now >= comparison.expires_at * 1000;
-  const mode = layout === 'split' || (layout === 'auto' && wide) ? DiffModeEnum.Split : DiffModeEnum.Unified;
+  const mode = layout === 'split' || (layout === 'auto' && wide) ? 'split' : 'unified';
   useEffect(() => {
     const width = matchMedia('(min-width: 900px)');
     const theme = matchMedia('(prefers-color-scheme: dark)');
@@ -222,7 +232,7 @@ function TextComparison() {
   }
   function changeView(next: PageView) { serial.current++; setError(''); setView(next); setPageIndex(0); setPage(null); }
   return <main className="text-comparison">
-    <header><p className="eyebrow">openlegal4everyone</p><h1>Text comparison</h1><p>Compare supplied text with Git. Differences do not establish legal equivalence.</p><p className="metadata">Texts are sent to the server through your host and retained for up to 10 minutes. Anyone with the comparison handle can read them until deletion or expiry.</p></header>
+    <header><p className="eyebrow">openlegal4everyone</p><h1>Text comparison</h1><p>Compare supplied text with character highlights. Differences do not establish legal equivalence.</p><p className="metadata">Texts are sent to the server through your host and retained for up to 10 minutes. Anyone with the comparison handle can read them until deletion or expiry.</p></header>
     {pair ? <section aria-label="Texts to compare" className="text-inputs">
       {(['before', 'after'] as const).map(side => <div key={side} className="text-input">
         <label>{side === 'before' ? 'Before label' : 'After label'}<input value={pair[`${side}_label`] ?? ''} disabled={!!busy} onChange={event => updatePair({ [`${side}_label`]: event.target.value })} /></label>

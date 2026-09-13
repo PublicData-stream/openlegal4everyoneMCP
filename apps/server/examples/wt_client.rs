@@ -290,6 +290,14 @@ async fn text_diff_smoke(
             return Err("comparison page mismatch or overflow".into());
         }
         if view == "changes" {
+            if page["fragments"][0]["inline_changes"]
+                != json!([
+                    {"row_index":1,"ranges":[[0,3]]},
+                    {"row_index":2,"ranges":[[0,3]]}
+                ])
+            {
+                return Err("text comparison scalar annotations mismatch".into());
+            }
             let patch = page["fragments"][0]["patch"]
                 .as_str()
                 .ok_or("change fragment missing")?;

@@ -5,6 +5,20 @@ use serde::{Deserialize, Serialize};
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
 pub const MAX_LINES: usize = 100_000;
+pub const MAX_INLINE_RANGES: usize = 65_536;
+pub const MAX_PAGE_INLINE_RANGES: usize = 4_096;
+
+/// Half-open Unicode scalar offsets in the original line, including CR/LF.
+pub type ScalarRange = [u32; 2];
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InlineChange {
+    /// Zero-based ordinal among all fragment data rows, excluding patch headers
+    /// and missing-final-newline markers. Only added/deleted rows have entries.
+    pub row_index: u32,
+    pub ranges: Vec<ScalarRange>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +84,7 @@ pub struct DiffFragment {
     pub before_count: usize,
     pub after_start: usize,
     pub after_count: usize,
+    pub inline_changes: Vec<InlineChange>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]

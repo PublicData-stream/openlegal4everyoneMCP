@@ -47,8 +47,8 @@ The mock runs on loopback inside the backend container. By default the resource
 is a small synthetic HTML fixture; set `DEMO_WIDGET_HTML=apps/widget/dist/index.html`
 and `TEXT_DIFF_WIDGET_HTML=apps/widget/dist/text-diff.html` after the widget build
 to test both complete bundled resources, as CI does. The text-comparison fixture
-installs Git, enables 16 MiB messages and 256 MiB transport buffering, and gives
-the backend a 1 GiB container limit. Both revisions/transports exercise exact
+runs the Rust comparison worker without Git, enables 16 MiB messages and 256 MiB
+transport buffering, and gives the backend a 1 GiB container limit. Both revisions/transports exercise exact
 1 MiB inputs, paged results, widget resources and bearer-authorized deletion.
 The `/mcp` route explicitly allows a 16 MiB request body to match the backend;
 the edge's inherited 10 MiB default cannot carry the largest escaped text pair.

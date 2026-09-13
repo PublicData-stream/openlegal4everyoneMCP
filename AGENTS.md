@@ -7,7 +7,7 @@ product. It is intended to provide open legal-information infrastructure through
 a Rust backend, hosted MCP, and potentially a public HTTP API.
 
 The repository implements a Rust server in `apps/server`, shared retrieval/cache
-services and compiled payload processors in `crates`, and React MCP Apps for synthetic records and Git text comparison in
+services and compiled payload processors in `crates`, and React MCP Apps for synthetic records and Rust text comparison in
 `apps/widget`. Streamable HTTP and native WebTransport share tools and progress.
 Only fictional upstream data is integrated; legal providers and deployment remain planned.
 Verify the checkout before acting. The [architecture](docs/architecture.md) separates
@@ -36,7 +36,7 @@ or execution permissions.
 | Identifiers, names, dates, revisions, normalization, or citations | [Legal-data policy](docs/legal-data-policy.md) and the relevant provider profile |
 | Retrieval, caching, refresh, concurrency, or retries | [Upstream policy](docs/upstream-policy.md) |
 | Synthetic provider, payload extensions, or widget | [Retrieval contract](docs/retrieval.md) and [demo guide](docs/demo.md) |
-| Supplied-text comparison, Git execution, or comparison widget | [Text comparison](docs/text-diff.md) and [server contract](docs/server.md) |
+| Supplied-text comparison, Rust comparison workers, or comparison widget | [Text comparison](docs/text-diff.md) and [server contract](docs/server.md) |
 | Korean legal data | [Korean provider profile](docs/providers/kr-law-go-kr.md) |
 | MCP/API input, outbound requests, parsers, secrets, or unsafe Rust | [Secure development](CONTRIBUTING.md#secure-development) and [review gates](CONTRIBUTING.md#review-gates) |
 | A suspected vulnerability | [Security policy](SECURITY.md), including its reporting-channel status |

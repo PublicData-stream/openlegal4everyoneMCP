@@ -8,7 +8,9 @@ export class DiffResponseError extends Error {}
 const invalid = () => new DiffResponseError('The server returned an unsupported comparison response.');
 export interface TextInfo { label: string; bytes: number; lines: number; crlf: number; lf: number; bare_cr: number; bom: boolean; final_newline: boolean }
 export interface Comparison { schema_version: 1; comparison_id: string; expires_at: number; before: TextInfo; after: TextInfo; additions: number; deletions: number; equal: boolean; change_pages: number }
-export interface Fragment { patch: string; before_start: number; before_count: number; after_start: number; after_count: number }
+export type ScalarRange = [number, number];
+export interface InlineChange { row_index: number; ranges: ScalarRange[] }
+export interface Fragment { inline_changes: InlineChange[]; patch: string; before_start: number; before_count: number; after_start: number; after_count: number }
 export type PageView = 'changes' | 'before' | 'after';
 export interface DiffPage { schema_version: 1; comparison_id: string; view: PageView; page: number; total_pages: number; text?: string; fragments: Fragment[] }
 export interface TextPair { before: string; after: string; before_label?: string; after_label?: string }
@@ -61,10 +63,39 @@ export function parseDelete(result: unknown): void {
   const value = data(result);
   if (value.schema_version !== 1 || value.deleted !== true) throw invalid();
 }
-function parseFragment(value: unknown): Fragment {
+interface PageBudget { rows: number; ranges: number; bytes: number }
+function consumeBytes(budget: PageBudget, bytes: number): void {
+  if (bytes > budget.bytes) throw invalid();
+  budget.bytes -= bytes;
+}
+function parseFragment(value: unknown, budget: PageBudget): Fragment {
+  if (budget.rows === 0 || budget.bytes === 0) throw invalid();
   const fragment = object(value);
-  const result: Fragment = { patch: string(fragment.patch, 256 * 1024), before_start: integer(fragment.before_start, MAX_LINES), before_count: integer(fragment.before_count, 400), after_start: integer(fragment.after_start, MAX_LINES), after_count: integer(fragment.after_count, 400) };
-  validateFragment(result);
+  // Check the remaining page width before splitting or inspecting annotations.
+  // Serialize only this bounded, whitelisted skeleton; never the raw envelope.
+  const result: Fragment = { inline_changes: [], patch: string(fragment.patch, budget.bytes), before_start: integer(fragment.before_start, MAX_LINES), before_count: integer(fragment.before_count, budget.rows), after_start: integer(fragment.after_start, MAX_LINES), after_count: integer(fragment.after_count, budget.rows) };
+  consumeBytes(budget, utf8Length(JSON.stringify(result)));
+  const rows = patchRows(result, budget.rows);
+  budget.rows -= rows.length;
+  if (!Array.isArray(fragment.inline_changes) || fragment.inline_changes.length > rows.length) throw invalid();
+  for (const value of fragment.inline_changes) {
+    const entry = object(value);
+    if (!Array.isArray(entry.ranges) || entry.ranges.length > budget.ranges) throw invalid();
+    budget.ranges -= entry.ranges.length;
+    const parsed: InlineChange = { row_index: integer(entry.row_index, 399), ranges: [] };
+    consumeBytes(budget, utf8Length(JSON.stringify(parsed)) + (result.inline_changes.length ? 1 : 0));
+    // Every range requires at least five JSON bytes plus its separator. Reject
+    // impossible widths before walking even an otherwise valid range array.
+    if (entry.ranges.length * 5 > budget.bytes) throw invalid();
+    for (const value of entry.ranges) {
+      if (!Array.isArray(value) || value.length !== 2) throw invalid();
+      const range: ScalarRange = [integer(value[0], MAX_LINE_BYTES + 1), integer(value[1], MAX_LINE_BYTES + 1)];
+      consumeBytes(budget, utf8Length(JSON.stringify(range)) + (parsed.ranges.length ? 1 : 0));
+      parsed.ranges.push(range);
+    }
+    result.inline_changes.push(parsed);
+  }
+  validateInlineChanges(result, rows);
   return result;
 }
 export function parsePage(result: unknown, expected: { comparison_id: string; view: PageView; page: number }): DiffPage {
@@ -75,46 +106,96 @@ export function parsePage(result: unknown, expected: { comparison_id: string; vi
   const total = integer(value.total_pages, expected.view === 'changes' ? MAX_LINES * 2 : 33);
   const page = integer(value.page, MAX_LINES * 2);
   if (total === 0 || page >= total || !Array.isArray(value.fragments) || value.fragments.length > 400) throw invalid();
-  const fragments = value.fragments.map(parseFragment);
+  const parsed: DiffPage = { schema_version: 1, comparison_id: id, view: expected.view, page, total_pages: total, fragments: [], ...(value.text === undefined ? {} : { text: string(value.text, 32 * 1024) }) };
   if (expected.view === 'changes') {
-    if (value.text !== undefined || fragments.length === 0 || fragments.reduce((count, fragment) => count + validateFragment(fragment).rows, 0) > 400) throw invalid();
-  } else if (fragments.length || typeof value.text !== 'string') throw invalid();
-  const parsed: DiffPage = { schema_version: 1, comparison_id: id, view: expected.view, page, total_pages: total, fragments, ...(value.text === undefined ? {} : { text: string(value.text, 32 * 1024) }) };
+    if (value.text !== undefined || value.fragments.length === 0) throw invalid();
+    const budget: PageBudget = { rows: 400, ranges: 4096, bytes: 256 * 1024 };
+    consumeBytes(budget, utf8Length(JSON.stringify(parsed)));
+    for (const fragment of value.fragments) {
+      if (parsed.fragments.length) consumeBytes(budget, 1);
+      parsed.fragments.push(parseFragment(fragment, budget));
+    }
+  } else if (value.fragments.length || typeof value.text !== 'string') throw invalid();
   if (utf8Length(JSON.stringify(parsed)) > 256 * 1024) throw invalid();
   return parsed;
 }
-/** Validate the server's single-hunk fragment before the library allocates its display. */
-function validateFragment(fragment: Fragment): { headerIndex: number; rows: number } {
-  const lines = fragment.patch.split('\n');
-  const headerIndex = lines.findIndex(line => /^@@ /.test(line));
-  if (headerIndex < 2 || !lines.slice(0, headerIndex).some(line => line.startsWith('--- ')) || !lines.slice(0, headerIndex).some(line => line.startsWith('+++ '))) throw invalid();
-  const match = /^@@ -(\d+),(\d+) \+(\d+),(\d+) @@(?:.*)$/.exec(lines[headerIndex]);
-  if (!match || Number(match[1]) !== fragment.before_start || Number(match[2]) !== fragment.before_count || Number(match[3]) !== fragment.after_start || Number(match[4]) !== fragment.after_count) throw invalid();
-  if (fragment.before_start + Math.max(fragment.before_count - 1, 0) > MAX_LINES || fragment.after_start + Math.max(fragment.after_count - 1, 0) > MAX_LINES) throw invalid();
-  let before = 0, after = 0, rows = 0, previousData = false;
-  for (let index = headerIndex + 1; index < lines.length; index++) {
-    const line = lines[index];
-    if (index === lines.length - 1 && line === '') break;
-    if (line === '\\ No newline at end of file') {
-      if (!previousData) throw invalid();
-      previousData = false;
-      continue;
-    }
-    if (![' ', '+', '-'].includes(line[0]) || utf8Length(line.slice(1)) > MAX_LINE_BYTES) throw invalid();
-    if (line[0] !== '+') before++;
-    if (line[0] !== '-') after++;
-    rows++;
-    previousData = true;
-  }
-  if (rows === 0 || rows > 400 || before !== fragment.before_count || after !== fragment.after_count) throw invalid();
-  return { headerIndex, rows };
+export interface DiffRow {
+  kind: ' ' | '+' | '-'; text: string; noFinalNewline: boolean;
+  before?: number; after?: number; ranges: ScalarRange[];
 }
-/** Only display positions change: the patch's data lines remain byte-for-byte intact. */
-export function localPatch(fragment: Fragment): string {
-  const { headerIndex } = validateFragment(fragment);
+/** Parse bounded patch rows and validate all Rust-provided scalar offsets. */
+export function fragmentRows(fragment: Fragment): DiffRow[] {
+  const rows = patchRows(fragment, 400);
+  validateInlineChanges(fragment, rows);
+  return rows;
+}
+function patchRows(fragment: Fragment, maximumRows: number): DiffRow[] {
   const lines = fragment.patch.split('\n');
-  lines[headerIndex] = `@@ -${fragment.before_count ? 1 : 0},${fragment.before_count} +${fragment.after_count ? 1 : 0},${fragment.after_count} @@`;
-  return lines.join('\n');
+  if (lines[0] !== '--- before' || lines[1] !== '+++ after' || lines.at(-1) !== '') throw invalid();
+  const match = /^@@ -(\d+),(\d+) \+(\d+),(\d+) @@$/.exec(lines[2]);
+  if (!match || Number(match[1]) !== fragment.before_start || Number(match[2]) !== fragment.before_count || Number(match[3]) !== fragment.after_start || Number(match[4]) !== fragment.after_count) throw invalid();
+  if (fragment.before_start + Math.max(fragment.before_count - 1, 0) > MAX_LINES || fragment.after_start + Math.max(fragment.after_count - 1, 0) > MAX_LINES || (fragment.before_count > 0 && fragment.before_start === 0) || (fragment.after_count > 0 && fragment.after_start === 0)) throw invalid();
+  let before = 0, after = 0;
+  const rows: DiffRow[] = [];
+  for (let index = 3; index < lines.length - 1; index++) {
+    if (rows.length >= maximumRows) throw invalid();
+    const line = lines[index];
+    const kind = line[0];
+    if (kind !== ' ' && kind !== '+' && kind !== '-') throw invalid();
+    const noFinalNewline = lines[index + 1] === '\\ No newline at end of file';
+    const text = line.slice(1) + (noFinalNewline ? '' : '\n');
+    try { validateText(text); } catch { throw invalid(); }
+    if (noFinalNewline) index++;
+    rows.push({ kind, text, noFinalNewline, ...(kind === '+' ? {} : { before: ++before }), ...(kind === '-' ? {} : { after: ++after }), ranges: [] });
+  }
+  if (rows.length === 0 || before !== fragment.before_count || after !== fragment.after_count) throw invalid();
+  return rows;
+}
+function validateInlineChanges(fragment: Fragment, rows: DiffRow[]): void {
+  if (!Array.isArray(fragment.inline_changes)) throw invalid();
+  let previousRow = -1, rangeCount = 0;
+  for (const entry of fragment.inline_changes) {
+    const row = rows[entry.row_index];
+    if (!Number.isSafeInteger(entry.row_index) || entry.row_index <= previousRow || !row || row.kind === ' ' || !Array.isArray(entry.ranges)) throw invalid();
+    previousRow = entry.row_index;
+    const length = Array.from(row.text).length;
+    let previousEnd = 0;
+    for (const range of entry.ranges) {
+      if (!Array.isArray(range) || range.length !== 2) throw invalid();
+      const [start, end] = range;
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < previousEnd || start < 0 || end <= start || end > length || ++rangeCount > 4096) throw invalid();
+      previousEnd = end;
+    }
+    row.ranges = entry.ranges;
+  }
+  if (fragment.inline_changes.length !== rows.filter(row => row.kind !== ' ').length) throw invalid();
+}
+/** Apply authoritative scalar ranges without comparing either source. */
+export function scalarSegments(text: string, ranges: ScalarRange[]): { text: string; changed: boolean }[] {
+  const scalars = Array.from(text);
+  const segments: { text: string; changed: boolean }[] = [];
+  let offset = 0;
+  for (const [start, end] of ranges) {
+    if (start > offset) segments.push({ text: scalars.slice(offset, start).join(''), changed: false });
+    segments.push({ text: scalars.slice(start, end).join(''), changed: true });
+    offset = end;
+  }
+  if (offset < scalars.length) segments.push({ text: scalars.slice(offset).join(''), changed: false });
+  return segments;
+}
+/** Adjacent changed rows are paired in source order for split presentation only. */
+export function splitRows(rows: DiffRow[]): { before?: DiffRow; after?: DiffRow }[] {
+  const result: { before?: DiffRow; after?: DiffRow }[] = [];
+  for (let index = 0; index < rows.length;) {
+    if (rows[index].kind === ' ') { result.push({ before: rows[index], after: rows[index] }); index++; continue; }
+    const before: DiffRow[] = [], after: DiffRow[] = [];
+    while (index < rows.length && rows[index].kind !== ' ') {
+      const row = rows[index++];
+      (row.kind === '-' ? before : after).push(row);
+    }
+    for (let offset = 0; offset < Math.max(before.length, after.length); offset++) result.push({ before: before[offset], after: after[offset] });
+  }
+  return result;
 }
 export function sourceRange(start: number, count: number): string { return count ? `${start}–${start + count - 1}` : `none (after ${start})`; }
 export function validateText(value: string): void {

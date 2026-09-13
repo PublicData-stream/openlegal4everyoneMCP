@@ -1,6 +1,8 @@
-# Text comparison implementation review
+# Original Git text comparison implementation review
 
-Review date: 2026-09-13. Contract: [supplied-text comparison](text-diff.md).
+Historical review date: 2026-09-13. Reviewed revision:
+`290078409573f7b6f52d571d8be9912f9f6b1a1f`. The Rust worker and character-highlight
+migration has separate [review evidence](similar-review.md).
 
 Independent reviewer: Codex agent `independent_diff_review`, separate from the
 implementers. Categories: MCP/API Boundary and Security, including shared
@@ -15,22 +17,23 @@ Base revision: `22ead58972a5121249003faa4bb9c635342306eb`.
 The reviewed scope contains 50 modified/new files, excluding this evidence document.
 SHA-256: `3f680e4870b4e6e8fb74804d9cebfa51564ddb4bed7d047af0ae8ba7a9e1aa3b`.
 
-At the final implementation revision, reproduce the digest from the repository root:
+Reproduce the historical digest from the repository root:
 
 ```sh
 python3 - <<'PY'
-from pathlib import Path
 import hashlib
 import subprocess
 
 base = "22ead58972a5121249003faa4bb9c635342306eb"
+revision = "290078409573f7b6f52d571d8be9912f9f6b1a1f"
 names = subprocess.check_output([
-    "git", "diff", "--name-only", "--diff-filter=ACMR", "-z", base, "HEAD",
+    "git", "diff", "--name-only", "--diff-filter=ACMR", "-z", base, revision,
 ]).decode().split("\0")
 paths = sorted(set(names) - {"", "docs/text-diff-review.md"})
 digest = hashlib.sha256()
 for name in paths:
-    digest.update(name.encode() + b"\0" + Path(name).read_bytes() + b"\0")
+    content = subprocess.check_output(["git", "show", f"{revision}:{name}"])
+    digest.update(name.encode() + b"\0" + content + b"\0")
 print(len(paths), digest.hexdigest())
 PY
 ```

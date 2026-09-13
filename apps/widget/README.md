@@ -128,20 +128,26 @@ before exposing the editor.
 `get_text_diff_page` takes `{comparison_id, view, page}`, where view is `changes`,
 `before`, or `after`, and pages are zero-based. Results include `schema_version: 1`,
 the same identity/view/page, `total_pages`, a `fragments` array, and source `text`
-only for source pages. Change fragments contain a standalone Git hunk and its
-original before/after starting lines and counts. The widget validates those
-counters and bounds before passing the patch to `@git-diff-view/react`.
+only for source pages. Change fragments contain a standalone Git-style hunk and its
+original before/after starting lines and counts. Each fragment includes
+`inline_changes: [{row_index, ranges: [[start, end], ...]}]`, supplied by Rust.
+Row indices count all data rows (context, removed, added), excluding headers and
+final-newline markers. Each changed row has exactly one entry, which may contain
+no ranges. Ranges are half-open Unicode scalar offsets in its original source line,
+including any CR/LF and excluding the patch prefix. The widget rejects missing,
+invalid, duplicate or out-of-bounds metadata, more than 4,096 ranges per page,
+and pages exceeding 400 rows or 256 KiB serialized output.
 
-The viewer renders the server patch, without recomputing the source diff. Each
-fragment is rebased to small local line positions for display because this version
-of the library otherwise allocates placeholders up to the original line offset.
-The original source ranges remain visible above every fragment, and gutter numbers
-are explicitly fragment-local. Changed-line text and Git final-newline markers are
-preserved. Split view is the wide-screen default, unified is the narrow-screen
-default; the layout selector overrides either. Syntax highlighting, unchanged-line
-expansion, comments, external fetching, and renderer cross-instance source caching
-are disabled. Source tabs expose exact, bounded text chunks, which can divide a
-line. This is a text comparison, not a claim about legal equivalence or revisions.
+A focused React renderer applies these authoritative ranges using `Array.from`;
+it never recalculates line or character differences in JavaScript. Each fragment
+uses small local gutter numbers with its original source ranges displayed above.
+Split view pairs adjacent removed/added lines in source order for presentation
+only. CR characters and changed LF characters use visible symbols; Git
+final-newline markers are retained. All supplied text is rendered as React text
+nodes, without HTML or syntax highlighting. Wide screens default to split view,
+narrow screens to unified; the layout selector overrides either. Source tabs expose
+exact bounded chunks, which can divide a line. This is a text comparison, not a
+claim about legal equivalence or revisions.
 
 Comparisons are retained server-side for up to ten minutes. The visible notice
 explains that the handle grants access to the retained text. **Clear** awaits
@@ -163,24 +169,13 @@ near source line 100,000, exact Unicode/CR/BOM handling, original source loading
 responsive layouts, inert HTML-like content, cancellation, and late-page rejection.
 This is not a live ChatGPT integration test.
 
-The pinned `@git-diff-view/react` 0.1.7 dependency (MIT) implements the requested
-React diff presentation and consumes existing Git hunks. A custom renderer or the
-library's browser diff generator would add a competing implementation; neither is
-used. Its ordinary entrypoint includes the MIT lowlight and BSD-3-Clause highlight.js language graph
-even with highlighting disabled. A production build probe measured approximately
-2.1 MiB for the self-contained comparison resource, motivating its separate 3 MiB
-limit while preserving the existing demo's 1 MiB cap. No CDN or Worker loading is
-introduced, and the resource retains empty external-origin CSP metadata. Updates
-must rerun model/browser tests, resource-size checks, npm advisories, and installed
-license checks; the pinned lockfile retains the exact graph and integrity values.
-
-The license gate admits only `highlight.js@11.11.2` and `highlight.js@11.12.0`
-with `BSD-3-Clause`, in addition to the existing general license set. These are
-transitive requirements of the pinned renderer graph. Their copyright notice,
-redistribution conditions, no-endorsement condition, and disclaimer are retained
-in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the comparison HTML's
-accessible notices panel, alongside the exact new dependency notices. This is a
-version-specific dependency admission, not a blanket license-policy exception;
-new versions require renewed review. The admission owner is PiQuark6046, with
-review due by 2026-12-12 or the next version change, whichever comes first. No new
-package install scripts are enabled.
+The comparison renderer is first-party React code. Removing
+`@git-diff-view/react` also removes its browser diff engines, highlighting graph,
+and version-specific BSD license exceptions. Rust `similar` owns both line and
+Unicode scalar character comparison. The resource retains its separate 3 MiB
+ceiling and the existing demo's 1 MiB cap, with no CDN or Worker loading and empty
+external-origin CSP metadata. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+retains notices for the current runtime packages; bundled JavaScript also retains
+license comments. Updates must rerun model/browser tests, resource-size checks,
+current npm advisories, and installed license checks. No new package install
+scripts are enabled.

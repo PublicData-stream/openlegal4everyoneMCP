@@ -19,7 +19,7 @@ come from crates.io; unreviewed Git dependencies and registries fail `cargo deny
 | http | HTTP vocabulary shared with the SDK stack; avoids incompatible representations and extra protocol conversions. MIT. |
 | TOML, url | Strict operator configuration and origin parsing. The URL parser normalizes origin tuples; raw string/prefix matching would be incorrect. MIT OR Apache-2.0. |
 | tracing, tracing-subscriber | Operational events and filtering; SDK payload logs are disabled regardless of the normal runtime log setting. MIT. |
-| rcgen, tempfile, reqwest test features | Isolated TLS fixtures, cleanup and native HTTP tests. rcgen remains development-only; tempfile is also used by the production Git adapter. Certificate generation uses ring; reqwest disables default features and uses Rustls. Production reqwest admission is described below. No production test certificates or live provider traffic. MIT / Apache-2.0 alternatives. |
+| rcgen, tempfile, reqwest test features | Isolated TLS fixtures, cleanup and native HTTP tests. rcgen and tempfile remain development-only. Certificate generation uses ring; reqwest disables default features and uses Rustls. Production reqwest admission is described below. No production test certificates or live provider traffic. MIT / Apache-2.0 alternatives. |
 
 The listed versions are baseline anchors; exact versions and checksums for all
 dependencies live in the lockfile. Source review covered relevant installed SDK
@@ -109,25 +109,30 @@ and readiness requirements remain owned by [Contributing](../CONTRIBUTING.md).
 
 ## Text comparison additions
 
-The operator supplies an absolute path to a maintained system Git executable.
-The isolated integration image installs its distribution Git package. Git is used
-through a subprocess, not linked into Rust; preserve its GPL-2.0 notices and
-distribution obligations in runtime images. The alternative libgit2 would change
-the explicitly selected Git CLI engine and add a native library dependency.
-Startup probes the executable; request execution uses fixed no-index comparison
-options, isolated configuration and private temporary input files.
+`similar` 3.2.0 (Apache-2.0, crates.io) replaces the system Git subprocess as the
+line and character comparison implementation. It is pinned exactly with default
+features disabled and only `std` and `text` enabled: no extra runtime dependencies,
+build script, Unicode segmentation, inline word refinement or WASM integration are
+requested. Its MSRV is Rust 1.85, below this workspace baseline. The maintained
+upstream release was published on 2026-08-17. Source and API:
+[similar 3.2.0](https://docs.rs/similar/3.2.0/similar/).
 
-`tempfile` 3 (MIT OR Apache-2.0, crates.io) provides private temporary directories
-and cleanup instead of hand-rolled name generation. `getrandom` supplies operating
-system randomness for 256-bit comparison handles; failure prevents publication.
-The lockfile owns exact admitted versions. Tokio's `process`, `fs` and `io-util`
-features support bounded I/O and process reaping. No first-party unsafe exception
-is introduced. These boundaries require independent Security review.
+Git requires an external installation and temporary inputs; libgit2 would add a
+native library, while handwritten diff algorithms would duplicate a maintained
+implementation. The Rust worker uses LF-delimited slices and scalar `diff_chars`
+to preserve this product's exactness contract. Parent process deadlines kill and
+reap the worker rather than using the library's deadline approximation. Pinned
+source review, Unicode fixtures, resource tests and independent MCP/API/Security
+review supplement license and current advisory checks for this boundary dependency.
 
-The widget pins MIT-licensed `@git-diff-view/react` 0.1.7 from npm. Its ordinary
-imports include the upstream syntax-language set even with highlighting disabled;
-a production feasibility bundle measured 2,112,375 bytes including the license.
-The explicitly registered comparison resource therefore permits 3 MiB, while the
-record browser retains 1 MiB. No CDN, worker, remote highlighter, package patch or
-bundler alias is used. The frozen graph receives the existing advisory/license
-checks; only esbuild's installation script remains enabled.
+`getrandom` supplies operating-system randomness for 256-bit comparison handles;
+failure prevents publication. Tokio's `process`, `fs` and `io-util` features support
+executable validation, bounded pipes and process reaping. `tempfile` is now used
+only in development fixtures. No first-party unsafe exception is introduced.
+
+The comparison widget uses a local React text-node renderer of Rust-computed
+scalar ranges. The previous `@git-diff-view/react`, syntax-highlighting graph and
+associated exact BSD license exceptions are removed. Remaining third-party
+notices are bundled locally; the source-offer marker and existing asset ceilings
+remain enforced. The frozen graph receives current advisory/license checks, and
+only esbuild's installation script remains enabled.

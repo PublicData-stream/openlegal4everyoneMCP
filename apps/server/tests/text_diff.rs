@@ -1,5 +1,5 @@
-//! Real-Git MCP boundary checks; inputs and UI resources are entirely synthetic.
-use openlegal_adapters::text_diff::{GitDiffEngine, OsHandleGenerator};
+//! Real-worker MCP boundary checks; inputs and UI resources are entirely synthetic.
+use openlegal_adapters::text_diff::{OsHandleGenerator, SimilarDiffEngine};
 use openlegal_application::text_diff::TextDiffService;
 use openlegal_server::{
     ServerBuilder,
@@ -37,7 +37,9 @@ impl Drop for Server {
 impl Server {
     async fn start(include_demo: bool) -> Self {
         let source = SourceOffer::new(SOURCE).unwrap();
-        let engine = GitDiffEngine::new(Path::new("/usr/bin/git")).await.unwrap();
+        let engine = SimilarDiffEngine::new(Path::new(env!("CARGO_BIN_EXE_openlegal-server")))
+            .await
+            .unwrap();
         let service = TextDiffService::new(Arc::new(engine), Arc::new(OsHandleGenerator));
         let mut registry = server_info_registry(source.clone()).unwrap();
         registry
@@ -519,4 +521,119 @@ async fn heavily_escaped_source_and_change_pages_fit_complete_wire_budget() {
             .await;
     }
     server.stop().await;
+}
+
+#[tokio::test]
+async fn unicode_scalar_highlights_are_exposed_in_both_revisions() {
+    let server = Server::start(false).await;
+    for revision in ["2025-11-25", "2026-07-28"] {
+        let summary = server
+            .successful_call(
+                revision,
+                "compare_texts",
+                json!({
+                    "before":"A한😀Z\r\n", "after":"A韓😀Q\n"
+                }),
+            )
+            .await;
+        let page = server
+            .successful_call(
+                revision,
+                "get_text_diff_page",
+                json!({
+                    "comparison_id":summary["comparison_id"], "page":0
+                }),
+            )
+            .await;
+        assert_eq!(
+            page["fragments"][0]["inline_changes"],
+            json!([
+                {"row_index":0,"ranges":[[1,2],[3,5]]},
+                {"row_index":1,"ranges":[[1,2],[3,4]]}
+            ])
+        );
+        server
+            .successful_call(
+                revision,
+                "delete_text_diff",
+                json!({"comparison_id":summary["comparison_id"]}),
+            )
+            .await;
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn maximum_raw_control_inputs_roundtrip_through_the_actual_worker() {
+    let engine = SimilarDiffEngine::new(Path::new(env!("CARGO_BIN_EXE_openlegal-server")))
+        .await
+        .unwrap();
+    let service = TextDiffService::new(Arc::new(engine), Arc::new(OsHandleGenerator));
+    let before = ("\u{1}".repeat(1023) + "\n").repeat(1024);
+    let mut after = before.clone();
+    after.replace_range(0..1, "\u{2}");
+    let summary = service
+        .compare(
+            openlegal_domain::text_diff::CompareInput {
+                before: before.clone(),
+                after: after.clone(),
+                before_label: None,
+                after_label: None,
+            },
+            CancellationToken::new(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.before.bytes, 1024 * 1024);
+    assert_eq!((summary.additions, summary.deletions), (1, 1));
+    let changes = service
+        .page(openlegal_domain::text_diff::PageRequest {
+            comparison_id: summary.comparison_id.clone(),
+            view: openlegal_domain::text_diff::PageView::Changes,
+            page: 0,
+        })
+        .unwrap();
+    assert_eq!(changes.fragments[0].inline_changes[0].ranges, vec![[0, 1]]);
+    for (view, original) in [
+        (openlegal_domain::text_diff::PageView::Before, before),
+        (openlegal_domain::text_diff::PageView::After, after),
+    ] {
+        let mut restored = String::new();
+        for page in 0..32 {
+            let result = service
+                .page(openlegal_domain::text_diff::PageRequest {
+                    comparison_id: summary.comparison_id.clone(),
+                    view,
+                    page,
+                })
+                .unwrap();
+            assert_eq!(result.total_pages, 32);
+            assert!(serde_json::to_vec(&result).unwrap().len() <= 256 * 1024);
+            restored.push_str(result.text.as_deref().unwrap());
+        }
+        assert_eq!(restored, original);
+    }
+    let stop = CancellationToken::new();
+    stop.cancel();
+    service.run(stop).await.unwrap();
+}
+
+#[test]
+fn internal_worker_dispatch_precedes_config_runtime_and_logs() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_openlegal-server"))
+        .arg("--text-diff-worker")
+        .env("RUST_LOG", "trace")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(&output.stdout[..8], b"OLDIFR01");
+    assert_eq!(output.stdout.len(), 20); // typed invalid-input response to empty stdin
+    let extra = std::process::Command::new(env!("CARGO_BIN_EXE_openlegal-server"))
+        .args(["--text-diff-worker", "unexpected"])
+        .output()
+        .unwrap();
+    assert!(!extra.status.success());
+    assert!(extra.stdout.is_empty());
 }

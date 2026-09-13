@@ -7,22 +7,32 @@ use openlegal_server::{
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
+fn main() -> Result<(), ServerError> {
+    let mut args = std::env::args_os().skip(1);
+    let path = args.next().ok_or("usage: openlegal-server CONFIG.toml")?;
+    if args.next().is_some() {
+        return Err("usage: openlegal-server CONFIG.toml".into());
+    }
+    if path == "--text-diff-worker" {
+        openlegal_adapters::text_diff::run_worker()?;
+        return Ok(());
+    }
+    run_server(path)
+}
+
 #[tokio::main]
-async fn main() -> Result<(), ServerError> {
+async fn run_server(path: std::ffi::OsString) -> Result<(), ServerError> {
     // SDK diagnostics can include caller payloads even at info/warn; never enable them here.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     logging_subscriber(filter, std::io::stdout).init();
-    let path = std::env::args_os()
-        .nth(1)
-        .ok_or("usage: openlegal-server CONFIG.toml")?;
     let config: Config = toml::from_str(&tokio::fs::read_to_string(path).await?)?;
     config.limits.validate()?;
     if let Some(diff) = &config.text_diff {
         diff.validate(&config.limits)?;
     }
     let mut registry = openlegal_server::registry::server_info_registry(config.source.url.clone())?;
-    let diff_service = if let Some(diff) = &config.text_diff {
-        Some(openlegal_server::text_diff::service(&diff.git_path).await?)
+    let diff_service = if config.text_diff.is_some() {
+        Some(openlegal_server::text_diff::service(&std::env::current_exe()?).await?)
     } else {
         None
     };

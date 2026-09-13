@@ -28,7 +28,7 @@ test('compares exact pasted text through the host, renders the actual diff, and 
   await widget.getByRole('button', { name: 'Get source code' }).click();
   await expect.poll(async () => JSON.parse(await page.locator('#links').textContent() || '[]')).toEqual(['https://source.example/release']);
   await widget.getByText('Third-party dependency notices', { exact: true }).click();
-  await expect(widget.locator('#dependency-notices')).toContainText('BSD 3-Clause License');
+  await expect(widget.locator('#dependency-notices')).toContainText('@modelcontextprotocol/ext-apps@2.0.0 (MIT)');
 });
 test('existing handles load source chunks in order for editing, preserving CR until explicit LF conversion', async ({ page }) => {
   const widget = await open(page, '?initial');
@@ -152,4 +152,28 @@ test('clear invalidates a page response still in flight', async ({ page }) => {
   await page.waitForTimeout(500);
   await expect(widget.locator('.diff-fragment')).toHaveCount(0);
   await expect(widget.getByLabel('Before text', { exact: true })).toHaveValue('');
+});
+
+test('uses supplied Rust scalar ranges without browser rediff, including CJK and visible newline changes', async ({ page }) => {
+  const widget = await open(page, '?initial&highlights');
+  await expect(widget.locator('.split-diff-view')).toBeVisible();
+  // Both lines share this emoji. The fixture intentionally marks it and the CR/LF
+  // while leaving other unequal characters unmarked, making browser rediff visible.
+  await expect(widget.locator('.removed .inline-change')).toHaveText(['😀', '␍␊']);
+  await expect(widget.locator('.added .inline-change')).toHaveCount(0);
+  await expect(widget.locator('.no-final-newline')).toHaveText('\\ No newline at end of file');
+  await expect(widget.locator('.diff-fragment')).toContainText('가é漢字A');
+  await widget.getByLabel('Layout', { exact: true }).selectOption('unified');
+  await expect(widget.locator('.removed .inline-change')).toHaveText(['😀', '␍␊']);
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await expect(widget.locator('.diff-fragment')).toHaveAttribute('data-theme', 'dark');
+  await page.emulateMedia({ colorScheme: 'light' });
+  await expect(widget.locator('.diff-fragment')).toHaveAttribute('data-theme', 'light');
+});
+test('missing or invalid server highlights fail visibly without rendering a fallback diff', async ({ page }) => {
+  for (const malformed of ['missinghighlights', 'badhighlights']) {
+    const widget = await open(page, `?initial&${malformed}`);
+    await expect(widget.getByRole('alert')).toContainText('unsupported comparison response');
+    await expect(widget.locator('.diff-fragment')).toHaveCount(0);
+  }
 });

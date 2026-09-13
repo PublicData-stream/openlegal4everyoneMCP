@@ -161,15 +161,13 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextDiffConfig {
-    /// Absolute operator-selected executable; callers cannot choose commands.
-    pub git_path: PathBuf,
     pub widget_html: PathBuf,
 }
 
 impl TextDiffConfig {
     pub fn validate(&self, limits: &Limits) -> Result<(), ServerError> {
-        if !self.git_path.is_absolute() || self.widget_html.as_os_str().is_empty() {
-            return Err("text_diff requires an absolute git_path and a widget_html path".into());
+        if self.widget_html.as_os_str().is_empty() {
+            return Err("text_diff requires a widget_html path".into());
         }
         if limits.max_message_bytes != 16 * 1024 * 1024
             || limits.max_buffer_bytes < 256 * 1024 * 1024
@@ -326,9 +324,8 @@ mod text_diff_config_tests {
     use super::*;
 
     #[test]
-    fn comparison_requires_absolute_git_and_an_explicit_large_message_profile() {
+    fn comparison_requires_widget_and_an_explicit_large_message_profile() {
         let mut config = TextDiffConfig {
-            git_path: "/usr/bin/git".into(),
             widget_html: "text-diff.html".into(),
         };
         assert!(config.validate(&Limits::default()).is_err());
@@ -338,7 +335,13 @@ mod text_diff_config_tests {
             ..Default::default()
         };
         assert!(config.validate(&limits).is_ok());
-        config.git_path = "git".into();
+        assert!(
+            toml::from_str::<TextDiffConfig>(
+                "git_path = \"/usr/bin/git\"\nwidget_html = \"text-diff.html\""
+            )
+            .is_err()
+        );
+        config.widget_html = "".into();
         assert!(config.validate(&limits).is_err());
     }
 }

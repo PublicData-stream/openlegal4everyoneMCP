@@ -14,8 +14,8 @@ The binary accepts one TOML configuration path. All tables below are required
 except `limits`; unknown fields are rejected. Generate certificates only for local
 fixtures, or supply operator-managed certificates for hosting.
 
-The optional `[text_diff]` table enables [Git text comparison](text-diff.md) without
-a synthetic upstream. It requires a Git executable, its separately built widget,
+The optional `[text_diff]` table enables [Rust text comparison](text-diff.md) without
+a synthetic upstream. It requires its separately built widget,
 16 MiB messages and at least 256 MiB transport buffering.
 
 The optional `[demo]` table is documented in the [demo guide](demo.md). It requires

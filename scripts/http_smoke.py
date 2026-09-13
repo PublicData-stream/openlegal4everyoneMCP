@@ -123,6 +123,10 @@ def text_diff_smoke(revision, session, tools):
         if view == "changes":
             assert page["fragments"] and "-old" in page["fragments"][0]["patch"], page
             assert "+new" in page["fragments"][0]["patch"], page
+            assert page["fragments"][0]["inline_changes"] == [
+                {"row_index": 1, "ranges": [[0, 3]]},
+                {"row_index": 2, "ranges": [[0, 3]]},
+            ], page
         else:
             assert page["text"] == ("first\nold\n" if view == "before" else "first\nnew\n"), page
         assert len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode()) <= 256 * 1024

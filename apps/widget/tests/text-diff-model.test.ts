@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { decodeFile, editAsLf, localPatch, MAX_LINE_BYTES, MAX_TEXT_BYTES, parseCompare, parseDelete, parsePage, parsePair, parseShow, parseSummary, validateLabel, validateText } from '../src/text-diff-model.ts';
+import { decodeFile, editAsLf, fragmentRows, scalarSegments, splitRows, MAX_LINE_BYTES, MAX_TEXT_BYTES, parseCompare, parseDelete, parsePage, parsePair, parseShow, parseSummary, validateLabel, validateText } from '../src/text-diff-model.ts';
 import { fixtureFragment, fixtureId, fixturePage, fixtureSummary } from './text-diff-fixtures.ts';
 const response = (structuredContent: unknown) => ({ structuredContent });
 const expected = { comparison_id: fixtureId, view: 'changes' as const, page: 0 };
@@ -35,14 +35,16 @@ test('versioned summary/show/delete parsing rejects inconsistent results without
   assert.throws(() => parseDelete(response({ deleted: true })));
   assert.throws(() => parseCompare({ isError: true, content: [{ type: 'text', text: 'private secret' }] }), error => error instanceof Error && !error.message.includes('private'));
 });
-test('fragment rebasing is bounded by its displayed rows, preserving all patch data and newline markers', () => {
+test('bounded fragment rows preserve exact Unicode and newline data at large source offsets', () => {
   const fragment = fixtureFragment('가\r\nlast', '😀\r\nlast\n', 99999, 99999);
-  const rendered = localPatch(fragment);
-  assert.ok(rendered.includes('@@ -1,2 +1,2 @@'));
-  assert.equal(rendered.slice(rendered.indexOf('\n-', rendered.indexOf('@@'))), fragment.patch.slice(fragment.patch.indexOf('\n-', fragment.patch.indexOf('@@'))));
-  assert.ok(rendered.includes('\\ No newline at end of file'));
-  assert.equal(localPatch(fixtureFragment('', 'added\n', 0, 99999)).includes('@@ -0,0 +1,1 @@'), true);
-  assert.equal(localPatch(fixtureFragment('deleted\n', '', 99999, 0)).includes('@@ -1,1 +0,0 @@'), true);
+  const rows = fragmentRows(fragment);
+  assert.deepEqual(rows.map(row => row.text), ['가\r\n', 'last', '😀\r\n', 'last\n']);
+  assert.deepEqual(rows.map(row => [row.before, row.after]), [[1, undefined], [2, undefined], [undefined, 1], [undefined, 2]]);
+  assert.equal(rows[1].noFinalNewline, true);
+  assert.equal(rows[3].noFinalNewline, false);
+  assert.deepEqual(splitRows(rows).map(pair => [pair.before?.text, pair.after?.text]), [['가\r\n', '😀\r\n'], ['last', 'last\n']]);
+  assert.equal(fragmentRows(fixtureFragment('', 'added\n', 0, 99999))[0].after, 1);
+  assert.equal(fragmentRows(fixtureFragment('deleted\n', '', 99999, 0))[0].before, 1);
 });
 test('pages validate identity, view, counters, row bounds and full source chunks before rendering', () => {
   const page = fixturePage('old\n', 'new\n');
@@ -59,4 +61,99 @@ test('initial pairs distinguish an empty pair from an existing handle and retain
   assert.equal(parsePair({ comparison_id: fixtureId }), null);
   assert.deepEqual(parsePair({ before: '', after: '', before_label: ' left ' }), { before: '', after: '', before_label: ' left ' });
   assert.throws(() => parsePair({ before: '' }));
+});
+
+test('Rust scalar offsets preserve supplementary characters, CJK, combining marks and separate changes', () => {
+  const raw = '😀가e\u0301漢字A\r\n';
+  assert.deepEqual(scalarSegments(raw, [[0, 1], [3, 4], [5, 6], [7, 9]]), [
+    { text: '😀', changed: true }, { text: '가e', changed: false },
+    { text: '\u0301', changed: true }, { text: '漢', changed: false },
+    { text: '字', changed: true }, { text: 'A', changed: false }, { text: '\r\n', changed: true },
+  ]);
+  const fragment = fixtureFragment(raw, '😀나e\u0301漢語B\n');
+  // Mark the shared emoji, deliberately leaving actual substitutions unmarked.
+  // The renderer follows server metadata instead of deriving another diff.
+  fragment.inline_changes = [{ row_index: 0, ranges: [[0, 1]] }, { row_index: 1, ranges: [] }];
+  assert.deepEqual(fragmentRows(fragment).map(row => scalarSegments(row.text, row.ranges).filter(part => part.changed)), [[{ text: '😀', changed: true }], []]);
+});
+test('missing, duplicate, malformed, overlapping and UTF-16-like out-of-bounds highlights fail closed', () => {
+  const page = fixturePage('😀\n', '가\n');
+  const fragment = page.fragments[0];
+  for (const inline_changes of [undefined, [], [{ row_index: 0, ranges: [] }],
+    [{ row_index: 0, ranges: [] }, { row_index: 0, ranges: [] }],
+    [{ row_index: 1, ranges: [] }, { row_index: 0, ranges: [] }],
+    [{ row_index: 0, ranges: [[0, 3]] }, { row_index: 1, ranges: [] }],
+    [{ row_index: 0, ranges: [[1, 1]] }, { row_index: 1, ranges: [] }],
+    [{ row_index: 0, ranges: [[0, 2], [1, 2]] }, { row_index: 1, ranges: [] }],
+    [{ row_index: 0, ranges: [[-1, 1]] }, { row_index: 1, ranges: [] }],
+    [{ row_index: 0, ranges: [[0, 1.5]] }, { row_index: 1, ranges: [] }],
+    [{ row_index: 0, ranges: [[0, 1, 2]] }, { row_index: 1, ranges: [] }]]) {
+    assert.throws(() => parsePage(response({ ...page, fragments: [{ ...fragment, inline_changes }] }), expected));
+  }
+  const noNewline = fixtureFragment('😀', '字');
+  noNewline.inline_changes[0].ranges = [[0, 2]];
+  assert.throws(() => fragmentRows(noNewline));
+  const context = { ...fragment, patch: '--- before\n+++ after\n@@ -1,1 +1,1 @@\n same\n', inline_changes: [{ row_index: 0, ranges: [] }] };
+  assert.throws(() => fragmentRows(context));
+  const invalidText = { ...fragment, patch: fragment.patch.replace('😀', '\ud800') };
+  assert.throws(() => fragmentRows(invalidText));
+});
+test('range budgets include every fragment and accept exactly 4096 page ranges', () => {
+  const fragment = fixtureFragment('x'.repeat(8192) + '\n', 'new\n');
+  fragment.inline_changes = [{ row_index: 0, ranges: Array.from({ length: 4096 }, (_, index) => [index * 2, index * 2 + 1]) }, { row_index: 1, ranges: [] }];
+  const page = { ...fixturePage('', ''), fragments: [fragment] };
+  assert.equal(parsePage(response(page), expected).fragments.length, 1);
+  assert.throws(() => parsePage(response({ ...page, fragments: [fragment, fixtureFragment('a', 'b')] }), expected));
+  fragment.inline_changes[1].ranges = [[0, 1]];
+  assert.throws(() => parsePage(response(page), expected));
+});
+test('split rows retain context and source order across unequal replacement blocks', () => {
+  const fragment = fixtureFragment('first\nsecond\n', 'new\n');
+  fragment.patch = fragment.patch.replace('@@ -1,2 +1,1 @@', '@@ -1,3 +1,2 @@') + ' same\n';
+  fragment.before_count = 3; fragment.after_count = 2;
+  const pairs = splitRows(fragmentRows(fragment));
+  assert.deepEqual(pairs.map(pair => [pair.before?.text, pair.after?.text]), [['first\n', 'new\n'], ['second\n', undefined], ['same\n', 'same\n']]);
+});
+test('shared range budget rejects before reading overflowing ranges or later fragments', () => {
+  const first = fixtureFragment('x'.repeat(8192) + '\n', '');
+  first.inline_changes[0].ranges = Array.from({ length: 2048 }, (_, index) => [index * 2, index * 2 + 1]);
+  const second = fixtureFragment('y'.repeat(8192) + '\n', '');
+  const ranges = new Array(2049);
+  Object.defineProperty(ranges, 0, { get() { throw new Error('overflowing range was processed'); } });
+  second.inline_changes[0].ranges = ranges;
+  const later = { get patch() { throw new Error('later fragment was processed'); } };
+  assert.throws(() => parsePage(response({ ...fixturePage('', ''), fragments: [first, second, later] }), expected), /unsupported comparison response/);
+});
+test('shared row budget stops before later fragments and before validating an excess data row', () => {
+  const full = fixtureFragment('', 'x\n'.repeat(400));
+  const later = { get patch() { throw new Error('later fragment was processed'); } };
+  assert.throws(() => parsePage(response({ ...fixturePage('', ''), fragments: [full, later] }), expected), /unsupported comparison response/);
+  const excess = { ...full, patch: full.patch + '+\0\n' };
+  // The 401st row is rejected before text validation or allocation. Metadata is
+  // intentionally inaccessible, detecting any work after the row budget fails.
+  Object.defineProperty(excess, 'inline_changes', { get() { throw new Error('annotations were processed'); } });
+  assert.throws(() => parsePage(response({ ...fixturePage('', ''), fragments: [excess] }), expected), /unsupported comparison response/);
+});
+test('shared byte budget rejects an oversized next patch before inspecting its annotations', () => {
+  const first = fixtureFragment('', ('\t'.repeat(16000) + '\n').repeat(8));
+  const second = fixtureFragment('', 'x'.repeat(16000) + '\n');
+  Object.defineProperty(second, 'inline_changes', { get() { throw new Error('oversized annotations were processed'); } });
+  const later = { get patch() { throw new Error('later fragment was processed'); } };
+  assert.throws(() => parsePage(response({ ...fixturePage('', ''), fragments: [first, second, later] }), expected), /unsupported comparison response/);
+});
+test('page byte accounting includes escaped patch data and highlight metadata at the exact limit', () => {
+  const maximum = 256 * 1024;
+  let padding = 0;
+  const makePage = () => ({ ...fixturePage('', ''), fragments: [fixtureFragment('', ('\t'.repeat(16000) + '\n').repeat(8) + 'x'.repeat(padding) + '\n')] });
+  let page = makePage();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const difference = maximum - new TextEncoder().encode(JSON.stringify(page)).byteLength;
+    if (difference === 0) break;
+    padding += difference;
+    page = makePage();
+  }
+  assert.equal(new TextEncoder().encode(JSON.stringify(page)).byteLength, maximum);
+  assert.equal(parsePage(response(page), expected).fragments.length, 1);
+  padding++;
+  assert.throws(() => parsePage(response(makePage()), expected), /unsupported comparison response/);
 });
