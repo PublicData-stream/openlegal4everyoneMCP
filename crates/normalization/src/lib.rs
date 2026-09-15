@@ -1,4 +1,6 @@
-//! Pure, bounded processors for two explicitly synthetic JSON representations.
+//! Pure, bounded processors for synthetic JSON and supplied search-query syntax.
+
+pub mod search_query;
 
 use openlegal_domain::{
     Query, Record, RetrievalData, RetrievalError, SearchPage, valid_identifier,

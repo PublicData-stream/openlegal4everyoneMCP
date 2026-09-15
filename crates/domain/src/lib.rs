@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub mod history;
+pub mod search_query;
 pub mod text_diff;
 
 /// A versioned operation identity. Freshness preferences are deliberately separate.

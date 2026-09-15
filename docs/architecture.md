@@ -11,6 +11,10 @@ Rust worker adapter and a separate transient result store. Real legal-data model
 and providers remain planned. The [server contract](server.md) owns the
 implemented extension interfaces and transport configuration.
 
+A standalone [search-query processor](search-query.md) now parses supplied query
+syntax into domain-owned expressions. It has no evaluator or serving integration;
+the existing synthetic search and historical query validation remain unchanged.
+
 - Support multiple jurisdictions without imposing one provider's identity or
   date semantics on all records.
 - Start provider coverage with Korean national legislation and history.
@@ -27,8 +31,8 @@ preempt future evidence-backed legal mappings. The CLI remains planned.
 
 | Component | Responsibility | Project dependencies |
 | --- | --- | --- |
-| `crates/domain` | Synthetic record/query types, supplied-text comparison contracts, provenance, freshness and errors; legal models remain future work | No other project layer |
-| `crates/normalization` | Pure parsing and provider-specific normalization modules | Domain |
+| `crates/domain` | Synthetic record/query types, search-syntax expressions, supplied-text comparison contracts, provenance, freshness and errors; legal models remain future work | No other project layer |
+| `crates/normalization` | Pure parsing, search-query syntax processing, and provider-specific normalization modules | Domain |
 | `crates/application` | Retrieval use cases and supplied-text comparisons; freshness, refresh, coalescing, retention and budgets; operation interfaces | Domain |
 | `crates/adapters` | Separate modules for upstream HTTP, cache storage, and bounded Rust comparison workers | Application interfaces, domain, normalization |
 | `apps/server` | Configuration, immutable tool/resource registries, worker/endpoint supervision, HTTP/WebTransport and private health | Application/adapters/normalization through demo composition; domain for typed tool results |

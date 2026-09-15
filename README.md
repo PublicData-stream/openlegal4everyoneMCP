@@ -25,6 +25,10 @@ paging and temporary results that users can delete. Real legal
 providers and user accounts remain planned. Local browser tests use a simulated
 host; the product domain does not imply deployment or verified live ChatGPT access.
 
+A standalone [search-query processor](docs/search-query.md) parses Boolean
+expressions, field scopes, exact phrases, word groups, and prefixes. Search
+execution integration remains planned; synthetic search still uses literal text.
+
 ## Run and extend
 
 Install the pinned Rust toolchain, prepare the configuration and TLS certificate
@@ -52,6 +56,7 @@ Node or a widget build.
 - [Server contract](docs/server.md): configuration, extension API and transport behavior.
 - [Dependencies](docs/dependencies.md): admission rationale and check tooling.
 - [Retrieval framework](docs/retrieval.md): processors, caching, evidence and resource limits.
+- [Search-query syntax](docs/search-query.md): standalone parser, operators, diagnostics, and bounds.
 - [Text comparison](docs/text-diff.md): Rust line/character engine, input limits, paging, retention and editable widget.
 - [Synthetic browser](docs/demo.md): local setup, tools, progress and ChatGPT manual checks.
 - [Retrieval validation](docs/retrieval-review.md): independent reviews, checks and remaining limits.
