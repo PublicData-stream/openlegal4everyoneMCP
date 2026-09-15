@@ -61,6 +61,30 @@ Only esbuild's installation script is enabled. The production resource bundles
 dependencies locally; it loads no CDN assets. Node 24.21.0/pnpm 12.3.4 are the
 declared frontend baseline, with browser and current advisory/license checks in CI.
 
+## Rustls security maintenance (2026-09-15)
+
+The workspace lockfile updates the single shared Rustls package from 0.23.44 to
+0.23.45 for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285).
+The affected version could accept a complete plaintext handshake message following
+a key-changing message within the same TLS record. The upstream patch corrects
+handshake alignment checks. The advisory does not establish handshake forgery or
+a certificate-verification bypass.
+
+This is the smallest patched release accepted by existing dependency constraints;
+no other package version or feature changes. Source remains crates.io, MSRV remains
+Rust 1.71, and the license remains Apache-2.0 OR ISC OR MIT. Manifests, enabled
+features, dependencies, and build scripts are otherwise unchanged. The release
+also zeroizes consumed private-key DER and tightens HelloRetryRequest validation;
+the existing verified TLS and QUIC workflows require compatibility checks.
+
+The package is shared by wtransport/Quinn, reqwest, and SQLx. The workspace enables
+both ring and AWS-LC; the retained in-memory TLS regression exercises both
+providers, a complete and a fragmented malicious handshake, and a valid handshake
+with application data. Existing native transport, OxiBelt, and PostgreSQL TLS gates
+cover their integration. The separately pinned OxiBelt edge build has its own
+dependency graph; this lockfile update does not upgrade that project. See the
+[maintenance review](rustls-review.md) for reproduction and validation evidence.
+
 ## License and build policy
 
 The initial resolved graph uses MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC,
