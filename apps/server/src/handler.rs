@@ -243,6 +243,12 @@ impl ServerHandler for McpHandler {
                     Ok(Err(error)) => {
                         self.counters.failures.fetch_add(1, Ordering::Relaxed);
                         let (code, message) = match error {
+                            ToolError::ProcessingPending => ("processing_pending", "An observed source replacement is awaiting processing."),
+                            ToolError::UnsupportedHistory => ("unsupported_history", "Provider revision history is not supported for this dataset."),
+                            ToolError::HistoryIncomplete => ("history_incomplete", "The revision inventory is insufficient for this selector."),
+                            ToolError::SessionExpired => ("session_expired", "The retained query session has expired."),
+                            ToolError::SnapshotInvalidated => ("snapshot_invalidated", "The retained query was invalidated by a source withdrawal."),
+                            ToolError::Withdrawn => ("withdrawn", "The source object was withdrawn."),
                             ToolError::StorageUnavailable => ("storage_unavailable", "Persistent storage is temporarily unavailable."),
                             ToolError::StorageCorrupt => ("storage_corrupt", "Retained data failed integrity checks."),
                             ToolError::StorageCapacity => ("storage_capacity", "Persistent storage capacity is exhausted."),

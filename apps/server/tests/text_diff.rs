@@ -196,7 +196,7 @@ async fn independent_comparison_tools_have_typed_schemas_and_accurate_deletion_a
     for version in ["2025-11-25", "2026-07-28"] {
         let listed = server.rpc(version, "tools/list", json!({})).await;
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 13);
         assert!(
             tools
                 .iter()
@@ -637,4 +637,78 @@ fn internal_worker_dispatch_precedes_config_runtime_and_logs() {
         .unwrap();
     assert!(!extra.status.success());
     assert!(extra.stdout.is_empty());
+}
+
+#[tokio::test]
+async fn canonical_diff_patch_export_and_attachment_application_roundtrip() {
+    let server = Server::start(false).await;
+    for version in ["2025-11-25", "2026-07-28"] {
+        let before = "\u{feff}첫\r\n끝";
+        let after = "\u{feff}첫\r\n끝!";
+        let diff = server
+            .successful_call(version, "text.diff", json!({"before":before,"after":after}))
+            .await;
+        assert!(diff["explanation"].as_str().unwrap().contains("Myers"));
+        let applied = server
+            .successful_call(
+                version,
+                "text.apply_patch",
+                json!({"target":before,"patch":{"attachment_id":diff["patch"]["attachment_id"]}}),
+            )
+            .await;
+        let page = server
+            .successful_call(
+                version,
+                "text.attachment.read",
+                json!({"attachment_id":applied["result"]["attachment_id"]}),
+            )
+            .await;
+        assert_eq!(page["text"], after);
+        assert_eq!(page["complete"], true);
+        let first = server
+            .successful_call(
+                version,
+                "text.attachment.upload",
+                json!({"kind":"text","total_bytes":5,"chunk":"한","final":false}),
+            )
+            .await;
+        let id = &first["attachment_id"];
+        let sealed = server
+            .successful_call(
+                version,
+                "text.attachment.upload",
+                json!({"attachment_id":id,"offset":3,"chunk":"\r\n","final":true}),
+            )
+            .await;
+        assert_eq!(sealed["sealed"], true);
+        let replay = server
+            .successful_call(
+                version,
+                "text.attachment.upload",
+                json!({"attachment_id":id,"offset":3,"chunk":"\r\n","final":true}),
+            )
+            .await;
+        assert_eq!(replay, sealed);
+        for attachment in [
+            id,
+            &diff["patch"]["attachment_id"],
+            &applied["result"]["attachment_id"],
+        ] {
+            server
+                .successful_call(
+                    version,
+                    "text.attachment.delete",
+                    json!({"attachment_id":attachment}),
+                )
+                .await;
+        }
+        server
+            .successful_call(
+                version,
+                "text.diff.delete",
+                json!({"comparison_id":diff["comparison"]["comparison_id"]}),
+            )
+            .await;
+    }
+    server.stop().await;
 }

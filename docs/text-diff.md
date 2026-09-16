@@ -165,7 +165,8 @@ replacement. Deletion prevents subsequent reads but cannot retract content alrea
 returned to another client. Closing a widget is not a reliable deletion signal;
 fixed expiry remains the fallback.
 
-`delete_text_diff` is the sole built-in mutation exception. Its annotations declare
+`delete_text_diff` and its `text.diff.delete` alias are built-in mutation exceptions
+alongside the temporary attachment upload/deletion tools described below. Their annotations declare
 read-only false, destructive true, idempotent true and open-world false. Generic
 extension registration still requires read-only behavior. This exception does not
 authorize repository changes, provider writes, or general administration.
@@ -196,3 +197,70 @@ comparison. `compare_texts` does not accept this field. Editing creates a suppli
 text comparison without a verified historical association. Original source payloads
 remain governed by L2 retention; comparison text and metadata expire after ten
 minutes even if the source snapshots are already evicted.
+
+## Canonical text tools and temporary attachments
+
+The canonical API adds `text.diff`, `text.apply_patch`, `text.diff.show`,
+`text.diff.page`, and `text.diff.delete`. The four original tool names remain
+available with their original input/output shapes; the namespaced show/page/delete
+helpers have the same contracts. `text.diff` accepts `before` and `after` as UTF-8
+strings or `{ "attachment_id": "<handle>" }`, plus optional display labels. Its
+result contains `comparison`, a sealed `patch` attachment, and a deterministic
+`explanation` of the line/scalar algorithm described above. The patch attachment
+contains one complete unified patch; concatenating display fragments is not a
+substitute. Equal texts export an empty no-op patch. Comparison and patch handles
+are independently deletable and expire ten minutes after their publication.
+
+`text.apply_patch` accepts `target` and `patch`, each either inline or an attachment
+reference of the corresponding kind. It returns `result` (a sealed text attachment)
+and `info` (text byte/line information). Read the result through attachment pages;
+its maximum escaped representation need not fit in one tool response. Applying a
+patch never writes a file, changes a database object, or modifies an input
+attachment. A separate comparison can visualize the target/result difference.
+
+Patch application accepts a single ordinary unified patch with `---`/`+++` headers,
+optional `diff --git` and `index` preamble, ordered hunks and standard missing-final-
+newline markers. Header names are ignored as paths. Every context/deletion line
+must match the target at exactly the declared location, including CR and LF bytes.
+There is no fuzz, offset search, whitespace repair, reverse mode or partial success.
+Mode changes, rename metadata, binary/combined/multi-file patches and malformed
+counts are rejected. Empty patches preserve the target. Invalid syntax and target
+mismatches return invalid-input errors; size/work limits remain resource errors.
+The target and result retain the existing 1 MiB/line-count/line-size text limits;
+patch inputs permit up to 8 MiB. This parser is a pure transformation in normalization;
+the same killable two-worker pool enforces the ten-second/caller deadline.
+
+Three built-in tools manage memory-only attachments:
+
+| Tool | Contract |
+| --- | --- |
+| `text.attachment.upload` | First call: `kind` (`text` or `patch`), `total_bytes`, `chunk`, `final`, and optional zero `offset`. Later calls: `attachment_id`, byte `offset`, `chunk`, `final`; omit kind/total. |
+| `text.attachment.read` | `attachment_id`, optional zero `offset`; returns `attachment` metadata, `text`, `next_offset` and `complete`. Only sealed attachments are readable. |
+| `text.attachment.delete` | `attachment_id`; repeated deletion of a well-formed absent handle succeeds. |
+
+Chunks contain at most 32 KiB of UTF-8 and offsets must be scalar boundaries.
+Upload sequentially. Exact replays of committed bytes succeed; gaps and conflicting
+replays fail. `final: true` seals only when the declared length has been reached;
+sealed bytes cannot change. Empty attachments are an empty final first upload.
+Text sealing checks the comparison text limits. Patch sealing checks UTF-8/NUL and
+byte limits; the application validates patch syntax when it is used.
+
+There are at most 64 attachment handles, including unfinished uploads. Their reserved
+capacity and any input leases share the 128 MiB comparison accounting allowance;
+comparison/job slots remain capped at 32. Declared upload capacity is reserved before
+acceptance. An attachment expires ten minutes from the initial upload; append,
+seal and read do not extend expiry. Deletion/expiry prevents new reads, while an
+operation that already acquired the bytes may finish; pinned bytes stay accounted
+until released. Restart discards all attachments. An initial response lost before
+its handle reaches the caller can leave an unreachable upload until fixed expiry.
+
+Handles authorize both read and deletion, without user/account isolation. Never log
+handles or source contents. Upload and deletion are narrow built-in mutation
+exceptions; ordinary extension registration stays read-only. Upload is marked
+non-idempotent because retrying initial creation may allocate another handle.
+
+The widget's patch panel loads local UTF-8 target/patch files with strict decoding,
+keeps CR/BOM bytes, uploads only on Apply patch, reads the complete result in bounded
+chunks and deletes its temporary handles. Clear patch retries any failed cleanup.
+The local result preview remains until cleared. A closed host may prevent cleanup;
+fixed expiry remains the fallback. No live ChatGPT compatibility is established.

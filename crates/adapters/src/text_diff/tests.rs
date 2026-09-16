@@ -100,7 +100,7 @@ fn fake_worker_script(directory: &Path, body: &str) -> SimilarDiffEngine {
 #[tokio::test]
 async fn cancellation_and_deadline_reap_worker() {
     let _fixture_gate = PROCESS_FIXTURE_GATE.lock().await;
-    for cancel in [true, false] {
+    for (cancel, patch) in [(true, false), (false, false), (true, true), (false, true)] {
         let fixture = tempfile::tempdir().unwrap();
         let engine = fake_worker(fixture.path(), "/bin/sleep 60");
         let cancellation = CancellationToken::new();
@@ -112,9 +112,16 @@ async fn cancellation_and_deadline_reap_worker() {
                 Duration::from_millis(150)
             };
         let task = tokio::spawn(async move {
-            engine
-                .diff(Arc::from("old"), Arc::from("new"), token, deadline)
-                .await
+            if patch {
+                engine
+                    .apply_patch(Arc::from("old"), Arc::from(""), token, deadline)
+                    .await
+                    .map(|_| ComputedDiff::default())
+            } else {
+                engine
+                    .diff(Arc::from("old"), Arc::from("new"), token, deadline)
+                    .await
+            }
         });
         tokio::time::timeout(Duration::from_secs(3), async {
             while !fixture.path().join("pid").exists() {
@@ -220,5 +227,28 @@ async fn oversized_framed_sections_kill_and_reap_running_workers() {
         );
         let pid = std::fs::read_to_string(fixture.path().join("pid")).unwrap();
         assert!(!Path::new("/proc").join(pid.trim()).exists());
+    }
+}
+
+#[test]
+fn generated_complete_patches_apply_exactly() {
+    for (before, after) in [
+        ("", ""),
+        ("", "한\n"),
+        ("a\n", ""),
+        ("a", "a\n"),
+        ("\u{feff}한\r\n끝", "\u{feff}한\n끝!"),
+        (
+            "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\n",
+            "A\nb\nc\nd\ne\nf\ng\nh\ni\nj\nK\n",
+        ),
+        ("x\rx\n", "x\ry\n"),
+        ("a\nb\n", "a\nx\nb\n"),
+    ] {
+        let result = compute::compare(before, after).unwrap();
+        assert_eq!(
+            openlegal_normalization::patch::apply_patch(before, &result.patch).unwrap(),
+            after
+        );
     }
 }

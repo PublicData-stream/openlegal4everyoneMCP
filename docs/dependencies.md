@@ -89,8 +89,8 @@ dependency graph; this lockfile update does not upgrade that project. See the
 
 The initial resolved graph uses MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC,
 MIT-0, Unicode-3.0 and Zlib licenses (or expressions satisfiable by these choices).
-These remain the explicit third-party allowlist in `deny.toml`; no advisory
-exceptions are installed. The five first-party workspace packages use
+These remain the default third-party allowlist in `deny.toml`; the exact corpus
+search exceptions are documented below. The five first-party workspace packages use
 `AGPL-3.0-only`, admitted through exact package/version exceptions rather than a
 global AGPL allowance. Owner: PiQuark6046; review by 2026-12-12 and on package
 version changes. The exceptions implement the project's licensing choice and do
@@ -194,3 +194,59 @@ Admission evidence must include current cargo-audit and cargo-deny results,
 features/source review, real PostgreSQL 18 tests, and focused independent reviews.
 See [persistence](persistence.md) for credentials, verified TLS, bounded pooling,
 and the explicit distinction between digest integrity and source authentication.
+
+## Corpus search admission (2026-09-16)
+
+- **Tantivy 0.26.2** provides immutable local index readers, atomic commits and
+  rebuildable storage. Only mmap and LZ4 compression features are enabled; no
+  external search service or caller-provided index path is introduced. Corpus
+  publication remains PostgreSQL-owned. Source: crates.io, MIT. Writer buffers,
+  document serialization, scans and retained reader sessions have separate bounds;
+  a writer buffer is not a total process-memory limit.
+- **Lindera 5.0.1**, with locked dictionary/ko-dic 5.3.0, provides Korean morphology.
+  Only the embedded Korean dictionary feature is requested. Search surfaces use
+  NFC and ASCII lowercase without stopwords; legal bodies remain unchanged.
+  Source: crates.io, MIT. Its build helper fetches the named
+  `mecab-ko-dic-2.1.1-20180720.tar.gz` artifact and verifies the upstream-configured
+  MD5 `b996764e91c96bc89dc32ea208514a96`. This is a build-time network dependency,
+  not a runtime dictionary download. Dictionary redistribution needs the original
+  Apache-2.0 notices. Dictionary/version changes require a new analyzer version
+  and complete index rebuild.
+- **grep-regex 0.1.14 / grep-matcher 0.1.8** are ripgrep's Rust regex/matcher
+  libraries, allowing typed, bounded matching without interpreting command-line
+  switches or spawning shell commands. Source: crates.io, MIT OR Unlicense;
+  select MIT. Regex automata and per-call scans have independent limits.
+- **unicode-normalization 0.1.25** implements NFC for analyzed search surfaces;
+  exact quoted matching and original text use the unmodified representation.
+  Source: crates.io, MIT OR Apache-2.0. Hand-written Unicode composition is not an
+  appropriate alternative.
+
+The requested alternative [hephaex/mecab-ko](https://github.com/hephaex/mecab-ko/tree/024a0e8ed9e3ba922ed21f786600881b7b8a75ae)
+was inspected at commit `024a0e8ed9e3ba922ed21f786600881b7b8a75ae`. It offers a Rust
+Tokenizer, original byte positions and user dictionaries under MIT OR Apache-2.0.
+It is not selected in this patch. Its mutable tokenizer and separate dictionary
+artifacts would require an explicit analyzer pool and dictionary admission. The
+reviewed default dictionary discovery includes a development miniature fallback;
+missing entries can also yield an empty entry set. An integration must use explicit
+validated full dictionaries. Upstream benchmark claims have not been reproduced on
+this project's legal text and do not establish search accuracy here.
+
+### Narrow dependency exceptions
+
+Tantivy 0.26.2 depends on lru 0.16.4, affected by
+[RUSTSEC-2026-0253](https://rustsec.org/advisories/RUSTSEC-2026-0253.html).
+The advisory requires `pop` to unwind through a panicking key destructor. Source
+and reverse-dependency review found one consumer: Tantivy's
+`store/reader.rs::BlockCache`, an `LruCache<usize, Block>` using new/get/put/len.
+It does not call `pop`; `usize` has no destructor. This is an unreachable
+precondition in the selected graph, not a fix to lru itself. `deny.toml` records the
+specific advisory exception. Owner: PiQuark6046; review by **2026-10-16**, on any
+Tantivy/lru update, or if another consumer appears. Independent review:
+`text_review`, actual dependency graph and source, 2026-09-16. Prefer an upstream
+Tantivy release using fixed lru >=0.18.2 when available.
+
+`webpki-roots 1.0.9`, used by Lindera's build/download support, adds
+CDLA-Permissive-2.0 licensed root-certificate data. The exception is scoped to that
+exact package/version; preserve its accompanying license when redistributing the
+data. Owner/review deadline: PiQuark6046, 2026-10-16. Other licenses retain their
+existing admission policy. No blanket license or advisory suppression is added.

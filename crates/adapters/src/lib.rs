@@ -5,6 +5,8 @@ extern crate self as openlegal_adapters;
 
 pub mod blob;
 mod cache;
+pub mod corpus;
+pub mod document_jobs;
 pub mod postgres;
 pub mod text_diff;
 pub use cache::MemoryCache;
@@ -437,3 +439,11 @@ mod tests {
         }
     }
 }
+
+pub mod search_index;
+
+pub mod law_go_kr;
+
+pub mod corpus_search;
+
+pub mod corpus_read;

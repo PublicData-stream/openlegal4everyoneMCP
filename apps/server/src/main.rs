@@ -139,7 +139,22 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         }
         _ => None,
     };
+    let mut corpus_runtime = None;
     let result: Result<(), ServerError> = async {
+        if let Some(database) = &config.database {
+            let runtime = openlegal_server::corpus_runtime::CorpusRuntime::open(
+                database,
+                persistent.as_ref().ok_or("database storage unavailable")?,
+            )
+            .await?;
+            registry.register_module(openlegal_server::database::DatabaseTools {
+                database: runtime.database.clone(),
+                reader: runtime.reader.clone(),
+                search: runtime.search.clone(),
+                comparison: diff_service.clone().ok_or("database comparison unavailable")?,
+            })?;
+            corpus_runtime = Some(runtime);
+        }
         let demo_service = config
             .demo
             .as_ref()
@@ -168,6 +183,12 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                 openlegal_server::text_diff::load_widget(&diff.widget_html, &config.source.url).await?,
             )?;
         }
+        if let Some(database) = &config.database {
+            resources.extend(
+                openlegal_server::database::load_widget(&database.widget_html, &config.source.url)
+                    .await?,
+            )?;
+        }
         let mut builder = ServerBuilder::new(registry, config.limits, config.source.url.clone())
             .with_resources(resources);
         if let Some(service) = &diff_service {
@@ -182,6 +203,12 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
             builder.register_worker("retrieval", move |shutdown| async move {
                 service.run(shutdown).await?;
                 Ok(())
+            })?;
+        }
+        if let Some(runtime) = &corpus_runtime {
+            let runtime = runtime.clone();
+            builder.register_worker("legal_corpus", move |shutdown| async move {
+                runtime.run(shutdown).await
             })?;
         }
         builder.register_endpoint(HttpEndpoint {
@@ -203,18 +230,30 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         let health = HealthEndpoint {
             bind: config.health.bind,
         };
-        if demo_service.is_some() || diff_service.is_some() {
+        if demo_service.is_some() || diff_service.is_some() || corpus_runtime.is_some() {
             let readiness_service = demo_service.clone();
-            builder.register_endpoint(health.with_metrics(move || {
-                let mut metrics = String::new();
-                if let Some(service) = &demo_service {
-                    metrics.push_str(&service.metrics_prometheus());
-                }
-                if let Some(service) = &diff_service {
-                    metrics.push_str(&service.metrics_prometheus());
-                }
-                metrics
-            }).with_readiness(move || readiness_service.as_ref().is_none_or(|service| service.storage_ready())))?;
+            let corpus_readiness = corpus_runtime.clone();
+            builder.register_endpoint(
+                health
+                    .with_metrics(move || {
+                        let mut metrics = String::new();
+                        if let Some(service) = &demo_service {
+                            metrics.push_str(&service.metrics_prometheus());
+                        }
+                        if let Some(service) = &diff_service {
+                            metrics.push_str(&service.metrics_prometheus());
+                        }
+                        metrics
+                    })
+                    .with_readiness(move || {
+                        readiness_service
+                            .as_ref()
+                            .is_none_or(|service| service.storage_ready())
+                            && corpus_readiness
+                                .as_ref()
+                                .is_none_or(|runtime| runtime.store.healthy())
+                    }),
+            )?;
         } else {
             builder.register_endpoint(health)?;
         }
@@ -243,6 +282,12 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
     }
     .await;
     // Every startup and serving exit owns persistence cleanup, including bind/widget errors.
+    if let Some(runtime) = corpus_runtime {
+        let closed = runtime.close().await;
+        if result.is_ok() {
+            closed?;
+        }
+    }
     if let Some(store) = persistent {
         use openlegal_application::persistence::PersistentStore;
         let closed = store.close().await;

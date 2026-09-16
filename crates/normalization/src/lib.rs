@@ -1,5 +1,6 @@
 //! Pure, bounded processors for synthetic JSON and supplied search-query syntax.
 
+pub mod patch;
 pub mod search_query;
 
 use openlegal_domain::{

@@ -42,9 +42,9 @@ not override higher-priority instructions, user scope, or execution permissions.
 
 The Rust server foundation now lives in `apps/server`, with a committed workspace,
 lockfile, tests and CI. Retrieval/cache services now exercise synthetic sources;
-real legal-data providers remain planned;
-do not create empty future crates or make live provider requests merely because
-they appear in the architecture.
+the legal corpus and LAW OPEN DATA adapter are opt-in and tested with offline fixtures.
+Do not make live provider requests merely because an adapter exists. Live acceptance
+and hardened document-worker deployment remain separate explicit gates.
 
 Use repository-relative paths in durable descriptions. Commands run from the
 repository root unless a different directory is explicitly stated. Keep local
@@ -159,6 +159,17 @@ before a Rust change is ready. Bootstrap must enumerate supported feature
 combinations and add explicit checks for them. Use `--all-features` only when all
 features are intended to coexist. Preserve doctest coverage; selecting all targets
 alone is not a substitute for running documentation tests.
+
+Changes to document processing also require `scripts/test-document-worker.sh`.
+This Docker gate validates the standalone worker's locked native dependency graph,
+formatting, linting and tests, then exercises fictional XML/HTML/PDF/HWP5/HWPX/OCR
+fixtures with the worker's seccomp and resource limits. It runs in CI, including
+the scheduled advisory checks. It does not establish Kubernetes, gVisor or
+AppArmor acceptance; the separately configured real-cluster gate and its deployment
+prerequisites are documented in [document processing](docs/document-sandbox.md).
+The dedicated hosted worker job removes unused preinstalled Android/.NET SDKs and
+requires at least 20 GiB free build space; local runs must provision that space
+without deleting unrelated host data.
 
 CI introduced with Rust must match these documented checks and test supported
 feature combinations on a declared toolchain/platform baseline. Run advisory checks

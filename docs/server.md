@@ -111,9 +111,12 @@ implements Serde deserialization and Schemars JSON Schema. The asynchronous hand
 receives typed input and `ToolContext`, returning `Result<Value, ToolError>`.
 `register_with_annotations` supplies accurate MCP annotations; public registration
 accepts only read-only modules. A crate-private registration path permits only the
-built-in `delete_text_diff` operation, marked read-only false, destructive true,
-idempotent true and open-world false. Possession of a valid comparison handle
-authorizes reading and deletion; this exception does not enable arbitrary writes. Annotations are descriptive,
+built-in comparison deletion aliases and managed attachment upload/deletion operations.
+Their annotations describe transient bearer-controlled mutations; database tools remain
+read-only. Possession of a valid comparison or attachment handle authorizes its
+permitted reads/deletion. Uploads only allocate bounded temporary text, and patch
+application only returns a new temporary result. These exceptions do not enable
+arbitrary filesystem or legal corpus writes. Annotations are descriptive,
 not a sandbox or authorization mechanism.
 
 Registration validates object input schemas, names, descriptions, duplicate names,
@@ -283,3 +286,18 @@ advertise history/comparison capability flags and source processor versions.
 Comparison summaries optionally carry server-derived `origin` metadata. These
 additions apply equally to both transports. Existing widget resources and source
 metadata requirements remain unchanged.
+
+
+## Canonical text and corpus tools
+
+`[text_diff]` registers `text.diff`, `text.apply_patch`, `text.diff.show`,
+`text.diff.page`, `text.diff.delete`, and the managed `text.attachment.*` helpers.
+Existing comparison tool names and schemas remain compatibility wrappers. See
+[text comparison](text-diff.md) for exact algorithms, patch restrictions and budgets.
+
+`[database]` additionally registers the six requested database operations plus
+`database.show`. Shared HTTP/WebTransport handlers use the same application services,
+result/error contracts and limits. Details, configuration, freshness, body/catalog
+paging and provider acceptance boundaries are in [legal corpus](database.md).
+No public ingestion, corpus mutation, arbitrary SQL or filesystem-search tool is
+registered. Operator ingestion configuration is a separate startup decision.

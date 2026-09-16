@@ -39,6 +39,7 @@ struct Counters {
 
 struct Shared {
     files: Filesystem,
+    max_object_bytes: usize,
     slots: Arc<Semaphore>,
     probe_slots: Arc<Semaphore>,
     closed: AtomicBool,
@@ -71,6 +72,14 @@ pub struct FsBlobStore {
 impl FsBlobStore {
     /// Opens a private absolute directory and probes the required durability APIs.
     pub async fn open(path: &Path) -> Result<Arc<Self>, Error> {
+        Self::open_with_limit(path, openlegal_application::MAX_RAW_BYTES).await
+    }
+
+    /// A separate dedicated corpus root may hold larger evidence objects.
+    pub async fn open_with_limit(path: &Path, max_object_bytes: usize) -> Result<Arc<Self>, Error> {
+        if !(1..=100 * 1024 * 1024).contains(&max_object_bytes) {
+            return Err(Error::InvalidInput);
+        }
         let path = path.to_owned();
         let startup = STARTUPS.try_acquire().map_err(|_| Error::Busy)?;
         // Bootstrap is one owned job, independent of the application runtime locks.
@@ -78,7 +87,7 @@ impl FsBlobStore {
             DEADLINE,
             tokio::task::spawn_blocking(move || {
                 let _startup = startup;
-                let files = Filesystem::open(&path)?;
+                let files = Filesystem::open_with_limit(&path, max_object_bytes)?;
                 files.health()?;
                 Ok::<_, Error>(files)
             }),
@@ -89,6 +98,7 @@ impl FsBlobStore {
         Ok(Arc::new(Self {
             shared: Arc::new(Shared {
                 files,
+                max_object_bytes,
                 slots: Arc::new(Semaphore::new(JOBS)),
                 probe_slots: Arc::new(Semaphore::new(1)),
                 closed: AtomicBool::new(false),
@@ -194,7 +204,7 @@ impl BlobStore for FsBlobStore {
         bytes: Vec<u8>,
         cancellation: CancellationToken,
     ) -> BoxFuture<'static, Result<BlobPutResult, Error>> {
-        if bytes.len() > openlegal_application::MAX_RAW_BYTES {
+        if bytes.len() > self.shared.max_object_bytes {
             return Box::pin(async { Err(Error::InvalidInput) });
         }
         self.job(cancellation, false, move |files, token, counters| {

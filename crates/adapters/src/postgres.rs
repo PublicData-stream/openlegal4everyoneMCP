@@ -150,13 +150,22 @@ const CLOSED: u8 = 4;
 const SQL: &str = include_str!("../migrations/0001_persistence.sql");
 
 fn migrator() -> Migrator {
-    let mut migrator = Migrator::with_migrations(vec![Migration::new(
-        1,
-        "persistence".into(),
-        MigrationType::Simple,
-        SQL.into_sql_str(),
-        false,
-    )]);
+    let mut migrator = Migrator::with_migrations(vec![
+        Migration::new(
+            1,
+            "persistence".into(),
+            MigrationType::Simple,
+            SQL.into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            2,
+            "legal corpus".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0002_legal_corpus.sql").into_sql_str(),
+            false,
+        ),
+    ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator
 }
@@ -260,7 +269,7 @@ async fn verify_version(pool: &PgPool) -> Result<(), Error> {
 async fn verify_schema(pool: &PgPool) -> Result<(), Error> {
     verify_version(pool).await?;
     let rows = sqlx::query(
-        "SELECT version, checksum, success FROM public._sqlx_migrations ORDER BY version LIMIT 2",
+        "SELECT version, checksum, success FROM public._sqlx_migrations ORDER BY version LIMIT 3",
     )
     .fetch_all(pool)
     .await
@@ -284,6 +293,10 @@ async fn verify_schema(pool: &PgPool) -> Result<(), Error> {
     Ok(())
 }
 impl PostgresStore {
+    /// Shared validated runtime pool; its lifetime remains owned by this store.
+    pub fn pool(&self) -> PgPool {
+        self.inner.pool.clone()
+    }
     pub async fn migrate(url: &str, options: PostgresOptions) -> Result<(), StartupError> {
         let pool = pool(url, options).await?;
         let result = async {

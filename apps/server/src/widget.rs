@@ -8,6 +8,7 @@ use tokio::io::AsyncReadExt;
 pub(crate) enum WidgetKind {
     Records,
     TextDiff,
+    Database,
 }
 
 impl WidgetKind {
@@ -16,6 +17,11 @@ impl WidgetKind {
             Self::Records => (
                 crate::demo::WIDGET_URI,
                 "Synthetic record browser",
+                1024 * 1024,
+            ),
+            Self::Database => (
+                crate::database::WIDGET_URI,
+                "Legal corpus browser",
                 1024 * 1024,
             ),
             Self::TextDiff => (
@@ -77,7 +83,7 @@ pub(crate) fn widget_resources(
         .with_meta(metadata);
     let mut resources = ResourceRegistry::new();
     match kind {
-        WidgetKind::Records => resources.register(definition, content)?,
+        WidgetKind::Records | WidgetKind::Database => resources.register(definition, content)?,
         WidgetKind::TextDiff => resources.register_comparison_widget(definition, content)?,
     }
     Ok(resources)

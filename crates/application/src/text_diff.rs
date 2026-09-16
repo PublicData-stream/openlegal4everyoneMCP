@@ -1,5 +1,7 @@
 //! Bounded transient comparisons shared by every transport.
+mod attachments;
 mod paging;
+use attachments::ResolvedCompare;
 
 use crate::{Clock, SystemClock};
 use futures::future::BoxFuture;
@@ -57,6 +59,16 @@ pub struct ComputedDiff {
 /// An engine must kill and reap its child before returning on cancellation/deadline.
 /// The service owns its future even when the requesting caller disappears.
 pub trait DiffEngine: Send + Sync + 'static {
+    /// Apply a strict patch in the same supervised, bounded worker pool.
+    fn apply_patch(
+        &self,
+        _target: Arc<str>,
+        _patch: Arc<str>,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> BoxFuture<'static, Result<String, TextDiffError>> {
+        Box::pin(async { Err(TextDiffError::Unavailable) })
+    }
     fn diff(
         &self,
         before: Arc<str>,
@@ -70,6 +82,7 @@ pub trait HandleGenerator: Send + Sync + 'static {
 }
 
 struct Stored {
+    patch: String,
     summary: ComparisonSummary,
     before: Arc<str>,
     after: Arc<str>,
@@ -80,6 +93,8 @@ struct Stored {
 }
 #[derive(Default)]
 struct State {
+    attachments: HashMap<String, attachments::StoredAttachment>,
+    attachment_bytes: Arc<std::sync::atomic::AtomicUsize>,
     entries: HashMap<String, Stored>,
     reserved: usize,
     reserved_slots: usize,
@@ -140,7 +155,7 @@ impl TextDiffService {
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<ComparisonSummary, TextDiffError> {
-        self.compare_inner(input, None, cancellation, deadline)
+        self.compare_inner(ResolvedCompare::from(input), None, cancellation, deadline)
             .await
     }
 
@@ -179,13 +194,18 @@ impl TextDiffService {
             before_label: Some(format!("Snapshot {}", origin.before.snapshot_id)),
             after_label: Some(format!("Snapshot {}", origin.after.snapshot_id)),
         };
-        self.compare_inner(input, Some(origin), cancellation, deadline)
-            .await
+        self.compare_inner(
+            ResolvedCompare::from(input),
+            Some(origin),
+            cancellation,
+            deadline,
+        )
+        .await
     }
 
     async fn compare_inner(
         self: &Arc<Self>,
-        input: CompareInput,
+        input: ResolvedCompare,
         origin: Option<openlegal_domain::history::SnapshotComparisonOrigin>,
         cancellation: CancellationToken,
         deadline: Instant,
@@ -223,7 +243,11 @@ impl TextDiffService {
                 }
                 let used: usize = state.entries.values().map(|entry| entry.bytes).sum();
                 if state.entries.len() + state.reserved_slots >= MAX_ENTRIES
-                    || used + state.reserved + JOB_RESERVATION > MAX_STORE_BYTES
+                    || used
+                        + state.attachment_bytes.load(Ordering::Relaxed)
+                        + state.reserved
+                        + JOB_RESERVATION
+                        > MAX_STORE_BYTES
                 {
                     return Err(TextDiffError::Busy);
                 }
@@ -236,8 +260,8 @@ impl TextDiffService {
             let guard = token.clone().drop_guard();
             let service = self.clone();
             let (send, receive) = oneshot::channel();
-            let before: Arc<str> = input.before.into();
-            let after: Arc<str> = input.after.into();
+            let before: Arc<str> = Arc::from(input.before.as_ref());
+            let after: Arc<str> = Arc::from(input.after.as_ref());
             let deadline = deadline.min(Instant::now() + Duration::from_secs(10));
             jobs.spawn(async move {
                 let _permit = permit;
@@ -305,13 +329,15 @@ impl TextDiffService {
                         .map_err(|_| TextDiffError::Internal)?
                         .len();
                     let bytes = retained_bytes(&before, &after, &changes, changes.capacity())?
-                        + origin_bytes;
+                        + origin_bytes
+                        + patch.patch.capacity();
                     if bytes > JOB_RESERVATION {
                         return Err(TextDiffError::ResourceLimit);
                     }
                     state.entries.insert(
                         id,
                         Stored {
+                            patch: patch.patch,
                             summary: summary.clone(),
                             before,
                             after,
@@ -444,7 +470,8 @@ impl TextDiffService {
                         .values()
                         .map(|entry| entry.bytes)
                         .sum::<usize>()
-                        + state.reserved,
+                        + state.reserved
+                        + state.attachment_bytes.load(Ordering::Relaxed),
                     state.reserved_slots,
                 )
             })
@@ -489,6 +516,11 @@ impl TextDiffService {
             .map_err(|_| TextDiffError::Internal)?
             .entries
             .clear();
+        self.state
+            .lock()
+            .map_err(|_| TextDiffError::Internal)?
+            .attachments
+            .clear();
         if failed || self.worker_failed.load(Ordering::Relaxed) {
             Err(TextDiffError::Internal)
         } else {
@@ -498,6 +530,9 @@ impl TextDiffService {
 }
 
 fn expire(state: &mut State) {
+    state
+        .attachments
+        .retain(|_, entry| entry.expires > Instant::now());
     state
         .entries
         .retain(|_, entry| entry.expires > Instant::now() && !entry.caller.is_cancelled());

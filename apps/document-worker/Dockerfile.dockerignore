@@ -1,0 +1,14 @@
+**
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!crates/
+!crates/**
+!apps/
+!apps/server/
+!apps/server/**
+!apps/document-worker/
+!apps/document-worker/**
+**/target/
+**/.git/
+**/node_modules/

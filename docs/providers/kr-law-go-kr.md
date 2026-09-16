@@ -1,106 +1,126 @@
 # Korean provider: LAW OPEN DATA
 
-## Status and scope
+## Implementation and evidence status
 
-Planned provider: the Republic of Korea's Ministry of Government Legislation
-(법제처), through 국가법령정보 공동활용 / LAW OPEN DATA and 국가법령정보센터.
-Initial coverage is national legislation and history. Other Korean dataset families
-and other jurisdictions require their own scoped integration work; the common
-domain must remain capable of distinguishing them.
+The repository implements an opt-in adapter for the Republic of Korea's Ministry
+of Government Legislation (법제처), through 국가법령정보 공동활용 / LAW OPEN DATA.
+Configured ingestion covers national statutes (`eflaw`), every ordinance type
+exposed by `ordin`, and precedents (`prec`), including an HTML processing path for
+National Tax Service records. Provider integration is disabled without explicit
+configuration and a document sandbox.
 
-This profile records official documentation inspected on **2026-09-10**. No
-authenticated data endpoint, account approval, quota, validator, or live response
-contract has been tested for this project. Documentation evidence is not a
-statement of successful integration or a complete identifier mapping.
+Official documentation was inspected during the September 2026 implementation.
+The checked-in mapping tests use **fictional fixtures**, not captured legal records.
+No authenticated endpoint, account approval, quota, live response contract, or
+production deployment has been verified. Implemented request construction and
+local tests do not establish successful live integration. In particular, actual
+NTS HTML identity markers remain unverified; unrecognized markup fails closed.
 
 ## Authoritative sources
 
-| Source | Use |
+| Source | Mapping evidence |
 | --- | --- |
-| [API guide index](https://open.law.go.kr/LSO/openApi/guideList.do) | Dataset/view families, including legislation and history |
+| [API guide index](https://open.law.go.kr/LSO/openApi/guideList.do) | Dataset and view families |
 | [API usage manual](https://open.law.go.kr/LSO/openApi/openApiManual.do) | List/detail flow and linked resources |
-| [Service usage guidance](https://open.law.go.kr/LSO/information/guide.do) | Application/approval, attribution, and service-use constraints |
-| [Effective-date detail guide](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=lsEfYdInfoGuide) | `target=eflaw`, `ID`, `MST`, `efYd`, and response fields |
-| [Promulgation-based detail guide](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=lsNwInfoGuide) | `target=law` and promulgation-based fields |
+| [Service guidance](https://open.law.go.kr/LSO/information/guide.do) | Access approval, attribution and use constraints |
+| [Effective-date list](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=lsEfYdListGuide) | `eflaw` inventory, `nw`, `LID`, revision and date fields |
+| [Effective-date detail](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=lsEfYdInfoGuide) | `ID`, `MST`, `efYd`, character view, nested text and attachments |
+| [Ordinance list](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=ordinListGuide) | Current/history inventory and ordinance identities |
+| [Ordinance detail](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=ordinInfoGuide) | Identifier fields, ordinance types and content |
+| [Precedent list](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=precListGuide) | Record identity, source, case number and judgment date |
+| [Precedent detail](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=precInfoGuide) | Detail fields and the NTS HTML-only restriction |
 
-Recheck the relevant documentation when implementing a mapping. Capture the exact
-endpoint/view and source section rather than citing only the index page.
+## Identity, views and dates
 
-## Documented endpoint and field distinctions
+Application identity is `(jurisdiction=kr, provider=law_go_kr, dataset, provider ID)`.
+Names never establish identity. National `법령ID` and ordinance `자치법규ID` are
+separate from the provider master/serial identifying a selected revision.
 
-The guide index distinguishes promulgation-based and effective-date-based views,
-along with history. They are not interchangeable meanings of "current law."
+National current inventory explicitly requests `nw=3`; historical inventory uses
+`nw=1,3`, optionally restricted by the documented `LID`. A national checkpoint
+is the composite `MST:efYd`, because an effective-date detail needs both values.
+Requests select the original-character view with `chrClsCd=010201`. Selecting
+current text by `ID` would ignore the supplied effective date, so it is not used
+as a historical substitute. The normalized response must match the requested
+object and effective date. Provider revision identifiers are not assumed immutable:
+corrected bytes create another capture under the same official revision.
 
-The effective-date detail guide documents `ID` as a law identifier and `MST` as a
-master number associated with `lsi_seq`. For that endpoint, `ID` selects current
-text and the guide says not to supply `efYd` with `ID`; master-based selection uses
-the effective date. Do not infer that `ID`, `MST`, and date selectors can be merged
-into one generic numeric ID or substituted without changing the requested view.
+Ordinance inventories request `nw=1` for current and `nw=2` for history. All
+provider ordinance types remain in scope, including rules, instructions, notices
+and council rules. History enumeration is global because the inspected guide
+does not establish a stable-object-ID list filter. Its current view retains the
+provider's classification; the adapter does not infer national effective-view
+semantics for ordinances.
 
-Both detail guides distinguish promulgation and effective dates. Provider mappings
-must also inspect provision-level date fields and revision metadata before claiming
-one date describes all provisions. Keep original Korean field names in mapping
-evidence where an English shorthand could hide a distinction.
+Precedents use the provider record serial. Judgment dates describe judgments,
+not revisions. `judgment_date_raw` preserves the supplied field; `judgment_date`
+is exposed to typed search only for a valid Gregorian `YYYYMMDD` value. Missing
+or malformed dates do not become guessed dates. Same-decision official revision
+history remains unsupported pending a documented provider; local capture history
+is available separately and is not described as official precedent history.
 
-## Implications for this integration
+Publication and effective dates remain separate. Date-only checkpoint resolution
+requires a complete observed inventory and exactly one matching revision; it
+refuses ambiguity, incomplete history and missing historical bodies. Inventory
+pagination is not a provider-guaranteed atomic snapshot. Runtime completeness must
+only be asserted after its stabilized full-traversal checks succeed. Catalog
+changes invalidate history/date-resolution views without invalidating a running
+normalization job; job publication has its own version fence.
 
-These are engineering conclusions from the documented distinctions, not additional
-upstream guarantees:
+## Text, evidence and references
 
-- Preserve view/target and supplied identifier/date selectors in request identity.
-- Separate instrument identity from a selected representation/revision.
-- Do not merge same-name records or assume a law identifier alone pins historical text.
-- Maintain distinct promulgation and effective-date mappings and test their use.
-- Validate response identity against the requested view before cache publication.
+Ordered XML fields retain article, paragraph, subparagraph, item and supplementary
+text. Explicit sections distinguish provider text, extracted attachment text and
+OCR. Source article keys or clearly named source ordinals identify sections;
+ordinals are not legal citations. Embedded HTML within XML text remains literal
+provider-field text. OCR never replaces provider text.
 
-Exact uniqueness, persistence across revisions, correction behavior, and complete
-historical-selection semantics remain to be established with endpoint-specific
-evidence. Do not assert undocumented permanent identifiers or immutable revisions.
+The adapter downloads documented national PDF/HWP attachment-link fields through
+an exact host/path allowlist. Ordinance attachment filenames alone do not justify
+inventing a download URL. Primary and attachment bytes are immutable evidence;
+extracted sections carry their source digest and physical page. XML, HTML, PDF,
+HWP5, HWPX and OCR parsing use the configured no-network document sandbox.
 
-## Access, attribution, and outbound references
+Source references preserve dataset, selected identifier, `efYd`, character view
+and the actual `type=XML` or `type=HTML`. The real `OC` value never appears in
+references, fixtures, logs or returned errors. Requests use HTTPS with certificate
+verification, bounded DNS resolution, no proxy or redirect following, and an
+explicit destination allowlist. These code-established restrictions have not
+been validated against live provider responses.
 
-The service guidance describes application/approval before data use, source
-attribution, and possible restriction for excessive traffic or other service-use
-violations. Verify the applicable dataset conditions and approved access before
-live integration; this profile does not claim approval has been obtained.
+## Local freshness and resource policy
 
-Detail guides document the `OC` authentication parameter. Keep the project's real
-authentication value out of source, fixtures, logs, errors, and citation URLs.
-Documentation sample credentials are not proof of permission for automated testing.
+These are application choices, not claimed upstream service guarantees:
 
-The usage manual describes linked attachment resources. Treat those links as
-untrusted input, with explicit destination and resource limits before any fetch.
-API documentation origins and request/resource origins need separate consideration:
-the integration's concrete origin/path/redirect allowlist has not yet been validated.
-Do not copy an HTTP example into an insecure default; verify the intended secure
-transport without disabling certificate validation.
+- HEAD is fresh for one hour; disclosed stale serving ends at 24 hours after
+  validation. An observed replacement immediately makes HEAD processing-pending,
+  including when the durable job queue is full.
+- Current bodies remain durable. Historical bodies have a 30-day retention policy;
+  independent revision and capture metadata catalogs survive body eviction.
+  Active sessions and index acknowledgment protect bytes during retention.
+- Daily bounded inventory revisits and durable jobs are coordinated by the runtime.
+  Identical catalog observations do not advance publication fences or sequences.
+- Admission allows one fetch at a time and starts at most one request per second.
+  HTTP 429/503 honors bounded admission pauses from `Retry-After`, including HTTP
+  dates. Permanent HTTP client rejection and deterministic parser/format failure
+  return `source_rejected`; cancellation remains cancellation. Transient sandbox
+  unavailability and timeouts remain retryable processing states.
+- The queue holds at most 128 active jobs, with at most three attempts and fenced
+  claims. A publication accepts at most 100 MiB combined source bytes and 64
+  attachments; extracted/OCR text is limited to 16 MiB. Raw corpus, historical
+  and staging accounting have separate limits of 1 TiB, 64 GiB and 16 GiB.
 
-## Capabilities to establish before implementation
+`retrieved_at` records completion of the primary download before sandbox parsing.
+`captured_at`/`cached_at` records the publication transaction timestamp after blob
+staging and lock admission; results become visible only after commit. It is not
+claimed to be the database's exact commit instant. Unchanged evidence updates
+validation timing without inventing a new capture.
 
-| Item | Current evidence/status | Required next step |
-| --- | --- | --- |
-| Project access/credentials | Not verified | Obtain/confirm appropriate approved access outside ordinary PR tests |
-| Exact legislation/history endpoints and mappings | Detail-view distinctions documented; complete mapping not established | Record selected endpoints, selectors, response identity and errors |
-| Numeric quotas and concurrency | Not established by the inspected pages | Confirm published/account constraints and choose documented conservative local budgets |
-| Conditional requests/validators | Unverified | Establish support per representation; otherwise use bounded refresh |
-| Incremental changes and deletion | Guide index lists related services; suitability/completeness unverified | Establish permissions, semantics, cursors and correction handling before relying on them |
-| Absence and transient errors | Unverified | Establish response/error classification before negative caching |
-| Freshness, stale limits and retention | Not chosen | Define per-class policy with evidence and operational rationale |
-| Secure origins, redirects and linked resources | Not validated for this integration | Define and test outbound restrictions using approved access and mocks |
-| Formats, encodings and resource bounds | Complete response behavior unverified | Collect minimal permitted fixtures; establish parser/decompression limits |
+## Remaining external validation
 
-An unavailable capability has the explicit fallback described in the
-[upstream policy](../upstream-policy.md); it is not silently assumed supported.
-
-## Fixture and mapping evidence
-
-Before merging a provider implementation, include curated list/detail and history
-fixtures as applicable, with source/capture context and sanitized credentials.
-Test distinct view/selector combinations, same-name records, missing fields,
-promulgation versus effective dates, provision references, revisions, and error
-responses. State which cases are authoritative captures and which are synthetic.
-
-Record each consequential mapping as an upstream field/selector, normalized meaning,
-source evidence, uncertainty, and expected test outcome. Follow the shared
-[legal-data policy](../legal-data-policy.md); do not fabricate records to fill gaps
-in provider coverage.
+Approved credentials, actual quotas, conditional validators, upstream error bodies,
+correction/deletion semantics, attachment availability and representative provider
+fixtures still require authorized verification. Preserve this distinction in
+release notes and coverage reporting. Ordinary tests must not make live provider
+requests. See the [legal-data policy](../legal-data-policy.md),
+[upstream policy](../upstream-policy.md) and [database contract](../database.md).

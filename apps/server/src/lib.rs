@@ -5,6 +5,8 @@
 //! Legal retrieval policy belongs in application services, not transport adapters.
 
 pub mod config;
+pub mod corpus_runtime;
+pub mod database;
 pub mod demo;
 pub mod endpoint;
 pub mod framing;

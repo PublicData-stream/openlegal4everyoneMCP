@@ -8,6 +8,7 @@ const marker = '__OPENLEGAL_SOURCE_URL__';
 await mkdir('dist', { recursive: true });
 for (const [entry, filename, title, maximum] of [
   ['src/main.tsx', 'index.html', 'Synthetic record browser', 1024 * 1024],
+  ['src/database.tsx', 'database.html', 'Legal corpus browser', 3 * 1024 * 1024],
   ['src/text-diff.tsx', 'text-diff.html', 'Text comparison', 3 * 1024 * 1024],
 ]) {
   const result = await build({ entryPoints: [entry], bundle: true, minify: true, write: false, outdir: 'dist', target: 'es2022', format: 'iife', legalComments: 'inline', define: { 'process.env.NODE_ENV': '"production"' } });

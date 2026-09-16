@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub mod history;
+pub mod legal;
 pub mod search_query;
 pub mod text_diff;
 
@@ -209,3 +210,5 @@ impl fmt::Display for RetrievalError {
     }
 }
 impl std::error::Error for RetrievalError {}
+
+pub mod legal_search;

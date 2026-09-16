@@ -4,6 +4,8 @@
 //! deployment-wide coordination design. Adapters never add their own retry loops.
 
 pub mod blob;
+pub mod database;
+pub mod document;
 pub mod persistence;
 mod service;
 pub mod text_diff;
@@ -77,3 +79,7 @@ impl Clock for SystemClock {
             .saturating_add(self.started.elapsed().as_secs())
     }
 }
+
+pub mod search;
+
+pub mod database_read;

@@ -6,8 +6,8 @@ open legal-information infrastructure project with a Rust MCP server foundation.
 The intended backend retrieves authoritative upstream legal data, normalizes it
 without inventing legal facts, preserves source references, and shares cached
 results across hosted MCP requests. A public HTTP API and administrative tooling
-may follow. The architecture supports multiple jurisdictions; the first planned
-integration covers Korean national legislation and history through LAW OPEN DATA.
+may follow. The architecture supports multiple jurisdictions; the first provider adapter covers Korean national legislation, ordinances and precedents
+through LAW OPEN DATA, with live acceptance and deployment still separate gates.
 
 ## Development status
 
@@ -21,13 +21,16 @@ The workspace includes tests, dependency checks, CI, and a pinned OxiBelt integr
 harness. A shared retrieval/cache framework, two synthetic JSON processors, and
 an opt-in React MCP Apps browser now demonstrate upstream extensions. A separate
 [Text comparison widget](docs/text-diff.md) compares supplied text with bounded
-paging and temporary results that users can delete. Real legal
-providers and user accounts remain planned. Local browser tests use a simulated
+paging, managed text-file attachments and strict atomic patch application. The optional
+[legal corpus tools](docs/database.md) provide indexed query/regex search, exact
+checkpoint retrieval, metadata, history and comparisons with provenance and HEAD TTL.
+The LAW OPEN DATA adapter and disposable document worker have offline fixtures;
+live provider acceptance, cluster isolation acceptance and user accounts remain pending. Local browser tests use a simulated
 host; the product domain does not imply deployment or verified live ChatGPT access.
 
 A standalone [search-query processor](docs/search-query.md) parses Boolean
-expressions, field scopes, exact phrases, word groups, and prefixes. Search
-execution integration remains planned; synthetic search still uses literal text.
+expressions, field scopes, exact phrases, word groups, and prefixes. The corpus search evaluator uses Korean morphology with exact quoted substrings;
+synthetic search still uses literal text.
 
 ## Run and extend
 
@@ -57,6 +60,8 @@ Node or a widget build.
 - [Dependencies](docs/dependencies.md): admission rationale and check tooling.
 - [Retrieval framework](docs/retrieval.md): processors, caching, evidence and resource limits.
 - [Search-query syntax](docs/search-query.md): standalone parser, operators, diagnostics, and bounds.
+- [Legal corpus](docs/database.md): search, checkpoint retrieval, history, freshness and ingestion.
+- [Document sandbox](docs/document-sandbox.md): isolated XML/HTML/PDF/HWP/OCR processing and acceptance.
 - [Text comparison](docs/text-diff.md): Rust line/character engine, input limits, paging, retention and editable widget.
 - [Synthetic browser](docs/demo.md): local setup, tools, progress and ChatGPT manual checks.
 - [Retrieval validation](docs/retrieval-review.md): independent reviews, checks and remaining limits.

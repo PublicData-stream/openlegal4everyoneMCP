@@ -158,6 +158,8 @@ pub struct Config {
     pub text_diff: Option<TextDiffConfig>,
     #[serde(default)]
     pub cache: Option<CacheConfig>,
+    #[serde(default)]
+    pub database: Option<DatabaseConfig>,
 }
 
 /// Persistence is an explicit operator decision whenever retrieval is enabled.
@@ -339,11 +341,36 @@ impl PostgresConfig {
 
 impl Config {
     pub fn validate_storage(&self) -> Result<(), ServerError> {
-        if self.demo.is_some() && self.cache.is_none() {
+        if (self.demo.is_some() || self.database.is_some()) && self.cache.is_none() {
             return Err("retrieval requires an explicit [cache] mode: memory or persistent".into());
         }
-        if self.demo.is_none() && self.cache.is_some() {
+        if self.demo.is_none() && self.database.is_none() && self.cache.is_some() {
             return Err("cache configuration requires a registered retrieval source".into());
+        }
+        if let Some(database) = &self.database {
+            database.validate()?;
+            if self.text_diff.is_none() {
+                return Err("database requires text_diff for checkpoint comparisons".into());
+            }
+            let Some(CacheConfig::Persistent {
+                blob: BlobConfig::Filesystem { path },
+                ..
+            }) = &self.cache
+            else {
+                return Err("database requires persistent PostgreSQL storage".into());
+            };
+            let a = std::path::absolute(path)?;
+            let b = std::path::absolute(&database.blob_path)?;
+            let c = std::path::absolute(&database.index_path)?;
+            if a.starts_with(&b)
+                || b.starts_with(&a)
+                || a.starts_with(&c)
+                || c.starts_with(&a)
+                || b.starts_with(&c)
+                || c.starts_with(&b)
+            {
+                return Err("cache blobs, corpus blobs, and corpus index require separate non-nested directories".into());
+            }
         }
         if let Some(cache) = &self.cache {
             cache.validate()?;
@@ -625,5 +652,52 @@ mod cache_config_tests {
         }
         assert!(toml::from_str::<PostgresConfig>("url='postgres://secret'").is_err());
         assert!(toml::from_str::<PostgresConfig>("tls_mode='prefer'").is_err());
+    }
+}
+
+/// Serving an existing corpus does not require provider credentials or Kubernetes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseConfig {
+    pub blob_path: PathBuf,
+    pub index_path: PathBuf,
+    pub widget_html: PathBuf,
+    pub ingestion: Option<IngestionConfig>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestionConfig {
+    pub credential_env: String,
+    pub kubectl: PathBuf,
+    pub kubeconfig: PathBuf,
+    pub context: String,
+    pub namespace: String,
+    pub worker_image: String,
+    /// Explicit operator authorization for managed background upstream traffic.
+    pub enabled: bool,
+    #[serde(default)]
+    pub retain_history_bodies: bool,
+}
+impl DatabaseConfig {
+    pub fn validate(&self) -> Result<(), ServerError> {
+        if [&self.blob_path, &self.index_path, &self.widget_html]
+            .iter()
+            .any(|p| p.as_os_str().is_empty())
+        {
+            return Err("database paths must be explicit".into());
+        }
+        if let Some(i) = &self.ingestion
+            && (i.credential_env.is_empty()
+                || i.credential_env.len() > 128
+                || !i
+                    .credential_env
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                || !i.kubectl.is_absolute()
+                || !i.kubeconfig.is_absolute())
+        {
+            return Err("ingestion requires explicit executable, kubeconfig and credential environment name".into());
+        }
+        Ok(())
     }
 }

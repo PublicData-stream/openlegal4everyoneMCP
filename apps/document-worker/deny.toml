@@ -1,0 +1,48 @@
+# Isolated parser graph only; the serving workspace keeps the root deny.toml.
+# All additions below require independent review with the parser boundary.
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = false
+
+[advisories]
+unmaintained = "all"
+unsound = "all"
+# Maintenance notices, not known vulnerability exemptions. Exact resolved crates:
+# paste 1.0.15, rustybuzz 0.20.1, ttf-parser 0.25.1. rhwp has no replacement release.
+# Owner: PiQuark6046. Review by 2026-10-16 and on every parser/dependency update.
+# See docs/document-sandbox.md; no exception permits in-process API parsing.
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "rhwp 0.8.6 build-time paste 1.0.15; owner PiQuark6046; review 2026-10-16" },
+  { id = "RUSTSEC-2026-0206", reason = "rhwp/resvg font shaping uses rustybuzz 0.20.1 only in disposable Pods; owner PiQuark6046; review 2026-10-16" },
+  { id = "RUSTSEC-2026-0192", reason = "rhwp/resvg font parsing uses ttf-parser 0.25.1 only in disposable Pods; owner PiQuark6046; review 2026-10-16" },
+]
+
+[licenses]
+confidence-threshold = 0.93
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT-0", "Unicode-3.0", "Zlib"]
+# Exact package licenses, retained in image notices. Owner: PiQuark6046.
+# Review by 2026-10-16 and whenever any listed package version changes.
+exceptions = [
+  { crate = "openlegal-document-worker@0.1.0", allow = ["AGPL-3.0-only"] },
+  { crate = "openlegal-domain@0.1.0", allow = ["AGPL-3.0-only"] },
+  { crate = "openlegal-application@0.1.0", allow = ["AGPL-3.0-only"] },
+  { crate = "cssparser@0.37.0", allow = ["MPL-2.0"] },
+  { crate = "cssparser-macros@0.7.1", allow = ["MPL-2.0"] },
+  { crate = "dtoa-short@0.3.5", allow = ["MPL-2.0"] },
+  { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
+  { crate = "selectors@0.38.0", allow = ["MPL-2.0"] },
+  { crate = "finl_unicode@1.4.0", allow = ["MIT", "Unicode-DFS-2016"] },
+  { crate = "tiny-keccak@2.0.2", allow = ["CC0-1.0"] },
+  { crate = "webpki-roots@1.0.9", allow = ["CDLA-Permissive-2.0"] },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# No registry release exists. Manifest+lockfile pin the inspected immutable commit.
+allow-git = ["https://github.com/edwardkim/rhwp"]
+required-git-spec = "rev"

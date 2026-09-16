@@ -1,8 +1,5 @@
 use super::{Error, MAX_BATCH, check_cancel};
-use openlegal_application::{
-    MAX_RAW_BYTES,
-    blob::{BlobLocation, BlobPage, BlobPutResult},
-};
+use openlegal_application::blob::{BlobLocation, BlobPage, BlobPutResult};
 use rustix::fs::{self, AtFlags, Mode, OFlags, RenameFlags};
 use sha2::{Digest, Sha256};
 use std::{
@@ -44,6 +41,7 @@ fn checkpoint() -> Result<(), Error> {
 
 pub(super) struct Filesystem {
     root: File,
+    max_object_bytes: usize,
     staging_cursor: Mutex<(u16, i64)>,
 }
 
@@ -132,12 +130,12 @@ fn parse_name(name: &str) -> Option<[u8; 32]> {
     }
     Some(value)
 }
-fn location_parts(location: &BlobLocation) -> Result<(&str, &str), Error> {
+fn location_parts(location: &BlobLocation, max_object_bytes: usize) -> Result<(&str, &str), Error> {
     let (prefix, name) = location
         .storage_key
         .split_once('/')
         .ok_or(Error::InvalidInput)?;
-    if location.size_bytes > MAX_RAW_BYTES as u64
+    if location.size_bytes > max_object_bytes as u64
         || prefix.len() != 2
         || !name.starts_with(prefix)
         || parse_name(name) != Some(location.digest)
@@ -159,7 +157,11 @@ fn staging_name(name: &str) -> bool {
 }
 
 impl Filesystem {
+    #[cfg(test)]
     pub(super) fn open(path: &Path) -> Result<Self, Error> {
+        Self::open_with_limit(path, openlegal_application::MAX_RAW_BYTES)
+    }
+    pub(super) fn open_with_limit(path: &Path, max_object_bytes: usize) -> Result<Self, Error> {
         if !path.is_absolute() || path.components().count() < 2 {
             return Err(Error::InvalidInput);
         }
@@ -200,6 +202,7 @@ impl Filesystem {
         }
         Ok(Self {
             root: private_directory(directory)?,
+            max_object_bytes,
             staging_cursor: Mutex::new((0, 0)),
         })
     }
@@ -252,7 +255,7 @@ impl Filesystem {
         Ok(Some(bytes))
     }
     pub(super) fn get(&self, location: &BlobLocation) -> Result<Option<Vec<u8>>, Error> {
-        let (prefix, name) = location_parts(location)?;
+        let (prefix, name) = location_parts(location, self.max_object_bytes)?;
         let Some(dir) = self.shard(prefix, false)? else {
             return Ok(None);
         };
@@ -264,7 +267,7 @@ impl Filesystem {
         bytes: &[u8],
         token: &CancellationToken,
     ) -> Result<BlobPutResult, Error> {
-        let (prefix, name) = location_parts(location)?;
+        let (prefix, name) = location_parts(location, self.max_object_bytes)?;
         if bytes.len() as u64 != location.size_bytes
             || Sha256::digest(bytes).as_slice() != location.digest
         {
@@ -321,7 +324,7 @@ impl Filesystem {
         }
     }
     pub(super) fn delete(&self, location: &BlobLocation) -> Result<bool, Error> {
-        let (prefix, name) = location_parts(location)?;
+        let (prefix, name) = location_parts(location, self.max_object_bytes)?;
         let Some(dir) = self.shard(prefix, false)? else {
             return Ok(false);
         };
@@ -387,7 +390,7 @@ impl Filesystem {
                 }
                 if let Some(file) = open_file(&dir, name, false)? {
                     let size_bytes = file.metadata().map_err(unavailable)?.len();
-                    if size_bytes > MAX_RAW_BYTES as u64 {
+                    if size_bytes > self.max_object_bytes as u64 {
                         return Err(Error::StorageCorrupt);
                     }
                     objects.push(BlobLocation {

@@ -10,7 +10,9 @@ use crate::{
 };
 use openlegal_application::text_diff::TextDiffService;
 use openlegal_domain::text_diff::{
-    CompareInput, ComparisonSummary, PageRequest, PageResponse, TextDiffError,
+    ApplyPatchInput, ApplyPatchResult, AttachmentHandle, AttachmentPage, AttachmentRead,
+    AttachmentSummary, AttachmentUpload, CompareInput, ComparisonSummary, DiffInput, DiffResult,
+    PageRequest, PageResponse, TextDiffError,
 };
 use rmcp::model::MetaObject;
 use schemars::JsonSchema;
@@ -77,9 +79,10 @@ impl ToolModule for TextDiffTools {
                 compare(&service, input, context).await.map(ToolOutput::new)
             } },
         )?;
-        let service = self.service.clone();
-        registry.register_typed::<ShowInput, ShowOutput, _, _>(
-            "show_text_diff",
+        for name in ["show_text_diff", "text.diff.show"] {
+            let service = self.service.clone();
+            registry.register_typed::<ShowInput, ShowOutput, _, _>(
+            name,
             "Open the editable text comparison app. Supply no arguments for an empty editor, before and after to create a comparison, or comparison_id to open an existing result without recomputing. Do not mix these modes. Existing original texts load on demand for editing.",
             ToolOptions { meta: Some(MetaObject(serde_json::from_value(serde_json::json!({
                 "ui": {"resourceUri": WIDGET_URI}
@@ -98,9 +101,11 @@ impl ToolModule for TextDiffTools {
                 Ok(ToolOutput::new(ShowOutput { schema_version: 1, comparison }))
             } },
         )?;
-        let service = self.service.clone();
-        registry.register_typed::<PageRequest, PageResponse, _, _>(
-            "get_text_diff_page",
+        }
+        for name in ["get_text_diff_page", "text.diff.page"] {
+            let service = self.service.clone();
+            registry.register_typed::<PageRequest, PageResponse, _, _>(
+            name,
             "Read a numbered changes/before/after page using a comparison bearer handle. Pages are bounded, ordered, and do not extend the ten-minute expiry. Original text pages concatenate exactly; change fragments include original source ranges.",
             ToolOptions::default(),
             move |input, _| { let service = service.clone(); async move {
@@ -114,16 +119,21 @@ impl ToolModule for TextDiffTools {
                 })
             } },
         )?;
-        registry.register_text_diff_delete::<HandleInput, DeleteOutput, _, _>(move |input, _| {
-            let service = self.service.clone();
-            async move {
-                service.delete(&input.comparison_id).map_err(map_error)?;
-                Ok(ToolOutput::new(DeleteOutput {
-                    schema_version: 1,
-                    deleted: true,
-                }))
-            }
-        })
+        }
+        let deletion = self.service.clone();
+        registry.register_text_diff_delete::<HandleInput, DeleteOutput, _, _>(
+            move |input, _| {
+                let service = deletion.clone();
+                async move {
+                    service.delete(&input.comparison_id).map_err(map_error)?;
+                    Ok(ToolOutput::new(DeleteOutput {
+                        schema_version: 1,
+                        deleted: true,
+                    }))
+                }
+            },
+        )?;
+        register_canonical(registry, self.service)
     }
 }
 
@@ -140,6 +150,82 @@ async fn compare(
     // The result already exists; do not discard its handle if a progress sink closes now.
     let _ = context.progress.report(ProgressStage::Complete).await;
     Ok(summary)
+}
+
+fn register_canonical(
+    registry: &mut ToolRegistry,
+    service: Arc<TextDiffService>,
+) -> Result<(), ServerError> {
+    let comparison = service.clone();
+    registry.register_typed::<DiffInput, DiffResult, _, _>(
+        "text.diff", "Compare UTF-8 text strings or sealed text attachment references. Returns paged character differences, a complete unified patch attachment, and an explanation of Rust Myers line/scalar comparison. Exact bytes are preserved; not a legal equivalence assessment.",
+        ToolOptions::default(), move |input, context| { let service = comparison.clone(); async move {
+            context.progress.report(ProgressStage::Processing).await?;
+            let result = service.compare_sources(input, context.request.cancellation, context.deadline).await.map_err(map_error)?;
+            let _ = context.progress.report(ProgressStage::Complete).await;
+            Ok(ToolOutput::new(result))
+        } }
+    )?;
+    let application = service.clone();
+    registry.register_typed::<ApplyPatchInput, ApplyPatchResult, _, _>(
+        "text.apply_patch", "Apply a single-text unified patch to a supplied UTF-8 target, inline or through sealed attachments. Exact declared positions and context must match; no fuzz, offsets, binary patches, multi-file changes or filesystem writes. Returns a complete text attachment; conflicts fail atomically.",
+        ToolOptions::default(), move |input, context| { let service = application.clone(); async move {
+            context.progress.report(ProgressStage::Processing).await?;
+            let result = service.apply_patch(input, context.request.cancellation, context.deadline).await.map_err(map_error)?;
+            let _ = context.progress.report(ProgressStage::Complete).await;
+            Ok(ToolOutput::new(result))
+        } }
+    )?;
+    let upload = service.clone();
+    registry.register_attachment_builtin::<AttachmentUpload, AttachmentSummary, _, _>(
+        "text.attachment.upload", "Create or append a temporary UTF-8 text/patch attachment in chunks of at most 32 KiB. Initial upload supplies kind and total_bytes; continuations supply attachment_id and byte offset. Exact retries succeed. Final seals immutable bytes; ten-minute expiry never extends. Bearer handles authorize read and deletion.",
+        ToolOptions { annotations: rmcp::model::ToolAnnotations::from_raw(None, Some(false), Some(false), Some(false), Some(false)), meta: None },
+        move |input, context| { let service = upload.clone(); async move {
+            if context.request.cancellation.is_cancelled() { return Err(ToolError::Unavailable); }
+            service.upload_attachment(input).map(ToolOutput::new).map_err(map_error)
+        } }
+    )?;
+    let reading = service.clone();
+    registry.register_typed::<AttachmentRead, AttachmentPage, _, _>(
+        "text.attachment.read", "Read a sealed attachment at a UTF-8 byte boundary. Returns up to 32 KiB with next_offset, total bytes and fixed expiry. Missing and expired handles are indistinguishable.",
+        ToolOptions::default(), move |input, _| { let service = reading.clone(); async move {
+            let page = service.read_attachment(input).map_err(map_error)?;
+            Ok(ToolOutput { structured: page, text: Some("Attachment chunk is in structuredContent.".into()), meta: None })
+        } }
+    )?;
+    let deleting = service.clone();
+    registry.register_attachment_builtin::<AttachmentHandle, DeleteOutput, _, _>(
+        "text.attachment.delete", "Delete a temporary attachment using its bearer handle. Repeated deletion succeeds. Bytes already acquired by a reader or running operation cannot be retracted.",
+        ToolOptions { annotations: rmcp::model::ToolAnnotations::from_raw(None, Some(false), Some(true), Some(true), Some(false)), meta: None },
+        move |input, _| { let service = deleting.clone(); async move {
+            service.delete_attachment(&input.attachment_id).map_err(map_error)?;
+            Ok(ToolOutput::new(DeleteOutput { schema_version: 1, deleted: true }))
+        } }
+    )?;
+    registry.register_attachment_builtin::<HandleInput, DeleteOutput, _, _>(
+        "text.diff.delete",
+        "Delete a transient comparison using its bearer handle; repeated deletion succeeds.",
+        ToolOptions {
+            annotations: rmcp::model::ToolAnnotations::from_raw(
+                None,
+                Some(false),
+                Some(true),
+                Some(true),
+                Some(false),
+            ),
+            meta: None,
+        },
+        move |input, _| {
+            let service = service.clone();
+            async move {
+                service.delete(&input.comparison_id).map_err(map_error)?;
+                Ok(ToolOutput::new(DeleteOutput {
+                    schema_version: 1,
+                    deleted: true,
+                }))
+            }
+        },
+    )
 }
 
 pub(crate) fn map_error(error: TextDiffError) -> ToolError {

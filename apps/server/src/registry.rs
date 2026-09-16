@@ -18,6 +18,12 @@ pub struct ToolContext {
 /// Public, sanitized failures. Keep provider errors and diagnostics inside the module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolError {
+    ProcessingPending,
+    UnsupportedHistory,
+    HistoryIncomplete,
+    SessionExpired,
+    SnapshotInvalidated,
+    Withdrawn,
     StorageUnavailable,
     StorageCorrupt,
     StorageCapacity,
@@ -162,7 +168,14 @@ impl ToolRegistry {
         Fut: Future<Output = Result<Value, ToolError>> + Send + 'static,
     {
         if annotations.read_only_hint != Some(true)
-            && !(ephemeral_delete && name == "delete_text_diff")
+            && !(ephemeral_delete
+                && matches!(
+                    name,
+                    "delete_text_diff"
+                        | "text.diff.delete"
+                        | "text.attachment.upload"
+                        | "text.attachment.delete"
+                ))
         {
             return Err("anonymous extension tools must be read-only".into());
         }
@@ -260,6 +273,30 @@ impl ToolRegistry {
             handler,
             true,
         )
+    }
+
+    /// Only the enumerated built-in transient operations may mutate anonymous state.
+    /// This is not an extension-facing permission to register arbitrary writes.
+    pub(crate) fn register_attachment_builtin<I, O, F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        options: ToolOptions,
+        handler: F,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: serde::Serialize + JsonSchema + Send + 'static,
+        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
+    {
+        if !matches!(
+            name,
+            "text.attachment.upload" | "text.attachment.delete" | "text.diff.delete"
+        ) {
+            return Err("unsupported built-in transient operation".into());
+        }
+        self.register_typed_internal(name, description, options, handler, true)
     }
 
     fn register_typed_internal<I, O, F, Fut>(

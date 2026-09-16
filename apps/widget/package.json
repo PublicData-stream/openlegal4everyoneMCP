@@ -11,7 +11,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test tests/model.test.ts tests/source-offer.test.ts tests/text-diff-model.test.ts",
+    "test": "node --experimental-strip-types --test tests/model.test.ts tests/source-offer.test.ts tests/text-diff-model.test.ts tests/database-model.test.ts",
     "test:browser": "playwright test",
     "harness": "node scripts/harness.mjs",
     "check:dependencies": "pnpm audit --audit-level=low && node scripts/check-dependencies.mjs"

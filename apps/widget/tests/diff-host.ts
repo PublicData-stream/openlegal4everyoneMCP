@@ -1,13 +1,15 @@
 /** Local-only bridge fixtures. No tool call leaves this browser harness. */
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import { fixtureFragment, fixtureId, fixtureSummary } from './text-diff-fixtures.ts';
-import type { Comparison, DiffPage } from '../src/text-diff-model.ts';
+import type { Attachment, Comparison, DiffPage } from '../src/text-diff-model.ts';
 const iframe = document.querySelector('iframe')!;
 const params = new URLSearchParams(location.search);
 const bridge = new AppBridge(null, { name: 'Offline comparison host', version: '1.0.0' }, { serverTools: {}, openLinks: {} });
 const sourceBefore = '가\r\nOriginal before\r끝';
 const sourceAfter = '😀\r\nOriginal after\n';
 const records = new Map<string, { before: string; after: string; summary: Comparison }>();
+const attachments = new Map<string, { summary: Attachment & { schema_version: number }; text: string }>();
+let attachmentCounter = 1000, attachmentDeletions = 0;
 let counter = 0, deletions = 0;
 function retain(before: string, after: string, id = (++counter).toString(16).padStart(64, '0')) {
   const summary = fixtureSummary(before, after, id);
@@ -25,6 +27,32 @@ bridge.oncalltool = async ({ name, arguments: args }) => {
   const calls = JSON.parse(document.getElementById('calls')!.textContent || '[]');
   calls.push({ name, arguments: input });
   document.getElementById('calls')!.textContent = JSON.stringify(calls);
+  if (name === 'text.attachment.upload') {
+    const id = String(input.attachment_id ?? (++attachmentCounter).toString(16).padStart(64, '0'));
+    const prior = attachments.get(id);
+    const text = (prior?.text ?? '') + String(input.chunk);
+    const summary = { schema_version: 1, attachment_id: id, kind: (prior?.summary.kind ?? input.kind) as 'text' | 'patch', total_bytes: Number(prior?.summary.total_bytes ?? input.total_bytes), committed_bytes: new TextEncoder().encode(text).length, sealed: Boolean(input.final), expires_at: prior?.summary.expires_at ?? Math.floor(Date.now() / 1000) + 600 };
+    attachments.set(id, { summary, text });
+    return result(summary);
+  }
+  if (name === 'text.apply_patch') {
+    // A known synthetic bridge response; parser correctness is tested in Rust.
+    const id = (++attachmentCounter).toString(16).padStart(64, '0');
+    const text = '\uFEFF한\r\n끝!';
+    const summary = { schema_version: 1, attachment_id: id, kind: 'text' as const, total_bytes: new TextEncoder().encode(text).length, committed_bytes: new TextEncoder().encode(text).length, sealed: true, expires_at: Math.floor(Date.now() / 1000) + 600 };
+    attachments.set(id, { summary, text });
+    return result({ schema_version: 1, result: summary });
+  }
+  if (name === 'text.attachment.read') {
+    const entry = attachments.get(String(input.attachment_id));
+    if (!entry) return failure();
+    return result({ schema_version: 1, attachment: entry.summary, offset: 0, next_offset: entry.summary.total_bytes, complete: true, text: entry.text });
+  }
+  if (name === 'text.attachment.delete') {
+    if (params.has('patchdeletefail') && attachmentDeletions++ === 0) return failure();
+    attachments.delete(String(input.attachment_id));
+    return result({ schema_version: 1, deleted: true });
+  }
   if (name === 'compare_texts') {
     if (input.before === 'slow') await new Promise(resolve => setTimeout(resolve, 350));
     if (input.before === 'error') return failure();

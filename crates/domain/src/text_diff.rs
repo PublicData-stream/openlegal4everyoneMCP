@@ -7,6 +7,103 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024;
 pub const MAX_LINES: usize = 100_000;
 pub const MAX_INLINE_RANGES: usize = 65_536;
 pub const MAX_PAGE_INLINE_RANGES: usize = 4_096;
+pub const MAX_PATCH_INPUT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ATTACHMENT_CHUNK_BYTES: usize = 32 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum TextSource {
+    Inline(String),
+    Attachment(AttachmentHandle),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentHandle {
+    #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+    pub attachment_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Text,
+    Patch,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentUpload {
+    pub attachment_id: Option<String>,
+    pub kind: Option<AttachmentKind>,
+    pub total_bytes: Option<usize>,
+    #[serde(default)]
+    pub offset: usize,
+    #[schemars(length(max = 32768))]
+    pub chunk: String,
+    #[serde(rename = "final")]
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct AttachmentSummary {
+    pub schema_version: u32,
+    pub attachment_id: String,
+    pub kind: AttachmentKind,
+    pub total_bytes: usize,
+    pub committed_bytes: usize,
+    pub sealed: bool,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentRead {
+    pub attachment_id: String,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct AttachmentPage {
+    pub schema_version: u32,
+    pub attachment: AttachmentSummary,
+    pub offset: usize,
+    pub next_offset: usize,
+    pub complete: bool,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DiffInput {
+    pub before: TextSource,
+    pub after: TextSource,
+    pub before_label: Option<String>,
+    pub after_label: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct DiffResult {
+    pub schema_version: u32,
+    pub comparison: ComparisonSummary,
+    pub patch: AttachmentSummary,
+    pub explanation: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyPatchInput {
+    pub target: TextSource,
+    pub patch: TextSource,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ApplyPatchResult {
+    pub schema_version: u32,
+    pub result: AttachmentSummary,
+    pub info: TextInfo,
+}
 
 /// Half-open Unicode scalar offsets in the original line, including CR/LF.
 pub type ScalarRange = [u32; 2];

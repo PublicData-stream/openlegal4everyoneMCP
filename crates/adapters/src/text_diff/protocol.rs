@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const REQUEST_MAGIC: &[u8; 8] = b"OLDIFF01";
+const PATCH_MAGIC: &[u8; 8] = b"OLPATC01";
 const RESPONSE_MAGIC: &[u8; 8] = b"OLDIFR01";
 const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 
@@ -19,6 +20,16 @@ pub(super) fn request_header(before: usize, after: usize) -> Result<[u8; 16], Te
     header[12..16].copy_from_slice(&(after as u32).to_be_bytes());
     Ok(header)
 }
+pub(super) fn patch_request_header(target: usize, patch: usize) -> Result<[u8; 16], TextDiffError> {
+    if target > MAX_TEXT_BYTES || patch > MAX_PATCH_BYTES {
+        return Err(TextDiffError::InvalidInput);
+    }
+    let mut header = [0; 16];
+    header[..8].copy_from_slice(PATCH_MAGIC);
+    header[8..12].copy_from_slice(&(target as u32).to_be_bytes());
+    header[12..16].copy_from_slice(&(patch as u32).to_be_bytes());
+    Ok(header)
+}
 fn read_u32(reader: &mut impl Read) -> Result<usize, TextDiffError> {
     let mut bytes = [0; 4];
     reader
@@ -26,17 +37,24 @@ fn read_u32(reader: &mut impl Read) -> Result<usize, TextDiffError> {
         .map_err(|_| TextDiffError::InvalidInput)?;
     Ok(u32::from_be_bytes(bytes) as usize)
 }
-fn request(reader: &mut impl Read) -> Result<(String, String), TextDiffError> {
+fn request(reader: &mut impl Read) -> Result<(bool, String, String), TextDiffError> {
     let mut magic = [0; 8];
     reader
         .read_exact(&mut magic)
         .map_err(|_| TextDiffError::InvalidInput)?;
-    if &magic != REQUEST_MAGIC {
+    if &magic != REQUEST_MAGIC && &magic != PATCH_MAGIC {
         return Err(TextDiffError::InvalidInput);
     }
     let before_len = read_u32(reader)?;
     let after_len = read_u32(reader)?;
-    if before_len > MAX_TEXT_BYTES || after_len > MAX_TEXT_BYTES {
+    if before_len > MAX_TEXT_BYTES
+        || after_len
+            > if &magic == PATCH_MAGIC {
+                MAX_PATCH_BYTES
+            } else {
+                MAX_TEXT_BYTES
+            }
+    {
         return Err(TextDiffError::InvalidInput);
     }
     let mut before = vec![0; before_len];
@@ -55,6 +73,7 @@ fn request(reader: &mut impl Read) -> Result<(String, String), TextDiffError> {
         return Err(TextDiffError::InvalidInput);
     }
     Ok((
+        &magic == PATCH_MAGIC,
         String::from_utf8(before).map_err(|_| TextDiffError::InvalidInput)?,
         String::from_utf8(after).map_err(|_| TextDiffError::InvalidInput)?,
     ))
@@ -75,7 +94,16 @@ impl Write for CappedMetadata {
 }
 
 pub(super) fn run(mut reader: impl Read, writer: impl Write) -> Result<(), TextDiffError> {
-    let result = request(&mut reader).and_then(|(before, after)| compute::compare(&before, &after));
+    let result = request(&mut reader).and_then(|(patch, before, after)| {
+        if patch {
+            openlegal_normalization::patch::apply_patch(&before, &after).map(|text| ComputedDiff {
+                patch: text,
+                inline_changes: Vec::new(),
+            })
+        } else {
+            compute::compare(&before, &after)
+        }
+    });
     write_response(result, writer)
 }
 

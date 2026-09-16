@@ -157,3 +157,25 @@ test('page byte accounting includes escaped patch data and highlight metadata at
   padding++;
   assert.throws(() => parsePage(response(makePage()), expected), /unsupported comparison response/);
 });
+
+test('attachment chunks preserve scalar boundaries and bound escaping independently', async () => {
+  const { attachmentChunks, decodePatchFile } = await import('../src/text-diff-model.ts');
+  const text = '\uFEFF' + '한😀\r\n'.repeat(10000);
+  const chunks = [...attachmentChunks(text)];
+  assert.equal(chunks.map(x => x.chunk).join(''), text);
+  let offset = 0;
+  for (const chunk of chunks) { assert.equal(chunk.offset, offset); const bytes = new TextEncoder().encode(chunk.chunk).byteLength; assert.ok(bytes <= 32768); offset += bytes; }
+  assert.equal(chunks.at(-1)?.final, true);
+  assert.deepEqual([...attachmentChunks('')], [{ offset: 0, chunk: '', final: true }]);
+  assert.equal(decodePatchFile(new TextEncoder().encode('\uFEFF한\r\n').buffer), '\uFEFF한\r\n');
+});
+
+test('attachment response validator rejects wrong identity and false completion', async () => {
+  const { parseAttachment, parseAttachmentChunk } = await import('../src/text-diff-model.ts');
+  const attachment = { schema_version: 1, attachment_id: 'a'.repeat(64), kind: 'text', total_bytes: 3, committed_bytes: 3, sealed: true, expires_at: 1234 };
+  const expected = parseAttachment(attachment);
+  const response = { structuredContent: { schema_version: 1, attachment, offset: 0, next_offset: 3, complete: true, text: '한' } };
+  assert.equal(parseAttachmentChunk(response, expected, 0).text, '한');
+  assert.throws(() => parseAttachmentChunk({ structuredContent: { ...response.structuredContent, complete: false } }, expected, 0));
+  assert.throws(() => parseAttachmentChunk(response, { ...expected, attachment_id: 'b'.repeat(64) }, 0));
+});

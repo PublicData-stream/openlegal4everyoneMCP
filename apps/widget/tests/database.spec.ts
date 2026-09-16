@@ -1,0 +1,56 @@
+import { test, expect } from '@playwright/test';
+test('fictional database bridge pins content pages and shows HEAD freshness', async ({ page }) => {
+  await page.goto('/database'); const widget = page.frameLocator('iframe');
+  await expect(widget.getByRole('button', { name: 'Search corpus' })).toBeEnabled();
+  await widget.getByLabel('Search expression').fill('fictional');
+  await widget.getByRole('button', { name: 'Search corpus' }).click();
+  await expect(widget.getByText('Partial corpus coverage', { exact: false })).toBeVisible();
+  await expect(widget.locator('article b')).toHaveCount(0);
+  await expect(widget.locator('article')).toContainText('Whole-object query match · illustrative excerpt from body');
+  await widget.getByRole('button', { name: 'Fictional sample statute' }).click();
+  await expect(widget.getByLabel('Object content')).toHaveText('first fictional page');
+  await widget.getByRole('button', { name: 'Next content page' }).click();
+  await expect(widget.getByLabel('Object content')).toHaveText('second fictional page');
+  const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  expect(calls.at(-1).arguments.selector).toEqual({ kind: 'capture', id: 'a'.repeat(64) });
+  expect(calls.at(-1).arguments.session).toBe('e'.repeat(64));
+  await widget.getByRole('button', { name: 'Read HEAD' }).click();
+  await expect(widget.getByText('fresh; cache age 10s; TTL 300s; fresh remaining 290s')).toBeVisible();
+});
+test('fictional checkpoint diff preserves provenance and deletes its handle', async ({ page }) => {
+  await page.goto('/database'); const widget = page.frameLocator('iframe');
+  await expect(widget.getByRole('button', { name: 'Search corpus' })).toBeEnabled();
+  await widget.getByLabel('Search method').selectOption('rg');
+  await widget.getByLabel('Search expression').fill('fictional.*');
+  await widget.getByRole('button', { name: 'Search corpus' }).click();
+  await widget.getByRole('button', { name: 'Fictional sample statute' }).click();
+  await widget.getByRole('button', { name: 'Load history' }).click();
+  await widget.getByRole('button', { name: 'Use as before' }).first().click();
+  await widget.getByRole('button', { name: 'Use as after' }).last().click();
+  await widget.getByRole('button', { name: 'Compare checkpoints' }).click();
+  await expect(widget.getByLabel('Checkpoint comparison')).toContainText('Before revision r1');
+  await expect(widget.getByLabel('Checkpoint comparison')).toContainText('OCR excluded.');
+  await widget.getByRole('button', { name: 'Clear comparison' }).click();
+  await expect(widget.getByLabel('Checkpoint comparison')).toHaveCount(0);
+  const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  expect(calls[0].name).toBe('database.rg');
+  expect(calls.at(-1).name).toBe('text.diff.delete');
+});
+
+test('fictional section catalog merges pages and keeps long section IDs with the capture session', async ({ page }) => {
+  await page.goto('/database'); const widget = page.frameLocator('iframe');
+  await expect(widget.getByRole('button', { name: 'Search corpus' })).toBeEnabled();
+  await widget.getByRole('button', { name: 'Search corpus' }).click();
+  await widget.getByRole('button', { name: 'Fictional sample statute' }).click();
+  await widget.getByRole('button', { name: 'Load more sections' }).click();
+  await expect(widget.getByText('2 of 2 section summaries loaded.')).toBeVisible();
+  await widget.getByLabel('Content section').selectOption('x'.repeat(256));
+  await expect(widget.getByLabel('Object content')).toHaveText('Fictional section content');
+  await expect(widget.getByText('2 of 2 section summaries loaded.')).toBeVisible();
+  await widget.getByRole('button', { name: 'Load history' }).click();
+  await expect(widget.getByText('Catalog entry; no retained capture observation', { exact: false }).first()).toBeVisible();
+  const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  const catalog = calls.find((call: { arguments: { sections_offset?: number } }) => call.arguments.sections_offset === 1);
+  expect(catalog.arguments.session).toBe('e'.repeat(64));
+  expect(catalog.arguments.selector).toEqual({ kind: 'capture', id: 'a'.repeat(64) });
+});

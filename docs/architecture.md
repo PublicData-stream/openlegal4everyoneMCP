@@ -7,13 +7,16 @@ It provides a startup tool registry and endpoint supervisor shared by Streamable
 and WebTransport adapters. The production binary requires both, plus a private
 health listener. Shared retrieval, memory caching, two pure synthetic processors,
 and React MCP Apps widgets are implemented. Supplied-text comparison uses a bounded
-Rust worker adapter and a separate transient result store. Real legal-data models
-and providers remain planned. The [server contract](server.md) owns the
+Rust worker adapter and a shared bounded transient comparison/attachment store.
+The optional legal corpus has typed identity/revision/capture contracts, PostgreSQL
+evidence retention, a rebuildable local index and a LAW OPEN DATA adapter. Provider
+XML/HTML and binary document parsing runs through disposable document-worker Pods;
+live provider and hardened-cluster acceptance remain separate deployment gates. The [server contract](server.md) owns the
 implemented extension interfaces and transport configuration.
 
 A standalone [search-query processor](search-query.md) now parses supplied query
-syntax into domain-owned expressions. It has no evaluator or serving integration;
-the existing synthetic search and historical query validation remain unchanged.
+syntax into domain-owned expressions. The corpus evaluator applies Korean analysis
+and exact quoted source matching; synthetic search retains its separate semantics.
 
 - Support multiple jurisdictions without imposing one provider's identity or
   date semantics on all records.
@@ -150,3 +153,26 @@ to cross a new module boundary. Choose those mechanisms for an explained need.
 Changes to dependency direction or shared public contracts update this document
 and explain the tradeoff. Introduce a separate decision record only when the
 decision warrants more history than this document and the PR can usefully hold.
+
+
+## Legal corpus and document processing
+
+[Corpus tools](database.md) compose application database/read-session/search services
+at the shared server registry. Domain types distinguish official revisions from
+capture observations, typed dates, source evidence and OCR representation. The
+PostgreSQL adapter owns transactions, durable jobs, pins and the ordered index
+outbox. The local index is derived state and cannot authorize source identity or
+freshness. Read sessions retain exact capture identities across content pages.
+
+The trusted provider adapter constructs approved upstream requests, validates
+network destinations and moves fetched bytes into the document-processing port.
+The standalone `apps/document-worker` workspace keeps heavy parser/native/renderer
+dependencies outside the serving executable. Its disposable Pod has no provider
+credentials or independent fetch role. Structured parser output is validated again
+before projection and publication. XML/HTML trees preserve source order; extraction
+and OCR retain digest/page provenance and do not replace provider text implicitly.
+
+The composition remains one backend instance. A second replica requires shared
+provider admission and compatible job/index coordination; a separate index directory
+does not provide that coordination automatically. Deployment resource and isolation
+requirements are documented in [document sandbox](document-sandbox.md).

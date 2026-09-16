@@ -66,6 +66,18 @@ impl SimilarDiffEngine {
         if !result.patch.is_empty() || !result.inline_changes.is_empty() {
             return Err(TextDiffError::Unavailable);
         }
+        if !engine
+            .apply_patch(
+                Arc::from(""),
+                Arc::from(""),
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await?
+            .is_empty()
+        {
+            return Err(TextDiffError::Unavailable);
+        }
         Ok(engine)
     }
     fn command(&self) -> Command {
@@ -81,6 +93,42 @@ impl SimilarDiffEngine {
     }
 }
 impl DiffEngine for SimilarDiffEngine {
+    fn apply_patch(
+        &self,
+        target: Arc<str>,
+        patch: Arc<str>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> BoxFuture<'static, Result<String, TextDiffError>> {
+        let engine = self.clone();
+        async move {
+            if cancellation.is_cancelled() || Instant::now() >= deadline {
+                return Err(TextDiffError::Cancelled);
+            }
+            openlegal_application::text_diff::text_info(&target, "Target")?;
+            if patch.len() > openlegal_application::text_diff::MAX_PATCH_BYTES
+                || patch.contains('\0')
+            {
+                return Err(TextDiffError::InvalidInput);
+            }
+            let result = execute(
+                engine.command(),
+                target,
+                patch,
+                true,
+                cancellation,
+                deadline,
+            )
+            .await?;
+            if !result.inline_changes.is_empty() {
+                return Err(TextDiffError::Unavailable);
+            }
+            openlegal_application::text_diff::text_info(&result.patch, "Result")?;
+            Ok(result.patch)
+        }
+        .boxed()
+    }
+
     fn diff(
         &self,
         before: Arc<str>,
@@ -95,7 +143,15 @@ impl DiffEngine for SimilarDiffEngine {
             }
             openlegal_application::text_diff::text_info(&before, "Before")?;
             openlegal_application::text_diff::text_info(&after, "After")?;
-            execute(engine.command(), before, after, cancellation, deadline).await
+            execute(
+                engine.command(),
+                before,
+                after,
+                false,
+                cancellation,
+                deadline,
+            )
+            .await
         }
         .boxed()
     }
@@ -119,6 +175,7 @@ async fn execute(
     mut command: Command,
     before: Arc<str>,
     after: Arc<str>,
+    patch: bool,
     cancellation: CancellationToken,
     deadline: Instant,
 ) -> Result<ComputedDiff, TextDiffError> {
@@ -133,7 +190,7 @@ async fn execute(
         _ = tokio::time::sleep_until(deadline) => Err(TextDiffError::Cancelled),
         result = async { tokio::try_join!(
             async {
-                let header = protocol::request_header(before.len(), after.len())?;
+                let header = if patch { protocol::patch_request_header(before.len(), after.len())? } else { protocol::request_header(before.len(), after.len())? };
                 stdin.write_all(&header).await.map_err(|_| TextDiffError::Unavailable)?;
                 stdin.write_all(before.as_bytes()).await.map_err(|_| TextDiffError::Unavailable)?;
                 stdin.write_all(after.as_bytes()).await.map_err(|_| TextDiffError::Unavailable)?;

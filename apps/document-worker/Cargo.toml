@@ -1,0 +1,33 @@
+[package]
+name = "openlegal-document-worker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "AGPL-3.0-only"
+publish = false
+
+# Deliberately isolated from the serving binary's dependency and native build graph.
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+[lints.clippy]
+all = "warn"
+
+[features]
+default = ["documents"]
+documents = ["dep:rhwp", "dep:xberg", "dep:xberg-native-pdf", "dep:resvg"]
+
+[dependencies]
+openlegal-application = { path = "../../crates/application", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+roxmltree = "=0.21.1"
+scraper = { version = "=0.27.0", default-features = false }
+tokio = { version = "1", features = ["rt", "macros"] }
+rhwp = { version = "=0.8.6", git = "https://github.com/edwardkim/rhwp", rev = "680111ec7bea2fe11110de18c3676ba5a1cf7847", default-features = false, optional = true }
+xberg = { version = "=1.2.2", default-features = false, features = ["pdf", "ocr", "tesseract-dynamic", "tokio-runtime"], optional = true }
+xberg-native-pdf = { version = "=1.2.2", optional = true }
+resvg = { version = "=0.47.0", default-features = false, features = ["text", "raster-images"], optional = true }

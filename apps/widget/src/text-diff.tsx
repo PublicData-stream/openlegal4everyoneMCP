@@ -5,6 +5,7 @@ import { SourceOffer } from './SourceOffer.tsx';
 import { decodeFile, DiffResponseError, editAsLf, MAX_TEXT_BYTES, parseCompare, parseDelete, parsePage, parsePair, parseShow, utf8Length, validateLabel, validateText, type Comparison, type DiffPage, type PageView, type TextPair } from './text-diff-model.ts';
 import './style.css';
 import './text-diff.css';
+import { TextPatchPanel } from './TextPatchPanel.tsx';
 import { ComparisonView } from './ComparisonView.tsx';
 
 const bridge = new App({ name: 'Text comparison', version: '0.1.0' }, {});
@@ -248,6 +249,7 @@ function TextComparison() {
     <div role="status" aria-live="polite">{busy === 'compare' ? 'Comparing texts…' : busy === 'delete' ? 'Deleting retained comparison…' : busy === 'load' ? 'Loading original texts…' : pageBusy ? 'Loading comparison page…' : !ready && !error ? 'Connecting to host…' : ''}</div>
     {error && <p role="alert" className="error">{error}</p>}
     {comparison && <ComparisonView comparison={comparison} page={page} expired={expired} busy={!!busy} pageBusy={pageBusy} dirty={dirty} view={view} layout={layout} wide={wide} dark={dark} error={error} onView={changeView} onLayout={setLayout} onPage={setPageIndex} onRetry={() => { setError(''); setComparison({ ...comparison }); }} />}
+    <TextPatchPanel ready={ready} bridge={bridge} />
     <SourceOffer ready={ready} bridge={bridge} />
   </main>;
 }

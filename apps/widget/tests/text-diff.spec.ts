@@ -223,3 +223,28 @@ test('initial supplied pairs cannot claim historical origin and retain only clea
   const invoked = await calls(page);
   expect(invoked.some(call => call.name === 'get_text_diff_page')).toBe(false);
 });
+
+test('patch file workflow uploads exact UTF-8 and cleans all temporary handles', async ({ page }) => {
+  const widget = await open(page);
+  await widget.getByLabel('Load target file', { exact: true }).setInputFiles({ name: 'target.txt', mimeType: 'text/plain', buffer: Buffer.from('\uFEFF한\r\n끝') });
+  await widget.getByLabel('Load patch file', { exact: true }).setInputFiles({ name: 'change.patch', mimeType: 'text/plain', buffer: Buffer.from('--- a\n+++ b\n@@ -1,2 +1,2 @@\n \uFEFF한\r\n-끝\n\\ No newline at end of file\n+끝!\n\\ No newline at end of file\n') });
+  expect((await calls(page)).length).toBe(0);
+  await widget.getByRole('button', { name: 'Apply patch', exact: true }).click();
+  await expect(widget.getByLabel('Patched text', { exact: true })).toContainText('끝!');
+  await expect(widget.getByRole('button', { name: 'Apply patch', exact: true })).toBeEnabled();
+  const invoked = await calls(page);
+  expect(invoked.find(x => x.name === 'text.attachment.upload')?.arguments.chunk).toBe('\uFEFF한\r\n끝');
+  expect(invoked.filter(x => x.name === 'text.attachment.delete')).toHaveLength(3);
+  await widget.getByRole('button', { name: 'Clear patch', exact: true }).click();
+  await expect(widget.getByLabel('Patched text', { exact: true })).toHaveCount(0);
+});
+
+test('patch cleanup failures keep a retryable handle', async ({ page }) => {
+  const widget = await open(page, '?patchdeletefail');
+  await widget.getByLabel('Patch target', { exact: true }).fill('a');
+  await widget.getByRole('button', { name: 'Apply patch', exact: true }).click();
+  await expect(widget.getByText('Some temporary attachments could not be deleted.', { exact: false })).toBeVisible();
+  await widget.getByRole('button', { name: 'Clear patch', exact: true }).click();
+  await expect(widget.getByRole('button', { name: 'Apply patch', exact: true })).toBeEnabled();
+  expect((await calls(page)).filter(x => x.name === 'text.attachment.delete')).toHaveLength(4);
+});

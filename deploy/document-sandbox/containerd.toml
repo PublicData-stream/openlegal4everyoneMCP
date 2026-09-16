@@ -1,0 +1,8 @@
+# Merge into the dedicated nodes' containerd 2.x configuration. No host-network
+# fallback is acceptable. Qualify this handler with hostUsers:false before labeling
+# a node openlegal.document-sandbox/ready=true.
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc-document]
+runtime_type = "io.containerd.runsc.v1"
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc-document.options]
+TypeUrl = "io.containerd.runsc.v1.options"
+ConfigPath = "/etc/containerd/runsc-document.toml"

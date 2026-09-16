@@ -240,3 +240,54 @@ export const editAsLf = (text: string) => text.replace(/\r\n?/g, '\n');
 export function metadata(info: TextInfo): string {
   return `${info.bytes.toLocaleString()} UTF-8 bytes · ${info.lines.toLocaleString()} lines · LF ${info.lf}, CRLF ${info.crlf}, bare CR ${info.bare_cr} · ${info.bom ? 'BOM present' : 'no BOM'} · ${info.final_newline ? 'final newline' : 'no final newline'}`;
 }
+
+export type Attachment = { attachment_id: string; kind: 'text' | 'patch'; total_bytes: number; committed_bytes: number; sealed: boolean; expires_at: number };
+export function parseAttachment(value: unknown): Attachment {
+  const item = object(value);
+  if (item.schema_version !== 1 || (item.kind !== 'text' && item.kind !== 'patch')) throw new DiffResponseError('The server returned an invalid attachment.');
+  const total = integer(item.total_bytes, item.kind === 'text' ? MAX_TEXT_BYTES : 8 * MAX_TEXT_BYTES);
+  const committed = integer(item.committed_bytes, total);
+  const sealed = boolean(item.sealed);
+  if (sealed && committed !== total) throw new DiffResponseError('The server returned an incomplete attachment.');
+  return { attachment_id: identity(item.attachment_id), kind: item.kind, total_bytes: total, committed_bytes: committed, sealed, expires_at: integer(item.expires_at, Number.MAX_SAFE_INTEGER) };
+}
+export function parseAttachmentUpload(result: unknown): Attachment { return parseAttachment(data(result)); }
+export function parsePatchResult(result: unknown): Attachment {
+  const value = data(result);
+  if (value.schema_version !== 1) throw new DiffResponseError('The patch result version is unsupported.');
+  const attachment = parseAttachment(value.result);
+  if (attachment.kind !== 'text' || !attachment.sealed) throw new DiffResponseError('The patch result is not complete text.');
+  return attachment;
+}
+export function parseAttachmentChunk(result: unknown, expected: Attachment, offset: number): { text: string; next_offset: number; complete: boolean } {
+  const value = data(result);
+  const attachment = parseAttachment(value.attachment);
+  if (value.schema_version !== 1 || attachment.attachment_id !== expected.attachment_id || attachment.kind !== expected.kind || attachment.total_bytes !== expected.total_bytes || attachment.expires_at !== expected.expires_at || !attachment.sealed || value.offset !== offset) throw new DiffResponseError('The server returned inconsistent attachment data.');
+  const text = string(value.text, 32 * 1024);
+  const next = integer(value.next_offset, attachment.total_bytes);
+  const complete = boolean(value.complete);
+  if (next !== offset + utf8Length(text) || complete !== (next === attachment.total_bytes) || (!complete && next <= offset)) throw new DiffResponseError('The server returned an invalid attachment chunk.');
+  return { text, next_offset: next, complete };
+}
+export function* attachmentChunks(text: string): Generator<{ offset: number; chunk: string; final: boolean }> {
+  let chunk = ''; let bytes = 0; let offset = 0;
+  for (const scalar of text) {
+    const point = scalar.codePointAt(0)!;
+    if (point >= 0xd800 && point <= 0xdfff) throw new Error('Text must contain valid Unicode.');
+    const size = point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+    if (bytes + size > 32 * 1024) { yield { offset, chunk, final: false }; offset += bytes; chunk = ''; bytes = 0; }
+    chunk += scalar; bytes += size;
+  }
+  yield { offset, chunk, final: true };
+}
+export function decodePatchFile(buffer: ArrayBuffer): string {
+  if (buffer.byteLength > 8 * MAX_TEXT_BYTES) throw new Error('The patch must fit within 8 MiB.');
+  const value = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer);
+  if (value.includes('\0')) throw new Error('Patches cannot contain NUL.');
+  return value;
+}
+
+export function validatePatch(text: string): void {
+  if (utf8Length(text) > 8 * MAX_TEXT_BYTES || text.includes('\0')) throw new Error('The patch must fit within 8 MiB and contain no NUL.');
+  for (const scalar of text) { const code = scalar.codePointAt(0)!; if (code >= 0xd800 && code <= 0xdfff) throw new Error('The patch must contain valid Unicode.'); }
+}
