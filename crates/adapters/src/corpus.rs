@@ -16,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod lifecycle;
+mod runtime_lease;
+pub use runtime_lease::CorpusRuntimeLease;
 
 #[derive(Clone)]
 pub struct PgCorpusStore {

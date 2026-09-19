@@ -1,7 +1,8 @@
 //! Search generations bind local index readers to durable corpus retention pins.
 use crate::{
     corpus::PgCorpusStore,
-    search_index::{ANALYZER_VERSION, CorpusIndex, IndexSnapshot, IndexedCapture, filters_match},
+    korean_query::CompiledQuery,
+    search_index::{CorpusIndex, IndexSnapshot, IndexedCapture, filters_match},
 };
 use futures::future::BoxFuture;
 use grep_matcher::Matcher;
@@ -32,6 +33,7 @@ struct Session {
     fingerprint: String,
     expires: u64,
     corpus_complete: bool,
+    query: Option<Arc<CompiledQuery>>,
 }
 #[derive(Clone)]
 struct Cursor {
@@ -78,7 +80,7 @@ impl CorpusSearch {
         &self,
         mode: SearchMode,
         mut request: SearchRequest,
-        budget: SearchBudget,
+        mut budget: SearchBudget,
         cancel: CancellationToken,
     ) -> Result<SearchPage, E> {
         self.store.health().await?;
@@ -105,12 +107,36 @@ impl CorpusSearch {
             (c.session.clone(), s.clone(), c.position.clone())
         } else {
             let snapshot_index = self.index.clone();
-            let snapshot = tokio::task::spawn_blocking(move || snapshot_index.snapshot())
-                .await
-                .map_err(|_| E::Capacity)??;
+            let query_text = request.query.clone();
+            let compile_cancel = cancel.clone();
+            let deadline = budget.deadline;
+            let (prepared, returned_budget) = tokio::task::spawn_blocking(move || {
+                let prepared = (|| {
+                    let query = if matches!(mode, SearchMode::Query) {
+                        let parsed = SearchQueryProcessor::new(&["title", "body"])
+                            .map_err(|_| E::InvalidInput)?
+                            .parse(&query_text)
+                            .map_err(|_| E::InvalidInput)?;
+                        Some(Arc::new(snapshot_index.compile_query(
+                            &parsed.expression,
+                            deadline,
+                            &compile_cancel,
+                        )?))
+                    } else {
+                        None
+                    };
+                    Ok::<_, E>((snapshot_index.snapshot()?, query))
+                })();
+                (prepared, budget)
+            })
+            .await
+            .map_err(|_| E::Capacity)?;
+            budget = returned_budget;
+            let (snapshot, query) = prepared?;
             let id = random()?;
             let session = Session {
                 snapshot: snapshot.clone(),
+                query,
                 fingerprint,
                 expires: now() + 600,
                 corpus_complete: !request.include_history
@@ -154,7 +180,7 @@ impl CorpusSearch {
         let (result, _lease) = tokio::task::spawn_blocking(move || {
             let result = scan(
                 &index,
-                &worker_session.snapshot,
+                &worker_session,
                 mode,
                 &request,
                 position,
@@ -207,7 +233,7 @@ impl CorpusSearch {
             generation: session.snapshot.generation,
             corpus_complete: session.corpus_complete,
             scanned_bytes: result.2 as u64,
-            analyzer_version: ANALYZER_VERSION.into(),
+            analyzer_version: session.snapshot.analyzer_version.clone(),
             index_lag: self
                 .store
                 .watermark()
@@ -231,24 +257,15 @@ impl SearchBackend for CorpusSearch {
 type ScanResult = (Vec<SearchHit>, Option<Position>, usize);
 fn scan(
     index: &CorpusIndex,
-    snapshot: &IndexSnapshot,
+    session: &Session,
     mode: SearchMode,
     request: &SearchRequest,
     mut position: Position,
     budget: &SearchBudget,
     cancel: &CancellationToken,
 ) -> Result<ScanResult, E> {
-    let expression = if matches!(mode, SearchMode::Query) {
-        Some(
-            SearchQueryProcessor::new(&["title", "body"])
-                .map_err(|_| E::InvalidInput)?
-                .parse(&request.query)
-                .map_err(|_| E::InvalidInput)?
-                .expression,
-        )
-    } else {
-        None
-    };
+    let snapshot = &session.snapshot;
+    let expression = session.query.as_deref();
     let regex = if matches!(mode, SearchMode::Ripgrep) {
         Some(
             RegexMatcherBuilder::new()
@@ -324,12 +341,13 @@ fn scan(
                 .map(|(_, text, _)| text.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            doc.body_tokens = index.tokens(&doc.capture.record.body)?;
+            doc.body_tokens =
+                index.tokens_with_budget(&doc.capture.record.body, budget.deadline, cancel)?;
             if !sections.iter().any(|(name, _, _)| name == "title") {
                 doc.capture.record.title.clear();
                 doc.title_tokens.clear();
             }
-            if index.matches(expression, &doc, None)? {
+            if index.matches(expression, &doc) {
                 let (name, source, ocr) = sections
                     .iter()
                     .find(|(_, text, _)| !text.is_empty())

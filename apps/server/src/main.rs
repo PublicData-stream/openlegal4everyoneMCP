@@ -12,13 +12,14 @@ enum Command {
     Serve,
     Migrate,
     Maintain,
+    RebuildCorpusIndex,
 }
 
 fn main() -> Result<(), ServerError> {
     let mut args = std::env::args_os().skip(1);
-    let first = args
-        .next()
-        .ok_or("usage: openlegal-server [--migrate|--maintain] CONFIG.toml")?;
+    let first = args.next().ok_or(
+        "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index] CONFIG.toml",
+    )?;
     if first == "--text-diff-worker" {
         if args.next().is_some() {
             return Err("text-diff worker takes no arguments".into());
@@ -26,25 +27,31 @@ fn main() -> Result<(), ServerError> {
         openlegal_adapters::text_diff::run_worker()?;
         return Ok(());
     }
-    let (command, path) = if first == "--migrate" || first == "--maintain" {
-        let command = if first == "--migrate" {
-            Command::Migrate
+    let (command, path) =
+        if first == "--migrate" || first == "--maintain" || first == "--rebuild-corpus-index" {
+            let command = if first == "--migrate" {
+                Command::Migrate
+            } else if first == "--maintain" {
+                Command::Maintain
+            } else {
+                Command::RebuildCorpusIndex
+            };
+            (
+                command,
+                args.next()
+                    .ok_or("storage administration requires CONFIG.toml")?,
+            )
         } else {
-            Command::Maintain
+            if first.to_string_lossy().starts_with("--") {
+                return Err("unknown server command".into());
+            }
+            (Command::Serve, first)
         };
-        (
-            command,
-            args.next()
-                .ok_or("storage administration requires CONFIG.toml")?,
-        )
-    } else {
-        if first.to_string_lossy().starts_with("--") {
-            return Err("unknown server command".into());
-        }
-        (Command::Serve, first)
-    };
     if args.next().is_some() {
-        return Err("usage: openlegal-server [--migrate|--maintain] CONFIG.toml".into());
+        return Err(
+            "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index] CONFIG.toml"
+                .into(),
+        );
     }
     run_server(path, command)
 }
@@ -106,6 +113,29 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                 postgres.options()?,
             )
             .await?;
+        } else if command == Command::RebuildCorpusIndex {
+            use openlegal_application::persistence::PersistentStore;
+            config.validate_storage()?;
+            let database = config
+                .database
+                .as_ref()
+                .ok_or("index rebuild requires [database]")?;
+            let store =
+                open_storage(cache, openlegal_adapters::postgres::StartupMode::Maintain).await?;
+            let cancel = CancellationToken::new();
+            let signal_cancel = cancel.clone();
+            let signal = tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                signal_cancel.cancel();
+            });
+            let result =
+                openlegal_server::corpus_runtime::rebuild_corpus_index(database, &store, cancel)
+                    .await;
+            signal.abort();
+            let closed = store.close().await;
+            let generation = result?;
+            closed?;
+            tracing::info!(generation, "corpus index rebuild complete");
         } else {
             use openlegal_application::persistence::PersistentStore;
             let store =

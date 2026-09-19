@@ -56,6 +56,9 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
         &DatabaseConfig {
             blob_path: fixture.directory.path().join("corpus-blobs"),
             index_path: fixture.directory.path().join("corpus-index"),
+            mecab_dictionary_path: std::env::var_os("OPENLEGAL_TEST_MECAB_DICTIONARY")
+                .expect("PostgreSQL gate must provide the pinned MeCab-Ko dictionary")
+                .into(),
             widget_html: "unused-fixture.html".into(),
             ingestion: None,
         },

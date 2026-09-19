@@ -1,20 +1,20 @@
 //! Rebuildable Tantivy corpus generations and Korean analysis. No provider I/O.
-use lindera::{
-    dictionary::{DictionaryKind, load_embedded_dictionary},
-    mode::Mode,
-    segmenter::Segmenter,
+use crate::{
+    korean_analysis::{AnalyzedText, KoreanAnalyzer},
+    korean_query::CompiledQuery,
 };
 use openlegal_domain::{
     legal::{Capture, DatabaseError as E},
     legal_search::{DateKind, Filters},
-    search_query::{Expr, ExprKind},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 use tantivy::{
@@ -22,19 +22,27 @@ use tantivy::{
     schema::{Field, IndexRecordOption, STORED, STRING, Schema, Value},
 };
 use tokio_util::sync::CancellationToken;
-use unicode_normalization::UnicodeNormalization;
-pub const ANALYZER_VERSION: &str = "ko_lindera5_surface_nfc_ascii_v1";
+const INDEX_FORMAT: u32 = 2;
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IndexMetadata {
+    format: u32,
+    analyzer: String,
+    generation: u64,
+    complete: bool,
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct IndexedCapture {
     pub capture: Capture,
     pub current: bool,
-    pub title_tokens: Vec<String>,
-    pub body_tokens: Vec<String>,
+    pub title_tokens: AnalyzedText,
+    pub body_tokens: AnalyzedText,
 }
 #[derive(Clone)]
 pub struct IndexSnapshot {
     pub reader: Searcher,
     pub generation: u64,
+    pub analyzer_version: String,
     key: Field,
     payload: Field,
 }
@@ -45,7 +53,8 @@ pub struct CorpusIndex {
     key: Field,
     object: Field,
     payload: Field,
-    analyzer: Segmenter,
+    analyzer: Arc<KoreanAnalyzer>,
+    complete: AtomicBool,
     mutation: Mutex<()>,
 }
 fn err(_: impl std::fmt::Debug) -> E {
@@ -72,18 +81,40 @@ fn hex(v: &[u8]) -> String {
     v.iter().map(|b| format!("{b:02x}")).collect()
 }
 impl CorpusIndex {
-    pub fn open(path: &Path) -> Result<Arc<Self>, E> {
+    pub fn open(path: &Path, analyzer: Arc<KoreanAnalyzer>) -> Result<Arc<Self>, E> {
+        Self::open_inner(path, analyzer, false)
+    }
+    /// Creates only a fresh destination; incomplete generations cannot be served.
+    pub fn create_rebuild(path: &Path, analyzer: Arc<KoreanAnalyzer>) -> Result<Arc<Self>, E> {
+        if path.exists() && std::fs::read_dir(path).map_err(err)?.next().is_some() {
+            return Err(E::Conflict);
+        }
+        Self::open_inner(path, analyzer, true)
+    }
+    fn open_inner(
+        path: &Path,
+        analyzer: Arc<KoreanAnalyzer>,
+        rebuilding: bool,
+    ) -> Result<Arc<Self>, E> {
         let mut schema = Schema::builder();
         let key = schema.add_text_field("key", STRING | STORED);
         let object = schema.add_text_field("object", STRING);
         let payload = schema.add_text_field("payload", STORED);
         let schema = schema.build();
         std::fs::create_dir_all(path).map_err(err)?;
-        let index = Index::open_or_create(
-            tantivy::directory::MmapDirectory::open(path).map_err(err)?,
-            schema,
-        )
-        .map_err(err)?;
+        let directory = tantivy::directory::MmapDirectory::open(path).map_err(err)?;
+        let existing = Index::exists(&directory).map_err(err)?;
+        let index = Index::open_or_create(directory, schema).map_err(err)?;
+        if existing {
+            let meta = index.load_metas().map_err(err)?;
+            let meta: IndexMetadata =
+                serde_json::from_str(meta.payload.as_deref().ok_or(E::StorageCorrupt)?)
+                    .map_err(err)?;
+            if meta.format != INDEX_FORMAT || meta.analyzer != analyzer.identity() || !meta.complete
+            {
+                return Err(E::StorageCorrupt);
+            }
+        }
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -92,49 +123,78 @@ impl CorpusIndex {
         let writer = index
             .writer_with_num_threads(1, 32 * 1024 * 1024)
             .map_err(err)?;
-        let dictionary = load_embedded_dictionary(DictionaryKind::KoDic).map_err(err)?;
-        Ok(Arc::new(Self {
+        let result = Arc::new(Self {
             index,
             reader,
             writer: Mutex::new(writer),
             key,
             object,
             payload,
-            analyzer: Segmenter::new(Mode::Normal, dictionary, None),
+            analyzer,
+            complete: AtomicBool::new(!rebuilding),
             mutation: Mutex::new(()),
-        }))
-    }
-    pub fn tokens(&self, text: &str) -> Result<Vec<String>, E> {
-        let normalized: String = text.nfc().collect::<String>().to_ascii_lowercase();
-        let mut result = Vec::new();
-        // Paragraph-size calls prevent one legal document from allocating an unbounded lattice.
-        for line in normalized.split_inclusive('\n') {
-            if line.len() > 65536 {
-                return Err(E::Capacity);
-            }
-            for token in self.analyzer.segment(Cow::Borrowed(line)).map_err(err)? {
-                if !token.surface.trim().is_empty() {
-                    result.push(token.surface.into_owned());
-                }
-                if result.len() > 262144 {
-                    return Err(E::Capacity);
-                }
-            }
+        });
+        if !existing {
+            result.advance_generation(0)?;
         }
         Ok(result)
+    }
+    pub fn tokens(&self, text: &str) -> Result<AnalyzedText, E> {
+        self.tokens_with_budget(
+            text,
+            Instant::now() + std::time::Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+    }
+    pub fn tokens_with_budget(
+        &self,
+        text: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<AnalyzedText, E> {
+        self.analyzer.analyze(text, deadline, cancel)
+    }
+    pub fn compile_query(
+        &self,
+        expression: &openlegal_domain::search_query::Expr,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<CompiledQuery, E> {
+        CompiledQuery::compile(expression, &self.analyzer, deadline, cancel)
+    }
+    fn metadata(&self, generation: u64, complete: bool) -> Result<String, E> {
+        serde_json::to_string(&IndexMetadata {
+            format: INDEX_FORMAT,
+            analyzer: self.analyzer.identity().into(),
+            generation,
+            complete,
+        })
+        .map_err(err)
+    }
+    /// Durable completion happens before the database acknowledgment.
+    pub fn finish_rebuild(&self) -> Result<(), E> {
+        let _mutation = self.mutation.lock().map_err(err)?;
+        let generation = self.snapshot()?.generation;
+        let mut writer = self.writer.lock().map_err(err)?;
+        let mut commit = writer.prepare_commit().map_err(err)?;
+        commit.set_payload(&self.metadata(generation, true)?);
+        commit.commit().map_err(err)?;
+        self.reader.reload().map_err(err)?;
+        self.complete.store(true, Ordering::Release);
+        Ok(())
     }
     pub fn snapshot(&self) -> Result<IndexSnapshot, E> {
         let _writer = self.writer.lock().map_err(err)?;
         let meta = self.index.load_metas().map_err(err)?;
-        let generation = meta
-            .payload
-            .as_deref()
-            .unwrap_or("0")
-            .parse()
-            .map_err(err)?;
+        let metadata: IndexMetadata =
+            serde_json::from_str(meta.payload.as_deref().ok_or(E::StorageCorrupt)?).map_err(err)?;
+        if metadata.format != INDEX_FORMAT || metadata.analyzer != self.analyzer.identity() {
+            return Err(E::StorageCorrupt);
+        }
         Ok(IndexSnapshot {
             reader: self.reader.searcher(),
-            generation,
+            generation: metadata.generation,
+            analyzer_version: metadata.analyzer,
             key: self.key,
             payload: self.payload,
         })
@@ -180,7 +240,7 @@ impl CorpusIndex {
             writer.add_document(doc).map_err(err)?;
         }
         let mut commit = writer.prepare_commit().map_err(err)?;
-        commit.set_payload(&generation.to_string());
+        commit.set_payload(&self.metadata(generation, self.complete.load(Ordering::Acquire))?);
         commit.commit().map_err(err)?;
         self.reader.reload().map_err(err)?;
         Ok(())
@@ -199,69 +259,18 @@ impl CorpusIndex {
         let mut writer = self.writer.lock().map_err(err)?;
         writer.delete_term(Term::from_field_text(self.object, &key));
         let mut commit = writer.prepare_commit().map_err(err)?;
-        commit.set_payload(&generation.to_string());
+        commit.set_payload(&self.metadata(generation, self.complete.load(Ordering::Acquire))?);
         commit.commit().map_err(err)?;
         self.reader.reload().map_err(err)?;
         Ok(())
     }
-    pub fn matches(
-        &self,
-        expression: &Expr,
-        doc: &IndexedCapture,
-        fields: Option<&str>,
-    ) -> Result<bool, E> {
-        let texts: Vec<(&str, &[String])> = match fields {
-            Some("title") => vec![(&doc.capture.record.title, &doc.title_tokens)],
-            Some("body") => vec![(&doc.capture.record.body, &doc.body_tokens)],
-            Some(_) => return Err(E::InvalidInput),
-            None => vec![
-                (&doc.capture.record.title, &doc.title_tokens),
-                (&doc.capture.record.body, &doc.body_tokens),
-            ],
-        };
-        Ok(match &expression.kind {
-            ExprKind::MatchAll => true,
-            ExprKind::Term(term) | ExprKind::Prefix(term) => {
-                let terms = self.tokens(term)?;
-                if terms.is_empty() {
-                    return Err(E::InvalidInput);
-                }
-                texts.iter().any(|(_, tokens)| {
-                    let set: HashSet<&str> = tokens.iter().map(String::as_str).collect();
-                    terms.iter().enumerate().all(|(i, t)| {
-                        if matches!(expression.kind, ExprKind::Prefix(_)) && i + 1 == terms.len() {
-                            set.iter().any(|v| v.starts_with(t))
-                        } else {
-                            set.contains(t.as_str())
-                        }
-                    })
-                })
-            }
-            ExprKind::Exact(text) => texts.iter().any(|(value, _)| value.contains(text)),
-            ExprKind::Not(child) => !self.matches(child, doc, fields)?,
-            ExprKind::And(children) => {
-                let mut found = true;
-                for child in children {
-                    if !self.matches(child, doc, fields)? {
-                        found = false;
-                        break;
-                    }
-                }
-                found
-            }
-            ExprKind::Or(children) => {
-                let mut found = false;
-                for child in children {
-                    if self.matches(child, doc, fields)? {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            }
-            ExprKind::Field { name, expression } => self.matches(expression, doc, Some(name))?,
-            ExprKind::Group { expression, .. } => self.matches(expression, doc, fields)?,
-        })
+    pub fn matches(&self, expression: &CompiledQuery, doc: &IndexedCapture) -> bool {
+        expression.matches(
+            &doc.capture.record.title,
+            &doc.title_tokens,
+            &doc.capture.record.body,
+            &doc.body_tokens,
+        )
     }
 }
 impl IndexSnapshot {
@@ -371,9 +380,21 @@ impl CorpusIndex {
     /// Pre-publication admission for the managed provider pipeline. Successful
     /// publication must not introduce an index event that cannot be represented.
     pub fn validate_record(&self, record: &openlegal_domain::legal::LegalRecord) -> Result<(), E> {
+        self.validate_record_with_budget(
+            record,
+            Instant::now() + std::time::Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+    }
+    pub fn validate_record_with_budget(
+        &self,
+        record: &openlegal_domain::legal::LegalRecord,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(), E> {
         record.validate()?;
-        let title = self.tokens(&record.title)?;
-        let body = self.tokens(&record.body)?;
+        let title = self.tokens_with_budget(&record.title, deadline, cancel)?;
+        let body = self.tokens_with_budget(&record.body, deadline, cancel)?;
         let size = serde_json::to_vec(&(record, title, body))
             .map_err(err)?
             .len();
@@ -387,11 +408,13 @@ impl CorpusIndex {
         &self,
         capture: Capture,
         current: bool,
+        deadline: Instant,
+        cancel: &CancellationToken,
     ) -> Result<tantivy::TantivyDocument, E> {
         capture.record.validate()?;
         let indexed = IndexedCapture {
-            title_tokens: self.tokens(&capture.record.title)?,
-            body_tokens: self.tokens(&capture.record.body)?,
+            title_tokens: self.tokens_with_budget(&capture.record.title, deadline, cancel)?,
+            body_tokens: self.tokens_with_budget(&capture.record.body, deadline, cancel)?,
             capture,
             current,
         };
@@ -417,7 +440,7 @@ impl CorpusIndex {
             writer.add_document(doc).map_err(err)?;
         }
         let mut commit = writer.prepare_commit().map_err(err)?;
-        commit.set_payload(&generation.to_string());
+        commit.set_payload(&self.metadata(generation, self.complete.load(Ordering::Acquire))?);
         commit.commit().map_err(err)?;
         self.reader.reload().map_err(err)?;
         Ok(())
@@ -429,6 +452,22 @@ impl CorpusIndex {
         install_head: bool,
         generation: u64,
     ) -> Result<(), E> {
+        self.apply_capture_with_budget(
+            capture,
+            install_head,
+            generation,
+            Instant::now() + std::time::Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+    }
+    pub fn apply_capture_with_budget(
+        &self,
+        capture: Capture,
+        install_head: bool,
+        generation: u64,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(), E> {
         let _mutation = self.mutation.lock().map_err(err)?;
         let snapshot = self.snapshot()?;
         let prefix = format!("{}/", object_key(&capture));
@@ -437,15 +476,11 @@ impl CorpusIndex {
         let mut documents = Vec::new();
         let mut current = install_head;
         let mut seen = 0;
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let Some((key, old)) = snapshot
-                .batch(&after, 1, deadline, &CancellationToken::new())?
-                .into_iter()
-                .next()
-            else {
-                break;
-            };
+        while let Some((key, old)) = snapshot
+            .batch(&after, 1, deadline, cancel)?
+            .into_iter()
+            .next()
+        {
             if !key.starts_with(&prefix) {
                 break;
             }
@@ -466,10 +501,16 @@ impl CorpusIndex {
                 if !documents.is_empty() {
                     return Err(E::StorageCorrupt);
                 }
-                documents.push(self.indexed_document(old.capture, false)?);
+                documents.push(self.indexed_document(old.capture, false, deadline, cancel)?);
             }
         }
-        documents.push(self.indexed_document(capture, current)?);
+        documents.push(self.indexed_document(capture, current, deadline, cancel)?);
+        if cancel.is_cancelled() {
+            return Err(E::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(E::Capacity);
+        }
         self.commit_changes(keys, documents, generation)
     }
     pub fn remove_capture(
@@ -520,6 +561,55 @@ impl CorpusIndex {
 mod tests {
     use super::*;
     use openlegal_domain::legal::{Dataset, LegalRecord, ObjectId};
+    #[test]
+    fn metadata_fences_legacy_mismatched_and_interrupted_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("index");
+        let analyzer = KoreanAnalyzer::fixture();
+        let index = CorpusIndex::create_rebuild(&path, analyzer.clone()).unwrap();
+        index
+            .apply_capture(capture("a", "r1", "대한민국"), true, 4)
+            .unwrap();
+        drop(index);
+        assert!(CorpusIndex::open(&path, analyzer.clone()).is_err());
+        assert!(CorpusIndex::create_rebuild(&path, analyzer.clone()).is_err());
+
+        let ready = directory.path().join("ready");
+        let index = CorpusIndex::create_rebuild(&ready, analyzer.clone()).unwrap();
+        index
+            .apply_capture(capture("a", "r1", "대한민국"), true, 4)
+            .unwrap();
+        index.finish_rebuild().unwrap();
+        drop(index);
+        let index = CorpusIndex::open(&ready, analyzer.clone()).unwrap();
+        assert_eq!(index.snapshot().unwrap().generation, 4);
+        assert_eq!(
+            index.snapshot().unwrap().analyzer_version,
+            analyzer.identity()
+        );
+        drop(index);
+        for payload in [
+            "4".to_string(),
+            "broken".to_string(),
+            serde_json::to_string(&IndexMetadata {
+                format: INDEX_FORMAT,
+                analyzer: "different-dictionary".into(),
+                generation: 4,
+                complete: true,
+            })
+            .unwrap(),
+        ] {
+            let raw = Index::open_in_dir(&ready).unwrap();
+            let mut writer = raw
+                .writer_with_num_threads::<tantivy::TantivyDocument>(1, 32 * 1024 * 1024)
+                .unwrap();
+            let mut commit = writer.prepare_commit().unwrap();
+            commit.set_payload(&payload);
+            commit.commit().unwrap();
+            drop(writer);
+            assert!(CorpusIndex::open(&ready, analyzer.clone()).is_err());
+        }
+    }
     pub(super) fn capture(id: &str, revision: &str, text: &str) -> Capture {
         Capture {
             capture_id: if revision == "r1" {
@@ -555,7 +645,7 @@ mod tests {
     #[test]
     fn exact_negation_and_korean_analysis_use_separate_semantics() {
         let dir = tempfile::tempdir().unwrap();
-        let index = CorpusIndex::open(dir.path()).unwrap();
+        let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
         let c = capture("a", "r1", "대한민국 ABC café");
         let doc = IndexedCapture {
             title_tokens: index.tokens(&c.record.title).unwrap(),
@@ -575,19 +665,26 @@ mod tests {
             ("cafe\u{301}", true),
         ] {
             assert_eq!(
-                index
-                    .matches(&parser.parse(query).unwrap().expression, &doc, None)
-                    .unwrap(),
+                index.matches(
+                    &index
+                        .compile_query(
+                            &parser.parse(query).unwrap().expression,
+                            Instant::now() + std::time::Duration::from_secs(10),
+                            &CancellationToken::new()
+                        )
+                        .unwrap(),
+                    &doc
+                ),
                 expected,
                 "{query}"
             );
         }
-        assert!(!index.tokens("대한민국 법률").unwrap().is_empty());
+        assert!(!index.tokens("대한민국 법률").unwrap().lindera.is_empty());
     }
     #[test]
     fn old_generation_survives_replacement_and_deleted_terms_do_not_end_scan() {
         let dir = tempfile::tempdir().unwrap();
-        let index = CorpusIndex::open(dir.path()).unwrap();
+        let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
         let a = capture("a", "r1", "old");
         index.apply_capture(a.clone(), true, 1).unwrap();
         let old = index.snapshot().unwrap();

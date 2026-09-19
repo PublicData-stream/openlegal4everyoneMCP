@@ -661,6 +661,8 @@ mod cache_config_tests {
 pub struct DatabaseConfig {
     pub blob_path: PathBuf,
     pub index_path: PathBuf,
+    /// Operator-provisioned, pinned MeCab-Ko dictionary. Never downloaded at runtime.
+    pub mecab_dictionary_path: PathBuf,
     pub widget_html: PathBuf,
     pub ingestion: Option<IngestionConfig>,
 }
@@ -680,9 +682,14 @@ pub struct IngestionConfig {
 }
 impl DatabaseConfig {
     pub fn validate(&self) -> Result<(), ServerError> {
-        if [&self.blob_path, &self.index_path, &self.widget_html]
-            .iter()
-            .any(|p| p.as_os_str().is_empty())
+        if [
+            &self.blob_path,
+            &self.index_path,
+            &self.mecab_dictionary_path,
+            &self.widget_html,
+        ]
+        .iter()
+        .any(|p| p.as_os_str().is_empty())
         {
             return Err("database paths must be explicit".into());
         }
@@ -699,5 +706,25 @@ impl DatabaseConfig {
             return Err("ingestion requires explicit executable, kubeconfig and credential environment name".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod database_config_tests {
+    use super::DatabaseConfig;
+
+    #[test]
+    fn corpus_requires_an_explicit_dictionary_without_loading_it() {
+        let base =
+            "blob_path='corpus-blobs'\nindex_path='corpus-index'\nwidget_html='database.html'\n";
+        assert!(toml::from_str::<DatabaseConfig>(base).is_err());
+        let empty: DatabaseConfig =
+            toml::from_str(&format!("{base}mecab_dictionary_path=''\n")).unwrap();
+        assert!(empty.validate().is_err());
+        let configured: DatabaseConfig = toml::from_str(&format!(
+            "{base}mecab_dictionary_path='operator-dictionary'\n"
+        ))
+        .unwrap();
+        configured.validate().unwrap();
     }
 }

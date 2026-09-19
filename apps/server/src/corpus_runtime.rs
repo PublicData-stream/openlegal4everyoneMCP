@@ -2,8 +2,9 @@
 use crate::{ServerError, config::DatabaseConfig};
 use openlegal_adapters::{
     blob::FsBlobStore,
-    corpus::PgCorpusStore,
+    corpus::{CorpusRuntimeLease, PgCorpusStore},
     corpus_search::CorpusSearch,
+    korean_analysis::KoreanAnalyzer,
     law_go_kr::{InventoryItem, LawClient},
     search_index::CorpusIndex,
 };
@@ -22,6 +23,7 @@ pub struct CorpusRuntime {
     pub reader: Arc<openlegal_application::database_read::DatabaseReader>,
     pub search: Arc<SearchService>,
     index: Arc<CorpusIndex>,
+    lease: CorpusRuntimeLease,
     blobs: Arc<FsBlobStore>,
     provider: Option<LawClient>,
     retain_history_bodies: bool,
@@ -29,6 +31,120 @@ pub struct CorpusRuntime {
 }
 fn now() -> u64 {
     SystemClock::default().now()
+}
+
+/// Rebuild derived state into a fresh configured index directory while corpus
+/// serving, ingestion and retention are stopped. No provider is constructed.
+pub async fn rebuild_corpus_index(
+    config: &DatabaseConfig,
+    persistent: &Arc<openlegal_adapters::postgres::PostgresStore>,
+    cancel: CancellationToken,
+) -> Result<u64, ServerError> {
+    config.validate()?;
+    let blobs =
+        FsBlobStore::open_with_limit(&std::path::absolute(&config.blob_path)?, 100 * 1024 * 1024)
+            .await?;
+    let store = PgCorpusStore::new(persistent.pool(), blobs.clone());
+    let result: Result<u64, ServerError> = async {
+        store.health().await?;
+        let lease = store.acquire_runtime_lease().await?;
+        let result = rebuild_with_lease(config, &store, &lease, &cancel).await;
+        let closed = lease.close().await;
+        let generation = result?;
+        closed?;
+        Ok(generation)
+    }
+    .await;
+    let closed = blobs.close().await;
+    let generation = result?;
+    closed?;
+    Ok(generation)
+}
+
+async fn rebuild_with_lease(
+    config: &DatabaseConfig,
+    store: &PgCorpusStore,
+    lease: &CorpusRuntimeLease,
+    cancel: &CancellationToken,
+) -> Result<u64, ServerError> {
+    if cancel.is_cancelled() {
+        return Err(DatabaseError::Cancelled.into());
+    }
+    let target = store.watermark().await?;
+    let index_path = std::path::absolute(&config.index_path)?;
+    let dictionary_path = std::path::absolute(&config.mecab_dictionary_path)?;
+    let index = tokio::task::spawn_blocking(move || {
+        CorpusIndex::create_rebuild(&index_path, KoreanAnalyzer::open(&dictionary_path)?)
+    })
+    .await??;
+    let mut generation = 0;
+    while generation < target {
+        lease.check().await?;
+        let events = store.outbox(generation, 100).await?;
+        if events.is_empty() {
+            return Err(DatabaseError::StorageCorrupt.into());
+        }
+        for event in events {
+            if cancel.is_cancelled() {
+                return Err(DatabaseError::Cancelled.into());
+            }
+            if event.sequence != generation + 1 || event.sequence > target {
+                return Err(DatabaseError::StorageCorrupt.into());
+            }
+            let sequence = event.sequence;
+            apply_index_event(&index, store, event, cancel).await?;
+            generation = sequence;
+        }
+    }
+    lease.check().await?;
+    if cancel.is_cancelled() {
+        return Err(DatabaseError::Cancelled.into());
+    }
+    if store.watermark().await? != target || index.snapshot()?.generation != target {
+        return Err(DatabaseError::Conflict.into());
+    }
+    tokio::task::spawn_blocking(move || index.finish_rebuild()).await??;
+    // Never acknowledge intermediate replay generations: the old index may
+    // already have acknowledged a later event. The durable fence is monotonic.
+    store.acknowledge_index(target).await?;
+    Ok(target)
+}
+
+async fn apply_index_event(
+    index: &Arc<CorpusIndex>,
+    store: &PgCorpusStore,
+    event: openlegal_application::database::OutboxEntry,
+    cancel: &CancellationToken,
+) -> Result<(), DatabaseError> {
+    let index = index.clone();
+    let sequence = event.sequence;
+    if event.withdrawn {
+        tokio::task::spawn_blocking(move || index.remove_object(&event.object, sequence))
+            .await
+            .map_err(|_| DatabaseError::Capacity)??;
+    } else if event.removed {
+        let id = event.capture_id.ok_or(DatabaseError::StorageCorrupt)?;
+        tokio::task::spawn_blocking(move || index.remove_capture(&event.object, &id, sequence))
+            .await
+            .map_err(|_| DatabaseError::Capacity)??;
+    } else {
+        let capture = store.index_capture(&event, cancel.clone()).await?;
+        let worker_cancel = cancel.clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        tokio::task::spawn_blocking(move || match capture {
+            Some(capture) => index.apply_capture_with_budget(
+                capture,
+                event.install_head,
+                sequence,
+                deadline,
+                &worker_cancel,
+            ),
+            None => index.advance_generation(sequence),
+        })
+        .await
+        .map_err(|_| DatabaseError::Capacity)??;
+    }
+    Ok(())
 }
 impl CorpusRuntime {
     pub async fn open(
@@ -51,8 +167,6 @@ impl CorpusRuntime {
         } else {
             None
         };
-        let index_path = std::path::absolute(&config.index_path)?;
-        let index = tokio::task::spawn_blocking(move || CorpusIndex::open(&index_path)).await??;
         let blobs = FsBlobStore::open_with_limit(
             &std::path::absolute(&config.blob_path)?,
             100 * 1024 * 1024,
@@ -63,6 +177,37 @@ impl CorpusRuntime {
             let _ = blobs.close().await;
             return Err(e.into());
         }
+        let lease = match store.acquire_runtime_lease().await {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = blobs.close().await;
+                return Err(error.into());
+            }
+        };
+        let index_path = std::path::absolute(&config.index_path)?;
+        let dictionary_path = std::path::absolute(&config.mecab_dictionary_path)?;
+        let opened: Result<_, ServerError> = async {
+            let index = tokio::task::spawn_blocking(move || {
+                CorpusIndex::open(&index_path, KoreanAnalyzer::open(&dictionary_path)?)
+            })
+            .await??;
+            let generation = index.snapshot()?.generation;
+            if generation < store.acknowledged_index().await?
+                || generation > store.watermark().await?
+            {
+                return Err("corpus index generation is incompatible with PostgreSQL; stop serving and run --rebuild-corpus-index with a fresh index_path".into());
+            }
+            Ok(index)
+        }
+        .await;
+        let index = match opened {
+            Ok(index) => index,
+            Err(error) => {
+                let _ = lease.close().await;
+                let _ = blobs.close().await;
+                return Err(error);
+            }
+        };
         let database = Arc::new(DatabaseService::new(
             store.clone(),
             Arc::new(SystemClock::default()),
@@ -85,6 +230,7 @@ impl CorpusRuntime {
             reader,
             search,
             index,
+            lease,
             blobs,
             provider,
             inventory_verified,
@@ -95,7 +241,10 @@ impl CorpusRuntime {
         }))
     }
     pub async fn close(&self) -> Result<(), ServerError> {
-        self.blobs.close().await?;
+        let blobs = self.blobs.close().await;
+        let lease = self.lease.close().await;
+        blobs?;
+        lease?;
         Ok(())
     }
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<(), ServerError> {
@@ -125,6 +274,9 @@ impl CorpusRuntime {
                     _ => Err(DatabaseError::StorageUnavailable),
                 },
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if let Err(e) = self.lease.check().await {
+                        break Err(e);
+                    }
                     if let Err(e) = self.index_events(&child).await {
                         break Err(e);
                     }
@@ -156,28 +308,9 @@ impl CorpusRuntime {
             if event.sequence != generation + 1 {
                 return Err(DatabaseError::StorageCorrupt);
             }
-            let index = self.index.clone();
+            self.lease.check().await?;
             let sequence = event.sequence;
-            if event.withdrawn {
-                tokio::task::spawn_blocking(move || index.remove_object(&event.object, sequence))
-                    .await
-                    .map_err(|_| DatabaseError::Capacity)??;
-            } else if event.removed {
-                let id = event.capture_id.ok_or(DatabaseError::StorageCorrupt)?;
-                tokio::task::spawn_blocking(move || {
-                    index.remove_capture(&event.object, &id, sequence)
-                })
-                .await
-                .map_err(|_| DatabaseError::Capacity)??;
-            } else {
-                let capture = self.store.index_capture(&event, cancel.clone()).await?;
-                tokio::task::spawn_blocking(move || match capture {
-                    Some(capture) => index.apply_capture(capture, event.install_head, sequence),
-                    None => index.advance_generation(sequence),
-                })
-                .await
-                .map_err(|_| DatabaseError::Capacity)??;
-            }
+            apply_index_event(&self.index, &self.store, event, cancel).await?;
             generation = sequence;
             self.store.acknowledge_index(generation).await?;
         }
@@ -407,12 +540,19 @@ impl CorpusRuntime {
                 Ok(detail) => {
                     let candidate = detail.record.clone();
                     let index = self.index.clone();
+                    let admission_cancel = attempt.child_token();
+                    let _admission_guard = admission_cancel.clone().drop_guard();
+                    let worker_cancel = admission_cancel.clone();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
                     let admission = tokio::time::timeout(
                         Duration::from_secs(10),
-                        tokio::task::spawn_blocking(move || index.validate_record(&candidate)),
+                        tokio::task::spawn_blocking(move || {
+                            index.validate_record_with_budget(&candidate, deadline, &worker_cancel)
+                        }),
                     )
                     .await;
                     if !matches!(admission, Ok(Ok(Ok(())))) {
+                        admission_cancel.cancel();
                         self.store.fail_claim(&job, false).await?;
                         continue;
                     }

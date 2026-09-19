@@ -233,7 +233,7 @@ impl ToolModule for DatabaseTools {
             (
                 "database.query",
                 SearchMode::Query,
-                "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, title/body fields, analyzed words and prefixes). Double quotes require an exact source substring. Korean Lindera analysis uses NFC and ASCII lowercase with no stopwords. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit.",
+                "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, title/body fields, analyzed words and prefixes). Korean Lindera and MeCab-Ko analysis uses NFC and ASCII lowercase with no stopwords. Positive expressions must match within one engine; NOT excludes a match by either engine. Double quotes require an exact source substring. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit.",
             ),
             (
                 "database.rg",

@@ -146,6 +146,19 @@ passed or silently skipped check. Ordinary Rust tests and compilation require
 neither Docker nor `DATABASE_URL`; tests requiring PostgreSQL are clearly marked
 and run by the dedicated gate.
 
+Korean corpus analysis, search semantics, dictionary provisioning and analyzer/index
+compatibility changes also require `scripts/test-korean-tokenization.sh`. This gate
+builds and validates the full pinned standard dictionary and runs the dual-engine
+integration cases and synthetic resource measurements. It runs in CI. Both it and
+the PostgreSQL gate provision a disposable dictionary unless
+`OPENLEGAL_TEST_MECAB_DICTIONARY` names an existing provisioned artifact. To reuse
+a downloaded source archive, set `MECAB_SOURCE_ARCHIVE`; its digest is still checked.
+The explicit provisioning step may download the pinned dictionary source; tests do
+not contact legal providers. Ordinary unit tests need no external MeCab-Ko artifact.
+A missing full dictionary or failed provisioning is an incomplete gate, never a
+silently skipped or successful check. See [corpus setup](docs/database.md) for
+artifact compatibility, index rebuild and rollback requirements.
+
 The PostgreSQL gate uses a disposable bridge with dynamically allocated
 localhost-only database ports on host runners; those fixture containers can make
 outbound connections. Inside a Docker development container, it instead joins the
