@@ -17,6 +17,9 @@ allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
 # First-party licensing only; do not admit AGPL dependencies globally.
 # Owner: PiQuark6046. Review by 2026-12-12 and whenever package versions change.
 exceptions = [
+    # MeCab-Ko's mandatory watcher dependency; runtime hot reload is never enabled.
+    # Owner: PiQuark6046. Review by 2026-12-19 or on MeCab-Ko/notify changes.
+    { crate = "notify@6.1.1", allow = ["CC0-1.0"] },
     { crate = "webpki-roots@1.0.9", allow = ["CDLA-Permissive-2.0"] },
     { crate = "openlegal-server@0.1.0", allow = ["AGPL-3.0-only"] },
     { crate = "openlegal-domain@0.1.0", allow = ["AGPL-3.0-only"] },

@@ -221,15 +221,41 @@ and the explicit distinction between digest integrity and source authentication.
   Source: crates.io, MIT OR Apache-2.0. Hand-written Unicode composition is not an
   appropriate alternative.
 
-The requested alternative [hephaex/mecab-ko](https://github.com/hephaex/mecab-ko/tree/024a0e8ed9e3ba922ed21f786600881b7b8a75ae)
-was inspected at commit `024a0e8ed9e3ba922ed21f786600881b7b8a75ae`. It offers a Rust
-Tokenizer, original byte positions and user dictionaries under MIT OR Apache-2.0.
-It is not selected in this patch. Its mutable tokenizer and separate dictionary
-artifacts would require an explicit analyzer pool and dictionary admission. The
-reviewed default dictionary discovery includes a development miniature fallback;
-missing entries can also yield an empty entry set. An integration must use explicit
-validated full dictionaries. Upstream benchmark claims have not been reproduced on
-this project's legal text and do not establish search accuracy here.
+### MeCab-Ko alongside Lindera (2026-09-19)
+
+The Rust [hephaex/mecab-ko](https://github.com/hephaex/mecab-ko) engine is admitted
+alongside Lindera, using the exact crates.io `mecab-ko =0.7.2` release and
+`mecab-ko-dict-builder =0.7.2` for provisioning. Runtime `mecab-ko` and
+`mecab-ko-dict` disable default features; the builder is a development dependency
+used by the provisioning example, outside the serving dependency graph.
+These published release sources
+must not be confused with later repository commits carrying the same version.
+Source: crates.io; MIT OR Apache-2.0. This is the Rust reimplementation, not C++
+MeCab FFI. Retaining Lindera preserves a separate analysis stream; neither engine
+is treated as a semantic authority for legal text.
+
+The builder consumes Lindera's exact `mecab-ko-dic-2.1.1-20180720.tar.gz` archive,
+SHA-256 `702ced21c6167e9d9aebc674ab5ee54af58d4443975f2940d37d0567c020591a`.
+Redistribution preserves its Apache-2.0 notices. Provisioning validates source
+encoding and CSV records, entry counts, trie mappings, matrix dimensions and
+context IDs, and emits release-compatible uncompressed artifacts and a manifest.
+Runtime accepts only a verified full dictionary at the configured explicit path,
+with eager loading. Default discovery, miniature fallback and empty-entry behavior
+are unsuitable for corpus search. No runtime downloads are introduced.
+
+A four-slot pool bounds mutable tokenizers, with one owned dictionary per slot.
+This costs four dictionary copies; compare memory and throughput with Lindera using
+`scripts/test-korean-tokenization.sh`. In addition to the existing byte, aggregate-token and serialized-index bounds,
+normalized lines admit at most 4096 Unicode scalars and whitespace-delimited runs
+at most 128 scalars. The pinned engine generates all unknown-word prefix candidates
+for some character classes; byte limits alone do not bound that expansion adequately.
+Oversized inputs fail capacity admission without changing their segmentation.
+Synthetic measurements cover accepted input sizes; they are not an absolute RSS
+or wall-clock guarantee for in-process native allocation. Dictionary parsers, lattice allocation,
+blocking-work cancellation and admission require focused independent review.
+Passing synthetic fixtures does not establish improved legal-search accuracy.
+Analyzer/dictionary changes invalidate index compatibility and require the
+[offline rebuild](database.md#offline-index-rebuild).
 
 ### Narrow dependency exceptions
 
@@ -250,3 +276,13 @@ CDLA-Permissive-2.0 licensed root-certificate data. The exception is scoped to t
 exact package/version; preserve its accompanying license when redistributing the
 data. Owner/review deadline: PiQuark6046, 2026-10-16. Other licenses retain their
 existing admission policy. No blanket license or advisory suppression is added.
+
+
+`notify 6.1.1` is an unconditional crates.io dependency of `mecab-ko-dict 0.7.2`,
+even with default features disabled. Its CC0-1.0 license is admitted only for this
+exact package/version in `deny.toml`; preserve the upstream license and attribution
+material when redistributing. The serving adapter does not construct file watchers
+or invoke hot-reload APIs. Removing the dependency requires an upstream graph change,
+not enabling a different first-party feature. Owner: PiQuark6046; review by
+**2026-12-19**, or on MeCab-Ko/notify changes. This is a narrow license admission,
+not a general CC0 allowlist or an advisory exception.

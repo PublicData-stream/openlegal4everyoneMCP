@@ -440,6 +440,8 @@ mod tests {
     }
 }
 
+pub mod korean_analysis;
+pub mod korean_dictionary;
 pub mod search_index;
 
 pub mod law_go_kr;
@@ -447,3 +449,5 @@ pub mod law_go_kr;
 pub mod corpus_search;
 
 pub mod corpus_read;
+
+pub mod korean_query;

@@ -32,8 +32,12 @@ lindera = { version = "=5.0.1", default-features = false, features = ["embed-ko-
 grep-regex = "=0.1.14"
 grep-matcher = "=0.1.8"
 unicode-normalization = "=0.1.25"
+mecab-ko = { version = "=0.7.2", default-features = false }
+mecab-ko-dict = { version = "=0.7.2", default-features = false }
 
 [dev-dependencies]
+mecab-ko-dict-builder = "=0.7.2"
+csv = "1"
 tempfile = "3"
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
