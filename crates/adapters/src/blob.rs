@@ -14,13 +14,14 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 mod filesystem;
 use filesystem::Filesystem;
 
 const JOBS: usize = 16;
+const HEALTH_WAITERS: usize = 16;
 const DEADLINE: Duration = Duration::from_secs(5);
 const MAX_BATCH: usize = 128;
 static STARTUPS: Semaphore = Semaphore::const_new(JOBS);
@@ -37,11 +38,24 @@ struct Counters {
     active_jobs: AtomicU64,
 }
 
+#[derive(Clone, Copy)]
+struct HealthOutcome {
+    result: Result<(), Error>,
+    generation: u64,
+    recovering: bool,
+}
+
+struct HealthFlight {
+    outcome: watch::Receiver<Option<HealthOutcome>>,
+}
+
 struct Shared {
     files: Filesystem,
     max_object_bytes: usize,
     slots: Arc<Semaphore>,
     probe_slots: Arc<Semaphore>,
+    health_waiters: Semaphore,
+    health_flight: Mutex<Option<Arc<HealthFlight>>>,
     closed: AtomicBool,
     healthy: AtomicBool,
     counters: Counters,
@@ -101,6 +115,8 @@ impl FsBlobStore {
                 max_object_bytes,
                 slots: Arc::new(Semaphore::new(JOBS)),
                 probe_slots: Arc::new(Semaphore::new(1)),
+                health_waiters: Semaphore::new(HEALTH_WAITERS),
+                health_flight: Mutex::new(None),
                 closed: AtomicBool::new(false),
                 healthy: AtomicBool::new(true),
                 counters: Counters::default(),
@@ -268,42 +284,110 @@ impl BlobStore for FsBlobStore {
     fn health(&self, cancellation: CancellationToken) -> BoxFuture<'static, Result<(), Error>> {
         let shared = self.shared.clone();
         Box::pin(async move {
-            let (generation, recovering) = {
+            check_cancel(&cancellation)?;
+            let _waiter = shared.health_waiters.try_acquire().map_err(|_| {
+                shared.counters.saturation.fetch_add(1, Ordering::Relaxed);
+                Error::Busy
+            })?;
+            let mut outcome = {
                 let _admission = shared.admission.lock().map_err(|_| Error::Internal)?;
-                (
-                    shared.failure_epoch.load(Ordering::Acquire),
-                    !shared.healthy.load(Ordering::Acquire),
-                )
-            };
-            let store = FsBlobStore {
-                shared: shared.clone(),
-            };
-            let worker = shared.clone();
-            let operation = store.job(cancellation.clone(), true, move |files, token, _| {
-                check_cancel(token)?;
-                // Recovery waits for older jobs. Routine probes have a reserved
-                // slot and may overlap healthy work without closing readiness.
-                if recovering && worker.counters.active_jobs.load(Ordering::Acquire) != 1 {
-                    return Err(Error::Busy);
+                if shared.closed.load(Ordering::Acquire) {
+                    return Err(Error::Shutdown);
                 }
-                files.health()?;
-                #[cfg(test)]
-                {
-                    let hook = worker
-                        .health_hook
-                        .lock()
-                        .map_err(|_| Error::Internal)?
-                        .clone();
-                    if let Some(hook) = hook {
-                        hook();
-                    }
+                let mut active = shared.health_flight.lock().map_err(|_| Error::Internal)?;
+                if let Some(flight) = active.as_ref() {
+                    flight.outcome.clone()
+                } else {
+                    let generation = shared.failure_epoch.load(Ordering::Acquire);
+                    let recovering = !shared.healthy.load(Ordering::Acquire);
+                    let (sender, receiver) = watch::channel(None);
+                    let flight = Arc::new(HealthFlight {
+                        outcome: receiver.clone(),
+                    });
+                    *active = Some(flight.clone());
+                    let worker = shared.clone();
+                    // The shared probe and watchdog outlive individual waiters.
+                    // Only a still-awaited result below may restore admission.
+                    tokio::spawn(async move {
+                        let store = FsBlobStore {
+                            shared: worker.clone(),
+                        };
+                        let probe_shared = worker.clone();
+                        let result = store
+                            .job(CancellationToken::new(), true, move |files, token, _| {
+                                check_cancel(token)?;
+                                {
+                                    let _admission = probe_shared
+                                        .admission
+                                        .lock()
+                                        .map_err(|_| Error::Internal)?;
+                                    if probe_shared.failure_epoch.load(Ordering::Acquire)
+                                        != generation
+                                    {
+                                        return Err(Error::StorageUnavailable);
+                                    }
+                                    if recovering
+                                        && !probe_shared.healthy.load(Ordering::Acquire)
+                                        && probe_shared.counters.active_jobs.load(Ordering::Acquire)
+                                            != 1
+                                    {
+                                        return Err(Error::Busy);
+                                    }
+                                }
+                                files.health()?;
+                                #[cfg(test)]
+                                {
+                                    let hook = probe_shared
+                                        .health_hook
+                                        .lock()
+                                        .map_err(|_| Error::Internal)?
+                                        .clone();
+                                    if let Some(hook) = hook {
+                                        hook();
+                                    }
+                                }
+                                check_cancel(token)?;
+                                Ok(())
+                            })
+                            .await;
+                        let result = match worker.health_flight.lock() {
+                            Ok(mut active) => {
+                                if active
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, &flight))
+                                {
+                                    *active = None;
+                                }
+                                result
+                            }
+                            Err(_) => Err(Error::Internal),
+                        };
+                        // The coordinator alone owns the sender, so unexpected
+                        // termination closes the channel instead of stranding waiters.
+                        sender.send_replace(Some(HealthOutcome {
+                            result,
+                            generation,
+                            recovering,
+                        }));
+                    });
+                    receiver
                 }
-                check_cancel(token)?;
-                Ok(())
-            });
-            // Only the timely, still-awaited successful result may reopen health.
-            // A late blocking completion has no authority to clear its watchdog.
-            operation.await?;
+            };
+            let HealthOutcome {
+                result,
+                generation,
+                recovering,
+            } = loop {
+                if let Some(result) = *outcome.borrow_and_update() {
+                    break result;
+                }
+                tokio::select! { biased;
+                    _ = cancellation.cancelled() => return Err(Error::Cancelled),
+                    changed = outcome.changed() => changed.map_err(|_| Error::StorageUnavailable)?,
+                }
+            };
+            check_cancel(&cancellation)?;
+            result?;
             let _admission = shared.admission.lock().map_err(|_| Error::Internal)?;
             if shared.closed.load(Ordering::Acquire) {
                 return Err(Error::Shutdown);
@@ -314,9 +398,10 @@ impl BlobStore for FsBlobStore {
             if shared.failure_epoch.load(Ordering::Acquire) != generation {
                 return Err(Error::StorageUnavailable);
             }
-            if recovering && shared.counters.active_jobs.load(Ordering::Acquire) != 0 {
-                return Err(Error::Busy);
-            }
+            // Recovery proved older jobs drained before probing. While unhealthy,
+            // admission forbids new ordinary jobs; an unchanged failure epoch
+            // preserves that proof. New probes or work admitted by another
+            // successful waiter of this epoch do not invalidate recovery.
             if recovering {
                 shared.healthy.store(true, Ordering::Release);
             }

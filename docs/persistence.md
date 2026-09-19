@@ -194,9 +194,15 @@ shapes and hard links, and durably publishes regular immutable files. Blocking j
 have bounded admission and retain their slots until actual filesystem completion,
 even after caller cancellation or deadline. A blocked mount cannot create an
 unbounded detached-work backlog. Sixteen ordinary filesystem jobs and one reserved
-health probe may run concurrently. Healthy probes can overlap ordinary work;
-recovery requires older failed or blocked jobs to drain. The adapter is not an index, history manifest,
-transaction journal, or exclusive cache-root database owner.
+health probe may run concurrently. Up to sixteen concurrent health callers share
+the in-progress probe and its five-second watchdog; completed results are not
+cached for later calls. Cancelling or dropping one caller does not cancel the
+probe for others. Only a still-waiting, uncancelled caller may reopen health after
+checking shutdown, the failure generation and recovery drainage; an abandoned or
+late probe cannot restore readiness. Healthy probes can overlap ordinary work;
+recovery requires older failed or blocked jobs to drain. The adapter is not an
+index, history manifest, transaction journal, or exclusive cache-root database
+owner.
 
 Retention first commits reference removal and enqueues retired physical generations
 in PostgreSQL, then deletes their blob objects. A failed deletion leaves reclaimable

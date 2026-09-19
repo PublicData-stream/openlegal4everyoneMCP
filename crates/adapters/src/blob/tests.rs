@@ -462,12 +462,40 @@ fn pause_health(blobs: &FsBlobStore) -> (ReleaseOnDrop, tokio::sync::mpsc::Unbou
 }
 
 #[tokio::test]
+async fn overlapping_health_checks_do_not_report_storage_failure() {
+    let root = root();
+    let blobs = FsBlobStore::open(root.path()).await.unwrap();
+    let (release, mut entered) = pause_health(&blobs);
+    let first = tokio::spawn(blobs.health(token()));
+    entered.recv().await.unwrap();
+    let second = blobs.health(token());
+    tokio::pin!(second);
+    // The second caller must wait for a real probe result, not report Busy
+    // merely because another health check owns the reserved physical slot.
+    let admission = futures::poll!(second.as_mut());
+    assert!(
+        admission.is_pending(),
+        "overlapping health result: {admission:?}"
+    );
+    assert_eq!(blobs.metrics().active_jobs, 1);
+    assert!(entered.try_recv().is_err());
+    drop(release);
+    first.await.unwrap().unwrap();
+    second.await.unwrap();
+    blobs.health(token()).await.unwrap();
+    entered.recv().await.unwrap();
+    blobs.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn successful_probe_cannot_clear_a_newer_failure() {
     let root = root();
     let blobs = FsBlobStore::open(root.path()).await.unwrap();
     let (release, mut entered) = pause_health(&blobs);
     let probe = tokio::spawn(blobs.health(token()));
     entered.recv().await.unwrap();
+    let mut second = blobs.health(token());
+    assert!(futures::poll!(second.as_mut()).is_pending());
     assert_eq!(
         blobs
             .job(token(), false, |_, _, _| Err::<(), _>(
@@ -479,6 +507,7 @@ async fn successful_probe_cannot_clear_a_newer_failure() {
     );
     drop(release);
     assert_eq!(probe.await.unwrap().unwrap_err(), Error::StorageUnavailable);
+    assert_eq!(second.await.unwrap_err(), Error::StorageUnavailable);
     assert!(!blobs.shared.healthy.load(Ordering::Acquire));
     *blobs.shared.health_hook.lock().unwrap() = None;
     blobs.health(token()).await.unwrap();
@@ -528,7 +557,12 @@ async fn late_probe_completion_cannot_clear_its_deadline_failure() {
     let (release, mut entered) = pause_health(&blobs);
     let probe = tokio::spawn(blobs.health(token()));
     entered.recv().await.unwrap();
+    let mut second = blobs.health(token());
+    assert!(futures::poll!(second.as_mut()).is_pending());
     assert_eq!(probe.await.unwrap().unwrap_err(), Error::StorageUnavailable);
+    assert_eq!(second.await.unwrap_err(), Error::StorageUnavailable);
+    assert_eq!(blobs.metrics().active_jobs, 1);
+    assert_eq!(blobs.health(token()).await.unwrap_err(), Error::Busy);
     assert!(!blobs.shared.healthy.load(Ordering::Acquire));
     let completed = blobs.shared.completed.notified();
     tokio::pin!(completed);
@@ -543,5 +577,179 @@ async fn late_probe_completion_cannot_clear_its_deadline_failure() {
     *blobs.shared.health_hook.lock().unwrap() = None;
     blobs.health(token()).await.unwrap();
     assert!(blobs.shared.healthy.load(Ordering::Acquire));
+    blobs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn initiating_health_waiter_cancellation_and_drop_leave_other_waiter_live() {
+    for cancel in [true, false] {
+        let root = root();
+        let blobs = FsBlobStore::open(root.path()).await.unwrap();
+        failed(&blobs.shared, Error::StorageUnavailable);
+        let (release, mut entered) = pause_health(&blobs);
+        let cancellation = token();
+        let mut first = blobs.health(cancellation.clone());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        entered.recv().await.unwrap();
+        let mut second = blobs.health(token());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        if cancel {
+            cancellation.cancel();
+            assert_eq!(first.await.unwrap_err(), Error::Cancelled);
+        } else {
+            drop(first);
+        }
+        assert_eq!(blobs.metrics().active_jobs, 1);
+        drop(release);
+        second.await.unwrap();
+        assert!(blobs.shared.healthy.load(Ordering::Acquire));
+        blobs.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn abandoned_shared_recovery_cannot_restore_health() {
+    let root = root();
+    let blobs = FsBlobStore::open(root.path()).await.unwrap();
+    failed(&blobs.shared, Error::StorageUnavailable);
+    let (release, mut entered) = pause_health(&blobs);
+    let mut first = blobs.health(token());
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    entered.recv().await.unwrap();
+    let cancellation = token();
+    let mut second = blobs.health(cancellation.clone());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    let mut outcome = blobs
+        .shared
+        .health_flight
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .outcome
+        .clone();
+    drop(first);
+    cancellation.cancel();
+    assert_eq!(second.await.unwrap_err(), Error::Cancelled);
+    drop(release);
+    outcome.changed().await.unwrap();
+    assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+    assert_eq!(blobs.metrics().active_jobs, 0);
+    blobs.health(token()).await.unwrap();
+    assert!(blobs.shared.healthy.load(Ordering::Acquire));
+    blobs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_health_waiters_are_bounded_and_release_admission() {
+    let root = root();
+    let blobs = FsBlobStore::open(root.path()).await.unwrap();
+    let (release, mut entered) = pause_health(&blobs);
+    let mut waiters = Vec::new();
+    for _ in 0..HEALTH_WAITERS {
+        let mut waiter = blobs.health(token());
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        waiters.push(waiter);
+    }
+    entered.recv().await.unwrap();
+    assert_eq!(blobs.health(token()).await.unwrap_err(), Error::Busy);
+    assert!(blobs.shared.healthy.load(Ordering::Acquire));
+    assert_eq!(blobs.metrics().active_jobs, 1);
+    drop(waiters.pop());
+    let mut replacement = blobs.health(token());
+    assert!(futures::poll!(replacement.as_mut()).is_pending());
+    drop(release);
+    for waiter in waiters {
+        waiter.await.unwrap();
+    }
+    replacement.await.unwrap();
+    assert_eq!(
+        blobs.shared.health_waiters.available_permits(),
+        HEALTH_WAITERS
+    );
+    blobs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn close_prevents_shared_recovery() {
+    let root = root();
+    let blobs = FsBlobStore::open(root.path()).await.unwrap();
+    failed(&blobs.shared, Error::StorageUnavailable);
+    let (release, mut entered) = pause_health(&blobs);
+    let mut first = blobs.health(token());
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    entered.recv().await.unwrap();
+    let mut second = blobs.health(token());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    let close = blobs.close();
+    drop(release);
+    assert_eq!(first.await.unwrap_err(), Error::Shutdown);
+    assert_eq!(second.await.unwrap_err(), Error::Shutdown);
+    close.await.unwrap();
+    assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn second_recovery_waiter_accepts_already_recovered_epoch_with_ordinary_work() {
+    let root = root();
+    let blobs = FsBlobStore::open(root.path()).await.unwrap();
+    failed(&blobs.shared, Error::StorageUnavailable);
+    let (release, mut entered) = pause_health(&blobs);
+    let mut first = blobs.health(token());
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    entered.recv().await.unwrap();
+    let mut second = blobs.health(token());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    drop(release);
+    first.await.unwrap();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = ReleaseOnDrop(gate.clone());
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let ordinary = tokio::spawn(blobs.job(token(), false, move |_, _, _| {
+        entered.send(()).unwrap();
+        let (lock, ready) = &*gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = ready.wait(released).unwrap();
+        }
+        Ok(())
+    }));
+    entry.await.unwrap();
+    second.await.unwrap();
+    drop(release);
+    ordinary.await.unwrap().unwrap();
+    blobs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn newer_probe_does_not_block_completed_recovery_acknowledgement() {
+    let root = root();
+    let blobs = FsBlobStore::open(root.path()).await.unwrap();
+    failed(&blobs.shared, Error::StorageUnavailable);
+    let (release, mut entered) = pause_health(&blobs);
+    let mut first = blobs.health(token());
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    entered.recv().await.unwrap();
+    let mut outcome = blobs
+        .shared
+        .health_flight
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .outcome
+        .clone();
+    drop(release);
+    outcome.changed().await.unwrap();
+    assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+    let (release, mut entered) = pause_health(&blobs);
+    let mut newer = blobs.health(token());
+    assert!(futures::poll!(newer.as_mut()).is_pending());
+    entered.recv().await.unwrap();
+    assert_eq!(blobs.metrics().active_jobs, 1);
+    first.await.unwrap();
+    assert!(blobs.shared.healthy.load(Ordering::Acquire));
+    drop(release);
+    newer.await.unwrap();
     blobs.close().await.unwrap();
 }

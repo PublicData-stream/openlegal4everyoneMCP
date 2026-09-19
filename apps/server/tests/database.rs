@@ -1,6 +1,7 @@
 //! Fictional corpus through the real PostgreSQL, index, workers and MCP boundary.
 #[path = "../../../test-support/postgres.rs"]
 mod postgres;
+use futures::FutureExt;
 use openlegal_application::{
     Clock, SystemClock, database::Publication, persistence::PersistentStore,
 };
@@ -14,9 +15,10 @@ use openlegal_server::{
     registry::server_info_registry,
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, panic::AssertUnwindSafe, time::Duration};
 use tokio_util::sync::CancellationToken;
-async fn call(url: &str, revision: &str, name: &str, arguments: Value) -> Value {
+async fn call(url: &str, revision: &str, name: &str, arguments: Value) -> Result<Value, String> {
+    let context = |stage: &str, error: String| format!("{revision} {name} {stage}: {error}");
     let mut params = json!({"name":name,"arguments":arguments});
     if revision == "2026-07-28" {
         params["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":revision,"io.modelcontextprotocol/clientInfo":{"name":"fictional-corpus-test","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}});
@@ -32,20 +34,31 @@ async fn call(url: &str, revision: &str, name: &str, arguments: Value) -> Value 
         .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":params}))
         .send()
         .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let text = response.text().await.unwrap();
-    assert!(text.len() < 1024 * 1024);
+        .map_err(|e| context("send", format!("{e:?}")))?;
+    if response.status() != 200 {
+        return Err(context("status", response.status().to_string()));
+    }
+    let text = response
+        .text()
+        .await
+        .map_err(|e| context("body", format!("{e:?}")))?;
+    if text.len() >= 1024 * 1024 {
+        return Err(context("body", "response exceeds fixture limit".into()));
+    }
     if text.trim_start().starts_with('{') {
-        serde_json::from_str(&text).unwrap()
+        serde_json::from_str(&text).map_err(|e| context("JSON decode", e.to_string()))
     } else {
-        text.lines()
-            .filter_map(|l| l.strip_prefix("data:"))
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .find(|v| v["id"] == 1)
-            .unwrap()
+        for data in text.lines().filter_map(|line| line.strip_prefix("data:")) {
+            let value: Value =
+                serde_json::from_str(data).map_err(|e| context("SSE decode", e.to_string()))?;
+            if value["id"] == 1 {
+                return Ok(value);
+            }
+        }
+        Err(context("SSE decode", "missing response with id 1".into()))
     }
 }
+
 #[tokio::test]
 #[ignore = "requires scripts/test-postgres.sh PostgreSQL 18 environment"]
 async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
@@ -74,6 +87,8 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
     };
     let mut captures = Vec::new();
     for (revision, word) in [("r1", "before"), ("r2", "after")] {
+        let body = format!("{word}\n{}", "Fictional line\n".repeat(4000));
+        assert!(body.len() > 32768 && body.len() < 65536);
         let version = runtime
             .store
             .state(&object)
@@ -88,7 +103,7 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
                         object: object.clone(),
                         revision_id: revision.into(),
                         title: "Fictional 대한민국 ABC".into(),
-                        body: format!("{word}\n{}", "Fictional line\n".repeat(4000)),
+                        body,
                         metadata: BTreeMap::new(),
                         publication_date: None,
                         effective_date: None,
@@ -164,88 +179,181 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
         .unwrap();
     let worker = runtime.clone();
     builder
-        .register_worker(
-            "corpus",
-            move |cancel| async move { worker.run(cancel).await },
-        )
+        .register_worker("corpus", move |cancel| async move {
+            let result = worker.run(cancel).await;
+            if let Err(error) = &result {
+                eprintln!("corpus worker failed: {error}");
+            }
+            result
+        })
         .unwrap();
     builder
         .register_worker("text", move |cancel| async move {
-            comparison.run(cancel).await?;
+            comparison.run(cancel).await.inspect_err(|error| {
+                eprintln!("text worker failed: {error}");
+            })?;
             Ok(())
         })
         .unwrap();
     let server = builder.bind().await.unwrap();
     let url = format!("http://{}/mcp", server.addresses()[0].1[0]);
     let shutdown = CancellationToken::new();
-    let task = tokio::spawn(server.run(shutdown.clone()));
-    for protocol in ["2025-11-25", "2026-07-28"] {
-        let get = call(&url, protocol, "database.get", json!({"object":object})).await;
-        assert!(get["error"].is_null(), "{get}");
-        assert_ne!(get["result"]["isError"], true, "{get}");
-        let page = &get["result"]["structuredContent"];
-        assert_eq!(page["metadata"]["revision_id"], "r2");
-        assert_eq!(page["metadata"]["freshness"]["state"], "fresh");
-        assert_eq!(page["text"].as_str().unwrap().len(), 32768);
-        let next=call(&url,protocol,"database.get",json!({"object":object,"selector":{"kind":"capture","id":page["metadata"]["capture_id"]},"session":page["session"],"offset":page["next_offset"]})).await;
-        assert_ne!(next["result"]["isError"], true, "{next}");
-        assert!(next["result"]["structuredContent"]["metadata"]["freshness"].is_null());
-        let metadata = call(
-            &url,
-            protocol,
-            "database.get_metadata",
-            json!({"object":object}),
-        )
-        .await;
-        assert!(
-            metadata["result"]["structuredContent"]
-                .get("body")
-                .is_none()
-        );
-        let history = call(
-            &url,
-            protocol,
-            "database.history",
-            json!({"object":object,"kind":"revisions"}),
-        )
-        .await;
-        assert_eq!(
-            history["result"]["structuredContent"]["entries"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        let diff=call(&url,protocol,"database.diff",json!({"object":object,"before":{"kind":"revision","id":"r1"},"after":{"kind":"revision","id":"r2"}})).await;
-        assert_ne!(diff["result"]["isError"], true, "{diff}");
-        assert_eq!(
-            diff["result"]["structuredContent"]["before"]["capture_id"],
-            captures[0].capture_id
-        );
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let result = call(&url, protocol, "database.query", json!({"query":"\"ABC\""})).await;
-            assert_ne!(result["result"]["isError"], true, "{result}");
-            let hits = result["result"]["structuredContent"]["hits"]
+    let mut task = tokio::spawn(server.run(shutdown.clone()));
+    let scenario = async {
+        for protocol in ["2025-11-25", "2026-07-28"] {
+            let get = call(&url, protocol, "database.get", json!({"object":object})).await?;
+            assert!(get["error"].is_null(), "{get}");
+            assert_ne!(get["result"]["isError"], true, "{get}");
+            let page = &get["result"]["structuredContent"];
+            assert_eq!(page["metadata"]["revision_id"], "r2");
+            assert_eq!(page["metadata"]["capture_id"], captures[1].capture_id);
+            assert_eq!(page["metadata"]["freshness"]["state"], "fresh");
+            assert_eq!(page["offset"], 0);
+            assert_eq!(page["next_offset"], 32768);
+            assert_eq!(page["text"].as_str().unwrap().len(), 32768);
+            let next = call(
+                &url,
+                protocol,
+                "database.get",
+                json!({
+                    "object":object,
+                    "selector":{"kind":"capture","id":page["metadata"]["capture_id"]},
+                    "session":page["session"],
+                    "offset":page["next_offset"]
+                }),
+            )
+            .await?;
+            assert_ne!(next["result"]["isError"], true, "{next}");
+            let next = &next["result"]["structuredContent"];
+            assert_eq!(next["session"], page["session"]);
+            assert_eq!(next["metadata"]["capture_id"], captures[1].capture_id);
+            assert_eq!(next["metadata"]["revision_id"], "r2");
+            assert!(next["metadata"]["freshness"].is_null());
+            assert_eq!(next["offset"], 32768);
+            assert!(next["next_offset"].is_null());
+            assert_eq!(
+                format!(
+                    "{}{}",
+                    page["text"].as_str().unwrap(),
+                    next["text"].as_str().unwrap()
+                ),
+                captures[1].record.body,
+            );
+            let metadata = call(
+                &url,
+                protocol,
+                "database.get_metadata",
+                json!({"object":object}),
+            )
+            .await?;
+            assert_eq!(
+                metadata["result"]["structuredContent"]["capture_id"],
+                captures[1].capture_id
+            );
+            assert!(
+                metadata["result"]["structuredContent"]
+                    .get("body")
+                    .is_none()
+            );
+            let history = call(
+                &url,
+                protocol,
+                "database.history",
+                json!({"object":object,"kind":"revisions"}),
+            )
+            .await?;
+            let entries = history["result"]["structuredContent"]["entries"]
                 .as_array()
                 .unwrap();
-            if !hits.is_empty() && result["result"]["structuredContent"]["index_lag"] == 0 {
-                assert_eq!(hits[0]["revision_id"], "r2");
-                assert_eq!(hits[0]["match_scope"], "object");
-                break;
+            assert_eq!(entries.len(), 2);
+            for capture in &captures {
+                assert!(
+                    entries
+                        .iter()
+                        .any(|entry| entry["revision_id"] == capture.record.revision_id
+                            && entry["capture_id"] == capture.capture_id),
+                    "{history}"
+                );
             }
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let diff = call(
+                &url, protocol, "database.diff",
+                json!({"object":object,"before":{"kind":"revision","id":"r1"},"after":{"kind":"revision","id":"r2"}}),
+            ).await?;
+            assert_ne!(diff["result"]["isError"], true, "{diff}");
+            let diff = &diff["result"]["structuredContent"];
+            for (side, capture) in [("before", &captures[0]), ("after", &captures[1])] {
+                assert_eq!(diff[side]["capture_id"], capture.capture_id);
+                assert_eq!(diff[side]["revision_id"], capture.record.revision_id);
+            }
+            assert_eq!(diff["comparison"]["equal"], false);
+            assert_eq!(diff["comparison"]["additions"], 1);
+            assert_eq!(diff["comparison"]["deletions"], 1);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let result =
+                    call(&url, protocol, "database.query", json!({"query":"\"ABC\""})).await?;
+                assert_ne!(result["result"]["isError"], true, "{result}");
+                let hits = result["result"]["structuredContent"]["hits"]
+                    .as_array()
+                    .unwrap();
+                if !hits.is_empty() && result["result"]["structuredContent"]["index_lag"] == 0 {
+                    assert_eq!(hits.len(), 1);
+                    assert_eq!(hits[0]["revision_id"], "r2");
+                    assert_eq!(hits[0]["capture_id"], captures[1].capture_id);
+                    assert_eq!(hits[0]["match_scope"], "object");
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{protocol} index catch-up: {result}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let regex = call(&url, protocol, "database.rg", json!({"query":"^after$"})).await?;
+            let hits = regex["result"]["structuredContent"]["hits"]
+                .as_array()
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            let hit = &hits[0];
+            assert_eq!(hit["revision_id"], "r2");
+            assert_eq!(hit["capture_id"], captures[1].capture_id);
+            assert_eq!(hit["section"], "body");
+            assert_eq!(hit["line"], 1);
+            assert_eq!(hit["text"], "after\n");
+            assert_eq!(hit["byte_start"], 0);
+            assert_eq!(hit["byte_end"], 5);
         }
-        let regex = call(&url, protocol, "database.rg", json!({"query":"^after$"})).await;
-        assert_eq!(regex["result"]["structuredContent"]["hits"][0]["line"], 1);
-    }
+        Ok::<(), String>(())
+    };
+    let scenario = AssertUnwindSafe(scenario).catch_unwind();
+    let (scenario_result, server_result) = tokio::select! {
+        result = &mut task => (
+            Ok(Err(format!("server exited before the scenario completed: {result:?}"))),
+            Some(result),
+        ),
+        result = scenario => (result, None),
+    };
     shutdown.cancel();
-    tokio::time::timeout(Duration::from_secs(15), task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    runtime.close().await.unwrap();
-    persistent.close().await.unwrap();
+    let server_result = match server_result {
+        Some(result) => Ok(result),
+        None => tokio::time::timeout(Duration::from_secs(20), &mut task).await,
+    };
+    if server_result.is_err() {
+        task.abort();
+        let _ = (&mut task).await;
+    }
+    let runtime_result = tokio::time::timeout(Duration::from_secs(15), runtime.close()).await;
+    let persistent_result = tokio::time::timeout(Duration::from_secs(15), persistent.close()).await;
+    // Report cleanup alongside the original failure, including assertion panics.
+    eprintln!(
+        "server: {server_result:?}; corpus close: {runtime_result:?}; persistence close: {persistent_result:?}"
+    );
+    match scenario_result {
+        Err(panic) => std::panic::resume_unwind(panic),
+        Ok(Err(error)) => panic!("{error}"),
+        Ok(Ok(())) => {}
+    }
+    server_result.unwrap().unwrap().unwrap();
+    runtime_result.unwrap().unwrap();
+    persistent_result.unwrap().unwrap();
 }
