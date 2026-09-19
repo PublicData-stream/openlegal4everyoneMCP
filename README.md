@@ -29,7 +29,8 @@ live provider acceptance, cluster isolation acceptance and user accounts remain 
 host; the product domain does not imply deployment or verified live ChatGPT access.
 
 A standalone [search-query processor](docs/search-query.md) parses Boolean
-expressions, field scopes, exact phrases, word groups, and prefixes. The corpus search evaluator uses Korean morphology with exact quoted substrings;
+expressions, field scopes, exact phrases, word groups, and prefixes. The corpus search evaluator combines Lindera and MeCab-Ko Korean morphology with
+exact quoted substrings;
 synthetic search still uses literal text.
 
 ## Run and extend
@@ -49,7 +50,8 @@ requirements are in [Contributing](CONTRIBUTING.md).
 
 For the runnable fictional provider and interactive widget, follow the
 [synthetic demo guide](docs/demo.md). Ordinary server startup does not require
-Node or a widget build.
+Node or a widget build. Enabling the legal corpus requires a provisioned MeCab-Ko
+dictionary; see [corpus setup and index upgrades](docs/database.md#operator-configuration).
 
 ## Documentation
 

@@ -164,6 +164,15 @@ PostgreSQL adapter owns transactions, durable jobs, pins and the ordered index
 outbox. The local index is derived state and cannot authorize source identity or
 freshness. Read sessions retain exact capture identities across content pages.
 
+The Korean analysis adapter produces independent Lindera and MeCab-Ko surface
+streams for the derived index and query evaluator. Normalization affects search
+surfaces only. A bounded four-slot pool owns explicitly provisioned, validated
+MeCab-Ko dictionaries; mutable tokenizers are never shared concurrently. Application
+admission, cancellation and deadlines bound their use. Persisted index metadata
+binds readers to the analyzer identity. Offline rebuild replays retained outbox
+evidence into a fresh index without fetching providers or modifying source text;
+see [search and rebuild contracts](database.md).
+
 The trusted provider adapter constructs approved upstream requests, validates
 network destinations and moves fetched bytes into the document-processing port.
 The standalone `apps/document-worker` workspace keeps heavy parser/native/renderer

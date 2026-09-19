@@ -76,21 +76,37 @@ bounds. Default page size is 20; maximum is 100. Results use stable object/revis
 capture/section ordering and retain one index reader for ten minutes.
 
 `database.query` uses the existing [query DSL](search-query.md): words, prefixes,
-Boolean expressions, grouping, and title/body fields. Lindera's Korean dictionary
-segments NFC/ASCII-lowercase search text with no stopword filter. Double-quoted
-strings are exact source substrings, including under NOT. Stored legal text is not
-normalized to implement these searches. Boolean results have whole-object scope;
-an excerpt is not a claimed matching span. Excerpt section and OCR inclusion are
-reported separately.
+Boolean expressions, grouping, and title/body fields. Lindera and the Rust MeCab-Ko
+engine analyze NFC/ASCII-lowercase search surfaces independently, without stopword,
+stemming, or POS filters. Original legal text is preserved. Double-quoted strings
+remain exact source substrings, including under NOT.
+
+Terms, prefixes, AND and OR are evaluated separately for each engine. At every NOT
+node, the union of its child's two engine results is negated and shared by both
+engines; the final root results are unioned. Thus `A AND B` requires one engine to
+satisfy both operands, while `A AND NOT B` is excluded if either engine matches B.
+This rule also applies recursively to nested NOT and field scopes. Query analysis
+is compiled once per search session. Explicitly selected sections, including OCR,
+use the same analyzers as indexed text. Analyzer failure is an explicit error;
+there is no silent single-engine fallback.
+
+Boolean results have whole-object scope; an excerpt is not a claimed matching span.
+Excerpt section and OCR inclusion are reported separately. Combining results is not
+a claim of improved legal-search accuracy; evaluate recall and false positives on
+appropriate evidence before making that claim.
 
 `database.rg` uses ripgrep's Rust regex engine. Matching is line oriented and case
 sensitive unless explicitly changed with typed `literal`, `ignore_case`, or
 `context_lines` options. There are no CLI flags, PCRE2 execution, or filesystem
 inputs. Match offsets are UTF-8 byte offsets in the identified original section.
 
-Managed publication preflights indexability: at most 262144 analyzed tokens per
-text field and a 48 MiB serialized index envelope, with 8 KiB reserved for capture
-metadata. A source exceeding these bounds remains unprocessed; it cannot publish a
+Managed publication preflights indexability: at most 262144 analyzed tokens combined across both
+engines per text field and a 48 MiB serialized index envelope, with 8 KiB reserved for capture
+metadata. Each analyzed line is limited to 64 KiB and 4096 Unicode scalars after
+normalization; a whitespace-delimited run is limited to 128 scalars. MeCab-Ko's
+unknown-word lattice expands superlinearly, so these additional limits reject
+pathological inputs before analysis rather than splitting text and changing its
+segmentation. They apply to queries and indexed or selected text alike. A source exceeding these bounds remains unprocessed; it cannot publish a
 new HEAD and then block the ordered index stream.
 
 Each call has a ten-second deadline and 64 MiB scan budget. A page can have zero
@@ -112,7 +128,29 @@ cache storage and the text-diff large-message profile:
 blob_path = "/var/lib/openlegal/corpus-blobs"
 index_path = "/var/lib/openlegal/corpus-index"
 widget_html = "apps/widget/dist/database.html"
+mecab_dictionary_path = "/var/lib/openlegal/mecab-ko-dictionary"
 ```
+
+Provision the pinned standard dictionary before startup:
+
+```sh
+scripts/prepare-korean-dictionary.sh /var/lib/openlegal/mecab-ko-dictionary
+```
+
+The destination must not already exist. Set `MECAB_SOURCE_ARCHIVE` to reuse a
+local source archive; its checksum is still verified. The helper builds from the
+exact archive selected by Lindera, verifies SHA-256,
+and retains upstream notices. Its manifest records source and output digests,
+builder version and validation counts. The runtime validates the manifest and the
+uncompressed `sys.dic`, `matrix.bin`, and release-compatible `entries.bin` artifacts;
+missing, miniature, empty, corrupt or incompatible dictionaries fail startup.
+The server does not download dictionaries or discover a default dictionary.
+
+The mutable MeCab-Ko engine uses four bounded tokenizer slots, each with an eagerly
+loaded dictionary copy. Budget memory for all four copies in addition to Lindera,
+index readers and server work. Excess admission fails explicitly; no unbounded
+queue is created. Cancellation retains its slot until blocking analysis actually
+finishes. Dictionary replacement requires a restart and compatible index rebuild.
 
 Use distinct, non-nested directories for synthetic cache blobs, corpus blobs and
 the index. Do not share a corpus index between concurrent server processes. Run
@@ -144,7 +182,49 @@ revision catalog metadata survives body eviction. Current corpus raw evidence ha
 index generations/rebuilds, history and filesystem overhead within the deployment's
 1.5 TiB managed-storage ceiling. These software bounds are not ZFS configuration.
 
+## Offline index rebuild
+
+Indexes persist format version, analyzer identity, generation and completion state.
+Analyzer identity includes both engine versions, dictionary digests, normalization
+and matching policy. Legacy, mismatched, malformed or incomplete indexes cannot be
+served. Responses report the identity from the validated retained index snapshot.
+
+To upgrade an existing index:
+
+1. Stop the sole backend, including its ingestion and retention maintenance.
+2. Keep the old index directory. Configure a fresh `database.index_path` and the
+   new provisioned dictionary in an operator configuration using retained storage.
+3. Run `openlegal-server --rebuild-corpus-index CONFIG.toml`.
+4. Start the backend only after the rebuild succeeds.
+
+The rebuild requires no provider credential, document worker or listeners. It
+replays the durable outbox in bounded batches through a captured watermark,
+including capture removals. Missing captures are skipped only when durable retirement
+evidence permits it; otherwise missing or corrupt evidence fails the rebuild.
+PostgreSQL acknowledgment is never rewound and is advanced only after the complete
+target generation is durable and the watermark remains unchanged. Interrupted replay
+leaves an incomplete, unservable destination; start again with a fresh one. If the
+final acknowledgment fails after index completion, resolve the failure before
+serving; rebuild again into a fresh directory to retry the complete operation.
+Rebuilding does not rewrite retained legal evidence.
+
+Restart expires search cursors. Rollback requires the previous binary, its dictionary
+and a compatible complete index generation. If acknowledgment advanced beyond the
+old index, simply pointing at that directory is insufficient. This command writes
+only the new dual-engine format, not the legacy Lindera-only format. Such a downgrade
+requires version-specific rebuilding tooling; otherwise repair forward with the
+new analyzer. Never rewind acknowledgment or discard corpus evidence to downgrade.
+
 ## Validation
+
+The full standard-dictionary gate is `scripts/test-korean-tokenization.sh`. It
+provisions its own artifact unless `OPENLEGAL_TEST_MECAB_DICTIONARY` is supplied.
+It exercises both engines and reports reproducible synthetic-input measurements;
+these are not legal accuracy or production capacity claims. The PostgreSQL gate
+also provisions a dictionary unless that variable names an existing artifact.
+Ordinary unit tests do not require the external MeCab-Ko artifact.
+The [implementation review](korean-tokenization-review.md) records independent
+review, local validation, dictionary identity and measured resource use.
 
 Required baseline and PostgreSQL/OxiBelt gates are in [CONTRIBUTING](../CONTRIBUTING.md).
 Fixtures label fictional legal records explicitly. Tests cover exact/ambiguous date
