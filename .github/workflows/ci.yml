@@ -16,12 +16,19 @@ concurrency:
 
 jobs:
   rust:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check x86-64-v3 support
+        if: runner.arch == 'X64'
+        run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
       - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -34,6 +41,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check x86-64-v3 support
+        if: runner.arch == 'X64'
+        run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
       - run: rustup toolchain install 1.98.1 --profile minimal
       - name: Provision and test the complete Korean dictionary
         run: scripts/test-korean-tokenization.sh
@@ -44,6 +54,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check x86-64-v3 support
+        if: runner.arch == 'X64'
+        run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
       - run: rustup toolchain install 1.98.1 --profile minimal
       - name: Test PostgreSQL 18 persistence and history transports
         run: scripts/test-postgres.sh
@@ -54,6 +67,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check x86-64-v3 support
+        if: runner.arch == 'X64'
+        run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
       - run: rustup toolchain install 1.98.1 --profile minimal
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo install cargo-deny --version 0.20.2 --locked
@@ -66,6 +82,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check x86-64-v3 support
+        if: runner.arch == 'X64'
+        run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
       - run: rustup toolchain install 1.98.1 --profile minimal
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -105,6 +124,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check x86-64-v3 support
+        if: runner.arch == 'X64'
+        run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
       - name: Reserve space for native parser source and build caches
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet
@@ -112,3 +134,25 @@ jobs:
           test "$available_kib" -ge 20971520
       - name: Build and validate confined native document processing
         run: scripts/test-document-worker.sh
+  server-image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check x86-64-v3 support
+        if: runner.arch == 'X64'
+        run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
+      - name: Report available image-build storage
+        run: df -h /
+      - name: Build and test the production server image
+        run: scripts/test-server-image.sh --platform '${{ matrix.platform }}'

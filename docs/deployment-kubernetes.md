@@ -3,8 +3,9 @@
 ## Status and baseline
 
 Phase 0 records the selected deployment design and existing server contracts.
-Production serving images, Kubernetes serving manifests, deployment CI and operator
-runbooks are planned. This document does not establish a running deployment or
+Phase 1 adds the production server image, local image acceptance and native
+amd64/ARM64 CI jobs. Kubernetes serving manifests and complete operator runbooks
+remain planned. This document does not establish a running deployment or
 successful real-cluster, live-provider, browser WebTransport or ChatGPT acceptance.
 
 The inventory was checked on `main` at
@@ -24,8 +25,106 @@ git remote -v
 The [architecture](architecture.md), [server contract](server.md),
 [corpus contract](database.md), [persistence contract](persistence.md) and
 [document sandbox](document-sandbox.md) remain authoritative for their behavior.
-Phase 0 changes documentation only; public MCP schemas, configuration types and
-legal-data semantics are unchanged.
+Phase 0 changed documentation only. Phase 1 changes packaging and the Rust CPU
+baseline; public MCP schemas, configuration types and legal-data semantics remain
+unchanged.
+
+## Production server image
+
+Build from the repository root with Docker BuildKit. The production platforms are
+Linux GNU x86_64 with **x86-64-v3 required**, and generic AArch64. An amd64 manifest
+does not itself communicate the stronger CPU requirement: check deployment nodes
+as described in the [contributor baseline](../CONTRIBUTING.md#rust-baseline).
+The same x86 CPU requirement applies to local Rust builds and the separate
+document-worker image; ARM64 support here covers the server, not that worker.
+
+```sh
+docker build --platform linux/amd64 -f apps/server/Dockerfile \
+  --build-arg REVISION="$(git rev-parse HEAD)" \
+  --build-arg VERSION=development \
+  -t openlegal-server:local-amd64 .
+docker build --platform linux/arm64 -f apps/server/Dockerfile \
+  --build-arg REVISION="$(git rev-parse HEAD)" \
+  --build-arg VERSION=development \
+  -t openlegal-server:local-arm64 .
+```
+
+Use a native builder for each architecture or a builder with explicitly configured
+emulation. No builder installation, registry login or image push is performed by
+these commands. The Rust build defaults to two jobs; `--build-arg BUILD_JOBS=N`
+can adjust build resource use. Provision space for native build caches and image
+layers; hosted jobs report available disk space, and their clean-build peak still
+requires measurement. Empty BuildKit
+caches are supported; compiled caches are separated by architecture. All base
+images and the frontend are digest-pinned, native build/runtime packages use a
+dated Debian snapshot, and application graphs use their committed lockfiles.
+This is pinned-input reproducibility, not a byte-identical-image guarantee.
+
+OCI labels record the source repository, revision, version, license and CPU
+baseline. Defaults are `unknown` revision and `development` version; set truthful
+values when producing an operator artifact. Build from a clean committed tree
+before identifying an image as that revision. Local tags above are disposable
+build handles; deployments must use the digest of the published immutable image.
+Publishing an image remains a separate operator action.
+
+The image runs `/usr/local/bin/openlegal-server` directly as `10004:10004` and
+defaults to `/etc/openlegal/server.toml`. Supply that file and WebTransport TLS
+material through read-only mounts; no default configuration or keys are baked in.
+The existing administrative command arguments can replace the default config
+argument, for example `--migrate /etc/openlegal/server.toml`. Ordinary startup
+does not migrate the database. Configure only the credentials each mode needs.
+
+| Configuration | Immutable image path |
+| --- | --- |
+| `[text_diff].widget_html` | `/opt/openlegal/widgets/text-diff.html` |
+| `[database].widget_html` | `/opt/openlegal/widgets/database.html` |
+| `[demo].widget_html` | `/opt/openlegal/widgets/index.html` |
+
+Shipping a widget does not enable its feature. Retained-corpus serving still needs
+the separately provisioned read-only MeCab dictionary, PostgreSQL and separate
+writable blob/index mounts. The Lindera dictionary is already embedded at build
+time; the image never downloads a dictionary at startup. Ingestion stays opt-in
+and requires a later ingestion-capable image: this image contains no `kubectl`.
+
+The image contains the CA trust bundle and runtime GNU libraries, but no compiler,
+Cargo, Node, pnpm, Git or build cache. Application files are root-owned and the
+image creates no writable application directory for UID 10004. Run with read-only
+root, dropped capabilities, no privilege escalation, the default seccomp policy
+and resource limits. Mount temporary storage and configured persistent directories
+explicitly; Docker image metadata cannot enforce these runtime controls itself.
+SIGTERM reaches the server directly. Keep its shutdown grace longer than the
+configured drain timeout.
+
+Licenses and dependency notices reside under `/opt/openlegal/notices/`, including
+a dependency inventory, supplemental source evidence and Rust standard-library
+notices. The build rejects missing or mismatched supplemental notices. The widget
+files retain their source-offer marker until the server replaces it with the
+operator's `[source].url`. That URL must provide corresponding source for the exact
+running server/widget, including modifications and necessary build material; OCI
+labels do not replace the [source-offer contract](server.md#source-offers-and-migration).
+
+### Image acceptance
+
+```sh
+scripts/test-server-image.sh --platform linux/amd64
+scripts/test-server-image.sh --platform linux/arm64
+```
+
+Omit `--platform` to select the Docker host architecture. The gate builds the final
+image and checks its identity, libraries, widgets, notices, absent build tools,
+non-root/read-only operation, invalid configuration, health, MCP text comparison
+and SIGTERM shutdown. It generates disposable certificates outside the build
+context and transfers them through named volumes, supporting development containers
+whose Docker daemon runs on the host. The client and server use an internal network
+without published host ports; no provider, database or Kubernetes credentials are
+needed. Requests, polling, resource use and cleanup are bounded.
+
+The CI image jobs use native `ubuntu-24.04` and `ubuntu-24.04-arm` runners, with no
+publication credentials. Label local ARM emulation evidence as emulated and native
+CI evidence separately. Neither the image smoke nor a committed workflow proves
+real-cluster isolation, retained-corpus startup, live provider or public transport
+acceptance. Existing PostgreSQL, Korean analyzer, OxiBelt and document-worker gates
+remain separate. Record actual check outcomes with the implementation handoff.
 
 ## Selected topology
 
@@ -148,7 +247,8 @@ and independent review of the documentation patch under
 [CONTRIBUTING.md](../CONTRIBUTING.md#documentation-only-changes). It supplies no
 new runtime, image, manifest or CI validation evidence.
 
-Image builds and deployment validation remain later repository phases. Real-cluster
+Image acceptance is available in Phase 1; Kubernetes deployment validation remains
+later work. Real-cluster
 networking, storage, shutdown and sandbox enforcement require operator acceptance;
 live LAW OPEN DATA access and public transport/platform acceptance are separate
 gates. Existing offline fixtures and local integration evidence do not satisfy

@@ -49,6 +49,12 @@ bind = "127.0.0.1:9090"
 cargo run --locked -p openlegal-server -- server.toml
 ```
 
+The [production image](deployment-kubernetes.md#production-server-image) includes
+all three widget artifacts under `/opt/openlegal/widgets/` and accepts the same
+configuration and administrative arguments. Configuration, TLS keys and persistent
+data are mounted by the operator. It supports Linux x86-64-v3 and generic ARM64;
+see the deployment guide for builds and image acceptance.
+
 HTTP `/mcp` is private plaintext behind the TLS edge. WebTransport `/mcp-wt/v1`
 always uses TLS/QUIC. Both must bind successfully before readiness becomes true.
 Keep health `/live`, `/ready`, and `/metrics` private; they have no authentication.

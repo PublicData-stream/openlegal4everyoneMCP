@@ -15,6 +15,31 @@ supported server target graphs; the worker retains its separate admission policy
 See [the contributor baseline](../CONTRIBUTING.md#rust-baseline) for host support
 and Cargo environment-variable precedence.
 
+## Production image build inputs
+
+The server image uses official Rust 1.98.1 slim-trixie and Node 24.21.0 images for
+builds and Debian trixie-slim for runtime, pinned by multi-platform manifest
+digests in `apps/server/Dockerfile`. The Dockerfile frontend is digest-pinned too.
+pnpm 12.3.4 installs the frozen widget graph. Native compiler dependencies use a
+dated Debian snapshot; compilers and language package managers stay in build stages.
+These inputs reuse the admitted toolchain and frontend baselines. A Debian
+runtime supplies the standard GNU libraries and CA trust store needed by the
+existing native dependencies without introducing a separate libc target or
+cross-compilation toolchain.
+
+The final image retains the first-party AGPL license, bundled widget notices,
+Rust dependency and standard-library notices, and embedded Korean dictionary
+notices. Notice collection follows the server's resolved non-dev graph and fails
+when a dependency has neither packaged notices nor a reviewed exact-version
+supplement. [Supplemental notice provenance](../apps/server/notices/README.md)
+records immutable upstream sources and hashes for crates whose archives omit
+license files; the image includes a per-package inventory. The embedded
+Lindera dictionary keeps its existing build-time download contract; the separately
+provisioned MeCab dictionary is neither shipped nor downloaded at runtime.
+Pinned inputs and locked dependency resolution are the reproducibility boundary;
+byte-identical image reproduction is not claimed. Updating a base digest, package
+snapshot or toolchain requires image acceptance and renewed relevant admission.
+
 ## Direct dependencies and alternatives
 
 | Dependency | Purpose, choice and boundary considerations |

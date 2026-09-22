@@ -125,7 +125,8 @@ as well. Do not create Rust tests that merely assert policy wording or headings.
 
 The baseline is Rust 1.98.1 on Linux GNU, with x86-64-v3 on x86_64 and the
 generic Rust CPU baseline on ARM64. Both transports compile together with no
-optional first-party features. The separate document worker remains
+optional first-party features. Native CI runs the Rust baseline on both
+`ubuntu-24.04` and `ubuntu-24.04-arm`. The separate document worker remains
 x86_64-only and also requires x86-64-v3. Required checks are:
 
 ```sh
@@ -196,6 +197,21 @@ prerequisites are documented in [document processing](docs/document-sandbox.md).
 The dedicated hosted worker job removes unused preinstalled Android/.NET SDKs and
 requires at least 20 GiB free build space; local runs must provision that space
 without deleting unrelated host data.
+
+Changes to the production server image, its build inputs or packaged widgets
+also require `scripts/test-server-image.sh --platform linux/amd64` and
+`scripts/test-server-image.sh --platform linux/arm64`. Each invocation builds and
+tests one architecture; omitting `--platform` selects the host architecture.
+Native image jobs run on both hosted runners. Local ARM64 emulation is useful
+evidence but does not replace native ARM64 CI acceptance. The gate uses disposable
+configuration/certificates and an internal Docker network to verify image contents,
+read-only execution, health, MCP text comparison and graceful shutdown. It needs
+no database, provider credentials or published host ports. Allow space for native
+build caches and image layers; the hosted job reports available disk space. Its
+clean-build peak has not been measured on hosted ARM64, so the worker's separate
+20 GiB requirement is not imposed on the server job.
+Unavailable Docker, architecture support or build inputs leave this gate incomplete.
+Image builds do not publish images. See [server deployment](docs/deployment-kubernetes.md).
 
 CI introduced with Rust must match these documented checks and test supported
 feature combinations on a declared toolchain/platform baseline. Run advisory checks
