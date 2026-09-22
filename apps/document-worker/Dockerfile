@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 FROM rust:1.98.1-slim-trixie@sha256:a2de23e559fd8afd260d22beb00f3987073ea0dcc2ba2646cccdaeda6a62a095 AS toolchain
 # A dated Debian snapshot fixes native Tesseract/Leptonica and compiler libraries.
-RUN rm -f /etc/apt/sources.list.d/* && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260915T000000Z trixie main\n' > /etc/apt/sources.list \
-    && apt-get -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt update && apt-get install -y --no-install-recommends ca-certificates curl git clang libclang-dev pkg-config libtesseract-dev libleptonica-dev libfontconfig1-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=bind,source=scripts/install-snapshot-packages.sh,target=/tmp/install-snapshot-packages.sh \
+    timeout --kill-after=10s 15m /bin/sh /tmp/install-snapshot-packages.sh \
+        ca-certificates curl git clang libclang-dev pkg-config libtesseract-dev libleptonica-dev libfontconfig1-dev
 FROM toolchain AS build
 RUN rustup component add clippy rustfmt
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -44,9 +44,9 @@ RUN curl -fsSLO https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/65
 
 FROM debian:trixie-slim@sha256:abc9cb88a5587630d7f915f47b23b0668fe250fbfc6457aa4d52b534c1bbf73f AS runtime
 COPY --from=toolchain /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-RUN rm -f /etc/apt/sources.list.d/* && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260915T000000Z trixie main\n' > /etc/apt/sources.list \
-    && apt-get -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt update && apt-get -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt install -y --no-install-recommends libtesseract5 libleptonica6 libfontconfig1 \
-    && rm -rf /var/lib/apt/lists/* \
+RUN --mount=type=bind,source=scripts/install-snapshot-packages.sh,target=/tmp/install-snapshot-packages.sh \
+    timeout --kill-after=10s 15m /bin/sh /tmp/install-snapshot-packages.sh \
+        libtesseract5 libleptonica6 libfontconfig1 \
     && mkdir -p /scratch /opt/probe /opt/fonts /opt/tessdata /opt/notices /usr/share/fonts/truetype/nanum \
     && chown 65532:65532 /scratch /opt/probe
 COPY --from=build /assets/openlegal-document-worker /usr/local/bin/openlegal-document-worker

@@ -124,7 +124,17 @@ jobs:
       - run: pnpm --dir apps/widget exec playwright install --with-deps chromium
       - run: pnpm --dir apps/widget test:browser
       - run: pnpm --dir apps/widget check:dependencies
+  snapshot-packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test bounded snapshot downloads and verification failures
+        run: scripts/test-snapshot-packages.sh
   document-worker:
+    needs: snapshot-packages
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -159,6 +169,7 @@ jobs:
       - name: Test disposable acceptance preparation without a cluster
         run: target/deployment-tools/bin/python -m unittest discover -s test-support/kubernetes-acceptance -p 'test_*.py'
   server-image:
+    needs: snapshot-packages
     strategy:
       fail-fast: false
       matrix:

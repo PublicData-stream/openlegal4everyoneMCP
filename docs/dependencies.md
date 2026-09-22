@@ -27,6 +27,27 @@ runtime supplies the standard GNU libraries and CA trust store needed by the
 existing native dependencies without introducing a separate libc target or
 cross-compilation toolchain.
 
+Server and document-worker package installation shares
+`scripts/install-snapshot-packages.sh`. It retains snapshot `20260915T000000Z`,
+uses five APT acquisition retries with native backoff, 30-second connection/data
+timeouts, and disables request pipelining to reduce concurrent requests to the
+snapshot service. Each Dockerfile invocation has a 15-minute total deadline and
+a 10-second termination grace period. Metadata errors, exhausted retries,
+timeouts, TLS errors, invalid signatures and package hash mismatches fail the
+build; there is no fallback to a moving mirror. HTTPS and APT authentication
+remain enabled. Options apply only to the build command, and the helper is
+mounted temporarily rather than shipped in the image.
+
+Run `scripts/test-snapshot-packages.sh` to exercise the pinned APT against an
+isolated synthetic HTTPS repository with disposable signing and TLS keys.
+The fixture verifies transient failure recovery, retry exhaustion, acquisition
+and transaction timeouts, stale-metadata failure and integrity rejection. CI
+runs it before worker and server image jobs. It requires Docker, Python 3,
+OpenSSL, GnuPG (including `gpgconf`), `dpkg-deb` and `tar`; it does not contact the
+real snapshot service after
+pulling the pinned fixture images. These checks establish bounded recovery from
+temporary failures, not availability during a persistent snapshot-service outage.
+
 The final image retains the first-party AGPL license, bundled widget notices,
 Rust dependency and standard-library notices, and embedded Korean dictionary
 notices. Notice collection follows the server's resolved non-dev graph and fails

@@ -121,8 +121,14 @@ data is intentionally refreshed when this validation stage executes.
 
 The Dockerfile pins Rust 1.98.1 and Debian base digests and uses the dated Debian
 snapshot `20260915T000000Z` for native Tesseract/Leptonica libraries. The standalone
-lockfile fixes Rust dependencies. The following source/version selections were
-verified on 2026-09-16:
+lockfile fixes Rust dependencies. Both native build and runtime package
+installation use the
+shared [bounded snapshot download policy](dependencies.md#production-image-build-inputs),
+including strict metadata failure and a 15-minute package transaction deadline.
+Run `scripts/test-snapshot-packages.sh` for its isolated failure-injection gate;
+the full worker gate above remains required for native extraction and OCR.
+
+The following source/version selections were verified on 2026-09-16:
 
 | Component | Selection and reason | License |
 | --- | --- | --- |

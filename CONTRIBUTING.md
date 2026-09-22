@@ -203,6 +203,12 @@ The dedicated hosted worker job removes unused preinstalled Android/.NET SDKs an
 requires at least 20 GiB free build space; local runs must provision that space
 without deleting unrelated host data.
 
+Changes to snapshot package installation also require
+`scripts/test-snapshot-packages.sh`. Its isolated signed HTTPS repository tests
+bounded retries, timeouts, strict metadata handling and integrity failures with
+the pinned APT. CI requires this gate before the worker and server image jobs;
+see [dependency admission](docs/dependencies.md) for prerequisites and limits.
+
 Changes to the production server image, its build inputs or packaged widgets
 also require `scripts/test-server-image.sh --platform linux/amd64` and
 `scripts/test-server-image.sh --platform linux/arm64`. Each invocation builds and

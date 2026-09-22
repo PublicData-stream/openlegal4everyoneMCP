@@ -2,6 +2,8 @@
 !Cargo.toml
 !Cargo.lock
 !LICENSE
+!scripts/
+!scripts/install-snapshot-packages.sh
 !.cargo/
 !.cargo/config.toml
 !crates/

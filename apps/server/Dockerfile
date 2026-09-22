@@ -14,11 +14,8 @@ RUN pnpm --dir apps/widget build
 
 FROM rust:1.98.1-slim-trixie@sha256:f47a8de237dcbb0b0ce1099901e60a89728e3d51f24e664b40e947171538ade7 AS build
 # Native build helpers only; nothing from this toolchain is installed at runtime.
-RUN rm -f /etc/apt/sources.list.d/* \
-    && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260915T000000Z trixie main\n' > /etc/apt/sources.list \
-    && apt-get -o APT::Update::Error-Mode=any update \
-    && apt-get install -y --no-install-recommends cmake pkg-config python3 \
-    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=bind,source=scripts/install-snapshot-packages.sh,target=/tmp/install-snapshot-packages.sh \
+    timeout --kill-after=10s 15m /bin/sh /tmp/install-snapshot-packages.sh cmake pkg-config python3
 WORKDIR /src
 COPY Cargo.toml Cargo.lock LICENSE ./
 COPY .cargo/config.toml ./.cargo/config.toml
@@ -45,11 +42,8 @@ RUN --mount=type=cache,id=openlegal-server-registry,target=/usr/local/cargo/regi
 
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime-base
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-RUN rm -f /etc/apt/sources.list.d/* \
-    && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260915T000000Z trixie main\n' > /etc/apt/sources.list \
-    && apt-get -o APT::Update::Error-Mode=any -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt update \
-    && apt-get -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt install -y --no-install-recommends ca-certificates libgcc-s1 \
-    && rm -rf /var/lib/apt/lists/* \
+RUN --mount=type=bind,source=scripts/install-snapshot-packages.sh,target=/tmp/install-snapshot-packages.sh \
+    timeout --kill-after=10s 15m /bin/sh /tmp/install-snapshot-packages.sh ca-certificates libgcc-s1 \
     && mkdir -p /etc/openlegal /opt/openlegal/widgets /opt/openlegal/notices
 COPY --from=build /assets/openlegal-server /usr/local/bin/openlegal-server
 COPY --from=build /assets/notices/ /opt/openlegal/notices/dependencies/
