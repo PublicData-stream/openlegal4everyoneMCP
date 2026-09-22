@@ -26,7 +26,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use wtransport::{Endpoint as QuicEndpoint, Identity, ServerConfig};
+use wtransport::{Endpoint as QuicEndpoint, Identity, ServerConfig, tls::rustls};
 
 use crate::{
     ServerError,
@@ -60,6 +60,24 @@ impl Endpoint for WebTransportEndpoint {
         self.access.validate()?;
         context.limits.validate()?;
         let identity = Identity::load_pemfiles(&self.certificate, &self.private_key).await?;
+        // Preserve wtransport's ring/TLS 1.3 defaults, but propagate invalid identity
+        // errors: its default TLS builder panics on empty chains or mismatched keys.
+        let certificates = identity
+            .certificate_chain()
+            .as_slice()
+            .iter()
+            .map(|certificate| rustls::pki_types::CertificateDer::from(certificate.der().to_vec()))
+            .collect();
+        let private_key = rustls::pki_types::PrivateKeyDer::try_from(
+            identity.private_key().secret_der().to_vec(),
+        )?;
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)?;
+        tls.alpn_protocols = vec![wtransport::tls::WEBTRANSPORT_ALPN.to_vec()];
         // Flow-control credit bounds transport reassembly, not complete JSON frames.
         // A large frame streams through FrameReader; granting its full size here
         // causes unnecessary bursts and excessive buffering through a QUIC proxy.
@@ -77,7 +95,7 @@ impl Endpoint for WebTransportEndpoint {
             .datagram_send_buffer_size(4096);
         let mut config = ServerConfig::builder()
             .with_bind_address(self.bind)
-            .with_custom_transport(identity, transport_config)
+            .with_custom_tls_and_transport(tls, transport_config)
             .max_idle_timeout(Some(Duration::from_secs(context.limits.idle_timeout_secs)))?
             .build();
         config.quic_config_mut()

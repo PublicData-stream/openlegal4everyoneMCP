@@ -25,6 +25,39 @@ struct Server {
     context: EndpointContext,
     active_plugins: Arc<std::sync::atomic::AtomicUsize>,
 }
+async fn assert_tls_identity_rejected(certificate_pem: &str, private_key_pem: &str) {
+    let server = Server::start().await;
+    let certificate = server._directory.path().join("invalid-cert.pem");
+    let private_key = server._directory.path().join("invalid-key.pem");
+    std::fs::write(&certificate, certificate_pem).unwrap();
+    std::fs::write(&private_key, private_key_pem).unwrap();
+    let result = WebTransportEndpoint {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        certificate,
+        private_key,
+        access: AccessPolicy {
+            allowed_hosts: vec!["localhost".into()],
+            allowed_origins: vec!["https://allowed.test".into()],
+        },
+    }
+    .bind(server.context.clone())
+    .await;
+    assert!(result.is_err(), "invalid TLS identity must fail binding");
+}
+
+#[tokio::test]
+async fn rejects_empty_certificate_chain_without_panicking() {
+    let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    assert_tls_identity_rejected("not a certificate", &identity.signing_key.serialize_pem()).await;
+}
+
+#[tokio::test]
+async fn rejects_mismatched_certificate_key_without_panicking() {
+    let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    assert_tls_identity_rejected(&identity.cert.pem(), &other.signing_key.serialize_pem()).await;
+}
+
 struct PluginGuard(Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for PluginGuard {
     fn drop(&mut self) {
