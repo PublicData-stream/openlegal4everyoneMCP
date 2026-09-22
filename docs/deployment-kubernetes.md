@@ -16,8 +16,12 @@ a Service or NetworkPolicy. Phase 7 adds an opt-in ingestion image, projected
 controller identity, separate RBAC/egress templates and offline controller checks.
 Phase 8 adds source-inventory checks and pinned offline Kubernetes 1.36.0/1.37.0
 schema validation to the existing deployment and four native image CI jobs.
-Complete production acceptance remains pending. This document does not establish a running deployment
-or successful real-cluster, live-provider, browser WebTransport or ChatGPT acceptance.
+Phase 9 adds a bounded explicit-endpoint smoke client and separately provisioned
+disposable Kubernetes serving acceptance. See the [checklist](#phase-9-serving-acceptance)
+and its [execution record](deployment-acceptance.md) for scoped disposable-cluster
+outcomes and unresolved HTTP stability. Complete production acceptance remains
+pending; no production deployment, live-provider, browser WebTransport or ChatGPT
+acceptance is established.
 
 The original Phase 0 inventory was recorded on `main` at
 `79a8a852916d6fb18f306e5d7541115e1bab87d8`. The earlier design baseline,
@@ -332,8 +336,9 @@ upgrades. Validation-tool versions are not a cluster compatibility matrix.
 The retained template exposes only the data transports through the Service
 described below. Health port 9090 has no Service port or public route. There is no
 Ingress resource. The default-deny baseline and selected allow policies restrict
-Pod traffic when the CNI enforces them; real-cluster enforcement remains an
-acceptance gate. Monitoring access to health is optional and explicit.
+Pod traffic when the CNI enforces them; enforcement requires acceptance on the
+selected cluster. The [disposable record](deployment-acceptance.md) covers only its
+tested topology. Monitoring access to health is optional and explicit.
 `kubectl port-forward` cannot validate UDP/WebTransport; a forwarded HTTP client
 must still send an allowed Host.
 
@@ -514,9 +519,10 @@ repository-owned `openlegal-allow-edge`, `openlegal-allow-postgres`,
 `openlegal-allow-dns` and `openlegal-allow-monitoring` by exact name as applicable.
 Keep `openlegal-default-deny` while the namespace exists with any workloads.
 
-#### Real-cluster network acceptance — pending
+#### Target-cluster network acceptance
 
-No cluster harness or deployment is added. Record cluster/CNI/service-proxy versions,
+Phase 6 templates alone provide no cluster evidence. The separately provisioned
+Phase 9 fixture records only its own observed boundaries. Record cluster/CNI/service-proxy versions,
 node interfaces, selected policy manifests, firewall rules and policy-visible peers.
 Use operator-controlled synthetic endpoints and bounded connection attempts. For
 each denied path, demonstrate that the endpoint is listening and reachable from an
@@ -1055,7 +1061,7 @@ It checks quota/Pod command compatibility, token-file replacement and authentica
 failures without legal-provider traffic. Tests use disposable credentials and do
 not implement or prove Kubernetes RBAC, projected-token delivery, Pod admission,
 gVisor or CNI enforcement. Native ARM64 CI remains distinct from local emulation.
-Real-cluster, live-provider and production traffic acceptance remain pending.
+Real-cluster ingestion, live-provider and production traffic acceptance remain pending.
 
 ## Template and operator ownership
 
@@ -1079,6 +1085,125 @@ production resource sizing remain operator inputs. The ingestion overlay preserv
 explicit kubeconfig/context authentication with a projected rotating token; no
 ambient in-cluster authentication mode is introduced.
 
+## Phase 9 serving acceptance
+
+The routine smoke command performs fixed, bounded serving operations against
+explicit endpoints. It neither deploys workloads nor runs migration, restarts,
+certificate replacements or provider ingestion. Tiny fictional text comparisons
+create transient comparison and patch handles; the client deletes only handles
+returned to its own run. No legal corpus operation is included.
+
+Build the native client explicitly before running smoke:
+
+```sh
+cargo build --locked -p openlegal-server --example wt_client
+scripts/smoke-kubernetes-serving.sh \
+  --http-url https://openlegal4everyone.stream/mcp \
+  --webtransport-url https://openlegal4everyone.stream/mcp-wt/v1 \
+  --origin https://openlegal4everyone.stream \
+  --ca-file /absolute/operator/edge-ca-bundle.pem \
+  --wt-client "$PWD/target/debug/examples/wt_client" \
+  --report /absolute/operator/new-smoke-report.json
+```
+
+Run only against an explicitly selected deployment. Supply an existing PEM
+certificate bundle that trusts the **edge**; the client's edge trust does not
+prove the edge's separate backend trust. Endpoints require verified HTTPS, exact
+MCP paths and no credentials, query or fragment. The positive Origin requires
+HTTPS and must be configured as allowed. Reserve `https://smoke-denied.invalid`
+outside all allowlists. There is no proxy, redirect, ambient endpoint discovery,
+runtime download or insecure TLS option. The Python driver requires Linux/POSIX,
+Python 3.11 or later and a compatible prebuilt native client.
+
+The client exercises both MCP revisions: legacy initialize/initialized and
+modern discovery, tool listing, server/source information, canonical `text.diff`,
+comparison and patch assertions, cleanup, HTTP SSE progress, and native
+WebTransport. Invalid Host/Origin and public health-route checks require explicit
+HTTP rejection responses. A connection failure never passes a denial check.
+The native SDK exposes WebTransport session rejection without its HTTP status;
+native evidence records `transport_session_rejected`, while HTTP independently
+requires 403 for the invalid Origin.
+
+Optional `--live-url http://PRIVATE_POD:9090/live` and
+`--ready-url http://PRIVATE_POD:9090/ready` checks run only from an already
+authorized private network. Do not introduce port forwarding or public routes to
+make them pass. Optional Pod readiness requires **all** of `--kubectl`,
+`--kubeconfig`, `--context`, `--namespace` and `--pod`. It requests only selected
+Pod identity/readiness fields; a stable UID, Running phase, Ready condition and
+absence of deletion are required. Neither health nor Pod readiness establishes
+fresh database access, index catch-up, singleton exclusion or firewall enforcement.
+
+Operations have ten-second absolute deadlines, including slow HTTP/SSE responses.
+The transport phase is bounded to 180 seconds, optional Pod readiness to 360
+seconds, and response bodies/frames to 16 MiB. Calls are sequential and not
+automatically retried. Failures include cleanup failures; interrupted connections
+can leave the run's transient objects to expire under the normal store TTL.
+
+The command exits nonzero for a selected failed check. Its optional version-1 JSON
+report uses `passed`, `failed` and `not_run`, fixed check/reason identifiers and
+timings. It creates a new report file and refuses to overwrite one. Reports omit
+URLs, response bodies, handles, credentials and raw subprocess diagnostics.
+“All selected smoke checks passed” means exactly that, not complete acceptance.
+
+### Acceptance checklist and evidence boundaries
+
+Execute disruptive cases only against the prepared disposable fixture or within
+a separately authorized operator maintenance window. The
+[fixture guide](../test-support/kubernetes-acceptance/README.md) owns pinned
+tool preparation and cluster cleanup; its [operations appendix](../test-support/kubernetes-acceptance/OPERATIONS.md)
+provides manual disruptive checks and restoration commands. Build and load images before running the
+single-node cluster; keep the whole dev workload within 7 GiB and run expensive
+checks sequentially. The server retains its canonical 4 GiB container limit.
+Use the fictional retained seed, full pinned dictionary and distinct migration
+and runtime credentials from the existing image fixture. Never copy a production
+database or enable ingestion for these checks.
+
+| Gate | Required observation | Evidence limit |
+| --- | --- | --- |
+| Pod and private health | Running, non-terminating Ready Pod; `/live` and `/ready` return 200 from permitted path | Not index catch-up or a fresh DB query |
+| TCP/UDP NodePorts | Actual edge container reaches HTTP and native WebTransport; unintended fixture clients are denied | Positive controls plus observed CNI/firewall counters; timeouts alone fail evidence requirements |
+| Public MCP | Both revisions, both transports, source metadata, tiny diff and HTTP SSE progress pass | Native clients, not browser or ChatGPT acceptance |
+| Host/Origin and health exclusion | Invalid HTTP Host 404, invalid Origin 403, public health paths 404; native invalid Origin is session-rejected | Keep known-good TLS/endpoint controls |
+| Backend trust and identity | Fresh WT connection fails under unrelated backend CA and under trusted wrong-SAN certificate; HTTP/private-health controls remain good; restoring trust/identity recovers WT | Change only disposable edge trust/backend certificate; client-side CA failure is a different boundary |
+| PostgreSQL credentials | Migration Job completes before serving; runtime role receives insufficient-privilege SQLSTATE for disposable DDL; serving has no migration credential reference or mount | Never print environment values, Secret data, SQL credentials or full workload dumps |
+| Storage | Separate PV/mount paths, expected ownership, writable private data paths and read-only dictionary | Local directories inside kind are not production ZFS qualification or disk quotas |
+| Graceful lifecycle | Stop an already-ready Deployment, observe clean server termination within grace, then start it and verify retained capture/search identity | Do not force-delete Pods; early initialization has a different shutdown boundary |
+| Singleton | Observe `Recreate` transition and no overlapping serving processes; competing runtime lease is rejected using a separate disposable index | Replica count and volume access mode alone are not fencing |
+
+For network denial evidence, establish a reachable positive control before each
+negative and inspect the corresponding CNI/node firewall counters or denial
+events. Place fixture firewall rules only in the disposable node network namespace;
+do not change the host's firewall. Check public NodePorts from distinct allowed
+and denied fixture containers, and health from permitted monitoring and unrelated
+Pod identities. A nested single-node fixture does not establish cross-node
+routing, physical-node interfaces, actual production source NAT, or the production
+host's firewall.
+
+For lifecycle evidence, record Pod UIDs and selected status fields, stop serving
+with `scale --replicas=0`, wait for termination, then restore one replica and wait
+for readiness. Compare the same known synthetic capture IDs and query results
+before and after. A separate `rollout restart` checks the Recreate upgrade path.
+Watch termination through completion so a fast replacement does not erase exit
+evidence. Never start the competing-instance test against the live index: give it
+a separate empty index path while preserving the same runtime-lease database.
+
+The Phase 9 dev run observed HTTP failures with `channel closed` in the pinned
+OxiBelt after backend replacement and again without another backend replacement.
+The cause remains unresolved. Do not treat backend readiness as restored
+public transport acceptance. Verify retained data through the trusted NodePort,
+restart the disposable edge to discard stale upstream connections, and rerun
+both public transports. Record the original failed public request as well as
+recovery; this is an operator workaround, not a proxy fix or seamless-upgrade
+claim. Reassess HTTP stability before accepting production traffic or backend upgrades.
+
+Record every checklist row individually in the [Phase 9 evidence record](deployment-acceptance.md),
+including exact commands, version/digest identities and failed or unexecuted cases.
+Keep raw private run artifacts outside Git. Distinguish implemented, executed in
+Docker, executed against PostgreSQL, executed on the disposable Kubernetes cluster,
+and observed CI results. Document sandbox, production ZFS/firewall, live LAW OPEN
+DATA, browser/ChatGPT and production traffic remain independently pending until
+their own gates are performed. Do not infer CI success from a configured job.
+
 ## Validation boundary
 
 Phase 0 acceptance consists of source/document inspection, Markdown/link checks
@@ -1099,3 +1224,8 @@ live LAW OPEN DATA access and public transport/platform acceptance are separate
 gates. Existing offline fixtures and local integration evidence do not satisfy
 those gates. Deployment, publication and live provider requests are not part of
 Phase 0.
+
+Phase 9 adds separately executed disposable serving-cluster observations in the
+[acceptance record](deployment-acceptance.md). They cover the stated topology and
+retain the unresolved public HTTP failure; they do not qualify production or the
+document sandbox.

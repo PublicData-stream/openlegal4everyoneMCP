@@ -270,6 +270,21 @@ credential values. Deployment-tool updates require the four image target/platfor
 checks and independent Security Review of the affected validation boundary.
 Run `shellcheck` on changed shell scripts and `actionlint` when the workflow changes. Do not describe these checks as real-cluster acceptance.
 
+Serving smoke client changes require
+`python3 -m unittest discover -s scripts/tests -p 'test_serving_smoke.py'`,
+`cargo test --locked -p openlegal-server --example wt_client serving_smoke`,
+and both OxiBelt profiles. Disposable fixture preparation changes also require
+`target/deployment-tools/bin/python -m unittest discover -s test-support/kubernetes-acceptance -p 'test_*.py'`.
+The OxiBelt gate
+executes the bounded deployed-endpoint profile against its synthetic fixture.
+The Python checks also run in the deployment CI job. Explicit-endpoint smoke
+is an operator action, not a default CI connection to a deployed service.
+Disposable Kubernetes serving acceptance is separately opt-in; its setup, evidence
+requirements and cleanup are in [deployment acceptance](docs/deployment-kubernetes.md#phase-9-serving-acceptance).
+Credential files, raw workload dumps and unsanitized test output are never
+acceptance evidence for publication. Apply independent Security and MCP/API
+Boundary review to changes in smoke endpoint, parser and reporting boundaries.
+
 CI introduced with Rust must match these documented checks and test supported
 feature combinations on a declared toolchain/platform baseline. Run advisory checks
 on a schedule as well as relevant changes. Failures, cancellations, and unexpected
