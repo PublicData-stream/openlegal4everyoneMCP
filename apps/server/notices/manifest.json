@@ -1,0 +1,346 @@
+{
+  "packages": {
+    "asn1-rs-impl@0.2.0": {
+      "files": [
+        {
+          "path": "files/rusticata_asn1-rs/a20e5f7319c896737ad0f2557037817b91ad854f/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "source": "https://raw.githubusercontent.com/rusticata/asn1-rs/a20e5f7319c896737ad0f2557037817b91ad854f/LICENSE-APACHE"
+        },
+        {
+          "path": "files/rusticata_asn1-rs/a20e5f7319c896737ad0f2557037817b91ad854f/LICENSE-MIT",
+          "sha256": "a5c61b93b6ee1d104af9920cf020ff3c7efe818e31fe562c72261847a728f513",
+          "source": "https://raw.githubusercontent.com/rusticata/asn1-rs/a20e5f7319c896737ad0f2557037817b91ad854f/LICENSE-MIT"
+        }
+      ],
+      "path_in_vcs": "impl",
+      "repository": "https://github.com/rusticata/asn1-rs",
+      "revision": "a20e5f7319c896737ad0f2557037817b91ad854f",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "datasketches@0.2.0": {
+      "files": [
+        {
+          "path": "files/apache_datasketches-rust/fdb38b85d22e6549ab283bf3b9b133659267d19f/LICENSE",
+          "sha256": "2a93522cc3e0d15510a70e0e7aaf33dc6a1588c39ca4a5c60c4b0121ed25eaf4",
+          "source": "https://raw.githubusercontent.com/apache/datasketches-rust/fdb38b85d22e6549ab283bf3b9b133659267d19f/LICENSE"
+        },
+        {
+          "path": "files/apache_datasketches-rust/fdb38b85d22e6549ab283bf3b9b133659267d19f/NOTICE",
+          "sha256": "624b424b930d7ce49f8856323c6aa5ffbcaa71a474d60bf8f60852f8aa20bcfa",
+          "source": "https://raw.githubusercontent.com/apache/datasketches-rust/fdb38b85d22e6549ab283bf3b9b133659267d19f/NOTICE"
+        }
+      ],
+      "path_in_vcs": "datasketches",
+      "repository": "https://github.com/apache/datasketches-rust",
+      "revision": "fdb38b85d22e6549ab283bf3b9b133659267d19f",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "htmlescape@0.3.1": {
+      "files": [
+        {
+          "path": "files/veddan_rust-htmlescape/1699b539179798e705ad8464128492a0a0092876/Cargo.toml",
+          "role": "published attribution and license declaration",
+          "sha256": "daad7e32ff2b04d0a74c3c9364a7c209f9b5a71f60193ca3c393f8fa6cc0dd7f",
+          "source": "https://raw.githubusercontent.com/veddan/rust-htmlescape/1699b539179798e705ad8464128492a0a0092876/Cargo.toml"
+        },
+        {
+          "path": "files/apache_www-site/1b29c866bab6e82860dce3f86045b349d10a6764/content/licenses/LICENSE-2.0.txt",
+          "role": "standard text of selected Apache-2.0 alternative; not an upstream htmlescape notice",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "source": "https://raw.githubusercontent.com/apache/www-site/1b29c866bab6e82860dce3f86045b349d10a6764/content/licenses/LICENSE-2.0.txt"
+        }
+      ],
+      "path_in_vcs": "",
+      "repository": "https://github.com/veddan/rust-htmlescape",
+      "revision": "1699b539179798e705ad8464128492a0a0092876",
+      "revision_evidence": "All 12 published crate files except Cargo cache marker .cargo-ok match Git blob SHA-1 at this revision; crate has no .cargo_vcs_info.json",
+      "selected_license": "Apache-2.0"
+    },
+    "httlib-huffman@0.3.4": {
+      "files": [
+        {
+          "path": "files/xpepermint_httlib-rs/b7e958aa0f7e0a9a10d8b31f1a782863e85542f8/LICENSE",
+          "sha256": "e9c2aae5b318871e726b787374b6acc637e4ea002301e938c620d14b437fb0fe",
+          "source": "https://raw.githubusercontent.com/xpepermint/httlib-rs/b7e958aa0f7e0a9a10d8b31f1a782863e85542f8/LICENSE"
+        }
+      ],
+      "path_in_vcs": "huffman",
+      "repository": "https://github.com/xpepermint/httlib-rs",
+      "revision": "b7e958aa0f7e0a9a10d8b31f1a782863e85542f8",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "jsonschema-regex@0.56.0": {
+      "files": [
+        {
+          "path": "files/Stranger6667_jsonschema/1e244c994dd81a1feb7801556a813c6bf2d45dad/LICENSE",
+          "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038",
+          "source": "https://raw.githubusercontent.com/Stranger6667/jsonschema/1e244c994dd81a1feb7801556a813c6bf2d45dad/LICENSE"
+        }
+      ],
+      "path_in_vcs": "crates/jsonschema-regex",
+      "repository": "https://github.com/Stranger6667/jsonschema",
+      "revision": "1e244c994dd81a1feb7801556a813c6bf2d45dad",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "jsonschema-value@0.56.0": {
+      "files": [
+        {
+          "path": "files/Stranger6667_jsonschema/1e244c994dd81a1feb7801556a813c6bf2d45dad/LICENSE",
+          "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038",
+          "source": "https://raw.githubusercontent.com/Stranger6667/jsonschema/1e244c994dd81a1feb7801556a813c6bf2d45dad/LICENSE"
+        }
+      ],
+      "path_in_vcs": "crates/jsonschema-value",
+      "repository": "https://github.com/Stranger6667/jsonschema",
+      "revision": "1e244c994dd81a1feb7801556a813c6bf2d45dad",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "lindera-dictionary@5.3.0": {
+      "files": [
+        {
+          "path": "files/lindera_lindera/b805dbe17cdd71b9aec319d604dfea96933744b4/LICENSE",
+          "sha256": "d37249886de3136db31717f15f6ade215a36fbed1c782381e38b2bf6047e8ec4",
+          "source": "https://raw.githubusercontent.com/lindera/lindera/b805dbe17cdd71b9aec319d604dfea96933744b4/LICENSE"
+        }
+      ],
+      "path_in_vcs": "lindera-dictionary",
+      "repository": "https://github.com/lindera/lindera",
+      "revision": "b805dbe17cdd71b9aec319d604dfea96933744b4",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "lindera@5.0.1": {
+      "files": [
+        {
+          "path": "files/lindera_lindera/7eebfd8248f1260ed74d52ffffff7edecc91d1ab/LICENSE",
+          "sha256": "d37249886de3136db31717f15f6ade215a36fbed1c782381e38b2bf6047e8ec4",
+          "source": "https://raw.githubusercontent.com/lindera/lindera/7eebfd8248f1260ed74d52ffffff7edecc91d1ab/LICENSE"
+        }
+      ],
+      "path_in_vcs": "lindera",
+      "repository": "https://github.com/lindera/lindera",
+      "revision": "7eebfd8248f1260ed74d52ffffff7edecc91d1ab",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "ownedbytes@0.9.0": {
+      "files": [
+        {
+          "path": "files/quickwit-oss_tantivy/c6e77d27c605cb3cea1a933fa7d68632aeb7865e/LICENSE",
+          "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/c6e77d27c605cb3cea1a933fa7d68632aeb7865e/LICENSE"
+        },
+        {
+          "path": "files/quickwit-oss_tantivy/c6e77d27c605cb3cea1a933fa7d68632aeb7865e/AUTHORS",
+          "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/c6e77d27c605cb3cea1a933fa7d68632aeb7865e/AUTHORS"
+        }
+      ],
+      "path_in_vcs": "ownedbytes",
+      "repository": "https://github.com/quickwit-oss/tantivy",
+      "revision": "c6e77d27c605cb3cea1a933fa7d68632aeb7865e",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "rmcp@3.3.0": {
+      "files": [
+        {
+          "path": "files/modelcontextprotocol_rust-sdk/3e636cab26c013eca5131103c03d20237f12c4df/LICENSE",
+          "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
+          "source": "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/3e636cab26c013eca5131103c03d20237f12c4df/LICENSE"
+        }
+      ],
+      "path_in_vcs": "crates/rmcp",
+      "repository": "https://github.com/modelcontextprotocol/rust-sdk",
+      "revision": "3e636cab26c013eca5131103c03d20237f12c4df",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "tantivy-bitpacker@0.10.0": {
+      "files": [
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+        },
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+        }
+      ],
+      "path_in_vcs": "bitpacker",
+      "repository": "https://github.com/quickwit-oss/tantivy",
+      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "tantivy-columnar@0.7.0": {
+      "files": [
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+        },
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+        }
+      ],
+      "path_in_vcs": "columnar",
+      "repository": "https://github.com/quickwit-oss/tantivy",
+      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "tantivy-common@0.11.0": {
+      "files": [
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+        },
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+        }
+      ],
+      "path_in_vcs": "common",
+      "repository": "https://github.com/quickwit-oss/tantivy",
+      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "tantivy-query-grammar@0.26.0": {
+      "files": [
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+        },
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+        }
+      ],
+      "path_in_vcs": "query-grammar",
+      "repository": "https://github.com/quickwit-oss/tantivy",
+      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "tantivy-sstable@0.7.0": {
+      "files": [
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+        },
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+        }
+      ],
+      "path_in_vcs": "sstable",
+      "repository": "https://github.com/quickwit-oss/tantivy",
+      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "tantivy-stacker@0.7.0": {
+      "files": [
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+        },
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+        }
+      ],
+      "path_in_vcs": "stacker",
+      "repository": "https://github.com/quickwit-oss/tantivy",
+      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "tantivy-tokenizer-api@0.7.0": {
+      "files": [
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+        },
+        {
+          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+        }
+      ],
+      "path_in_vcs": "tokenizer-api",
+      "repository": "https://github.com/quickwit-oss/tantivy",
+      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "uuid-simd@0.8.0": {
+      "files": [
+        {
+          "path": "files/Nugine_simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+          "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d",
+          "source": "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE"
+        }
+      ],
+      "path_in_vcs": "crates/uuid-simd",
+      "repository": "https://github.com/Nugine/simd",
+      "revision": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "vsimd@0.8.0": {
+      "files": [
+        {
+          "path": "files/Nugine_simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+          "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d",
+          "source": "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE"
+        }
+      ],
+      "path_in_vcs": "crates/vsimd",
+      "repository": "https://github.com/Nugine/simd",
+      "revision": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "wtransport-proto@0.7.2": {
+      "files": [
+        {
+          "path": "files/BiagioFesta_wtransport/d022a6ad5f6260cb526e06d8ca42d09516ce6440/LICENSE-APACHE",
+          "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+          "source": "https://raw.githubusercontent.com/BiagioFesta/wtransport/d022a6ad5f6260cb526e06d8ca42d09516ce6440/LICENSE-APACHE"
+        },
+        {
+          "path": "files/BiagioFesta_wtransport/d022a6ad5f6260cb526e06d8ca42d09516ce6440/LICENSE-MIT",
+          "sha256": "2cd08fe6d90701192ea4a85e103a5e298c006975e8c4f4cd44decfde290837ca",
+          "source": "https://raw.githubusercontent.com/BiagioFesta/wtransport/d022a6ad5f6260cb526e06d8ca42d09516ce6440/LICENSE-MIT"
+        }
+      ],
+      "path_in_vcs": "wtransport-proto",
+      "repository": "https://github.com/BiagioFesta/wtransport",
+      "revision": "d022a6ad5f6260cb526e06d8ca42d09516ce6440",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    },
+    "wtransport@0.7.2": {
+      "files": [
+        {
+          "path": "files/BiagioFesta_wtransport/d022a6ad5f6260cb526e06d8ca42d09516ce6440/LICENSE-APACHE",
+          "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+          "source": "https://raw.githubusercontent.com/BiagioFesta/wtransport/d022a6ad5f6260cb526e06d8ca42d09516ce6440/LICENSE-APACHE"
+        },
+        {
+          "path": "files/BiagioFesta_wtransport/d022a6ad5f6260cb526e06d8ca42d09516ce6440/LICENSE-MIT",
+          "sha256": "2cd08fe6d90701192ea4a85e103a5e298c006975e8c4f4cd44decfde290837ca",
+          "source": "https://raw.githubusercontent.com/BiagioFesta/wtransport/d022a6ad5f6260cb526e06d8ca42d09516ce6440/LICENSE-MIT"
+        }
+      ],
+      "path_in_vcs": "wtransport",
+      "repository": "https://github.com/BiagioFesta/wtransport",
+      "revision": "d022a6ad5f6260cb526e06d8ca42d09516ce6440",
+      "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
+    }
+  },
+  "version": 1
+}
