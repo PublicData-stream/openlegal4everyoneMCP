@@ -42,23 +42,41 @@ cp test-support/snapshot-packages/{server.mjs,client.sh} scripts/install-snapsho
 docker network create --internal "$network" >/dev/null
 docker volume create "$volume" >/dev/null
 # Stream only runtime inputs; remote/rootless daemons need no host bind mounts.
-tar -C "$fixture" -cf - repository ca.crt server.key fixture.gpg server.mjs client.sh install-snapshot-packages.sh |
-    docker run --pull never --rm -i --network none --mount "type=volume,source=$volume,target=/fixture" \
-        --entrypoint tar "$node_image" -xf - -C /fixture
+# Deliberately use a nonroot archive owner so root-run tests also cover CI ownership.
+tar --owner=1001 --group=1001 --numeric-owner -C "$fixture" -cf - \
+    repository ca.crt server.key fixture.gpg server.mjs client.sh install-snapshot-packages.sh |
+    docker run --pull never --rm -i --user 0:0 --network none \
+        --mount "type=volume,source=$volume,target=/fixture" \
+        --entrypoint sh "$node_image" -ec '
+            tar --no-same-owner -xf - -C /fixture
+            test "$(stat -c "%u:%g:%a" /fixture/server.key)" = 0:0:600
+        '
+
+origin_failed() {
+    echo "Fixture origin failed to start: scenario=$scenario: $1" >&2
+    docker inspect --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' \
+        "$server" >&2 || true
+    docker logs "$server" >&2 || true
+    exit 1
+}
 
 for scenario in "${scenarios[@]}"; do
     echo "Testing snapshot packages: $scenario"
-    docker run --pull never -d --name "$server" --network "$network" \
+    docker run --pull never -d --user 0:0 --name "$server" --network "$network" \
         --network-alias snapshot.debian.org --read-only --cap-drop ALL --cap-add NET_BIND_SERVICE \
         --security-opt no-new-privileges --memory 256m --pids-limit 64 --tmpfs /tmp:rw,size=16m \
         --mount "type=volume,source=$volume,target=/fixture,readonly" --env "SCENARIO=$scenario" \
         --entrypoint node "$node_image" /fixture/server.mjs >/dev/null
     ready=false
     for ((attempt = 0; attempt < 30; attempt++)); do
-        if docker exec "$server" test -f /tmp/ready; then ready=true; break; fi
+        if docker exec "$server" test -f /tmp/ready 2>/dev/null; then ready=true; break; fi
+        if ! running=$(docker inspect --format '{{.State.Running}}' "$server"); then
+            origin_failed 'container state unavailable'
+        fi
+        if [[ "$running" != true ]]; then origin_failed 'container stopped'; fi
         sleep 1
     done
-    if [[ "$ready" != true ]]; then docker logs "$server"; echo 'Fixture origin failed to start' >&2; exit 1; fi
+    if [[ "$ready" != true ]]; then origin_failed 'readiness timeout'; fi
     if ! docker run --pull never --rm --name "$client" --network "$network" \
         --security-opt no-new-privileges --memory 512m --pids-limit 128 \
         --mount "type=volume,source=$volume,target=/fixture,readonly" \

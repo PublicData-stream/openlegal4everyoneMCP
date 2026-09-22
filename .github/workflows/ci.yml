@@ -131,6 +131,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Test snapshot fixture lifecycle
+        run: python3 -m unittest discover -s scripts/tests -p 'test_snapshot_packages.py'
       - name: Test bounded snapshot downloads and verification failures
         run: scripts/test-snapshot-packages.sh
   document-worker:
