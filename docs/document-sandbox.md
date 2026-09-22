@@ -20,6 +20,25 @@ an explicit context and namespace, and an image pinned by SHA-256 digest. There 
 no ambient-context or mutable-image fallback. Configure one controller process;
 the namespace quota additionally limits live Pods to two across controller crashes.
 
+Each `kubectl` subprocess starts with a cleared environment and only fixed
+`PATH=/usr/local/bin:/usr/bin:/bin`, `HOME=/tmp` and `TMPDIR=/tmp`. This includes
+cleanup commands. Provider/database credentials, proxy settings, `KUBECONFIG`
+and credential-plugin environment variables are not inherited. Explicit kubeconfig,
+context and namespace arguments remain required; authentication configurations
+that depended on inherited environment variables must be changed by the operator.
+The discovery cache is explicitly `/tmp/openlegal-kubectl-cache`. Provide writable,
+bounded temporary storage at `/tmp` when using a read-only controller root.
+
+The opt-in [Kubernetes deployment](deployment-kubernetes.md) preserves this
+configuration contract using a dedicated read-only kubeconfig and projected
+ServiceAccount identity. The kubeconfig references the rotating token through
+`tokenFile` and the cluster CA through `certificate-authority`, both at explicit
+absolute paths. Mount the projected identity directory without `subPath` so token
+rotation remains visible. Parser Pods never receive these controller mounts.
+The controller identity is bound only to the existing namespaced Role; the
+acceptance harness uses a separately authorized operator identity because its
+NetworkPolicy and log checks require permissions beyond that Role.
+
 The application supplies a typed format, at most 100 MiB of already fetched source
 bytes, their SHA-256, and the OCR choice. A fixed `kubectl exec -i` invocation runs
 `/usr/local/bin/openlegal-document-worker --process`. The input is a four-byte

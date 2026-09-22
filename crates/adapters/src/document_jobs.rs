@@ -78,6 +78,12 @@ impl KubernetesDocumentProcessor {
     fn command(&self) -> Command {
         let mut command = Command::new(&self.kubectl);
         command
+            // The trusted adapter needs only explicit file-backed credentials;
+            // never pass server secrets, proxies or ambient kubectl settings.
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", "/tmp")
+            .env("TMPDIR", "/tmp")
             .args(["--kubeconfig"])
             .arg(&self.kubeconfig)
             .args([
@@ -86,6 +92,7 @@ impl KubernetesDocumentProcessor {
                 "--namespace",
                 &self.namespace,
                 "--request-timeout=30s",
+                "--cache-dir=/tmp/openlegal-kubectl-cache",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -417,9 +424,20 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let executable = directory.join("kubectl");
         let script = r#"#!/usr/bin/python3
-import sys,json,pathlib,struct,time
+import sys,json,pathlib,struct,time,os
 root=pathlib.Path(@ROOT@)
 args=sys.argv[1:]
+assert args[:8] == ['--kubeconfig',str(root/'kubeconfig'),'--context','fixture',
+                    '--namespace','documents','--request-timeout=30s',
+                    '--cache-dir=/tmp/openlegal-kubectl-cache']
+assert os.environ['PATH'] == '/usr/local/bin:/usr/bin:/bin'
+assert os.environ['HOME'] == os.environ['TMPDIR'] == '/tmp'
+for key in ['OPENLEGAL_LAW_PROVIDER_CREDENTIAL','OPENLEGAL_DATABASE_URL',
+            'KUBECONFIG','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY',
+            'http_proxy','https_proxy','all_proxy','no_proxy','OPENLEGAL_CONTROLLER_ENV_TEST']:
+    assert key not in os.environ
+with (root/'commands').open('a') as log:
+    log.write(json.dumps(args[8:])+'\n')
 if 'get' in args:
     spec={'hard':{'pods':'2'}}
     if @MODE@ == 'scoped': spec['scopes']=['BestEffort']
@@ -430,6 +448,12 @@ elif 'create' in args:
     (root/'created').write_text('yes')
     pod=json.load(sys.stdin)
     assert pod['spec']['hostUsers'] is False
+    assert pod['spec']['automountServiceAccountToken'] is False
+    assert pod['spec']['volumes'] == [{'name':'scratch','emptyDir':{'sizeLimit':'2Gi'}}]
+    assert pod['spec']['containers'][0]['volumeMounts'] == [{'name':'scratch','mountPath':'/scratch'}]
+    assert pod['spec']['containers'][0]['env'] == [
+        {'name':'TMPDIR','value':'/scratch'}, {'name':'TESSDATA_PREFIX','value':'/opt/tessdata'},
+        {'name':'OMP_THREAD_LIMIT','value':'2'}, {'name':'RAYON_NUM_THREADS','value':'2'}]
     assert pod['spec']['containers'][0]['securityContext']['readOnlyRootFilesystem']
 elif 'exec' in args:
     data=sys.stdin.buffer.read()
@@ -470,6 +494,75 @@ elif 'delete' in args:
             format: openlegal_application::document::DocumentFormat::Xml,
             ocr: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn controller_subprocess_environment_is_isolated() {
+        const CHILD: &str = "OPENLEGAL_CONTROLLER_ENV_TEST";
+        const INJECTED: &[&str] = &[
+            "OPENLEGAL_LAW_PROVIDER_CREDENTIAL",
+            "OPENLEGAL_DATABASE_URL",
+            "KUBECONFIG",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ];
+        if std::env::var_os(CHILD).is_none() {
+            // Inject into a separate test process; never mutate the concurrent
+            // test runner's global environment (which would require unsafe Rust).
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "document_jobs::tests::controller_subprocess_environment_is_isolated",
+                    "--nocapture",
+                ])
+                .env(CHILD, "child")
+                .env("HOME", "/ambient-home-must-not-be-used")
+                .envs(
+                    INJECTED
+                        .iter()
+                        .map(|name| (*name, "synthetic-private-value")),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for name in INJECTED {
+            assert_eq!(std::env::var(name).unwrap(), "synthetic-private-value");
+        }
+        let _guard = SERIAL.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let processor = fixture_controller(directory.path(), "valid");
+        let result = processor
+            .process(fixture_input(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.text, "fixture");
+        let commands = std::fs::read_to_string(directory.path().join("commands")).unwrap();
+        let commands: Vec<Vec<String>> = commands
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|args| args[0].as_str())
+                .collect::<Vec<_>>(),
+            ["get", "create", "wait", "exec", "delete"]
+        );
+        assert!(directory.path().join("deleted").is_file());
     }
 
     #[cfg(unix)]
