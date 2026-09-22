@@ -6,7 +6,9 @@ read-only; the built-in text comparison feature additionally permits deletion of
 a temporary result using its bearer handle. Both adapters
 are required by the production binary. An explicitly configured synthetic provider,
 shared memory retrieval cache, progress notifications, and React MCP Apps widget
-extend this foundation. No real legal provider, user account, or deployment is implemented.
+extend this foundation. The optional legal corpus and LAW OPEN DATA adapter have
+offline fixtures; live-provider acceptance, hardened-cluster acceptance and
+production deployment remain pending. User accounts remain unimplemented.
 
 ## Configure and run
 

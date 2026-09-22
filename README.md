@@ -57,8 +57,9 @@ dictionary; see [corpus setup and index upgrades](docs/database.md#operator-conf
 
 - [Contributing](CONTRIBUTING.md): workflow, checks, security engineering, and review.
 - [Agent orientation](AGENTS.md): where coding agents should begin.
-- [Architecture](docs/architecture.md): implemented server and planned legal-data layers.
+- [Architecture](docs/architecture.md): server, legal-data and document-processing responsibilities.
 - [Server contract](docs/server.md): configuration, extension API and transport behavior.
+- [Kubernetes deployment design](docs/deployment-kubernetes.md): verified baseline, selected topology and operator boundaries; production artifacts remain planned.
 - [Dependencies](docs/dependencies.md): admission rationale and check tooling.
 - [Retrieval framework](docs/retrieval.md): processors, caching, evidence and resource limits.
 - [Search-query syntax](docs/search-query.md): standalone parser, operators, diagnostics, and bounds.

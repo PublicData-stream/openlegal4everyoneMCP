@@ -7,11 +7,13 @@ product. It is intended to provide open legal-information infrastructure through
 a Rust backend, hosted MCP, and potentially a public HTTP API.
 
 The repository implements a Rust server in `apps/server`, shared retrieval/cache
-services and compiled payload processors in `crates`, and React MCP Apps for synthetic records and Rust text comparison in
-`apps/widget`. Streamable HTTP and native WebTransport share tools and progress.
-Only fictional upstream data is integrated; legal providers and deployment remain planned.
+services and compiled payload processors in `crates`, and React MCP Apps for synthetic
+records, Rust text comparison and the optional legal corpus in `apps/widget`.
+Streamable HTTP and native WebTransport share tools and progress. The opt-in LAW
+OPEN DATA adapter and disposable document worker have offline fixtures; live-provider
+acceptance, hardened-cluster acceptance and production deployment remain pending.
 Verify the checkout before acting. The [architecture](docs/architecture.md) separates
-implemented serving responsibilities from the future legal-data layers; the
+serving, legal-data and document-processing responsibilities; the
 [server contract](docs/server.md) documents extensions, configuration and transports.
 
 ## Authoritative guidance

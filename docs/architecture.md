@@ -29,12 +29,13 @@ and exact quoted source matching; synthetic search retains its separate semantic
 ## Responsibility map
 
 The server, domain, normalization, application, and adapters contain working
-implementations. Their initial data model is explicitly synthetic; it does not
-preempt future evidence-backed legal mappings. The CLI remains planned.
+implementations. Synthetic retrieval and the optional legal corpus have separate
+models; live-provider acceptance remains a separate gate. A standalone CLI remains
+planned; the server binary already provides storage administration commands.
 
 | Component | Responsibility | Project dependencies |
 | --- | --- | --- |
-| `crates/domain` | Synthetic record/query types, search-syntax expressions, supplied-text comparison contracts, provenance, freshness and errors; legal models remain future work | No other project layer |
+| `crates/domain` | Synthetic record/query types, legal identity/revision/capture models, search-syntax expressions, supplied-text comparison contracts, provenance, freshness and errors | No other project layer |
 | `crates/normalization` | Pure parsing, search-query syntax processing, and provider-specific normalization modules | Domain |
 | `crates/application` | Retrieval use cases and supplied-text comparisons; freshness, refresh, coalescing, retention and budgets; operation interfaces | Domain |
 | `crates/adapters` | Separate modules for upstream HTTP, cache storage, and bounded Rust comparison workers | Application interfaces, domain, normalization |
