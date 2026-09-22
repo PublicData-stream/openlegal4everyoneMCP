@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Offline serving-template invariants; not Kubernetes schema/cluster validation."""
+"""Offline serving/admin invariants; not Kubernetes schema/cluster validation."""
 
 import argparse
+import copy
 import re
 import sys
 import tomllib
@@ -65,6 +66,11 @@ def load_documents(text):
 
 
 STORAGE = ("cache-blobs", "corpus-blobs", "corpus-index", "mecab-ko-dictionary")
+ADMIN = {
+    "migrate": ("--migrate", 600, ()),
+    "maintain": ("--maintain", 300, ("cache-blobs",)),
+    "rebuild": ("--rebuild-corpus-index", 86400, STORAGE),
+}
 
 
 def claim_name(volume):
@@ -240,10 +246,57 @@ def validate(documents, profile="retained"):
     return raw
 
 
+def validate_admin(documents, serving_documents, operation):
+    """Check a separately rendered Job against the validated serving revision."""
+    require(operation in ADMIN, "unsupported administration operation")
+    validate(serving_documents)
+    require(isinstance(documents, list) and len(documents) == 2,
+            "administration root must contain only its Job and shared ConfigMap")
+    objects = {}
+    for obj in documents:
+        require(isinstance(obj, dict), "administration document must be a mapping")
+        kind = obj.get("kind")
+        require(isinstance(kind, str) and kind not in objects, "duplicate/missing admin kind")
+        objects[kind] = obj
+    keys(objects, ("ConfigMap", "Job"), "administration objects")
+    serving = {obj["kind"]: obj for obj in serving_documents}
+    equal(objects["ConfigMap"], serving["ConfigMap"], "shared admin ConfigMap")
+    command, deadline, storage = ADMIN[operation]
+    pod = copy.deepcopy(serving["Deployment"]["spec"]["template"]["spec"])
+    pod["restartPolicy"] = "Never"
+    container = pod["containers"][0]
+    for field in ("ports", "startupProbe", "livenessProbe", "readinessProbe"):
+        del container[field]
+    container["args"] = [command, "/etc/openlegal/server.toml"]
+    if operation == "migrate":
+        container["env"] = [{"name": "OPENLEGAL_MIGRATION_DATABASE_URL", "valueFrom": {
+            "secretKeyRef": {"name": "openlegal-migration-db", "key": "OPENLEGAL_MIGRATION_DATABASE_URL"}}}]
+    if operation != "rebuild":
+        container["resources"] = {"requests": {"cpu": "100m", "memory": "128Mi"},
+                                  "limits": {"cpu": "1", "memory": "512Mi"}}
+    allowed = ("config", "postgres-ca", *storage)
+    container["volumeMounts"] = [mount for mount in container["volumeMounts"] if mount["name"] in allowed]
+    pod["volumes"] = [volume for volume in pod["volumes"] if volume["name"] in allowed]
+    if operation == "rebuild":
+        index = next(volume for volume in pod["volumes"] if volume["name"] == "corpus-index")
+        index["persistentVolumeClaim"]["claimName"] = "openlegal-corpus-index-rebuild"
+    expected = {
+        "apiVersion": "batch/v1", "kind": "Job",
+        "metadata": {"name": f"openlegal-{operation}", "namespace": "openlegal-serving"},
+        "spec": {"suspend": True, "parallelism": 1, "completions": 1, "backoffLimit": 0,
+                 "podReplacementPolicy": "Failed", "activeDeadlineSeconds": deadline,
+                 "template": {"metadata": {"labels": {"app.kubernetes.io/name": "openlegal-admin",
+                                                        "app.kubernetes.io/component": operation}},
+                              "spec": pod}},
+    }
+    equal(objects["Job"], expected, f"{operation} Job")
+    return objects["ConfigMap"]["data"]["server.toml"]
+
+
 def validate_storage(documents):
     """Validate unconfigured operator examples, never actual cluster state."""
-    require(isinstance(documents, list) and len(documents) == 9,
-            "expected one StorageClass, four reserved PVs and four PVCs")
+    require(isinstance(documents, list) and len(documents) == 11,
+            "expected one StorageClass, five reserved PVs and five PVCs including fresh rebuild storage")
     objects = {}
     for obj in documents:
         require(isinstance(obj, dict) and isinstance(obj.get("metadata"), dict), "storage object must have metadata")
@@ -260,7 +313,7 @@ def validate_storage(documents):
             "reclaimPolicy": "Retain",
         }
     }
-    for volume in STORAGE:
+    for volume in (*STORAGE, "corpus-index-rebuild"):
         name = claim_name(volume)
         placeholder = name.removeprefix("openlegal-").upper().replace("-", "_")
         capacity = f"REPLACE_WITH_{placeholder}_CAPACITY"
@@ -356,10 +409,19 @@ def main():
     parser.add_argument("--profile", choices=("retained", "text-only"), default="retained")
     parser.add_argument("--storage-manifest", type=Path)
     parser.add_argument("--oxibelt-config", type=Path)
+    parser.add_argument("--admin-manifest", action="append", default=[], metavar="OPERATION=FILE")
     args = parser.parse_args()
     try:
         documents = load_documents(args.manifest.read_text())
         raw = validate(documents, args.profile)
+        seen = set()
+        for admin in args.admin_manifest:
+            require(args.profile == "retained", "administration requires retained serving profile")
+            operation, separator, path = admin.partition("=")
+            require(separator and path and operation in ADMIN and operation not in seen,
+                    "admin manifest must be a unique migrate|maintain|rebuild=FILE")
+            seen.add(operation)
+            validate_admin(load_documents(Path(path).read_text()), documents, operation)
         if args.oxibelt_config:
             require(args.profile == "retained", "OxiBelt handoff requires retained profile")
             service = next(obj for obj in documents if obj["kind"] == "Service")
@@ -369,8 +431,8 @@ def main():
         if args.config_output:
             args.config_output.write_text(raw)
     except (ValidationError, yaml.YAMLError, tomllib.TOMLDecodeError, OSError, ValueError) as error:
-        parser.exit(1, f"Serving template validation failed: {error}\n")
-    print("Serving template invariants passed (offline; no Kubernetes API admission or cluster acceptance).")
+        parser.exit(1, f"Deployment template validation failed: {error}\n")
+    print("Deployment template invariants passed (offline; no Kubernetes API admission or cluster acceptance).")
 
 
 if __name__ == "__main__":

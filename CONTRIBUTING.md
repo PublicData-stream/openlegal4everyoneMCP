@@ -231,9 +231,13 @@ without cluster access. It checks rendered project invariants, not Kubernetes AP
 schema admission. A dedicated CI job runs the same gate; both native image jobs
 provision these tools and consume both rendered profiles. The manifest gate defaults
 to retained; also run `scripts/test-kubernetes-serving.sh --profile text-only` to
-validate the separate fixture. It checks the separately applied Local PV/PVC
-examples as well. Run both image platforms when changing the serving configuration,
-container contract or image smoke harness. Retained deployment/storage changes
+validate the separate fixture. Every invocation also validates all three suspended
+administrative Job roots, shared configuration/image identity, and separately
+applied Local PV/PVC examples, including fresh rebuild storage. Administrative
+command or mount changes require the PostgreSQL gate and both image platforms;
+the image gate exercises cache maintenance, fresh index rebuild and interruption
+recovery with disposable storage. Run both image platforms when changing the
+serving configuration, container contract or image smoke harness. Retained deployment/storage changes
 also require the Rust baseline, PostgreSQL, Korean tokenization and OxiBelt gates.
 Run `shellcheck` on changed shell scripts and `actionlint` when the workflow changes. Do not describe these checks as real-cluster acceptance.
 

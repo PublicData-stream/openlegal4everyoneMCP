@@ -1,0 +1,118 @@
+# Kubernetes 1.34+. Apply suspended, verify shutdown/inputs, then explicitly resume.
+# Resource budgets are provisional; this Job does not guarantee exactly-once execution.
+# Every attempt needs a fresh destination; preserve the old index unmounted.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openlegal-rebuild
+spec:
+  suspend: true
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  podReplacementPolicy: Failed
+  activeDeadlineSeconds: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openlegal-admin
+        app.kubernetes.io/component: rebuild
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        kubernetes.io/os: linux
+        openlegal.server/ready: 'true'
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - amd64
+                      - arm64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10004
+        runAsGroup: 10004
+        fsGroup: 10004
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: server
+          image: registry.example/openlegal-server@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args:
+            - --rebuild-corpus-index
+            - /etc/openlegal/server.toml
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: OPENLEGAL_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: openlegal-runtime-db
+                  key: OPENLEGAL_DATABASE_URL
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/openlegal
+              readOnly: true
+            - name: postgres-ca
+              mountPath: /run/secrets/postgres-ca
+              readOnly: true
+            - name: cache-blobs
+              mountPath: /var/lib/openlegal/cache-blobs
+              readOnly: false
+            - name: corpus-blobs
+              mountPath: /var/lib/openlegal/corpus-blobs
+              readOnly: false
+            - name: corpus-index
+              mountPath: /var/lib/openlegal/corpus-index
+              readOnly: false
+            - name: mecab-ko-dictionary
+              mountPath: /var/lib/openlegal/mecab-ko-dictionary
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: openlegal-server-config
+            defaultMode: 0444
+        - name: postgres-ca
+          secret:
+            secretName: openlegal-postgres-ca
+            defaultMode: 0440
+            items:
+              - key: ca.crt
+                path: ca.crt
+        - name: cache-blobs
+          persistentVolumeClaim:
+            claimName: openlegal-cache-blobs
+            readOnly: false
+        - name: corpus-blobs
+          persistentVolumeClaim:
+            claimName: openlegal-corpus-blobs
+            readOnly: false
+        - name: corpus-index
+          persistentVolumeClaim:
+            claimName: openlegal-corpus-index-rebuild
+            readOnly: false
+        - name: mecab-ko-dictionary
+          persistentVolumeClaim:
+            claimName: openlegal-mecab-dictionary
+            readOnly: true
+      restartPolicy: Never

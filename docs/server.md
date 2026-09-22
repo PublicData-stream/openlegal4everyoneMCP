@@ -273,10 +273,12 @@ SQL migrations, retention and the storage failure/recovery lifecycle.
 Run `openlegal-server --migrate CONFIG.toml` with the separately configured migration
 credential before serving. Ordinary startup uses only the runtime credential and
 rejects unsupported PostgreSQL versions or missing, pending or changed migrations.
-Run `openlegal-server --maintain CONFIG.toml` for explicit bounded retention pruning,
+Run `openlegal-server --maintain CONFIG.toml` for explicit bounded cache retention pruning,
 including after lowering limits below retained totals. Both commands finish without
 opening listeners or initializing retrieval, widgets or text-comparison workers.
-There is intentionally no conversion of old filesystem cache data.
+The [Kubernetes administration runbook](deployment-kubernetes.md#administrative-jobs)
+provides separate suspended Jobs and offline execution windows. There is intentionally
+no conversion of old filesystem cache data.
 
 Startup verifies PostgreSQL and blob health before listener admission. A runtime
 storage outage makes `/ready` return 503 and rejects persistent retrieval, including

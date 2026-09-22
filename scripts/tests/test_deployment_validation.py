@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from deployment_validation import ValidationError, load_documents, validate, validate_oxibelt, validate_storage
+from deployment_validation import ValidationError, load_documents, validate, validate_admin, validate_oxibelt, validate_storage
 
 
 class ServingValidationTests(unittest.TestCase):
@@ -19,6 +19,9 @@ class ServingValidationTests(unittest.TestCase):
         cls.text_only = load_documents(Path(os.environ["OPENLEGAL_RENDERED_TEXT_ONLY"]).read_text())
         cls.storage = load_documents(Path(os.environ["OPENLEGAL_STORAGE_EXAMPLES"]).read_text())
         cls.oxibelt = Path(os.environ["OPENLEGAL_OXIBELT_EXAMPLE"]).read_text()
+        cls.admin = {operation: load_documents((Path(os.environ["OPENLEGAL_RENDERED_ADMIN_DIR"])
+                                               / f"{operation}.yaml").read_text())
+                     for operation in ("migrate", "maintain", "rebuild")}
 
     def setUp(self):
         self.docs = copy.deepcopy(self.documents)
@@ -268,6 +271,125 @@ class ServingValidationTests(unittest.TestCase):
         for docs in ([], [None, {}, {}], [{"kind": []}, {}, {}]):
             with self.subTest(docs=docs), self.assertRaises(ValidationError):
                 validate(docs)
+
+    def test_admin_roots_share_config_image_and_exclude_serving(self):
+        for operation, documents in self.admin.items():
+            with self.subTest(operation=operation):
+                self.assertEqual(validate_admin(documents, self.docs, operation),
+                                 self.objects["ConfigMap"]["data"]["server.toml"])
+                job = next(obj for obj in documents if obj["kind"] == "Job")
+                labels = job["spec"]["template"]["metadata"]["labels"]
+                selector = self.objects["Service"]["spec"]["selector"]
+                self.assertFalse(all(labels.get(key) == value for key, value in selector.items()))
+                with self.assertRaises(ValidationError):
+                    validate(self.docs + [job])
+                with self.assertRaises(ValidationError):
+                    validate_admin(documents + [self.objects["Deployment"]], self.docs, operation)
+        published = "ghcr.io/example/server@sha256:" + "abcde012" * 8
+        self.container["image"] = published
+        for operation, documents in self.admin.items():
+            docs = copy.deepcopy(documents)
+            with self.assertRaises(ValidationError):
+                validate_admin(docs, self.docs, operation)
+            next(obj for obj in docs if obj["kind"] == "Job")["spec"]["template"]["spec"]["containers"][0]["image"] = published
+            validate_admin(docs, self.docs, operation)
+
+    def test_admin_rejects_automatic_retries_privilege_and_extra_execution(self):
+        for operation, documents in self.admin.items():
+            docs = copy.deepcopy(documents)
+            job = next(obj for obj in docs if obj["kind"] == "Job")
+            spec = job["spec"]
+            template = spec["template"]
+            pod = template["spec"]
+            container = pod["containers"][0]
+            cases = (
+                (spec, "suspend", False), (spec, "backoffLimit", 1),
+                (spec, "parallelism", 2), (spec, "completions", True),
+                (spec, "podReplacementPolicy", "TerminatingOrFailed"),
+                (spec, "activeDeadlineSeconds", 0), (spec, "ttlSecondsAfterFinished", 10),
+                (pod, "restartPolicy", "OnFailure"),
+                (pod, "automountServiceAccountToken", True), (pod, "enableServiceLinks", True),
+                (pod, "hostNetwork", True), (pod, "initContainers", [{"name": "extra"}]),
+                (pod["nodeSelector"], "openlegal.server/ready", "false"),
+                (pod["securityContext"], "runAsUser", 0),
+                (pod["securityContext"], "fsGroupChangePolicy", "Always"),
+                (pod["securityContext"], "seccompProfile", {"type": "Unconfined"}),
+                (template["metadata"], "labels", {"app.kubernetes.io/name": "openlegal-server"}),
+                (container, "command", ["/bin/sh"]), (container, "args", ["/etc/openlegal/server.toml"]),
+                (container, "ports", self.container["ports"]),
+                (container, "livenessProbe", self.container["livenessProbe"]),
+                (container, "envFrom", [{"secretRef": {"name": "provider"}}]),
+                (container["securityContext"], "allowPrivilegeEscalation", True),
+                (container["securityContext"], "readOnlyRootFilesystem", False),
+                (container["securityContext"], "capabilities", {"add": ["SYS_ADMIN"]}),
+                (container["resources"]["limits"], "memory", "16Mi"),
+                (container, "image", "example/server:latest"),
+            )
+            missing = object()
+            for mapping, key, value in cases:
+                original = mapping.get(key, missing)
+                with self.subTest(operation=operation, key=key):
+                    mapping[key] = value
+                    with self.assertRaises(ValidationError):
+                        validate_admin(docs, self.docs, operation)
+                if original is missing:
+                    del mapping[key]
+                else:
+                    mapping[key] = original
+
+    def test_admin_rejects_credential_mount_and_config_drift(self):
+        for operation, documents in self.admin.items():
+            docs = copy.deepcopy(documents)
+            pod = next(obj for obj in docs if obj["kind"] == "Job")["spec"]["template"]["spec"]
+            container = pod["containers"][0]
+            original = copy.deepcopy(container["env"])
+            wrong = "OPENLEGAL_DATABASE_URL" if operation == "migrate" else "OPENLEGAL_MIGRATION_DATABASE_URL"
+            for env in ([], [{"name": wrong, "value": "postgres://inline-secret"}],
+                        original + [{"name": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "value": "provider"}]):
+                with self.subTest(operation=operation, env=env):
+                    container["env"] = env
+                    with self.assertRaises(ValidationError):
+                        validate_admin(docs, self.docs, operation)
+            container["env"] = original
+            for volume in ({"name": "backend-tls", "secret": {"secretName": "openlegal-backend-tls"}},
+                           {"name": "tmp", "emptyDir": {}},
+                           {"name": "old-index", "persistentVolumeClaim": {"claimName": "openlegal-corpus-index"}}):
+                with self.subTest(operation=operation, volume=volume):
+                    pod["volumes"].append(volume)
+                    with self.assertRaises(ValidationError):
+                        validate_admin(docs, self.docs, operation)
+                    pod["volumes"].pop()
+            for mount in container["volumeMounts"]:
+                mount["readOnly"] = not mount["readOnly"]
+                with self.subTest(operation=operation, mount=mount["name"]), self.assertRaises(ValidationError):
+                    validate_admin(docs, self.docs, operation)
+                mount["readOnly"] = not mount["readOnly"]
+            cm = next(obj for obj in docs if obj["kind"] == "ConfigMap")
+            cm["data"]["server.toml"] += "\n# stale configuration\n"
+            with self.assertRaises(ValidationError):
+                validate_admin(docs, self.docs, operation)
+
+    def test_rebuild_rejects_old_or_incompatible_destination(self):
+        docs = copy.deepcopy(self.admin["rebuild"])
+        pod = next(obj for obj in docs if obj["kind"] == "Job")["spec"]["template"]["spec"]
+        index = next(volume for volume in pod["volumes"] if volume["name"] == "corpus-index")
+        index["persistentVolumeClaim"]["claimName"] = "openlegal-corpus-index"
+        with self.assertRaises(ValidationError):
+            validate_admin(docs, self.docs, "rebuild")
+        for kind, path, value in (
+            ("PersistentVolume", ("spec", "local", "path"), "/REPLACE_WITH_CORPUS_INDEX_HOST_PATH"),
+            ("PersistentVolume", ("spec", "nodeAffinity"), {}),
+            ("PersistentVolume", ("spec", "persistentVolumeReclaimPolicy"), "Delete"),
+            ("PersistentVolumeClaim", ("spec", "volumeName"), "openlegal-corpus-index"),
+        ):
+            storage = copy.deepcopy(self.storage)
+            mapping = next(obj for obj in storage if obj["kind"] == kind
+                           and obj["metadata"]["name"] == "openlegal-corpus-index-rebuild")
+            for key in path[:-1]:
+                mapping = mapping[key]
+            mapping[path[-1]] = value
+            with self.subTest(kind=kind, path=path), self.assertRaises(ValidationError):
+                validate_storage(storage)
 
 
 if __name__ == "__main__":

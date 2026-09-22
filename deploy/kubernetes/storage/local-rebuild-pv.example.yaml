@@ -1,0 +1,27 @@
+# Apply separately for an offline rebuild; use a new name and distinct fresh host path
+# for each attempt. Keep the old index; prepare root:10004 2770 as documented.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: openlegal-corpus-index-rebuild
+spec:
+  capacity:
+    storage: REPLACE_WITH_CORPUS_INDEX_REBUILD_CAPACITY
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: openlegal-local
+  claimRef:
+    namespace: openlegal-serving
+    name: openlegal-corpus-index-rebuild
+  local:
+    path: /REPLACE_WITH_CORPUS_INDEX_REBUILD_HOST_PATH
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - REPLACE_WITH_STORAGE_NODE

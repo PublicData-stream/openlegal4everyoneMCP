@@ -3,6 +3,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 config_args=()
+admin_output_dir=
 profile=retained
 while (( $# )); do
     case "$1" in
@@ -14,7 +15,11 @@ while (( $# )); do
             [[ $# -ge 2 && -n $2 ]] || { echo '--config-output needs FILE' >&2; exit 2; }
             config_args=(--config-output "$2")
             shift 2 ;;
-        *) echo "usage: $0 [--profile retained|text-only] [--config-output FILE]" >&2; exit 2 ;;
+        --admin-output-dir)
+            [[ $# -ge 2 && -n $2 ]] || { echo '--admin-output-dir needs DIR' >&2; exit 2; }
+            admin_output_dir=$2
+            shift 2 ;;
+        *) echo "usage: $0 [--profile retained|text-only] [--config-output FILE] [--admin-output-dir DIR]" >&2; exit 2 ;;
     esac
 done
 case "$profile" in retained|text-only) ;; *) echo 'Invalid profile' >&2; exit 2 ;; esac
@@ -36,27 +41,41 @@ trap 'rm -rf "$scratch"' EXIT
 # Kustomize build is local: no cluster, credentials, discovery or API schema fetch.
 "$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/serving" > "$scratch/retained.yaml"
 "$tools_dir/bin/kubectl" kustomize "$repo/test-support/deployment/text-only" > "$scratch/text-only.yaml"
+admin_args=()
+for operation in migrate maintain rebuild; do
+    "$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/admin/$operation" > "$scratch/$operation.yaml"
+    admin_args+=(--admin-manifest "$operation=$scratch/$operation.yaml")
+done
 # Storage examples intentionally contain operator capacity placeholders and are
 # parsed directly, not passed to Kubernetes schema/admission or attached to serving.
-for example in storage-class local-pv local-pvc; do
+for example in storage-class local-pv local-pvc local-rebuild-pv local-rebuild-pvc; do
     printf '%s\n' '---' >> "$scratch/storage.yaml"
     cat "$repo/deploy/kubernetes/storage/$example.example.yaml" >> "$scratch/storage.yaml"
 done
 for checked_profile in retained text-only; do
     output_args=()
     edge_args=()
+    operation_args=()
     if [[ $checked_profile == retained ]]; then
         edge_args=(--oxibelt-config "$repo/deploy/oxibelt/kubernetes-upstream.example.toml")
+        operation_args=("${admin_args[@]}")
     fi
     if [[ $checked_profile == "$profile" ]]; then
         output_args=("${config_args[@]}")
     fi
     PYTHONDONTWRITEBYTECODE=1 "$tools_dir/bin/python" "$repo/scripts/deployment_validation.py" \
         "$scratch/$checked_profile.yaml" --profile "$checked_profile" \
-        --storage-manifest "$scratch/storage.yaml" "${edge_args[@]}" "${output_args[@]}"
+        --storage-manifest "$scratch/storage.yaml" "${edge_args[@]}" "${output_args[@]}" "${operation_args[@]}"
 done
 OPENLEGAL_RENDERED_SERVING="$scratch/retained.yaml" \
     OPENLEGAL_RENDERED_TEXT_ONLY="$scratch/text-only.yaml" \
     OPENLEGAL_STORAGE_EXAMPLES="$scratch/storage.yaml" PYTHONDONTWRITEBYTECODE=1 \
     OPENLEGAL_OXIBELT_EXAMPLE="$repo/deploy/oxibelt/kubernetes-upstream.example.toml" \
+    OPENLEGAL_RENDERED_ADMIN_DIR="$scratch" \
     "$tools_dir/bin/python" -m unittest discover -s "$repo/scripts/tests" -p test_deployment_validation.py
+if [[ -n $admin_output_dir ]]; then
+    mkdir -p "$admin_output_dir"
+    for operation in migrate maintain rebuild; do
+        cp "$scratch/$operation.yaml" "$admin_output_dir/$operation.yaml"
+    done
+fi

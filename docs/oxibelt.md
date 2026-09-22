@@ -155,7 +155,7 @@ The backend still listens on 8080/TCP and 4433/UDP. Kubernetes translates the
 NodePorts; it does not rewrite HTTP Host or WebTransport authority. Because
 `preserve_host = false`, the backend receives the upstream hostname and NodePort,
 not its Pod listener port. Replace both existing authority placeholders in the
-[serving configuration](../deploy/kubernetes/serving/server.toml) accordingly.
+[serving configuration](../deploy/kubernetes/config/server.toml) accordingly.
 Caller Origin must pass through unchanged. Retain HTTP/1 upstream forwarding,
 HTTP/3 WebTransport, the 16 MiB HTTP request limit, streaming request/response
 bodies, disabled caching/compression and the example's connection/request/idle

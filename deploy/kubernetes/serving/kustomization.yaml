@@ -5,8 +5,4 @@ resources:
   - namespace.yaml
   - deployment.yaml
   - service.yaml
-configMapGenerator:
-  - name: openlegal-server-config
-    files:
-      - server.toml
-# Keep the content hash: config changes must replace the Pod through Recreate.
+  - ../config

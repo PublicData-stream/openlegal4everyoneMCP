@@ -5,7 +5,7 @@ use openlegal_server::config::{AccessPolicy, CacheConfig, Config};
 fn template() -> String {
     match std::env::var_os("OPENLEGAL_RENDERED_CONFIG") {
         Some(path) => std::fs::read_to_string(path).expect("rendered deployment configuration"),
-        None => include_str!("../../../deploy/kubernetes/serving/server.toml").into(),
+        None => include_str!("../../../deploy/kubernetes/config/server.toml").into(),
     }
 }
 

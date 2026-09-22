@@ -8,9 +8,10 @@ amd64/ARM64 CI jobs. Phase 2 established hardened text-only serving and offline
 manifest checks. Phase 3 makes retained-corpus serving the default template, adds
 operator-managed storage examples and extends image acceptance to retained data.
 Phase 4 adds the TCP/UDP NodePort Service and a tested OxiBelt handoff example.
-The text-only profile remains a separate test fixture without a Service.
-NetworkPolicy, migration Jobs, ingestion integration and complete production
-runbooks remain planned. This document does not establish a running deployment
+Phase 5 adds suspended migration, cache-maintenance and offline index-rebuild Jobs
+with separate credentials and an operator-controlled maintenance window. The
+text-only profile remains a separate test fixture without a Service. NetworkPolicy,
+ingestion integration and complete production acceptance remain planned. This document does not establish a running deployment
 or successful real-cluster, live-provider, browser WebTransport or ChatGPT acceptance.
 
 The original Phase 0 inventory was recorded on `main` at
@@ -38,6 +39,9 @@ as normal startup errors instead of panicking in the TLS dependency. Valid TLS
 configuration retains ring, TLS 1.3, WebTransport ALPN and existing QUIC limits.
 Phase 3 preserves Rust configuration types and MCP schemas; its default template
 now requires migrated PostgreSQL, prepared storage and a provisioned dictionary.
+Phase 5 preserves production Rust behavior and the configuration contents; serving
+and administration import the same content-hashed ConfigMap from the
+[shared configuration base](../deploy/kubernetes/config/).
 
 ## Production server image
 
@@ -186,17 +190,16 @@ retention maintenance. The former text-only configuration is now a
   generic CPU baseline. The label is an operator assertion, not auto-detection.
 - Provision PostgreSQL 18, distinct migration/runtime roles, grants and verified
   TLS according to [persistence](persistence.md#configuration-and-startup). Ordinary
-  startup never migrates. Before serving, run the existing
-  `openlegal-server --migrate CONFIG.toml` command in an operator-controlled
-  environment with only `OPENLEGAL_MIGRATION_DATABASE_URL` and the CA available.
-  A Kubernetes migration Job is a later phase. The serving configuration names
-  that variable but the serving Deployment must never inject its credential.
+  startup never migrates. Complete the [migration Job](#administrative-jobs) before
+  serving. The serving configuration names `OPENLEGAL_MIGRATION_DATABASE_URL`,
+  but the serving Deployment must never inject its credential.
 - Create namespace `openlegal-serving` and the following operator-managed Secrets.
   Keep values and private keys outside Git, images, command histories and logs.
 
 | Secret | Required keys | Serving access |
 | --- | --- | --- |
 | `openlegal-runtime-db` | `OPENLEGAL_DATABASE_URL` | Individual `secretKeyRef` into the runtime environment |
+| `openlegal-migration-db` | `OPENLEGAL_MIGRATION_DATABASE_URL` | None; migration Job only |
 | `openlegal-backend-tls` | `tls.crt`, `tls.key` | Read-only `/run/secrets/backend-tls`, mode `0440` |
 | `openlegal-postgres-ca` | `ca.crt` | Read-only `/run/secrets/postgres-ca/ca.crt`, mode `0440` |
 
@@ -289,8 +292,13 @@ follow the documented monotonic acknowledgment/rebuild constraints.
 Use an operator-owned copy/overlay, render it before applying, and select an explicit
 kubeconfig/context for every cluster command. Create the namespace, Secrets and
 prepared storage first, establish the NodePort firewall restrictions below, and
-require migration success before starting the Deployment.
-For example, after all placeholders and prerequisites have been resolved:
+require migration success before starting the Deployment. On first installation,
+create the namespace from `serving/namespace.yaml` separately; applying the serving
+Kustomization creates a one-replica Deployment immediately. Follow the
+[administration sequence](#administrative-jobs) before the example below. On an
+upgrade, keep the operator serving overlay at zero replicas until administration
+has succeeded. For example, after all placeholders and prerequisites have been
+resolved and the selected administrative Jobs have completed:
 
 ```sh
 kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT \
@@ -408,6 +416,11 @@ serving and three for text-only, and checks the Service port/selector contract
 against the OxiBelt example. It rejects serving migration/provider
 credentials, inline connection URLs, insecure TLS, overlapping storage paths,
 reused claims, writable dictionaries, missing ownership policy and mutable images.
+Every invocation also renders the three independent admin roots and checks their
+image/configuration identity, credentials, mounts, suspended lifecycle and exclusion
+from the serving Service selector. Separate fresh-rebuild PV/PVC examples are checked
+without applying them. `--admin-output-dir DIR` exports validated Job/ConfigMap
+YAML for fixture use; this is template validation, not production-value admission.
 Rust configuration tests exercise the rendered TOML through existing validation.
 These are repository checks, not API schema admission or enforcement proof.
 
@@ -430,6 +443,170 @@ plus shellcheck for changed shell scripts and actionlint for workflow changes.
 Local ARM64 emulation does not establish native CI success. Real-cluster admission,
 Local PV binding, kubelet permission preservation across restart, Secret permissions,
 probe timing, rollout ordering and network enforcement remain operator gates.
+
+## Administrative Jobs
+
+The independent [admin roots](../deploy/kubernetes/admin/) each render one
+`batch/v1` Job and the shared ConfigMap, without a Deployment, Service, Secret,
+namespace or PVC. They require **Kubernetes 1.34 or later** for
+`podReplacementPolicy: Failed`. Serving does not include them. Use an operator-owned
+copy preserving the `config`, `serving`, `admin` and `storage` directory relationships.
+Replace image references in serving and every selected Job with the same immutable
+image digest for the intended release. Render and compare the images and generated
+configuration before applying. Do not use a ConfigMap from a different release.
+
+All commands receive the full TOML and read-only PostgreSQL CA. The full TOML must
+parse even when it references serving files that the command does not open.
+
+| Root / Job | Arguments | Additional access |
+| --- | --- | --- |
+| `admin/migrate` / `openlegal-migrate` | `--migrate /etc/openlegal/server.toml` | Migration credential only; no PVCs |
+| `admin/maintain` / `openlegal-maintain` | `--maintain /etc/openlegal/server.toml` | Runtime credential and writable cache blob PVC only |
+| `admin/rebuild` / `openlegal-rebuild` | `--rebuild-corpus-index /etc/openlegal/server.toml` | Runtime credential, writable cache/corpus blobs and fresh index PVC, read-only dictionary |
+
+No Job receives backend TLS keys, provider credentials, a service-account token or
+cluster-control permissions. Both blob stores need writable mounts during rebuild
+because initialization/health performs filesystem canary writes; retained evidence
+is not rewritten. The old index is not mounted in the rebuild Pod.
+
+Jobs start suspended, with one completion, parallelism one, `restartPolicy: Never`,
+zero retries, and replacement delayed until the previous Pod is terminal/failed.
+These settings limit accidental repetition but do **not** guarantee exactly-once
+execution. Database migration locking and the corpus rebuild lease retain their
+existing roles. A duplicate rebuild may fail on an occupied lease or populated
+destination and requires investigation. See the
+[Kubernetes Job lifecycle](https://kubernetes.io/docs/concepts/workloads/controllers/job/).
+
+| Operation | Deadline after activation | CPU / memory request | CPU / memory limit |
+| --- | --- | --- | --- |
+| Migration | 600 seconds | 100m / 128 MiB | 1 / 512 MiB |
+| Cache maintenance | 300 seconds | 100m / 128 MiB | 1 / 512 MiB |
+| Index rebuild | 86400 seconds | 1 / 2 GiB | 2 / 4 GiB |
+
+These are provisional budgets, not full-corpus sizing evidence. The cache command
+also retains its internal sixty-second pruning deadline. Investigate OOM, deadline
+expiry or insufficient capacity before preparing a new attempt with deliberately
+revised limits. Do not silently increase resources. Jobs retain the serving node
+qualification and container hardening, including a 30-second termination grace;
+admin modes do not promise serving's graceful SIGTERM handling.
+
+### Prepare, stop and execute
+
+1. On first installation, apply only the standalone namespace manifest, provision
+   external PostgreSQL roles/credentials and the CA, then create the migration Job.
+   Migration does not need storage or backend TLS. Runtime grants must be applied
+   by the database administrator after the relevant tables exist; migration does
+   not provision roles, passwords or grants.
+2. Before an upgrade or any cache maintenance/rebuild, stop all serving, ingestion,
+   retention and other publishing processes using this database/storage. Keep the
+   operator serving overlay at `replicas: 0`, scale the existing Deployment to zero,
+   and prevent deployment automation from restoring replicas during the window.
+   Verify actual termination of every relevant Pod/process, including prior admin
+   attempts and legacy/out-of-cluster processes. Zero ready replicas, a missing Pod
+   object, `ReadWriteOnce`, and the corpus lease alone are not proof of shutdown.
+3. Render the selected admin root, verify its exact image/config, credential and
+   mount set, and apply it suspended. Run only one selected operation at a time.
+   Use migration first when the intended binary requires a new schema; apply needed
+   runtime grants before maintenance or rebuild. Neither operation is mandatory on
+   every upgrade.
+4. Resume only after prerequisites hold. Require `Complete=True`, successful process
+   exit and actual termination before continuing. Failure or an ambiguous result
+   keeps serving stopped. Inspect bounded operational diagnostics; keep credentials,
+   SQL payloads and raw evidence out of shared logs or tickets.
+5. After successful administration, apply the verified serving configuration/image
+   and, if rebuilt, replacement index claim **while replicas remain zero**. Then
+   set the operator overlay back to one replica, apply it, check rollout/readiness
+   and perform bounded retained-search/capture checks. Restore exactly one backend.
+
+The following examples are operator actions, not a repository deployment script.
+Substitute all paths and context names first. The first command is for a new
+installation; the shutdown commands require an existing Deployment.
+
+```bash
+kube=(kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT)
+"${kube[@]}" apply -f /absolute/operator/serving/namespace.yaml
+# Existing deployment only; also keep the operator overlay at replicas: 0.
+"${kube[@]}" -n openlegal-serving scale deployment/openlegal-server --replicas=0
+"${kube[@]}" -n openlegal-serving wait --for=delete pod \
+  -l app.kubernetes.io/name=openlegal-server --timeout=360s
+"${kube[@]}" -n openlegal-serving get pods,jobs
+# Confirm all relevant processes stopped, then render and inspect this file.
+kubectl kustomize /absolute/operator/admin/migrate > /absolute/operator/migrate-rendered.yaml
+"${kube[@]}" apply -f /absolute/operator/migrate-rendered.yaml
+"${kube[@]}" -n openlegal-serving patch job/openlegal-migrate \
+  --type=merge -p '{"spec":{"suspend":false}}'
+"${kube[@]}" -n openlegal-serving wait --for=condition=complete \
+  job/openlegal-migrate --timeout=660s
+```
+
+Use the corresponding root and Job name for maintenance/rebuild; bounded waits may
+allow 360 seconds for maintenance and 86460 seconds for rebuild. A wait timeout is
+not permission to start another attempt or serving. Check Job conditions and all
+associated Pods. There is no automatic restart of serving after an administrative
+failure. Do not reapply a suspended manifest over an active Job: that can terminate
+its Pods. Jobs are outside the ordinary serving apply/reconciliation path.
+
+### Cache maintenance window
+
+`--maintain` performs bounded **cache** pruning and cleanup, not corpus-history
+pruning, and does not promise to exhaust all orphan/deletion queues. It opens only
+the cache blob root. It acquires no corpus runtime lease; its process-local cache
+invalidation cannot fence a separate serving process. Keep serving and all writers
+stopped, including when changing retention limits in the shared config. Use the
+same limits for the administrative attempt and subsequent serving. The
+[persistence retention contract](persistence.md#blob-publication-and-garbage-collection)
+owns pruning behavior. Corpus retention remains part of the ordinary corpus runtime.
+No CronJob or arbitrary schedule is supplied.
+
+### Fresh index destination and recovery
+
+Copy the separate
+[fresh PV](../deploy/kubernetes/storage/local-rebuild-pv.example.yaml) and
+[fresh PVC](../deploy/kubernetes/storage/local-rebuild-pvc.example.yaml) examples.
+Their default name is `openlegal-corpus-index-rebuild`; assign a unique PV/PVC pair
+and host directory per attempt, and change the Job claim reference to match.
+Capacity is operator-supplied. Use the existing `openlegal-local` StorageClass,
+`Retain`, and the same qualified storage node as the retained blob volumes. Verify
+physical host paths are distinct and non-nested, not aliases of the old index,
+blobs or dictionary. Reserve enough space to retain both old and new indexes.
+
+Prepare the new empty volume root and private `data` child using the
+[storage ownership procedure](#storage-and-permissions). Mount the new claim at
+`/var/lib/openlegal/corpus-index`; the shared TOML still points to its `data` child.
+The old claim stays preserved and unmounted. The CLI rejects a populated destination.
+After success, change only the serving index volume's claim to the successful new
+claim while replicas remain zero; also verify the intended dictionary and image.
+Retain prior image/configuration/dictionary/index recovery material.
+
+Suspending or deleting a running Job, eviction and deadline expiration may abruptly
+terminate rebuild. The CLI's interrupt handler does not establish graceful SIGTERM
+cancellation. Interruption can leave an incomplete index, a complete index awaiting
+acknowledgment, or an ambiguous outcome after acknowledgment. A nonempty directory
+or completion metadata alone is not command success. Keep the failed destination
+for investigation and retry with another fresh one only after the old process has
+actually terminated. Do not resume an interrupted Job into its used destination.
+
+A changed image, ConfigMap reference or claim requires a **new Job**, because Job
+Pod templates are immutable. An operator overlay may patch only the Job
+`metadata.name` to a unique attempt name; use that rendered name in commands.
+Avoid a root-wide `nameSuffix`, which would also rename the shared ConfigMap. Retain old Job/Pod diagnostics
+until investigated, then explicitly clean up terminated attempts and unreferenced
+ConfigMaps. There is no TTL controller configuration or automatic volume deletion.
+
+The [canonical rebuild contract](database.md#offline-index-rebuild) governs replay,
+completion and monotonic acknowledgment. Never rewind acknowledgment. A preserved
+old index may be behind the database after rebuilding and cannot simply be selected
+for rollback. Require a compatible binary, dictionary and complete index; otherwise
+repair forward or use appropriate version-specific rebuild tooling. Schema migration
+rollback likewise needs an individually assessed compatible binary/schema or a
+coordinated restore of database and retained storage from operator recovery material;
+reapplying an old image does not undo migrations. Keep serving stopped while resolving
+uncertainty, and never discard retained legal evidence to make a rollback start.
+
+Repository checks establish rendered relationships and disposable fixture behavior.
+Target-cluster Job admission, scheduling, Secret permissions, storage binding,
+shutdown exclusion, failure recovery and resource sizing remain operator acceptance
+gates. These templates do not perform a deployment or live-provider acceptance.
 
 ## Selected topology
 
@@ -506,7 +683,8 @@ Runtime and migration environment names are configurable and must differ. Keep
 the existing defaults, `OPENLEGAL_DATABASE_URL` and
 `OPENLEGAL_MIGRATION_DATABASE_URL`, in the serving template. The serving workload
 receives only the runtime credential; the operator migration command receives only
-the migration credential. A separate migration Job remains planned. Preserve
+the migration credential. The [separate Job](#administrative-jobs) enforces this
+mount/environment separation. Preserve
 verified PostgreSQL TLS and operator CA inputs as described in the [persistence configuration](persistence.md#configuration-and-startup).
 
 The [health handlers](../apps/server/src/http.rs) expose unauthenticated
@@ -555,8 +733,10 @@ new runtime, image, manifest or CI validation evidence.
 
 Image acceptance began in Phase 1, rendering/invariant checks in Phase 2, and
 retained configuration/storage/restart checks in Phase 3. Phase 4 adds offline
-Service/example consistency checks and a Docker OxiBelt handoff profile.
-Real-cluster networking, storage, shutdown and sandbox enforcement require operator acceptance;
+Service/example consistency checks and a Docker OxiBelt handoff profile. Phase 5
+adds offline admin-manifest checks and disposable database/image administration
+scenarios. These do not validate Job admission, scheduling or termination on a
+real cluster. Real-cluster networking, storage, shutdown and sandbox enforcement require operator acceptance;
 live LAW OPEN DATA access and public transport/platform acceptance are separate
 gates. Existing offline fixtures and local integration evidence do not satisfy
 those gates. Deployment, publication and live provider requests are not part of

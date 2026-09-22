@@ -1,0 +1,16 @@
+# Apply separately for an offline rebuild; use a new name and distinct fresh host path
+# for each attempt. Keep the old index; prepare root:10004 2770 as documented.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openlegal-corpus-index-rebuild
+  namespace: openlegal-serving
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Filesystem
+  storageClassName: openlegal-local
+  volumeName: openlegal-corpus-index-rebuild
+  resources:
+    requests:
+      storage: REPLACE_WITH_CORPUS_INDEX_REBUILD_CAPACITY
