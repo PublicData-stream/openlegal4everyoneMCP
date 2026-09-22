@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openlegal-allow-edge
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openlegal-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Replace outside Git with the verified edge source at policy enforcement.
+        # NodePort source translation and node exemptions require host firewalls.
+        - ipBlock:
+            cidr: 192.0.2.10/32
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: UDP
+          port: 4433

@@ -233,7 +233,12 @@ provision these tools and consume both rendered profiles. The manifest gate defa
 to retained; also run `scripts/test-kubernetes-serving.sh --profile text-only` to
 validate the separate fixture. Every invocation also validates all three suspended
 administrative Job roots, shared configuration/image identity, and separately
-applied Local PV/PVC examples, including fresh rebuild storage. Administrative
+applied Local PV/PVC examples, including fresh rebuild storage. Network
+checks cover the namespace default deny, each standalone allow example,
+all supported database/DNS/monitoring combinations and actual workload selectors.
+The gate also checks the unchanged document namespace denial, quota and prepared-node
+runtime invariants. These are committed-template checks, not admission of arbitrary
+operator overlays or proof of CNI enforcement. Administrative
 command or mount changes require the PostgreSQL gate and both image platforms;
 the image gate exercises cache maintenance, fresh index rebuild and interruption
 recovery with disposable storage. Run both image platforms when changing the

@@ -1,6 +1,8 @@
 """Exercise rejected deployment regressions against the actual rendered example."""
 
 import copy
+import ipaddress
+import itertools
 import os
 import sys
 import unittest
@@ -9,7 +11,9 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from deployment_validation import ValidationError, load_documents, validate, validate_admin, validate_oxibelt, validate_storage
+from deployment_validation import (NETWORK_VARIANTS, ValidationError, load_documents, validate,
+                                   validate_admin, validate_document_boundary, validate_network,
+                                   validate_oxibelt, validate_storage)
 
 
 class ServingValidationTests(unittest.TestCase):
@@ -390,6 +394,191 @@ class ServingValidationTests(unittest.TestCase):
             mapping[path[-1]] = value
             with self.subTest(kind=kind, path=path), self.assertRaises(ValidationError):
                 validate_storage(storage)
+
+
+class NetworkValidationTests(unittest.TestCase):
+    """Check declared traffic intent, not CNI execution, NAT or host exemptions."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(os.environ["OPENLEGAL_RENDERED_NETWORK_DIR"])
+        cls.examples = {variant: load_documents((root / f"{variant}.yaml").read_text())
+                        for variant in NETWORK_VARIANTS}
+        cls.serving = load_documents(Path(os.environ["OPENLEGAL_RENDERED_SERVING"]).read_text())
+        cls.sandbox = load_documents(Path(os.environ["OPENLEGAL_DOCUMENT_BOUNDARY"]).read_text())
+        cls.workloads = [next(obj for obj in cls.serving if obj["kind"] == "Deployment")
+                         ["spec"]["template"]["metadata"]["labels"]]
+        for operation in ("migrate", "maintain", "rebuild"):
+            docs = load_documents((Path(os.environ["OPENLEGAL_RENDERED_ADMIN_DIR"])
+                                   / f"{operation}.yaml").read_text())
+            cls.workloads.append(next(obj for obj in docs if obj["kind"] == "Job")
+                                 ["spec"]["template"]["metadata"]["labels"])
+
+    @staticmethod
+    def selects(selector, labels):
+        if any(labels.get(key) != value for key, value in selector.get("matchLabels", {}).items()):
+            return False
+        for expression in selector.get("matchExpressions", []):
+            if expression["operator"] != "In":
+                raise AssertionError("test evaluator supports only the admitted In selector")
+            if labels.get(expression["key"]) not in expression["values"]:
+                return False
+        return True
+
+    def permits(self, policies, workload, direction, protocol, port, *, address="198.51.100.99",
+                namespace="unrelated", labels=None):
+        """Evaluate only explicit allows in these validated, isolated examples."""
+        for policy in policies:
+            spec = policy["spec"]
+            if not self.selects(spec["podSelector"], workload):
+                continue
+            for rule in spec.get(direction, []):
+                if not any(item["port"] == port and item["protocol"] == protocol
+                           for item in rule["ports"]):
+                    continue
+                for peer in rule["to" if direction == "egress" else "from"]:
+                    if "ipBlock" in peer:
+                        if ipaddress.ip_address(address) in ipaddress.ip_network(peer["ipBlock"]["cidr"]):
+                            return True
+                    elif (self.selects(peer["namespaceSelector"], {"kubernetes.io/metadata.name": namespace})
+                          and self.selects(peer["podSelector"], labels or {})):
+                        return True
+        return False
+
+    def combination(self, database, dns, monitoring):
+        variants = ["base", "edge", database] + ([dns] if dns else [])
+        if monitoring:
+            variants.append("monitoring")
+        docs = [copy.deepcopy(obj) for variant in variants for obj in self.examples[variant]]
+        validate_network(docs, variants)
+        return docs
+
+    def test_complete_matrix_and_actual_workload_selectors(self):
+        for database, dns, monitoring in itertools.product(
+                ("postgres-in-cluster", "postgres-external"), (None, "dns-cluster", "dns-fixed"),
+                (False, True)):
+            with self.subTest(database=database, dns=dns, monitoring=monitoring):
+                docs = self.combination(database, dns, monitoring)
+                db_peer = ({"namespace": "replace-with-postgres-namespace",
+                            "labels": {"app.kubernetes.io/name": "replace-with-postgres-app"}}
+                           if database == "postgres-in-cluster" else {"address": "192.0.2.20"})
+                dns_peer = ({"namespace": "kube-system", "labels": {"k8s-app": "kube-dns"}}
+                            if dns == "dns-cluster" else {"address": "192.0.2.53"})
+                monitor_peer = {"namespace": "replace-with-monitoring-namespace",
+                                "labels": {"app.kubernetes.io/name": "replace-with-monitoring-app"}}
+                for index, workload in enumerate(self.workloads + [{"app.kubernetes.io/name": "other"}]):
+                    supported = index < 4
+                    self.assertEqual(self.permits(docs, workload, "egress", "TCP", 5432, **db_peer), supported)
+                    for protocol in ("TCP", "UDP"):
+                        self.assertEqual(self.permits(docs, workload, "egress", protocol, 53, **dns_peer),
+                                         supported and dns is not None)
+                    for protocol, port in (("TCP", 8080), ("UDP", 4433)):
+                        self.assertEqual(self.permits(docs, workload, "ingress", protocol, port,
+                                                      address="192.0.2.10"), index == 0)
+                    self.assertEqual(self.permits(docs, workload, "ingress", "TCP", 9090, **monitor_peer),
+                                     index == 0 and monitoring)
+                    for port in (443, 6443, 5432):
+                        self.assertFalse(self.permits(docs, workload, "egress", "TCP", port))
+                    self.assertFalse(self.permits(docs, workload, "ingress", "TCP", 9090,
+                                                  address="192.0.2.10"))
+                    self.assertFalse(self.permits(docs, workload, "ingress", "TCP", 8080))
+
+    def test_peer_conjunction_ports_and_destination_boundaries(self):
+        docs = self.combination("postgres-in-cluster", "dns-cluster", True)
+        serving = self.workloads[0]
+        for direction, port, namespace, labels in (
+            ("egress", 5432, "replace-with-postgres-namespace",
+             {"app.kubernetes.io/name": "replace-with-postgres-app"}),
+            ("egress", 53, "kube-system", {"k8s-app": "kube-dns"}),
+            ("ingress", 9090, "replace-with-monitoring-namespace",
+             {"app.kubernetes.io/name": "replace-with-monitoring-app"}),
+        ):
+            self.assertTrue(self.permits(docs, serving, direction, "TCP", port, namespace=namespace, labels=labels))
+            self.assertFalse(self.permits(docs, serving, direction, "TCP", port, namespace="other", labels=labels))
+            self.assertFalse(self.permits(docs, serving, direction, "TCP", port, namespace=namespace, labels={}))
+            self.assertFalse(self.permits(docs, serving, direction, "TCP", port + 1, namespace=namespace, labels=labels))
+        for protocol, port in (("UDP", 8080), ("TCP", 4433), ("TCP", 30080), ("UDP", 30433)):
+            self.assertFalse(self.permits(docs, serving, "ingress", protocol, port, address="192.0.2.10"))
+        docs = self.combination("postgres-external", "dns-fixed", False)
+        for address in ("192.0.2.19", "192.0.2.21", "198.51.100.20"):
+            self.assertFalse(self.permits(docs, serving, "egress", "TCP", 5432, address=address))
+
+    def test_missing_duplicate_extra_and_exclusive_policies(self):
+        docs = self.combination("postgres-external", None, False)
+        variants = ["base", "edge", "postgres-external"]
+        for changed in (docs[1:], docs + [docs[0]], docs + self.examples["monitoring"]):
+            with self.assertRaises(ValidationError):
+                validate_network(changed, variants)
+        for first, second in (("postgres-in-cluster", "postgres-external"), ("dns-cluster", "dns-fixed")):
+            self.assertEqual(self.examples[first][0]["metadata"], self.examples[second][0]["metadata"])
+            with self.assertRaises(ValidationError):
+                validate_network(self.examples[first] + self.examples[second], [first, second])
+        baseline = next(obj for obj in self.serving if obj["kind"] == "NetworkPolicy")
+        self.assertEqual(baseline, self.examples["base"][0])
+        with self.assertRaises(ValidationError):
+            validate([obj for obj in self.serving if obj is not baseline])
+
+    def test_rejects_weakened_baseline_and_allow_rules(self):
+        for variant, example in self.examples.items():
+            cases = [(('metadata', 'namespace'), 'other'), (('spec', 'podSelector'), {}),
+                     (('spec', 'policyTypes'), [])]
+            if variant == "base":
+                cases = [(('spec', 'podSelector'), {"matchLabels": {"app": "one"}}),
+                         (('spec', 'policyTypes'), ["Ingress"]),
+                         (('spec', 'ingress'), [{}]), (('spec', 'egress'), [{}])]
+            else:
+                direction = "ingress" if variant in ("edge", "monitoring") else "egress"
+                peers = "from" if direction == "ingress" else "to"
+                rule = ("spec", direction, 0)
+                cases += [(rule + (peers,), [{}]), (rule + (peers,), []),
+                          (rule + ("ports",), []), (rule + ("ports", 0, "port"), True),
+                          (rule + ("ports", 0, "protocol"), "SCTP"),
+                          (rule + (peers,), [{"ipBlock": {"cidr": "0.0.0.0/0"}}]),
+                          (rule + (peers,), [{"ipBlock": {"cidr": "::/0"}}])]
+                if variant in ("postgres-in-cluster", "dns-cluster", "monitoring"):
+                    peer = example[0]["spec"][direction][0][peers][0]
+                    cases.append((rule + (peers,), [{key: value} for key, value in peer.items()]))
+                else:
+                    cases.append((rule + (peers, 0, "ipBlock", "cidr"), "192.0.2.0/24"))
+                if direction == "egress":
+                    cases.append((("spec", "podSelector", "matchExpressions", 0, "values"), ["openlegal-server"]))
+                else:
+                    cases.append((("spec", "podSelector"), {"matchLabels": {"app.kubernetes.io/name": "openlegal-admin"}}))
+                for omitted in ("ports", peers):
+                    changed = copy.deepcopy(example)
+                    del changed[0]["spec"][direction][0][omitted]
+                    with self.assertRaises(ValidationError):
+                        validate_network(changed, [variant])
+            for path, value in cases:
+                with self.subTest(variant=variant, path=path, value=value):
+                    changed = copy.deepcopy(example)
+                    mapping = changed[0]
+                    for key in path[:-1]:
+                        mapping = mapping[key]
+                    mapping[path[-1]] = value
+                    with self.assertRaises(ValidationError):
+                        validate_network(changed, [variant])
+
+    def test_document_namespace_remains_separate(self):
+        validate_document_boundary(self.sandbox)
+        for kind, path, value in (
+            ("NetworkPolicy", ("spec", "egress"), [{}]),
+            ("NetworkPolicy", ("spec", "ingress"), [{}]),
+            ("ResourceQuota", ("spec", "hard", "pods"), "3"),
+            ("RuntimeClass", ("handler",), "runc"),
+            ("RuntimeClass", ("scheduling",), {}),
+            ("Namespace", ("metadata", "labels", "pod-security.kubernetes.io/enforce"), "privileged"),
+        ):
+            changed = copy.deepcopy(self.sandbox)
+            mapping = next(obj for obj in changed if obj["kind"] == kind)
+            for key in path[:-1]:
+                mapping = mapping[key]
+            mapping[path[-1]] = value
+            with self.subTest(kind=kind), self.assertRaises(ValidationError):
+                validate_document_boundary(changed)
+        for changed in (self.sandbox[:-1], self.sandbox + self.examples["edge"]):
+            with self.assertRaises(ValidationError):
+                validate_document_boundary(changed)
 
 
 if __name__ == "__main__":

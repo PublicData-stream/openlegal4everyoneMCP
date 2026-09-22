@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openlegal-allow-postgres
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - openlegal-server
+          - openlegal-admin
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # Replace both selectors outside Git; they must remain in the same peer.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: replace-with-postgres-namespace
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: replace-with-postgres-app
+      ports:
+        - protocol: TCP
+          port: 5432

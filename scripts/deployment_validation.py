@@ -72,6 +72,110 @@ ADMIN = {
     "rebuild": ("--rebuild-corpus-index", 86400, STORAGE),
 }
 
+NETWORK_VARIANTS = ("base", "edge", "postgres-in-cluster", "postgres-external",
+                    "dns-cluster", "dns-fixed", "monitoring")
+
+
+def resource_index(documents):
+    """Index by resource identity without silently overwriting repeated kinds."""
+    require(isinstance(documents, list), "manifest must be a document list")
+    result = {}
+    for obj in documents:
+        require(isinstance(obj, dict), "manifest document must be a mapping")
+        metadata = obj.get("metadata")
+        require(isinstance(metadata, dict), "resource metadata must be a mapping")
+        identity = (obj.get("apiVersion"), obj.get("kind"),
+                    metadata.get("namespace", ""), metadata.get("name"))
+        require(all(isinstance(value, str) for value in identity)
+                and all(identity[i] for i in (0, 1, 3)), "missing resource identity")
+        require(identity not in result, "duplicate resource identity")
+        result[identity] = obj
+    return result
+
+
+def network_example(variant):
+    """Contract for committed examples, not admission of production overlays."""
+    require(variant in NETWORK_VARIANTS, "unknown network example")
+    serving = {"matchLabels": {"app.kubernetes.io/name": "openlegal-server"}}
+    database_clients = {"matchExpressions": [{"key": "app.kubernetes.io/name",
+                        "operator": "In", "values": ["openlegal-server", "openlegal-admin"]}]}
+
+    def selected_peer(namespace, key, value):
+        return {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": namespace}},
+                "podSelector": {"matchLabels": {key: value}}}
+
+    def port(protocol, number):
+        return {"protocol": protocol, "port": number}
+
+    if variant == "base":
+        name = "openlegal-default-deny"
+        spec = {"podSelector": {}, "policyTypes": ["Ingress", "Egress"],
+                "ingress": [], "egress": []}
+    else:
+        ingress = variant in ("edge", "monitoring")
+        direction = "ingress" if ingress else "egress"
+        if variant == "edge":
+            name, peer = "openlegal-allow-edge", {"ipBlock": {"cidr": "192.0.2.10/32"}}
+            ports = [port("TCP", 8080), port("UDP", 4433)]
+        elif variant.startswith("postgres-"):
+            name = "openlegal-allow-postgres"
+            peer = (selected_peer("replace-with-postgres-namespace", "app.kubernetes.io/name",
+                                  "replace-with-postgres-app") if variant == "postgres-in-cluster"
+                    else {"ipBlock": {"cidr": "192.0.2.20/32"}})
+            ports = [port("TCP", 5432)]
+        elif variant.startswith("dns-"):
+            name = "openlegal-allow-dns"
+            peer = (selected_peer("kube-system", "k8s-app", "kube-dns") if variant == "dns-cluster"
+                    else {"ipBlock": {"cidr": "192.0.2.53/32"}})
+            ports = [port("TCP", 53), port("UDP", 53)]
+        else:
+            name = "openlegal-allow-monitoring"
+            peer = selected_peer("replace-with-monitoring-namespace", "app.kubernetes.io/name",
+                                 "replace-with-monitoring-app")
+            ports = [port("TCP", 9090)]
+        spec = {"podSelector": serving if ingress else database_clients,
+                "policyTypes": ["Ingress" if ingress else "Egress"],
+                direction: [{"from" if ingress else "to": [peer], "ports": ports}]}
+    return {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+            "metadata": {"name": name, "namespace": "openlegal-serving"}, "spec": spec}
+
+
+def validate_network(documents, variants):
+    """Validate an exact selection, rejecting combined mutually exclusive variants."""
+    expected = resource_index([network_example(variant) for variant in variants])
+    actual = resource_index(documents)
+    require(actual.keys() == expected.keys(), "unexpected or missing network policy")
+    for identity, policy in expected.items():
+        equal(actual[identity], policy, f"NetworkPolicy {identity[-1]}")
+
+
+def validate_document_boundary(documents):
+    """Guard the existing document trust domain without altering its resources."""
+    objects = resource_index(documents)
+    expected = {
+        ("v1", "Namespace", "", "openlegal-documents"),
+        ("v1", "ResourceQuota", "openlegal-documents", "document-budget"),
+        ("networking.k8s.io/v1", "NetworkPolicy", "openlegal-documents", "deny-all"),
+        ("node.k8s.io/v1", "RuntimeClass", "", "openlegal-document"),
+    }
+    require(objects.keys() == expected, "unexpected document boundary resource")
+    by_kind = {obj["kind"]: obj for obj in objects.values()}
+
+    def field(kind, *path):
+        value = by_kind[kind]
+        for key in path:
+            require(isinstance(value, dict) and key in value, f"missing document {kind}.{key}")
+            value = value[key]
+        return value
+
+    equal(field("NetworkPolicy", "spec"), network_example("base")["spec"], "document denial")
+    equal(field("ResourceQuota", "spec", "hard", "pods"), "2", "document Pod quota")
+    equal(field("Namespace", "metadata", "labels", "pod-security.kubernetes.io/enforce"),
+          "restricted", "document Pod Security")
+    equal(field("RuntimeClass", "handler"), "runsc-document", "document runtime handler")
+    equal(field("RuntimeClass", "scheduling"), {"nodeSelector": {"openlegal.document-sandbox/ready": "true"}},
+          "document prepared-node scheduling")
+
 
 def claim_name(volume):
     return "openlegal-" + ("mecab-dictionary" if volume == "mecab-ko-dictionary" else volume)
@@ -137,9 +241,10 @@ def validate(documents, profile="retained"):
     require(profile in ("retained", "text-only"), "unsupported profile")
     kinds = ("Namespace", "ConfigMap", "Deployment")
     if profile == "retained":
-        kinds += ("Service",)
+        kinds += ("Service", "NetworkPolicy")
     require(isinstance(documents, list) and len(documents) == len(kinds),
             f"expected only {', '.join(kinds)}")
+    resource_index(documents)
     objects = {}
     for obj in documents:
         require(isinstance(obj, dict), "manifest document must be a mapping")
@@ -149,6 +254,7 @@ def validate(documents, profile="retained"):
     keys(objects, kinds, "rendered objects")
     if profile == "retained":
         validate_service(objects["Service"])
+        validate_network([objects["NetworkPolicy"]], ["base"])
     namespace, cm, deployment = (objects[k] for k in ("Namespace", "ConfigMap", "Deployment"))
     labels = {f"pod-security.kubernetes.io/{mode}{suffix}": value
               for mode in ("enforce", "audit", "warn")
@@ -410,10 +516,19 @@ def main():
     parser.add_argument("--storage-manifest", type=Path)
     parser.add_argument("--oxibelt-config", type=Path)
     parser.add_argument("--admin-manifest", action="append", default=[], metavar="OPERATION=FILE")
+    parser.add_argument("--network-dir", type=Path,
+                        help="directory of all separately rendered network examples")
+    parser.add_argument("--document-boundary", type=Path)
     args = parser.parse_args()
     try:
         documents = load_documents(args.manifest.read_text())
         raw = validate(documents, args.profile)
+        if args.network_dir:
+            for variant in NETWORK_VARIANTS:
+                validate_network(load_documents((args.network_dir / f"{variant}.yaml").read_text()),
+                                 [variant])
+        if args.document_boundary:
+            validate_document_boundary(load_documents(args.document_boundary.read_text()))
         seen = set()
         for admin in args.admin_manifest:
             require(args.profile == "retained", "administration requires retained serving profile")

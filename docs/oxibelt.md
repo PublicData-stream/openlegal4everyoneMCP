@@ -193,7 +193,11 @@ daemon does not by itself establish that route. See
 [Compose host mappings](https://docs.docker.com/reference/compose-file/services/#extra_hosts).
 
 Complete the [NodePort firewall prerequisites](deployment-kubernetes.md#service-and-private-network-handoff)
-before applying the Service. Port 9090 and `/live`, `/ready`, `/metrics` have no
+before applying the Service. Apply the [default-deny baseline and tailored network
+allows](deployment-kubernetes.md#network-and-namespace-boundaries) before starting
+serving or administrative Jobs. Verify the CNI-visible edge source with the actual
+`externalTrafficPolicy: Cluster` path; node exemptions and source translation mean
+NetworkPolicy does not replace the host firewall. Port 9090 and `/live`, `/ready`, `/metrics` have no
 Service or public edge route. Pod-network isolation, real TCP/UDP routing, source
 translation, firewall enforcement, public edge access and browser/ChatGPT platform
 acceptance require their own operator checks; the isolated harness supplies no

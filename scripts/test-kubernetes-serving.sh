@@ -41,6 +41,10 @@ trap 'rm -rf "$scratch"' EXIT
 # Kustomize build is local: no cluster, credentials, discovery or API schema fetch.
 "$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/serving" > "$scratch/retained.yaml"
 "$tools_dir/bin/kubectl" kustomize "$repo/test-support/deployment/text-only" > "$scratch/text-only.yaml"
+mkdir "$scratch/network"
+for variant in base edge postgres-in-cluster postgres-external dns-cluster dns-fixed monitoring; do
+    "$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/network/$variant" > "$scratch/network/$variant.yaml"
+done
 admin_args=()
 for operation in migrate maintain rebuild; do
     "$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/admin/$operation" > "$scratch/$operation.yaml"
@@ -65,6 +69,8 @@ for checked_profile in retained text-only; do
     fi
     PYTHONDONTWRITEBYTECODE=1 "$tools_dir/bin/python" "$repo/scripts/deployment_validation.py" \
         "$scratch/$checked_profile.yaml" --profile "$checked_profile" \
+        --network-dir "$scratch/network" \
+        --document-boundary "$repo/deploy/document-sandbox/namespace.yaml" \
         --storage-manifest "$scratch/storage.yaml" "${edge_args[@]}" "${output_args[@]}" "${operation_args[@]}"
 done
 OPENLEGAL_RENDERED_SERVING="$scratch/retained.yaml" \
@@ -72,6 +78,8 @@ OPENLEGAL_RENDERED_SERVING="$scratch/retained.yaml" \
     OPENLEGAL_STORAGE_EXAMPLES="$scratch/storage.yaml" PYTHONDONTWRITEBYTECODE=1 \
     OPENLEGAL_OXIBELT_EXAMPLE="$repo/deploy/oxibelt/kubernetes-upstream.example.toml" \
     OPENLEGAL_RENDERED_ADMIN_DIR="$scratch" \
+    OPENLEGAL_RENDERED_NETWORK_DIR="$scratch/network" \
+    OPENLEGAL_DOCUMENT_BOUNDARY="$repo/deploy/document-sandbox/namespace.yaml" \
     "$tools_dir/bin/python" -m unittest discover -s "$repo/scripts/tests" -p test_deployment_validation.py
 if [[ -n $admin_output_dir ]]; then
     mkdir -p "$admin_output_dir"

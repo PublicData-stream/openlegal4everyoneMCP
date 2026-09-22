@@ -9,9 +9,11 @@ manifest checks. Phase 3 makes retained-corpus serving the default template, add
 operator-managed storage examples and extends image acceptance to retained data.
 Phase 4 adds the TCP/UDP NodePort Service and a tested OxiBelt handoff example.
 Phase 5 adds suspended migration, cache-maintenance and offline index-rebuild Jobs
-with separate credentials and an operator-controlled maintenance window. The
-text-only profile remains a separate test fixture without a Service. NetworkPolicy,
-ingestion integration and complete production acceptance remain planned. This document does not establish a running deployment
+with separate credentials and an operator-controlled maintenance window. Phase 6
+adds namespace-wide default deny, separately selected allow policies and a network
+acceptance runbook. The text-only profile remains a separate test fixture without
+a Service or NetworkPolicy. Ingestion integration and complete production
+acceptance remain planned. This document does not establish a running deployment
 or successful real-cluster, live-provider, browser WebTransport or ChatGPT acceptance.
 
 The original Phase 0 inventory was recorded on `main` at
@@ -161,7 +163,9 @@ check outcomes with the implementation handoff.
 ## Retained-corpus serving template
 
 The [serving Kustomization](../deploy/kubernetes/serving/) generates a Namespace,
-Deployment, content-hashed ConfigMap and NodePort Service. It enables supplied-text
+Deployment, content-hashed ConfigMap, NodePort Service and default-deny NetworkPolicy.
+Required allow policies are applied separately before administration or startup.
+It enables supplied-text
 comparison and retained-corpus serving with persistent PostgreSQL, two blob stores and a corpus
 index. Ingestion is omitted. There is no provider credential, controller identity
 or document-worker access. Retained serving still writes index events and performs
@@ -183,7 +187,9 @@ retention maintenance. The former text-only configuration is now a
   `https://openlegal4everyone.stream`; retain explicit Origin validation. Follow
   the [OxiBelt hosting contract](oxibelt.md#adapt-the-configuration-for-hosting).
 - Establish and verify the [NodePort firewall restrictions](#service-and-private-network-handoff)
-  before applying the serving Kustomization, which creates the Service.
+  before applying the serving Kustomization, which creates the Service. Apply the
+  [network baseline and tailored allows](#network-and-namespace-boundaries) before
+  resuming any administrative Job or starting serving.
 - Qualify Linux amd64 or ARM64 nodes before applying `openlegal.server/ready=true`.
   Verify the [x86-64-v3 baseline](../CONTRIBUTING.md#rust-baseline) on amd64, resource
   availability, Restricted Pod Security and storage suitability. ARM64 uses the
@@ -291,8 +297,9 @@ follow the documented monotonic acknowledgment/rebuild constraints.
 
 Use an operator-owned copy/overlay, render it before applying, and select an explicit
 kubeconfig/context for every cluster command. Create the namespace, Secrets and
-prepared storage first, establish the NodePort firewall restrictions below, and
-require migration success before starting the Deployment. On first installation,
+prepared storage first, establish the NodePort firewall restrictions below, apply
+the default-deny baseline and selected allow policies, and require migration success
+before starting the Deployment. On first installation,
 create the namespace from `serving/namespace.yaml` separately; applying the serving
 Kustomization creates a one-replica Deployment immediately. Follow the
 [administration sequence](#administrative-jobs) before the example below. On an
@@ -320,8 +327,9 @@ upgrades. Validation-tool versions are not a cluster compatibility matrix.
 
 The retained template exposes only the data transports through the Service
 described below. Health port 9090 has no Service port or public route. There is no
-Ingress or NetworkPolicy in this phase; cluster peers may still reach Pod IPs,
-including health. NetworkPolicy and its real enforcement remain Phase 6 gates.
+Ingress resource. The default-deny baseline and selected allow policies restrict
+Pod traffic when the CNI enforces them; real-cluster enforcement remains an
+acceptance gate. Monitoring access to health is optional and explicit.
 `kubectl port-forward` cannot validate UDP/WebTransport; a forwarded HTTP client
 must still send an allowed Host.
 
@@ -388,7 +396,161 @@ networks across all exposed nodes/interfaces. Verify backend certificate trust a
 hostname validation, allowed Host/Origin behavior, and absence of public health
 routes. Run these checks again after service-proxy, CNI, Docker, firewall or node
 changes. Offline rendering and Docker fixtures do not establish these properties
-on a real cluster. This handoff adds no intermediary proxy or serving NetworkPolicy.
+on a real cluster. The [network policies](#network-and-namespace-boundaries)
+complement these host restrictions; no intermediary proxy is introduced.
+
+### Network and namespace boundaries
+
+The [network roots](../deploy/kubernetes/network/) each render one NetworkPolicy
+in `openlegal-serving`. The retained serving root imports only `network/base`;
+allow policies are deliberate, separate operator selections. Applying serving alone
+can block its database access and prevent startup. The text-only fixture has no
+network policy and does not establish namespace isolation.
+
+| Root | Workloads / direction | Permitted peer and ports |
+| --- | --- | --- |
+| `base` | Every Pod / ingress and egress | Nothing; namespace default deny |
+| `edge` | Serving / ingress | Explicit edge source host IPs; TCP 8080 and UDP 4433 |
+| `postgres-in-cluster` | Serving and all administrative modes / egress | Combined database namespace and Pod selectors; TCP 5432 |
+| `postgres-external` | Serving and all administrative modes / egress | Explicit database host IPs; TCP 5432 |
+| `dns-cluster` | Serving and all administrative modes / egress | Combined cluster DNS namespace and Pod selectors; TCP and UDP 53 |
+| `dns-fixed` | Serving and all administrative modes / egress | Explicit resolver host IPs; TCP and UDP 53 |
+| `monitoring` | Serving / ingress | Combined monitoring namespace and Pod selectors; TCP 9090 |
+
+Select exactly one PostgreSQL variant, zero or one DNS variant, and monitoring only
+when needed. The alternatives use the same resource names (`openlegal-allow-postgres`
+and `openlegal-allow-dns`) so changing variant replaces the existing rule. Do not
+combine both variants in one Kustomization or apply them concurrently. Default deny
+selects every Pod; allow rules select `app.kubernetes.io/name: openlegal-server`
+and, for database/DNS egress only, `openlegal-admin`. Administrative Pods receive no
+ingress allowance.
+
+Tailor an operator-owned copy outside Git. Replace reserved `192.0.2.*` addresses
+and every `replace-with-*` selector; verify the example cluster DNS labels against
+the actual resolver. Use individual `/32` IPv4 or `/128` IPv6 host addresses,
+including each intended dual-stack destination, and the actual database port if it
+differs from 5432. Keep namespace and Pod selectors together in one peer to require
+both. Do not use unrestricted CIDRs, empty allow peers, namespace-wide database
+allows or broad node exceptions. Track address drift and coordinate policy updates
+with destination changes. Keep database `verify-full` and its verified hostname;
+an IP allow rule does not require changing the connection hostname or disabling TLS.
+DNS can be omitted only when the selected application addressing needs no lookup.
+DNS permission does not restrict queried domain names or authorize connections to
+the returned addresses. No provider HTTPS or Kubernetes API egress is included.
+
+NetworkPolicy requires an enforcing CNI. Allows are additive: another matching
+policy can broaden access despite default deny. For Pod-to-Pod traffic, both source
+egress and destination ingress must allow it. Inventory all policies selecting these
+workloads and inspect unknown policies before acceptance. Node-originating traffic
+has exemptions, and address translation relative to policy enforcement varies by
+network implementation. With `externalTrafficPolicy: Cluster`, do not assume the
+edge IP remains visible; determine the policy-visible source along the actual path.
+The required node firewall remains part of the boundary. See the
+[Kubernetes NetworkPolicy guidance](https://kubernetes.io/docs/concepts/services-networking/network-policies/).
+
+For NodeLocal DNS, select and verify the actual local resolver address in
+`dns-fixed`. A host-network resolver or node-local path may not be controlled as an
+ordinary DNS Pod by the CNI; do not infer enforcement from this rule's presence.
+Verify both TCP and UDP, Service translation and host-network handling. See
+[NodeLocal DNSCache](https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/).
+
+Verify kubelet probes on the target cluster without adding a broad kubelet/node
+allow. A CNI-specific probe exception, if actually required, needs a separately
+reviewed narrowly scoped operator rule. The optional monitoring rule opens the
+entire unauthenticated health listener: `/live`, `/ready` and `/metrics`. It cannot
+restrict an HTTP path. Port 9090 remains absent from the Service and public edge.
+
+#### Bootstrap and policy changes
+
+For first installation, prepare the firewall, then create the Namespace, apply
+default deny and the tailored allow policies, verify enforcement, and only then
+resume migration. Prepare Secrets and storage as required by each mode; complete
+migration before starting serving. For an existing installation, introduce or
+change these restrictions during the [administrative maintenance window](#prepare-stop-and-execute),
+with serving stopped and administrative Jobs suspended. Do not briefly delete
+default deny to diagnose a blocked dependency.
+
+The following operator example selects an in-cluster database, cluster DNS and no
+monitoring. Replace paths, context, peers and ports before use; the repository
+examples are intentionally not ready-to-apply production policies.
+
+```bash
+kube=(kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT)
+"${kube[@]}" apply -f /absolute/operator/serving/namespace.yaml
+"${kube[@]}" apply -k /absolute/operator/network/base
+"${kube[@]}" apply -k /absolute/operator/network/edge
+"${kube[@]}" apply -k /absolute/operator/network/postgres-in-cluster
+"${kube[@]}" apply -k /absolute/operator/network/dns-cluster
+"${kube[@]}" -n openlegal-serving get networkpolicies -o yaml
+# Verify enforcement and the chosen destinations before resuming migration.
+# Complete administration before applying serving with one replica.
+```
+
+Use `postgres-external` instead when appropriate, and omit DNS or substitute
+`dns-fixed` as selected. Apply `monitoring` separately if required. NetworkPolicy
+updates may converge asynchronously; inspect the CNI's enforcement state and test
+new connections before proceeding.
+
+A later apply does not remove policies omitted from that apply. When disabling
+monitoring, explicitly delete only `networkpolicy/openlegal-allow-monitoring`; when
+removing DNS, delete only `networkpolicy/openlegal-allow-dns`, after confirming all
+selected workloads can operate without it. Use the explicit context above, for
+example:
+
+```bash
+"${kube[@]}" -n openlegal-serving delete networkpolicy/openlegal-allow-monitoring
+# Only when DNS is also deliberately disabled:
+"${kube[@]}" -n openlegal-serving delete networkpolicy/openlegal-allow-dns
+```
+
+Inventory policies again after each change. Review unknown or differently named
+legacy allows and remove them only after establishing ownership and intended use;
+never delete all policies as cleanup. On full workload decommission, remove the
+repository-owned `openlegal-allow-edge`, `openlegal-allow-postgres`,
+`openlegal-allow-dns` and `openlegal-allow-monitoring` by exact name as applicable.
+Keep `openlegal-default-deny` while the namespace exists with any workloads.
+
+#### Real-cluster network acceptance — pending
+
+No cluster harness or deployment is added. Record cluster/CNI/service-proxy versions,
+node interfaces, selected policy manifests, firewall rules and policy-visible peers.
+Use operator-controlled synthetic endpoints and bounded connection attempts. For
+each denied path, demonstrate that the endpoint is listening and reachable from an
+appropriate permitted control, then correlate the rejected attempt with CNI/firewall
+denial evidence. A timeout, authentication failure, TLS rejection or missing listener
+alone does not prove network denial. Use fresh connections after policy convergence.
+
+- From the actual OxiBelt container, verify HTTP and native WebTransport through
+  the two NodePorts, retaining certificate, Host and Origin checks. From unintended
+  networks, verify rejection on every exposed node/interface and both protocols;
+  include direct Pod paths when routable. Node-exempt paths require firewall evidence.
+- Verify PostgreSQL with hostname-validated TLS for serving and each of migration,
+  maintenance and rebuild under the appropriate credential and storage contracts.
+  Exercise administrative operations against disposable synthetic data and fresh
+  rebuild storage; do not run destructive acceptance against retained production data.
+- Verify selected DNS over UDP and TCP, including actual Service/NodeLocal routing.
+  Reject unselected resolver destinations using synthetic reachable controls. With
+  DNS omitted, demonstrate that serving and every administrative mode still work.
+- Verify startup, liveness and readiness probes. If monitoring is selected, verify
+  access to all three health routes only from the selected namespace-and-Pod pair;
+  reject matching Pods in another namespace and unrelated Pods in that namespace.
+  With monitoring absent, ordinary Pod access to TCP 9090 must be rejected.
+- Reject unrelated Pod ingress to serving and administrative Pods, and unrelated
+  egress from each selected workload label. For administrative ingress, use a
+  disposable restricted synthetic listener with matching labels; closed ports on
+  the real Jobs are not denial evidence. Do not add test listeners to production Pods.
+- Verify no unintended API/provider egress rule exists and demonstrate rejection
+  of representative TCP HTTPS paths with operator-controlled reachable synthetic
+  endpoints. Make no authenticated API operations or live legal-provider requests;
+  synthetic denial checks alone do not establish reachability of every real endpoint.
+  Record CNI/firewall evidence for any node-address exemptions.
+
+The [document namespace](document-sandbox.md) remains a separate trust boundary:
+its deny-all ingress/egress, two-Pod quota and prepared-node gVisor RuntimeClass are
+unchanged. No serving policy grants parser access or a fetch role. Its existing
+real-cluster sandbox acceptance remains independently pending. Offline manifests,
+Docker OxiBelt tests and synthetic controls do not establish completed production,
+live-provider, browser or ChatGPT acceptance.
 
 ### Local and CI checks
 
@@ -411,7 +573,7 @@ validation is offline with no kubeconfig, discovery or client dry-run.
 
 The fast gate validates rendered YAML/TOML relationships, profile-specific security,
 lifecycle and storage invariants, and rejection of unsafe mutations. It validates
-Local PV/PVC examples without applying them, requires four objects for retained
+Local PV/PVC examples without applying them, requires five objects for retained
 serving and three for text-only, and checks the Service port/selector contract
 against the OxiBelt example. It rejects serving migration/provider
 credentials, inline connection URLs, insecure TLS, overlapping storage paths,
@@ -422,7 +584,12 @@ from the serving Service selector. Separate fresh-rebuild PV/PVC examples are ch
 without applying them. `--admin-output-dir DIR` exports validated Job/ConfigMap
 YAML for fixture use; this is template validation, not production-value admission.
 Rust configuration tests exercise the rendered TOML through existing validation.
-These are repository checks, not API schema admission or enforcement proof.
+It also validates each independent network root, all supported database/DNS/monitoring
+combinations, workload selectors and the unchanged document-sandbox network, quota
+and prepared-node RuntimeClass invariants. Duplicate, missing or unexpected resources
+and broadened peers/ports fail validation. This gate checks committed templates,
+not arbitrary operator overlays or production values. These are repository checks,
+not API schema admission or enforcement proof.
 
 The image gate consumes rendered configurations with the same runtime paths,
 using disposable values for authorities, corresponding source and certificates.
@@ -450,7 +617,8 @@ The independent [admin roots](../deploy/kubernetes/admin/) each render one
 `batch/v1` Job and the shared ConfigMap, without a Deployment, Service, Secret,
 namespace or PVC. They require **Kubernetes 1.34 or later** for
 `podReplacementPolicy: Failed`. Serving does not include them. Use an operator-owned
-copy preserving the `config`, `serving`, `admin` and `storage` directory relationships.
+copy preserving the `config`, `serving`, `admin`, `network` and `storage` directory
+relationships.
 Replace image references in serving and every selected Job with the same immutable
 image digest for the intended release. Render and compare the images and generated
 configuration before applying. Do not use a ConfigMap from a different release.
@@ -492,7 +660,8 @@ admin modes do not promise serving's graceful SIGTERM handling.
 
 ### Prepare, stop and execute
 
-1. On first installation, apply only the standalone namespace manifest, provision
+1. On first installation, apply the standalone namespace manifest and establish
+   the firewall and [network policies](#network-and-namespace-boundaries). Provision
    external PostgreSQL roles/credentials and the CA, then create the migration Job.
    Migration does not need storage or backend TLS. Runtime grants must be applied
    by the database administrator after the relevant tables exist; migration does
@@ -509,7 +678,8 @@ admin modes do not promise serving's graceful SIGTERM handling.
    Use migration first when the intended binary requires a new schema; apply needed
    runtime grants before maintenance or rebuild. Neither operation is mandatory on
    every upgrade.
-4. Resume only after prerequisites hold. Require `Complete=True`, successful process
+4. Resume only after prerequisites, including verified network enforcement and
+   database/DNS access for administrative Pods, hold. Require `Complete=True`, successful process
    exit and actual termination before continuing. Failure or an ambiguous result
    keeps serving stopped. Inspect bounded operational diagnostics; keep credentials,
    SQL payloads and raw evidence out of shared logs or tickets.
@@ -525,6 +695,7 @@ installation; the shutdown commands require an existing Deployment.
 ```bash
 kube=(kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT)
 "${kube[@]}" apply -f /absolute/operator/serving/namespace.yaml
+# Complete the network bootstrap above before creating or resuming any Job.
 # Existing deployment only; also keep the operator overlay at replicas: 0.
 "${kube[@]}" -n openlegal-serving scale deployment/openlegal-server --replicas=0
 "${kube[@]}" -n openlegal-serving wait --for=delete pod \
@@ -714,6 +885,7 @@ remain planned.
 | Image build, immutable image references, widget locations and source-offer field | Published image digests and a public corresponding-source URL for the exact running server/widget |
 | Serving namespace, one replica, Recreate, security settings and probe definitions | Target cluster/runtime, measured resource sizing and real-cluster acceptance |
 | Fixed TCP 30080 / UDP 30433 NodePorts and OxiBelt handoff example | NodePort availability, private node DNS, backend authorities, allowed origins, firewall rules and host Compose/certificate configuration |
+| Namespace-wide default deny and independently selected allow templates | Enforcing CNI, exact edge/database/DNS/monitoring peers, firewall controls and network acceptance |
 | Separate storage mounts and generic Local PV/PVC examples | ZFS datasets, host paths, node affinity, capacity, ownership/permissions and provisioned dictionary |
 | Secret references and separate serving/migration commands | PostgreSQL endpoint, roles/grants, credentials, CA material and backend TLS certificate/key |
 | Explicit opt-in ingestion overlay and namespace-scoped controller access | Provider credential, digest-pinned worker image and separately configured controller identity after sandbox acceptance |
@@ -735,8 +907,10 @@ Image acceptance began in Phase 1, rendering/invariant checks in Phase 2, and
 retained configuration/storage/restart checks in Phase 3. Phase 4 adds offline
 Service/example consistency checks and a Docker OxiBelt handoff profile. Phase 5
 adds offline admin-manifest checks and disposable database/image administration
-scenarios. These do not validate Job admission, scheduling or termination on a
-real cluster. Real-cluster networking, storage, shutdown and sandbox enforcement require operator acceptance;
+scenarios. Phase 6 adds offline network-template and document-boundary invariants
+and an operator network acceptance runbook. These do not validate Job admission,
+scheduling, termination or network enforcement on a real cluster. Real-cluster
+networking, storage, shutdown and sandbox enforcement require operator acceptance;
 live LAW OPEN DATA access and public transport/platform acceptance are separate
 gates. Existing offline fixtures and local integration evidence do not satisfy
 those gates. Deployment, publication and live provider requests are not part of

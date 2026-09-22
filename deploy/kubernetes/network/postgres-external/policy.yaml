@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openlegal-allow-postgres
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - openlegal-server
+          - openlegal-admin
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # Replace outside Git with the database host address; retain verified TLS.
+        - ipBlock:
+            cidr: 192.0.2.20/32
+      ports:
+        - protocol: TCP
+          port: 5432

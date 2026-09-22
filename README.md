@@ -60,7 +60,7 @@ dictionary; see [corpus setup and index upgrades](docs/database.md#operator-conf
 - [Agent orientation](AGENTS.md): where coding agents should begin.
 - [Architecture](docs/architecture.md): server, legal-data and document-processing responsibilities.
 - [Server contract](docs/server.md): configuration, extension API and transport behavior.
-- [Kubernetes deployment design](docs/deployment-kubernetes.md): production image, retained-corpus serving, storage and NodePort templates, suspended administration Jobs, OxiBelt handoff, local/CI checks and operator boundaries; complete production deployment remains pending.
+- [Kubernetes deployment design](docs/deployment-kubernetes.md): production image, retained-corpus serving, storage and NodePort templates, suspended administration Jobs, explicit network policy templates, OxiBelt handoff, local/CI checks and operator boundaries; complete production deployment remains pending.
 - [Dependencies](docs/dependencies.md): admission rationale and check tooling.
 - [Retrieval framework](docs/retrieval.md): processors, caching, evidence and resource limits.
 - [Search-query syntax](docs/search-query.md): standalone parser, operators, diagnostics, and bounds.

@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openlegal-allow-dns
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - openlegal-server
+          - openlegal-admin
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # Replace outside Git with the resolver host address; verify NodeLocal CNI handling.
+        - ipBlock:
+            cidr: 192.0.2.53/32
+      ports:
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53

@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openlegal-allow-monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openlegal-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Replace both selectors outside Git; this permits all health routes on 9090.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: replace-with-monitoring-namespace
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: replace-with-monitoring-app
+      ports:
+        - protocol: TCP
+          port: 9090
