@@ -6,14 +6,20 @@ use openlegal_adapters::{
     postgres::{PostgresOptions, PostgresStore, PostgresTls, StartupMode},
 };
 use openlegal_application::{
-    Clock, SystemClock,
+    Clock, StoredPayload, SystemClock,
     blob::BlobStore,
     database::Publication,
-    persistence::{PersistentStore, RetentionPolicy},
+    persistence::{
+        HistoryKey, PersistentKey, PersistentStore, PublicationOutcome, PublicationRequest,
+        RetentionPolicy, digest_hex,
+    },
 };
-use openlegal_domain::legal::{Dataset, LegalRecord, ObjectId};
+use openlegal_domain::{
+    Provenance, Query, Record, RetrievalData,
+    legal::{Dataset, LegalRecord, ObjectId},
+};
 use serde_json::json;
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -71,6 +77,61 @@ async fn seed() -> Result<serde_json::Value, Error> {
         // Refuse to seed an existing corpus, even when the fictional ID is absent.
         if corpus.watermark().await? != 0 || corpus.acknowledged_index().await? != 0 {
             return Err::<_, Error>("fixture corpus must be empty".into());
+        }
+        // One expired synthetic cache occurrence lets the real maintenance CLI
+        // prove pruning with cache-only mounts before corpus serving begins.
+        let captured_at = now - 31 * 86400;
+        let key = PersistentKey {
+            history: HistoryKey {
+                namespace: "retained-image-fixture".into(),
+                provider: "synthetic".into(),
+                dataset: "records".into(),
+                query: Query::Get {
+                    source: "fixture".into(),
+                    id: "expired".into(),
+                },
+            },
+            processor_version: "fixture-v1".into(),
+            schema_version: 1,
+        };
+        let data = RetrievalData::Get(Record {
+            source: "fixture".into(),
+            id: "expired".into(),
+            title: "Expired fictional cache fixture".into(),
+            body: "Expired fictional body".into(),
+            synthetic: true,
+        });
+        let raw = serde_json::to_vec(&data)?;
+        let expected = persistent
+            .lookup(key.clone(), captured_at, CancellationToken::new())
+            .await?
+            .observation;
+        let published = persistent
+            .publish(PublicationRequest {
+                key,
+                expected,
+                now: captured_at,
+                authorize: Arc::new(|| true),
+                cancellation: CancellationToken::new(),
+                value: Arc::new(StoredPayload {
+                    bytes: raw.len() + 2048,
+                    data,
+                    snapshot: None,
+                    provenance: Provenance {
+                        provider: "synthetic".into(),
+                        dataset: "records".into(),
+                        source_reference: "https://example.test/fictional/expired".into(),
+                        payload_sha256: digest_hex(&raw),
+                        processor_version: "fixture-v1".into(),
+                        retrieved_at: captured_at,
+                        validated_at: captured_at,
+                    },
+                    raw,
+                }),
+            })
+            .await?;
+        if !matches!(published, PublicationOutcome::Accepted(_)) {
+            return Err("fixture cache publication conflicted".into());
         }
         let object = ObjectId {
             jurisdiction: "kr".into(),

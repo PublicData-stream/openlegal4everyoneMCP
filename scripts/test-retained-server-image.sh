@@ -27,10 +27,13 @@ postgres=$run_id-postgres
 client=$run_id-client
 initializer=$run_id-initialize
 migration=$run_id-migrate
+maintenance=$run_id-maintain
+interrupted=$run_id-interrupted
+rebuild=$run_id-rebuild
 seed=$run_id-seed
 fixture=$run_id-fixture
 helper_image=$run_id-helper:local
-volumes=("$fixture" "$run_id-cache" "$run_id-corpus" "$run_id-index" "$run_id-dictionary")
+volumes=("$fixture" "$run_id-cache" "$run_id-corpus" "$run_id-index" "$run_id-dictionary" "$run_id-interrupted-index" "$run_id-rebuilt-index")
 node_image=node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe
 postgres_image=postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a
 cleanup() {
@@ -38,9 +41,9 @@ cleanup() {
     if (( status != 0 )); then
         # Never inspect Config.Env, SQL input, or print raw database/driver logs.
         docker inspect --format '{{.Name}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} running={{.State.Running}}' \
-            "$server" "$migration" "$seed" "$postgres" >&2 2>/dev/null || true
+            "$server" "$migration" "$maintenance" "$interrupted" "$rebuild" "$seed" "$postgres" >&2 2>/dev/null || true
     fi
-    docker rm -fv "$server" "$client" "$initializer" "$migration" "$seed" "$postgres" >/dev/null 2>&1 || true
+    docker rm -fv "$server" "$client" "$initializer" "$migration" "$maintenance" "$interrupted" "$rebuild" "$seed" "$postgres" >/dev/null 2>&1 || true
     docker network rm "$network" >/dev/null 2>&1 || true
     docker volume rm "${volumes[@]}" >/dev/null 2>&1 || true
     docker image rm "$helper_image" >/dev/null 2>&1 || true
@@ -64,7 +67,21 @@ docker build --platform "$native_platform" --file test-support/retained-image/Do
 docker pull --platform "$native_platform" "$node_image" >/dev/null
 docker pull --platform "$native_platform" "$postgres_image" >/dev/null
 mkdir -p "$scratch/fixture/config" "$scratch/fixture/tls" "$scratch/fixture/postgres-ca" "$scratch/fixture/bad-ca" "$scratch/postgres-tls"
-scripts/test-kubernetes-serving.sh --profile retained --config-output "$scratch/fixture/config/server.toml"
+scripts/test-kubernetes-serving.sh --profile retained --config-output "$scratch/fixture/config/server.toml" \
+    --admin-output-dir "$scratch/admin"
+deploy_tools=${OPENLEGAL_DEPLOY_TOOLS:-$repo/target/deployment-tools}
+"$deploy_tools/bin/python" - "$scratch/admin" <<'PYTHON'
+import pathlib, sys, yaml
+root = pathlib.Path(sys.argv[1])
+for operation in ('migrate', 'maintain', 'rebuild'):
+    docs = list(yaml.safe_load_all((root / f'{operation}.yaml').read_text()))
+    job, = [doc for doc in docs if doc and doc['kind'] == 'Job']
+    container, = job['spec']['template']['spec']['containers']
+    (root / f'{operation}.args').write_text('\n'.join(container['args']) + '\n')
+PYTHON
+mapfile -t migrate_args < "$scratch/admin/migrate.args"
+mapfile -t maintain_args < "$scratch/admin/maintain.args"
+mapfile -t rebuild_args < "$scratch/admin/rebuild.args"
 OPENLEGAL_RENDERED_CONFIG="$scratch/fixture/config/server.toml" \
     cargo test --locked -p openlegal-server --test deployment_config
 cp scripts/server-image-smoke.mjs "$scratch/fixture/"
@@ -108,9 +125,13 @@ for name in ('postgres.env', 'runtime.env', 'migration.env', 'probe.env', 'roles
 PY
 docker network create --internal "$network" >/dev/null
 for volume in "${volumes[@]}"; do docker volume create "$volume" >/dev/null; done
-storage=(--mount "type=volume,source=$run_id-cache,target=/var/lib/openlegal/cache-blobs" \
-    --mount "type=volume,source=$run_id-corpus,target=/var/lib/openlegal/corpus-blobs" \
-    --mount "type=volume,source=$run_id-index,target=/var/lib/openlegal/corpus-index")
+cache_storage=(--mount "type=volume,source=$run_id-cache,target=/var/lib/openlegal/cache-blobs")
+select_index() {
+    storage=("${cache_storage[@]}" \
+        --mount "type=volume,source=$run_id-corpus,target=/var/lib/openlegal/corpus-blobs" \
+        --mount "type=volume,source=$1,target=/var/lib/openlegal/corpus-index")
+}
+select_index "$run_id-index"
 fixture_rw=(--mount "type=volume,source=$fixture,target=/fixture")
 fixture_ro=(--mount "type=volume,source=$fixture,target=/fixture,readonly")
 dictionary_rw=(--mount "type=volume,source=$run_id-dictionary,target=/var/lib/openlegal/mecab-ko-dictionary")
@@ -132,6 +153,14 @@ docker run --rm --name "$initializer" --platform "$native_platform" --network no
     chmod 750 /fixture/tls /fixture/postgres-ca /fixture/bad-ca
     chmod 440 /fixture/tls/* /fixture/postgres-ca/* /fixture/bad-ca/*
     '
+# Fresh rebuild destinations retain the same volume-root/private-data contract.
+for volume in "$run_id-interrupted-index" "$run_id-rebuilt-index"; do
+    docker run --rm --name "$initializer" --platform "$native_platform" --network none --user 0:0 \
+        --mount "type=volume,source=$volume,target=/fresh" --entrypoint sh "$node_image" -ec '
+        chown 0:10004 /fresh; chmod 2770 /fresh
+        mkdir /fresh/data; chown 10004:10004 /fresh/data; chmod 00700 /fresh/data
+        '
+done
 tar -c -C "$dictionary" . | docker run --rm -i --name "$initializer" --platform "$native_platform" \
     --network none --user 0:0 "${dictionary_rw[@]}" --entrypoint tar "$node_image" -x -C /var/lib/openlegal/mecab-ko-dictionary/data
 docker run --rm --name "$initializer" --platform "$native_platform" --network none --user 0:0 \
@@ -208,8 +237,8 @@ for attempt in {1..10}; do
 done
 # Migration receives its distinct credential and no writable storage or runtime URL.
 if ! docker run --name "$migration" --platform "$platform" --network "$network" "${hardening[@]}" \
-    "${config[@]}" "${ca[@]}" --env-file "$scratch/migration.env" "$image" \
-    --migrate /etc/openlegal/server.toml > "$scratch/migrate.log" 2>&1; then
+    --memory 512m --cpus 1 "${config[@]}" "${ca[@]}" --env-file "$scratch/migration.env" "$image" \
+    "${migrate_args[@]}" > "$scratch/migrate.log" 2>&1; then
     report_failure_category Migration "$scratch/migrate.log"; exit 1
 fi
 printf '%s\n' 'REVOKE CREATE ON SCHEMA public FROM PUBLIC;' 'GRANT USAGE ON SCHEMA openlegal TO runtime;' \
@@ -225,6 +254,20 @@ if ! docker run --name "$seed" --platform "$native_platform" --network "$network
 fi
 tar -c -C "$scratch/fixture" expected.json | docker run --rm -i --name "$initializer" --platform "$native_platform" \
     --network none --user 0:0 "${fixture_rw[@]}" --entrypoint tar "$node_image" -x -C /fixture
+fixture_sql() {
+    docker exec "$postgres" psql -X -U postgres -d openlegal -v ON_ERROR_STOP=1 -Atc "$1"
+}
+[[ $(fixture_sql 'SELECT count(*) FROM openlegal.cache_snapshot') == 1 ]]
+# Maintenance must succeed with only cache blobs; corpus/index/dictionary, backend
+# TLS and migration credentials are absent even though retained config names them.
+if ! docker run --name "$maintenance" --platform "$platform" --network "$network" "${hardening[@]}" \
+    --memory 512m --cpus 1 "${config[@]}" "${ca[@]}" "${cache_storage[@]}" \
+    --env-file "$scratch/runtime.env" "$image" "${maintain_args[@]}" > "$scratch/maintain.log" 2>&1; then
+    report_failure_category Maintenance "$scratch/maintain.log"; exit 1
+fi
+[[ $(fixture_sql 'SELECT count(*) FROM openlegal.cache_snapshot') == 0 ]]
+[[ $(fixture_sql 'SELECT snapshots FROM openlegal.cache_storage WHERE singleton') == 0 ]]
+[[ $(fixture_sql 'SELECT count(*) FROM openlegal.corpus_capture') == 2 ]]
 start_server() {
     docker run -d --name "$server" --platform "$platform" --network "$network" --network-alias server \
         "${hardening[@]}" "${config[@]}" "${tls[@]}" "${ca[@]}" "${storage[@]}" "${dictionary_ro[@]}" \
@@ -308,6 +351,54 @@ expect_failure() {
     docker rm "$server" >/dev/null
     printf 'Expected startup rejection: %s\n' "$label"
 }
+# Pause replay at a real database lock, after create_rebuild has committed its
+# incomplete metadata. This fixture changes no production code and does not rely
+# on a large corpus or a guessed sleep to interrupt the correct phase.
+old_index_digest=$(docker run --rm --name "$initializer" --platform "$native_platform" --network none \
+    --user 10004:10004 --mount "type=volume,source=$run_id-index,target=/old,readonly" \
+    --entrypoint sha256sum "$node_image" /old/data/meta.json)
+ack_before=$(fixture_sql 'SELECT index_ack FROM openlegal.corpus_control')
+docker exec -d --env PGAPPNAME=openlegal-rebuild-barrier "$postgres" \
+    psql -X -U postgres -d openlegal -v ON_ERROR_STOP=1 -c \
+    'BEGIN; LOCK TABLE openlegal.corpus_outbox IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(600); ROLLBACK;'
+for attempt in {1..100}; do
+    [[ $(fixture_sql "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.application_name='openlegal-rebuild-barrier' AND l.relation='openlegal.corpus_outbox'::regclass AND l.granted") == 1 ]] && break
+    (( attempt < 100 )) || { echo 'Rebuild barrier was not acquired' >&2; exit 1; }
+    sleep 0.1
+done
+select_index "$run_id-interrupted-index"
+docker run -d --name "$interrupted" --platform "$platform" --network "$network" "${hardening[@]}" \
+    "${config[@]}" "${ca[@]}" "${storage[@]}" "${dictionary_ro[@]}" \
+    --env-file "$scratch/runtime.env" "$image" "${rebuild_args[@]}" >/dev/null
+for attempt in {1..3000}; do
+    if [[ $(fixture_sql "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.usename='runtime' AND l.relation='openlegal.corpus_outbox'::regclass AND NOT l.granted") == 1 ]]; then
+        docker kill --signal SIGKILL "$interrupted" >/dev/null
+        break
+    fi
+    [[ $(docker inspect --format '{{.State.Running}}' "$interrupted") == true ]] || {
+        echo 'Rebuild exited before controlled interruption' >&2; exit 1;
+    }
+    (( attempt < 3000 )) || { echo 'Rebuild never reached replay barrier' >&2; exit 1; }
+    sleep 0.1
+done
+docker wait "$interrupted" >/dev/null
+[[ $(docker inspect --format '{{.State.ExitCode}}:{{.State.OOMKilled}}' "$interrupted") == 137:false ]]
+fixture_sql "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='openlegal-rebuild-barrier'" >/dev/null
+[[ $(fixture_sql 'SELECT index_ack FROM openlegal.corpus_control') == "$ack_before" ]]
+expect_failure 'interrupted incomplete index' 'Error: StorageCorrupt' --env-file "$scratch/runtime.env"
+select_index "$run_id-rebuilt-index"
+if ! docker run --name "$rebuild" --platform "$platform" --network "$network" "${hardening[@]}" \
+    "${config[@]}" "${ca[@]}" "${storage[@]}" "${dictionary_ro[@]}" \
+    --env-file "$scratch/runtime.env" "$image" "${rebuild_args[@]}" > "$scratch/rebuild.log" 2>&1; then
+    report_failure_category Rebuild "$scratch/rebuild.log"; exit 1
+fi
+[[ $(fixture_sql 'SELECT index_ack = next_event - 1 FROM openlegal.corpus_control') == t ]]
+[[ $(docker run --rm --name "$initializer" --platform "$native_platform" --network none \
+    --user 10004:10004 --mount "type=volume,source=$run_id-index,target=/old,readonly" \
+    --entrypoint sha256sum "$node_image" /old/data/meta.json) == "$old_index_digest" ]]
+# Serving now consumes the fresh completed destination, with identical capture
+# and query assertions. The previous index remains preserved on its own volume.
+acceptance_cycle rebuilt
 expect_failure 'missing runtime credential' 'Error: "required PostgreSQL connection environment value is missing or invalid"'
 ca=(--mount "type=volume,source=$fixture,target=/run/secrets/postgres-ca,volume-subpath=bad-ca,readonly")
 expect_failure 'untrusted PostgreSQL certificate' 'Error: Storage(StorageUnavailable)' --env-file "$scratch/runtime.env"

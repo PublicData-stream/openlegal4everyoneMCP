@@ -521,3 +521,230 @@ async fn migration_uses_only_admin_secret_and_never_initializes_serving() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains(&database.url));
     assert!(!String::from_utf8_lossy(&output.stderr).contains(&database.url));
 }
+
+async fn maintenance_cli_prunes_and_reopens(processes: usize) {
+    use openlegal_adapters::{
+        blob::FsBlobStore,
+        postgres::{PostgresStore, StartupMode},
+    };
+    use openlegal_application::{
+        SystemClock,
+        persistence::{HistoryKey, PersistentStore, RetentionPolicy},
+    };
+    let database = postgres::TestDatabase::new().await;
+    let now = SystemClock::default().now();
+    let store = database.open(now).await;
+    let time = Arc::new(Time(AtomicU64::new(now - 180)));
+    let revision = Arc::new(AtomicUsize::new(1));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let namespace = "d".repeat(64);
+    let service = RetrievalService::with_persistence(
+        vec![Source {
+            id: "layout_a".into(),
+            provider: "synthetic".into(),
+            dataset: "records".into(),
+            processor_version: "test-v1".into(),
+            upstream: Arc::new(Mock {
+                revision: revision.clone(),
+                calls: calls.clone(),
+            }),
+        }],
+        time.clone(),
+        Box::new(openlegal_adapters::MemoryCache::new()),
+        store.clone(),
+        namespace.clone(),
+    )
+    .unwrap();
+    let query = Query::Get {
+        source: "layout_a".into(),
+        id: "001".into(),
+    };
+    let mut captures = Vec::new();
+    for n in 0..3 {
+        time.0.store(now - 180 + n * 61, Ordering::SeqCst);
+        revision.store(n as usize + 1, Ordering::SeqCst);
+        captures.push(
+            service
+                .retrieve(
+                    query.clone(),
+                    FreshnessRequirement::FreshOnly,
+                    CancellationToken::new(),
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let history = HistoryKey {
+        namespace: namespace.clone(),
+        provider: "synthetic".into(),
+        dataset: "records".into(),
+        query: query.clone(),
+    };
+    assert_eq!(
+        store
+            .list(history, None, 20, now, CancellationToken::new())
+            .await
+            .unwrap()
+            .snapshots
+            .len(),
+        3
+    );
+    service.shutdown().await.unwrap();
+    drop(service);
+    drop(store);
+
+    let root = database.directory.path();
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config: toml::Value =
+        toml::from_str(include_str!("../../../deploy/demo/server.toml")).unwrap();
+    config["http"]["bind"] = toml::Value::String(occupied.local_addr().unwrap().to_string());
+    config["cache"]["blob"]["path"] =
+        toml::Value::String(root.join("blobs").to_str().unwrap().into());
+    for limit in ["max_snapshots_per_query", "max_snapshots", "max_queries"] {
+        config["cache"][limit] = toml::Value::Integer(1);
+    }
+    config["demo"]["widget_html"] =
+        toml::Value::String(root.join("missing-demo.html").to_str().unwrap().into());
+    config["text_diff"]["widget_html"] =
+        toml::Value::String(root.join("missing-diff.html").to_str().unwrap().into());
+    config["webtransport"]["certificate"] =
+        toml::Value::String(root.join("missing.crt").to_str().unwrap().into());
+    config["webtransport"]["private_key"] =
+        toml::Value::String(root.join("missing.key").to_str().unwrap().into());
+    let unused = root.join("unused-corpus");
+    config.as_table_mut().unwrap().insert(
+        "database".into(),
+        toml::Value::Table(toml::map::Map::from_iter([
+            (
+                "blob_path".into(),
+                toml::Value::String(unused.join("blobs").to_str().unwrap().into()),
+            ),
+            (
+                "index_path".into(),
+                toml::Value::String(unused.join("index").to_str().unwrap().into()),
+            ),
+            (
+                "mecab_dictionary_path".into(),
+                toml::Value::String(unused.join("dictionary").to_str().unwrap().into()),
+            ),
+            (
+                "widget_html".into(),
+                toml::Value::String(unused.join("widget.html").to_str().unwrap().into()),
+            ),
+        ])),
+    );
+    let path = root.join("maintain.toml");
+    tokio::fs::write(&path, toml::to_string(&config).unwrap())
+        .await
+        .unwrap();
+    // Separate OS processes, identical configuration, and all publishers closed.
+    // Start both before awaiting either; idempotent completion does not imply
+    // that Kubernetes provides exactly-once Job execution.
+    let mut children = Vec::new();
+    for _ in 0..processes {
+        children.push(
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_openlegal-server"))
+                .arg("--maintain")
+                .arg(&path)
+                .env("OPENLEGAL_DATABASE_URL", &database.url)
+                .env(
+                    "OPENLEGAL_MIGRATION_DATABASE_URL",
+                    "invalid-admin-url-must-not-be-read",
+                )
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in children {
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(output.status.success(), "cache-maintenance command failed");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(&database.url));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&database.url));
+    }
+    assert!(
+        !unused.exists(),
+        "maintenance must not initialize unused corpus storage"
+    );
+    let blobs = FsBlobStore::open(&root.join("blobs")).await.unwrap();
+    let reopened = PostgresStore::open(
+        &database.url,
+        postgres::options(),
+        blobs,
+        RetentionPolicy {
+            max_snapshots_per_query: 1,
+            max_snapshots: 1,
+            max_queries: 1,
+            ..RetentionPolicy::default()
+        },
+        now,
+        StartupMode::Serve,
+    )
+    .await
+    .unwrap();
+    // Serve-mode reopen verifies persisted accounting against actual rows.
+    assert_eq!(reopened.metrics().snapshots, 1);
+    assert_eq!(reopened.metrics().queries, 1);
+    assert!(reopened.metrics().bytes > 0);
+    let history = HistoryKey {
+        namespace,
+        provider: "synthetic".into(),
+        dataset: "records".into(),
+        query,
+    };
+    let page = reopened
+        .list(history.clone(), None, 20, now, CancellationToken::new())
+        .await
+        .unwrap();
+    let latest = captures.last().unwrap().snapshot.as_ref().unwrap();
+    assert_eq!(page.snapshots.len(), 1);
+    assert_eq!(page.snapshots[0].snapshot_id, latest.snapshot_id);
+    let exact = reopened
+        .get(
+            history.clone(),
+            latest.snapshot_id.clone(),
+            now,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.data, captures.last().unwrap().data);
+    assert_eq!(exact.provenance, captures.last().unwrap().provenance);
+    assert_eq!(
+        reopened
+            .get(
+                history,
+                captures[0].snapshot.as_ref().unwrap().snapshot_id.clone(),
+                now,
+                CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+        RetrievalError::SnapshotUnavailable
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "administration never fetches upstreams"
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh PostgreSQL 18 environment"]
+async fn maintenance_cli_prunes_without_unused_serving_inputs() {
+    maintenance_cli_prunes_and_reopens(1).await;
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh PostgreSQL 18 environment"]
+async fn duplicate_maintenance_processes_preserve_retained_evidence_and_accounting() {
+    maintenance_cli_prunes_and_reopens(2).await;
+}
