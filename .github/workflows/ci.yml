@@ -33,6 +33,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - run: cargo test --locked -p openlegal-server --example wt_client serving_smoke
       - run: git diff --check
   korean-tokenization:
     runs-on: ubuntu-24.04
@@ -153,6 +154,10 @@ jobs:
         run: scripts/setup-deployment-tools.sh
       - name: Check deployment sources, invariants and both Kubernetes schemas offline
         run: scripts/test-kubernetes-serving.sh
+      - name: Test bounded serving smoke without external endpoints
+        run: python3 -m unittest discover -s scripts/tests -p 'test_serving_smoke.py'
+      - name: Test disposable acceptance preparation without a cluster
+        run: target/deployment-tools/bin/python -m unittest discover -s test-support/kubernetes-acceptance -p 'test_*.py'
   server-image:
     strategy:
       fail-fast: false
