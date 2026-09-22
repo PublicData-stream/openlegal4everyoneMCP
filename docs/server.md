@@ -311,3 +311,8 @@ result/error contracts and limits. Details, configuration, freshness, body/catal
 paging and provider acceptance boundaries are in [legal corpus](database.md).
 No public ingestion, corpus mutation, arbitrary SQL or filesystem-search tool is
 registered. Operator ingestion configuration is a separate startup decision.
+The [optional Kubernetes ingestion overlay](deployment-kubernetes.md#optional-ingestion-integration)
+uses the existing explicit kubeconfig/context fields with a projected token; it
+adds no public API or ambient authentication mode. See the
+[document controller contract](document-sandbox.md#input-output-and-lifecycle)
+for subprocess environment and credential boundaries.

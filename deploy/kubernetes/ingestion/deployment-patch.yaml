@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openlegal-server
+spec:
+  template:
+    metadata:
+      labels:
+        openlegal.ingestion/enabled: "true"
+    spec:
+      serviceAccountName: openlegal-document-controller
+      containers:
+        - name: server
+          # Non-pullable sentinel; replace registry AND digest before use.
+          image: registry.example/openlegal-server-ingestion@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          env:
+            - name: OPENLEGAL_LAW_PROVIDER_CREDENTIAL
+              valueFrom:
+                secretKeyRef:
+                  name: openlegal-law-provider
+                  key: OPENLEGAL_LAW_PROVIDER_CREDENTIAL
+          resources:
+            requests:
+              ephemeral-storage: 64Mi
+            limits:
+              ephemeral-storage: 128Mi
+          volumeMounts:
+            - name: controller-config
+              mountPath: /run/secrets/document-controller/config
+              readOnly: true
+            - name: controller-identity
+              mountPath: /run/secrets/document-controller/identity
+              readOnly: true
+            - name: kubectl-tmp
+              mountPath: /tmp
+              readOnly: false
+      volumes:
+        - name: controller-config
+          configMap:
+            name: openlegal-document-controller-config
+            defaultMode: 0444
+        - name: controller-identity
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+        - name: kubectl-tmp
+          # Disk-backed; size and ephemeral-storage limits use kubelet eviction.
+          emptyDir:
+            sizeLimit: 64Mi

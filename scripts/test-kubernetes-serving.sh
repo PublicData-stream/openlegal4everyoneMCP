@@ -42,9 +42,11 @@ trap 'rm -rf "$scratch"' EXIT
 "$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/serving" > "$scratch/retained.yaml"
 "$tools_dir/bin/kubectl" kustomize "$repo/test-support/deployment/text-only" > "$scratch/text-only.yaml"
 mkdir "$scratch/network"
-for variant in base edge postgres-in-cluster postgres-external dns-cluster dns-fixed monitoring; do
+for variant in base edge postgres-in-cluster postgres-external dns-cluster dns-fixed monitoring ingestion-api ingestion-provider; do
     "$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/network/$variant" > "$scratch/network/$variant.yaml"
 done
+"$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/ingestion" > "$scratch/ingestion.yaml"
+"$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/ingestion/rbac" > "$scratch/ingestion-rbac.yaml"
 admin_args=()
 for operation in migrate maintain rebuild; do
     "$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/admin/$operation" > "$scratch/$operation.yaml"
@@ -62,7 +64,8 @@ for checked_profile in retained text-only; do
     operation_args=()
     if [[ $checked_profile == retained ]]; then
         edge_args=(--oxibelt-config "$repo/deploy/oxibelt/kubernetes-upstream.example.toml")
-        operation_args=("${admin_args[@]}")
+        operation_args=("${admin_args[@]}" --ingestion-manifest "$scratch/ingestion.yaml" \
+            --ingestion-rbac "$scratch/ingestion-rbac.yaml")
     fi
     if [[ $checked_profile == "$profile" ]]; then
         output_args=("${config_args[@]}")
@@ -71,15 +74,19 @@ for checked_profile in retained text-only; do
         "$scratch/$checked_profile.yaml" --profile "$checked_profile" \
         --network-dir "$scratch/network" \
         --document-boundary "$repo/deploy/document-sandbox/namespace.yaml" \
+        --document-controller-role "$repo/deploy/document-sandbox/controller-role.yaml" \
         --storage-manifest "$scratch/storage.yaml" "${edge_args[@]}" "${output_args[@]}" "${operation_args[@]}"
 done
-OPENLEGAL_RENDERED_SERVING="$scratch/retained.yaml" \
+OPENLEGAL_RENDERED_INGESTION="$scratch/ingestion.yaml" \
+    OPENLEGAL_RENDERED_INGESTION_RBAC="$scratch/ingestion-rbac.yaml" \
+    OPENLEGAL_RENDERED_SERVING="$scratch/retained.yaml" \
     OPENLEGAL_RENDERED_TEXT_ONLY="$scratch/text-only.yaml" \
     OPENLEGAL_STORAGE_EXAMPLES="$scratch/storage.yaml" PYTHONDONTWRITEBYTECODE=1 \
     OPENLEGAL_OXIBELT_EXAMPLE="$repo/deploy/oxibelt/kubernetes-upstream.example.toml" \
     OPENLEGAL_RENDERED_ADMIN_DIR="$scratch" \
     OPENLEGAL_RENDERED_NETWORK_DIR="$scratch/network" \
     OPENLEGAL_DOCUMENT_BOUNDARY="$repo/deploy/document-sandbox/namespace.yaml" \
+    OPENLEGAL_DOCUMENT_CONTROLLER_ROLE="$repo/deploy/document-sandbox/controller-role.yaml" \
     "$tools_dir/bin/python" -m unittest discover -s "$repo/scripts/tests" -p test_deployment_validation.py
 if [[ -n $admin_output_dir ]]; then
     mkdir -p "$admin_output_dir"

@@ -1,0 +1,5 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Keep this root separate: the serving overlay must not rewrite this namespace.
+resources:
+  - role-binding.yaml

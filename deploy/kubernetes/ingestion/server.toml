@@ -1,0 +1,58 @@
+# Retained-corpus serving template. See docs/deployment-kubernetes.md before deployment.
+# Replace with free corresponding source for the exact running server and widget.
+[source]
+url = "https://github.com/PublicData-stream/openlegal4everyoneMCP/tree/REPLACE_WITH_RELEASE_REVISION"
+
+[http]
+bind = "0.0.0.0:8080"
+allowed_hosts = ["REPLACE_WITH_OXIBELT_BACKEND_AUTHORITY"]
+allowed_origins = ["https://openlegal4everyone.stream"]
+
+[webtransport]
+bind = "0.0.0.0:4433"
+certificate = "/run/secrets/backend-tls/tls.crt"
+private_key = "/run/secrets/backend-tls/tls.key"
+allowed_hosts = ["REPLACE_WITH_OXIBELT_WEBTRANSPORT_AUTHORITY"]
+allowed_origins = ["https://openlegal4everyone.stream"]
+
+[health]
+bind = "0.0.0.0:9090"
+
+[limits]
+max_message_bytes = 16777216
+max_buffer_bytes = 268435456
+shutdown_timeout_secs = 15
+
+[text_diff]
+widget_html = "/opt/openlegal/widgets/text-diff.html"
+
+[cache]
+mode = "persistent"
+
+[cache.postgres]
+url_env = "OPENLEGAL_DATABASE_URL"
+# Name only: the serving Pod must never receive this credential.
+migration_url_env = "OPENLEGAL_MIGRATION_DATABASE_URL"
+tls_mode = "verify-full"
+ca_file = "/run/secrets/postgres-ca/ca.crt"
+
+[cache.blob]
+kind = "filesystem"
+path = "/var/lib/openlegal/cache-blobs/data"
+
+[database]
+blob_path = "/var/lib/openlegal/corpus-blobs/data"
+index_path = "/var/lib/openlegal/corpus-index/data"
+widget_html = "/opt/openlegal/widgets/database.html"
+mecab_dictionary_path = "/var/lib/openlegal/mecab-ko-dictionary/data"
+
+# Opt in only after retained serving, sandbox and provider acceptance.
+[database.ingestion]
+credential_env = "OPENLEGAL_LAW_PROVIDER_CREDENTIAL"
+kubectl = "/usr/local/bin/kubectl"
+kubeconfig = "/run/secrets/document-controller/config/kubeconfig"
+context = "openlegal-document-controller"
+namespace = "openlegal-documents"
+worker_image = "registry.example/openlegal-document-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+enabled = true
+retain_history_bodies = false

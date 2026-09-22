@@ -73,7 +73,7 @@ ADMIN = {
 }
 
 NETWORK_VARIANTS = ("base", "edge", "postgres-in-cluster", "postgres-external",
-                    "dns-cluster", "dns-fixed", "monitoring")
+                    "dns-cluster", "dns-fixed", "monitoring", "ingestion-api", "ingestion-provider")
 
 
 def resource_index(documents):
@@ -128,12 +128,21 @@ def network_example(variant):
             peer = (selected_peer("kube-system", "k8s-app", "kube-dns") if variant == "dns-cluster"
                     else {"ipBlock": {"cidr": "192.0.2.53/32"}})
             ports = [port("TCP", 53), port("UDP", 53)]
+        elif variant.startswith("ingestion-"):
+            name = "openlegal-allow-" + variant
+            address = "192.0.2.40" if variant == "ingestion-api" else "192.0.2.50"
+            peer = {"ipBlock": {"cidr": address + "/32"}}
+            ports = [port("TCP", 443)]
         else:
             name = "openlegal-allow-monitoring"
             peer = selected_peer("replace-with-monitoring-namespace", "app.kubernetes.io/name",
                                  "replace-with-monitoring-app")
             ports = [port("TCP", 9090)]
-        spec = {"podSelector": serving if ingress else database_clients,
+        selector = (serving if ingress else database_clients)
+        if variant.startswith("ingestion-"):
+            selector = {"matchLabels": {"app.kubernetes.io/name": "openlegal-server",
+                                        "openlegal.ingestion/enabled": "true"}}
+        spec = {"podSelector": selector,
                 "policyTypes": ["Ingress" if ingress else "Egress"],
                 direction: [{"from" if ingress else "to": [peer], "ports": ports}]}
     return {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
@@ -312,13 +321,7 @@ def validate(documents, profile="retained"):
               "periodSeconds": 5, "timeoutSeconds": 2, "failureThreshold": 60,
               "successThreshold": 1}, "startup probe")
     equal(container["name"], "server", "container name")
-    image = container["image"]
-    require(isinstance(image, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:/-]*@sha256:[a-f0-9]{64}", image),
-            "image must use a sha256 digest reference")
-    require(":" not in image.split("@", 1)[0].rsplit("/", 1)[-1], "image tags are not supported")
-    if image.endswith("@sha256:" + "0" * 64):
-        require(image == "registry.example/openlegal-server@sha256:" + "0" * 64,
-                "only the documented image placeholder may use a zero digest")
+    digest_image(container["image"], "openlegal-server")
     equal(container["imagePullPolicy"], "IfNotPresent", "image pull policy")
     equal(container["ports"], [{"name": n, "containerPort": p, "protocol": protocol}
           for n, p, protocol in (("http", 8080, "TCP"), ("webtransport", 4433, "UDP"), ("health", 9090, "TCP"))], "ports")
@@ -350,6 +353,133 @@ def validate(documents, profile="retained"):
     equal(container["volumeMounts"], mounts, "mounts")
     equal(pod["volumes"], volumes, "volumes")
     return raw
+
+
+def digest_image(image, placeholder):
+    require(isinstance(image, str) and re.fullmatch(
+        r"[a-zA-Z0-9][a-zA-Z0-9._:/-]*@sha256:[a-f0-9]{64}", image),
+        "image must use a sha256 digest reference")
+    require(":" not in image.split("@", 1)[0].rsplit("/", 1)[-1], "image tags are not supported")
+    if image.endswith("@sha256:" + "0" * 64):
+        equal(image, f"registry.example/{placeholder}@sha256:" + "0" * 64, "image placeholder")
+
+
+def validate_ingestion(documents, retained_documents):
+    """Require the explicit opt-in additions and exact retained behavior parity."""
+    retained_raw = validate(retained_documents)
+    actual = resource_index(documents)
+    expected_documents = copy.deepcopy(retained_documents)
+
+    def one(kind, prefix=None):
+        matches = [obj for obj in documents if obj["kind"] == kind
+                   and (prefix is None or obj["metadata"]["name"].startswith(prefix))]
+        require(len(matches) == 1, f"expected one ingestion {kind} {prefix or ''}")
+        return matches[0]
+
+    server_cm = one("ConfigMap", "openlegal-server-config-")
+    controller_cm = one("ConfigMap", "openlegal-document-controller-config-")
+    for cm, prefix in ((server_cm, "openlegal-server-config"),
+                       (controller_cm, "openlegal-document-controller-config")):
+        require(re.fullmatch(prefix + r"-[a-z0-9]{10}", cm["metadata"]["name"]),
+                "ingestion ConfigMap must retain content hash")
+        keys(cm.get("data"), ("server.toml",) if cm is server_cm else ("kubeconfig",), "ingestion ConfigMap data")
+    raw = server_cm["data"]["server.toml"]
+    require(isinstance(raw, str), "ingestion server.toml must be text")
+    config = tomllib.loads(raw)
+    require(isinstance(config.get("database"), dict), "ingestion database configuration required")
+    ingestion = config["database"].pop("ingestion", None)
+    require(isinstance(ingestion, dict), "ingestion configuration required")
+    equal(config, tomllib.loads(retained_raw), "ingestion retained configuration parity")
+    worker = ingestion.get("worker_image")
+    digest_image(worker, "openlegal-document-worker")
+    equal(ingestion, {
+        "credential_env": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "kubectl": "/usr/local/bin/kubectl",
+        "kubeconfig": "/run/secrets/document-controller/config/kubeconfig",
+        "context": "openlegal-document-controller", "namespace": "openlegal-documents",
+        "worker_image": worker, "enabled": True, "retain_history_bodies": False,
+    }, "ingestion configuration")
+    identity = "/run/secrets/document-controller/identity"
+    kubeconfig = {
+        "apiVersion": "v1", "kind": "Config",
+        "clusters": [{"name": "document-cluster", "cluster": {
+            "server": "https://kubernetes.default.svc:443", "certificate-authority": identity + "/ca.crt"}}],
+        "users": [{"name": "openlegal-document-controller", "user": {"tokenFile": identity + "/token"}}],
+        "contexts": [{"name": "openlegal-document-controller", "context": {
+            "cluster": "document-cluster", "user": "openlegal-document-controller", "namespace": "openlegal-documents"}}],
+        "current-context": "openlegal-document-controller",
+    }
+    require(isinstance(controller_cm["data"]["kubeconfig"], str), "kubeconfig must be text")
+    parsed_kubeconfig = load_documents(controller_cm["data"]["kubeconfig"])
+    equal(parsed_kubeconfig, [kubeconfig], "dedicated kubeconfig")
+    expected_controller = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {
+        "name": controller_cm["metadata"]["name"], "namespace": "openlegal-serving"},
+        "data": {"kubeconfig": controller_cm["data"]["kubeconfig"]}}
+    expected_documents.extend([expected_controller, {
+        "apiVersion": "v1", "kind": "ServiceAccount", "metadata": {
+            "name": "openlegal-document-controller", "namespace": "openlegal-serving"},
+        "automountServiceAccountToken": False}])
+    base_cm = next(obj for obj in expected_documents if obj["kind"] == "ConfigMap"
+                   and obj["metadata"]["name"].startswith("openlegal-server-config-"))
+    require(base_cm["metadata"]["name"] != server_cm["metadata"]["name"], "ingestion needs a distinct configuration hash")
+    base_cm["metadata"]["name"] = server_cm["metadata"]["name"]
+    base_cm["data"]["server.toml"] = raw
+    template = next(obj for obj in expected_documents if obj["kind"] == "Deployment")["spec"]["template"]
+    template["metadata"]["labels"]["openlegal.ingestion/enabled"] = "true"
+    pod = template["spec"]
+    pod["serviceAccountName"] = "openlegal-document-controller"
+    container = pod["containers"][0]
+    image = one("Deployment")["spec"]["template"]["spec"]["containers"][0].get("image")
+    digest_image(image, "openlegal-server-ingestion")
+    container["image"] = image
+    container["env"].append({"name": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "valueFrom": {
+        "secretKeyRef": {"name": "openlegal-law-provider", "key": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL"}}})
+    container["resources"]["requests"]["ephemeral-storage"] = "64Mi"
+    container["resources"]["limits"]["ephemeral-storage"] = "128Mi"
+    container["volumeMounts"].extend([
+        {"name": "controller-config", "mountPath": "/run/secrets/document-controller/config", "readOnly": True},
+        {"name": "controller-identity", "mountPath": identity, "readOnly": True},
+        {"name": "kubectl-tmp", "mountPath": "/tmp", "readOnly": False}])
+    next(volume for volume in pod["volumes"] if volume["name"] == "config")["configMap"]["name"] = server_cm["metadata"]["name"]
+    pod["volumes"].extend([
+        {"name": "controller-config", "configMap": {"name": controller_cm["metadata"]["name"], "defaultMode": 0o444}},
+        {"name": "controller-identity", "projected": {"defaultMode": 0o440, "sources": [
+            {"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}},
+            {"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}}]}},
+        {"name": "kubectl-tmp", "emptyDir": {"sizeLimit": "64Mi"}}])
+    # Kustomize prepends strategic-merge entries. Order is irrelevant for these
+    # unique named items; duplicate names remain rejected by exact list equality.
+    actual = copy.deepcopy(actual)
+    expected = resource_index(expected_documents)
+    for indexed in (actual, expected):
+        deployment = next(obj for obj in indexed.values() if obj["kind"] == "Deployment")
+        spec = deployment["spec"]["template"]["spec"]
+        for items in (spec["volumes"], spec["containers"][0]["volumeMounts"], spec["containers"][0]["env"]):
+            items.sort(key=lambda item: item.get("name", ""))
+    require(actual.keys() == expected.keys(), "unexpected or missing ingestion resources")
+    for identity_key, obj in expected.items():
+        equal(actual[identity_key], obj, f"ingestion {identity_key[-1]}")
+    return raw
+
+
+def validate_document_controller_role(documents):
+    equal(documents, [{
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+        "metadata": {"name": "document-controller", "namespace": "openlegal-documents"},
+        "rules": [
+            {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "get", "list", "watch", "delete"]},
+            {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["get", "create"]},
+            {"apiGroups": [""], "resources": ["resourcequotas"], "resourceNames": ["document-budget"], "verbs": ["get"]},
+        ],
+    }], "existing document controller Role")
+
+
+def validate_ingestion_rbac(documents):
+    equal(documents, [{
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+        "metadata": {"name": "openlegal-document-controller", "namespace": "openlegal-documents"},
+        "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "document-controller"},
+        "subjects": [{"kind": "ServiceAccount", "name": "openlegal-document-controller", "namespace": "openlegal-serving"}],
+    }], "controller namespace-scoped binding")
 
 
 def validate_admin(documents, serving_documents, operation):
@@ -519,10 +649,20 @@ def main():
     parser.add_argument("--network-dir", type=Path,
                         help="directory of all separately rendered network examples")
     parser.add_argument("--document-boundary", type=Path)
+    parser.add_argument("--ingestion-manifest", type=Path)
+    parser.add_argument("--ingestion-rbac", type=Path)
+    parser.add_argument("--document-controller-role", type=Path)
     args = parser.parse_args()
     try:
         documents = load_documents(args.manifest.read_text())
         raw = validate(documents, args.profile)
+        if args.ingestion_manifest:
+            require(args.profile == "retained", "ingestion requires retained baseline")
+            validate_ingestion(load_documents(args.ingestion_manifest.read_text()), documents)
+        if args.document_controller_role:
+            validate_document_controller_role(load_documents(args.document_controller_role.read_text()))
+        if args.ingestion_rbac:
+            validate_ingestion_rbac(load_documents(args.ingestion_rbac.read_text()))
         if args.network_dir:
             for variant in NETWORK_VARIANTS:
                 validate_network(load_documents((args.network_dir / f"{variant}.yaml").read_text()),

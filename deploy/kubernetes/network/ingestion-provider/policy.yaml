@@ -1,0 +1,19 @@
+# Apply separately after replacing the documentation-only address.
+# API addresses/ports depend on CNI Service translation; provider IPs need maintenance.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openlegal-allow-ingestion-provider
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openlegal-server
+      openlegal.ingestion/enabled: "true"
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.50/32
+      ports:
+        - protocol: TCP
+          port: 443

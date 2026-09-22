@@ -12,8 +12,9 @@ Phase 5 adds suspended migration, cache-maintenance and offline index-rebuild Jo
 with separate credentials and an operator-controlled maintenance window. Phase 6
 adds namespace-wide default deny, separately selected allow policies and a network
 acceptance runbook. The text-only profile remains a separate test fixture without
-a Service or NetworkPolicy. Ingestion integration and complete production
-acceptance remain planned. This document does not establish a running deployment
+a Service or NetworkPolicy. Phase 7 adds an opt-in ingestion image, projected
+controller identity, separate RBAC/egress templates and offline controller checks.
+Complete production acceptance remains pending. This document does not establish a running deployment
 or successful real-cluster, live-provider, browser WebTransport or ChatGPT acceptance.
 
 The original Phase 0 inventory was recorded on `main` at
@@ -100,7 +101,8 @@ Shipping a widget does not enable its feature. Retained-corpus serving still nee
 the separately provisioned read-only MeCab dictionary, PostgreSQL and separate
 writable blob/index mounts. The Lindera dictionary is already embedded at build
 time; the image never downloads a dictionary at startup. Ingestion stays opt-in
-and requires a later ingestion-capable image: this image contains no `kubectl`.
+and requires the explicit `runtime-ingestion` image target; the default image
+contains no `kubectl`.
 
 The image contains the CA trust bundle and runtime GNU libraries, but no compiler,
 Cargo, Node, pnpm, Git or build cache. Application files are root-owned and the
@@ -874,6 +876,152 @@ dictionary before startup, mount it read-only, and follow the
 [dictionary and index contracts](database.md#operator-configuration) for changes;
 there is no runtime download or ambient dictionary discovery.
 
+## Optional ingestion integration
+
+Retained serving is the default. The [ingestion overlay](../deploy/kubernetes/ingestion/)
+enables managed background LAW OPEN DATA traffic as soon as its server starts.
+Applying it is an operator decision requiring separate live-provider authorization;
+rendering it offline does not authorize traffic. It uses the same one-replica
+Deployment and storage, not a second independently budgeted crawler.
+
+### Ingestion image and configuration
+
+Build the explicit target for each server architecture:
+
+```sh
+docker build --platform linux/amd64 --target runtime-ingestion \
+  -f apps/server/Dockerfile --build-arg REVISION="$(git rev-parse HEAD)" \
+  --build-arg VERSION=development -t openlegal-server-ingestion:local-amd64 .
+docker build --platform linux/arm64 --target runtime-ingestion \
+  -f apps/server/Dockerfile --build-arg REVISION="$(git rev-parse HEAD)" \
+  --build-arg VERSION=development -t openlegal-server-ingestion:local-arm64 .
+```
+
+The final/default Docker target remains minimal `runtime`. Both targets preserve
+UID/GID 10004, hardening, widgets and source metadata. Only ingestion includes the
+checksum-verified kubectl v1.37.0 at `/usr/local/bin/kubectl` and its redistribution
+notices. Initial API-server targets are Kubernetes 1.36–1.37, within the upstream
+[version-skew policy](https://kubernetes.io/releases/version-skew-policy/).
+The document worker remains separately built for amd64/x86-64-v3: qualify only
+compatible worker nodes with `openlegal.document-sandbox/ready=true`. ARM64 server
+support does not imply ARM64 document-worker support.
+
+The overlay replaces the generated server ConfigMap with retained configuration
+plus `[database.ingestion]`. Its fixed context is `openlegal-document-controller`,
+its namespace is `openlegal-documents`, and history-body ingestion remains disabled.
+Replace both non-pullable server/worker digest sentinels and the corresponding-source
+revision in an operator copy. Keep all retained configuration fields consistent
+with the shared serving/admin base when changing endpoints or storage.
+Administrative Jobs keep their original minimal image and ingestion-free ConfigMap;
+the ingestion ConfigMap has a different content hash by design.
+
+Create `Secret/openlegal-law-provider` outside Git in `openlegal-serving`, with key
+`OPENLEGAL_LAW_PROVIDER_CREDENTIAL`. Only the serving container references it. Never
+put its value in TOML, kubeconfig, image layers, command arguments or test artifacts.
+The server continues to receive only runtime PostgreSQL credentials.
+
+### Explicit projected identity
+
+The overlay creates `ServiceAccount/openlegal-document-controller` with automatic
+token mounting disabled, also disabled on the Pod. A dedicated directory projection
+supplies a token requested for 3,600 seconds and `kube-root-ca.crt`; omitting audience
+uses the API server default. The actual token expiry is determined by the API server.
+UID/GID 10004 can read the 0440 projection through the Pod's fsGroup. Do not use
+`subPath`: directory projection must receive token rotation updates.
+
+The nonsecret kubeconfig at
+`/run/secrets/document-controller/config/kubeconfig` contains exactly one cluster,
+user and context. It references absolute CA/token paths under the sibling
+`/run/secrets/document-controller/identity` mount and defaults to
+`https://kubernetes.default.svc:443`. There is no inline token, authentication plugin,
+proxy URL or insecure TLS setting. See Kubernetes' [token projection guidance](https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#serviceaccount-token-volume-projection).
+
+Apply the existing document namespace and `Role/document-controller` as sandbox
+prerequisites. The separate [RoleBinding root](../deploy/kubernetes/ingestion/rbac/)
+binds that unchanged Role in `openlegal-documents` to the ServiceAccount in
+`openlegal-serving`; do not import it under a serving namespace transformer.
+The controller has no Secret/log access or cluster-wide binding. Sandbox acceptance
+uses a separate operator identity with the additional inspection permissions it
+needs; do not broaden the controller Role to run that harness.
+
+Every kubectl subprocess receives only fixed PATH/HOME/TMPDIR values and explicit
+kubeconfig/context/namespace/cache arguments. Server credentials, ambient Kubernetes
+configuration and proxy variables are not inherited. The executable remains trusted
+code in the serving container, not a separate security sandbox. Existing external
+controller setups relying on inherited proxy/plugin variables must be adapted.
+
+Only ingestion mounts a writable 64 MiB disk-backed `emptyDir` at `/tmp`, with
+ephemeral-storage request/limit of 64/128 MiB. This provisional budget covers kubectl
+discovery/schema caches and logs and must be measured on the target cluster.
+Kubernetes accounting/eviction is not a synchronous filesystem quota. The root
+filesystem stays read-only; no new persistent application storage is introduced.
+
+### Network preparation, activation and rollback
+
+The overlay imports only the existing default-deny policy. Independently tailor and
+apply [API egress](../deploy/kubernetes/network/ingestion-api/) and
+[provider egress](../deploy/kubernetes/network/ingestion-provider/) examples. Both
+select the serving application plus `openlegal.ingestion/enabled=true`; neither
+selects administrative Jobs, retained-only Pods or document workers. The examples
+use documentation-only /32 addresses and TCP 443. Replace these with verified
+API/provider host addresses and actual API ports; never replace them with an
+unrestricted internet or namespace-wide allow.
+
+Apply an existing DNS allow policy for `kubernetes.default.svc` and `www.law.go.kr`.
+Determine whether the CNI evaluates API Service traffic before or after DNAT, then
+allow only the necessary Service/backend IPs and ports. Maintain provider address
+changes explicitly, including /128 entries if using IPv6. Stale lists fail closed;
+there is no automatic address update or broader-network fallback. NetworkPolicy
+does not enforce provider hostnames; the existing HTTPS/destination policy remains
+the application boundary. Parser Pods retain deny-all networking and receive no
+controller token or provider credential.
+
+Operator sequence (commands refer to an explicitly tailored copy):
+
+1. Complete retained-serving acceptance and stop the sole backend during the
+   activation window. Do not run an additional ingestion process against its index.
+2. Prepare compatible document nodes and complete the separately configured
+   [sandbox acceptance gate](document-sandbox.md#cluster-preparation-and-acceptance).
+3. Provision immutable images, provider Secret, controller identity/RoleBinding and
+   explicit DNS/API/provider policies. Inspect rendered namespace references before
+   applying anything. Record real-cluster token rotation, RBAC denial outside the
+   intended namespace, CNI enforcement and worker credential isolation.
+4. Obtain separate authorization for bounded live-provider acceptance. Only then
+   apply the ingestion overlay and complete that acceptance; its startup immediately
+   enables managed upstream requests. Keep production acceptance pending until
+   the required evidence is recorded.
+5. Verify the single Pod becomes Ready, provider/sandbox failures remain bounded,
+   and corpus freshness/coverage is reported honestly. Private readiness is not
+   proof of successful ingestion or corpus completeness.
+
+To disable ingestion, replace the Deployment/configuration with the retained root
+and wait for the ingestion Pod to terminate. Explicitly delete its two allow
+policies, RoleBinding and ServiceAccount once no ingestion Pod uses them; remove
+the unused provider Secret/controller ConfigMap according to operator policy.
+Reconcile leftover worker Pods with the operator identity. Applying a different
+Kustomize root alone does not prune these separately applied objects. Do not delete
+the shared document Role/namespace, retained storage or base network policies.
+
+### Offline acceptance
+
+```sh
+scripts/setup-deployment-tools.sh
+scripts/test-kubernetes-serving.sh
+scripts/test-kubernetes-serving.sh --profile text-only
+scripts/test-server-image.sh --platform linux/amd64 --target runtime-ingestion
+scripts/test-server-image.sh --platform linux/arm64 --target runtime-ingestion
+```
+
+The manifest gate checks ingestion/configuration parity, cross-namespace RBAC,
+projection/Secret boundaries and scoped egress along with retained/admin invariants.
+The image gate exercises retained serving with ingestion disabled, then invokes
+the packaged kubectl against a synthetic TLS API on an internal Docker network.
+It checks quota/Pod command compatibility, token-file replacement and authentication
+failures without legal-provider traffic. Tests use disposable credentials and do
+not implement or prove Kubernetes RBAC, projected-token delivery, Pod admission,
+gVisor or CNI enforcement. Native ARM64 CI remains distinct from local emulation.
+Real-cluster, live-provider and production traffic acceptance remain pending.
+
 ## Template and operator ownership
 
 The following division covers the full deployment design. Retained-corpus serving
@@ -892,9 +1040,9 @@ remain planned.
 
 Commit no credentials, private keys, production kubeconfig, database URL, real
 node identifier or host-specific ZFS path. Private network/storage values and
-production resource sizing remain operator inputs; later ingestion authentication integration remains future-phase work.
-The current controller requires explicit kubeconfig and context; any in-cluster
-authentication alternative needs a deliberate contract change and Security Review.
+production resource sizing remain operator inputs. The ingestion overlay preserves
+explicit kubeconfig/context authentication with a projected rotating token; no
+ambient in-cluster authentication mode is introduced.
 
 ## Validation boundary
 
@@ -908,7 +1056,8 @@ retained configuration/storage/restart checks in Phase 3. Phase 4 adds offline
 Service/example consistency checks and a Docker OxiBelt handoff profile. Phase 5
 adds offline admin-manifest checks and disposable database/image administration
 scenarios. Phase 6 adds offline network-template and document-boundary invariants
-and an operator network acceptance runbook. These do not validate Job admission,
+and an operator network acceptance runbook. Phase 7 adds ingestion manifest
+invariants and a synthetic TLS API fixture for the packaged kubectl. These do not validate Job admission,
 scheduling, termination or network enforcement on a real cluster. Real-cluster
 networking, storage, shutdown and sandbox enforcement require operator acceptance;
 live LAW OPEN DATA access and public transport/platform acceptance are separate

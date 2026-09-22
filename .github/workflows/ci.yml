@@ -160,8 +160,16 @@ jobs:
         include:
           - runner: ubuntu-24.04
             platform: linux/amd64
+            target: runtime
           - runner: ubuntu-24.04-arm
             platform: linux/arm64
+            target: runtime
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            target: runtime-ingestion
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: runtime-ingestion
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
@@ -181,7 +189,7 @@ jobs:
         run: rustup toolchain install 1.98.1 --profile minimal
       - name: Provision the complete pinned Korean dictionary
         run: scripts/prepare-korean-dictionary.sh "$RUNNER_TEMP/retained-image-dictionary"
-      - name: Build and test text-only and retained production image
-        run: scripts/test-server-image.sh --platform '${{ matrix.platform }}'
+      - name: Build and test production image target and offline controller fixture
+        run: scripts/test-server-image.sh --platform '${{ matrix.platform }}' --target '${{ matrix.target }}'
         env:
           OPENLEGAL_TEST_MECAB_DICTIONARY: ${{ runner.temp }}/retained-image-dictionary

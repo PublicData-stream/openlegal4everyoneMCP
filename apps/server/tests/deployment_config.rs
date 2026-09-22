@@ -107,3 +107,37 @@ fn retained_configuration_rejects_shared_credential_names_and_tls_downgrade_with
     value["cache"]["postgres"]["tls_mode"] = "plaintext".into();
     assert!(validate(&toml::to_string(&value).unwrap()).is_err());
 }
+
+#[test]
+fn ingestion_template_preserves_retained_config_and_explicit_controller_contract() {
+    let raw = include_str!("../../../deploy/kubernetes/ingestion/server.toml");
+    validate(raw).unwrap();
+    let mut value: toml::Value = toml::from_str(raw).unwrap();
+    value["database"]
+        .as_table_mut()
+        .unwrap()
+        .remove("ingestion");
+    let retained: toml::Value = toml::from_str(include_str!(
+        "../../../deploy/kubernetes/config/server.toml"
+    ))
+    .unwrap();
+    assert_eq!(value, retained);
+    let config: Config = toml::from_str(raw).unwrap();
+    let ingestion = config.database.unwrap().ingestion.unwrap();
+    assert!(ingestion.enabled);
+    assert!(!ingestion.retain_history_bodies);
+    assert_eq!(
+        ingestion.credential_env,
+        "OPENLEGAL_LAW_PROVIDER_CREDENTIAL"
+    );
+    // Construction validates paths, context, namespace and immutable image
+    // without reading credentials, launching kubectl or making upstream calls.
+    openlegal_adapters::document_jobs::KubernetesDocumentProcessor::new(
+        ingestion.kubectl,
+        ingestion.kubeconfig,
+        ingestion.context,
+        ingestion.namespace,
+        ingestion.worker_image,
+    )
+    .unwrap();
+}

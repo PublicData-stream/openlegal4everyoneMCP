@@ -13,7 +13,8 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from deployment_validation import (NETWORK_VARIANTS, ValidationError, load_documents, validate,
                                    validate_admin, validate_document_boundary, validate_network,
-                                   validate_oxibelt, validate_storage)
+                                   validate_oxibelt, validate_storage, validate_ingestion, validate_ingestion_rbac,
+                                   validate_document_controller_role)
 
 
 class ServingValidationTests(unittest.TestCase):
@@ -396,6 +397,163 @@ class ServingValidationTests(unittest.TestCase):
                 validate_storage(storage)
 
 
+class IngestionValidationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.retained = load_documents(Path(os.environ["OPENLEGAL_RENDERED_SERVING"]).read_text())
+        cls.baseline = load_documents(Path(os.environ["OPENLEGAL_RENDERED_INGESTION"]).read_text())
+        cls.binding = load_documents(Path(os.environ["OPENLEGAL_RENDERED_INGESTION_RBAC"]).read_text())
+
+    def setUp(self):
+        self.docs = copy.deepcopy(self.baseline)
+        self.deployment = next(obj for obj in self.docs if obj["kind"] == "Deployment")
+        self.pod = self.deployment["spec"]["template"]["spec"]
+        self.container = self.pod["containers"][0]
+        self.mounts = {item["name"]: item for item in self.container["volumeMounts"]}
+        self.volumes = {item["name"]: item for item in self.pod["volumes"]}
+        self.config = next(obj for obj in self.docs if obj["kind"] == "ConfigMap"
+                           and "server.toml" in obj["data"])
+        self.controller_config = next(obj for obj in self.docs if obj["kind"] == "ConfigMap"
+                                      and "kubeconfig" in obj["data"])
+
+    def rejected(self):
+        with self.assertRaises(ValidationError):
+            validate_ingestion(self.docs, self.retained)
+
+    def test_opt_in_template_and_distinct_admin_configuration(self):
+        validate_ingestion(self.docs, self.retained)
+        validate_ingestion_rbac(self.binding)
+        with self.assertRaises(ValidationError):
+            validate(self.docs)
+        for operation in ("migrate", "maintain", "rebuild"):
+            admin = load_documents((Path(os.environ["OPENLEGAL_RENDERED_ADMIN_DIR"])
+                                    / f"{operation}.yaml").read_text())
+            validate_admin(admin, self.retained, operation)
+            with self.assertRaises(ValidationError):
+                validate_admin(admin, self.docs, operation)
+
+    def test_projected_identity_and_bounded_writable_volume(self):
+        account = next(obj for obj in self.docs if obj["kind"] == "ServiceAccount")
+        projection = self.volumes["controller-identity"]["projected"]
+        token = projection["sources"][0]["serviceAccountToken"]
+        missing = object()
+        for mapping, key, value in (
+            (account, "automountServiceAccountToken", True),
+            (self.pod, "automountServiceAccountToken", True),
+            (self.pod, "serviceAccountName", "default"),
+            (projection, "defaultMode", 0o444),
+            (token, "expirationSeconds", 86400), (token, "audience", "other"),
+            (projection["sources"][1]["configMap"], "name", "untrusted-ca"),
+            (self.mounts["controller-identity"], "subPath", "token"),
+            (self.mounts["controller-config"], "readOnly", False),
+            (self.mounts["controller-identity"], "readOnly", False),
+            (self.volumes["kubectl-tmp"]["emptyDir"], "medium", "Memory"),
+            (self.volumes["kubectl-tmp"]["emptyDir"], "sizeLimit", "1Gi"),
+            (self.container["resources"]["limits"], "ephemeral-storage", "1Gi"),
+            (self.deployment["spec"], "replicas", 2),
+        ):
+            before = mapping.get(key, missing)
+            with self.subTest(key=key, value=value):
+                mapping[key] = value
+                self.rejected()
+            if before is missing:
+                del mapping[key]
+            else:
+                mapping[key] = before
+
+    def test_provider_secret_and_extra_resources(self):
+        env = next(item for item in self.container["env"] if item["name"] == "OPENLEGAL_LAW_PROVIDER_CREDENTIAL")
+        original = copy.deepcopy(env)
+        for replacement in (
+            {"name": env["name"], "value": "inline-provider-secret"},
+            {"name": env["name"], "valueFrom": {"secretKeyRef": {"name": "other", "key": env["name"]}}},
+        ):
+            env.clear()
+            env.update(replacement)
+            self.rejected()
+        env.clear()
+        env.update(original)
+        self.docs.append({"apiVersion": "v1", "kind": "Secret", "metadata": {
+            "name": "openlegal-law-provider", "namespace": "openlegal-serving"}, "stringData": {"token": "inline"}})
+        self.rejected()
+
+    def test_kubeconfig_rejects_ambient_or_embedded_authentication_and_tls_downgrade(self):
+        data = self.controller_config["data"]
+        original = data["kubeconfig"]
+        for old, new in (
+            ("tokenFile:", "token:"), ("tokenFile:", "exec:"),
+            ("https://kubernetes.default.svc:443", "http://kubernetes.default.svc:443"),
+            ("certificate-authority:", "insecure-skip-tls-verify:"),
+            ("current-context: openlegal-document-controller", "current-context: ambient"),
+            ("namespace: openlegal-documents", "namespace: default"),
+        ):
+            with self.subTest(new=new):
+                self.assertIn(old, original)
+                data["kubeconfig"] = original.replace(old, new)
+                self.rejected()
+        data["kubeconfig"] = original + "preferences: {}\n"
+        self.rejected()
+
+    def test_configuration_parity_image_digests_and_explicit_context(self):
+        data = self.config["data"]
+        original = data["server.toml"]
+        for old, new in (
+            ('enabled = true', 'enabled = false'),
+            ('retain_history_bodies = false', 'retain_history_bodies = true'),
+            ('context = "openlegal-document-controller"', 'context = "ambient"'),
+            ('namespace = "openlegal-documents"', 'namespace = "default"'),
+            ('/usr/local/bin/kubectl', 'kubectl'),
+            ('/run/secrets/document-controller/config/kubeconfig', '/root/.kube/config'),
+            ('@sha256:' + '0' * 64, ':latest'),
+            ('tls_mode = "verify-full"', 'tls_mode = "plaintext"'),
+            ('OPENLEGAL_LAW_PROVIDER_CREDENTIAL', 'OPENLEGAL_DATABASE_URL'),
+        ):
+            with self.subTest(new=new):
+                self.assertIn(old, original)
+                data["server.toml"] = original.replace(old, new)
+                self.rejected()
+        data["server.toml"] = original
+        for image in ('example/server:latest', 'example/server@sha256:' + '0' * 64,
+                      'example/server:tag@sha256:' + 'a' * 64):
+            self.container["image"] = image
+            self.rejected()
+        self.container["image"] = 'example/server@sha256:' + 'a' * 64
+        data["server.toml"] = original.replace('registry.example/openlegal-document-worker@sha256:' + '0' * 64,
+                                               'example/worker@sha256:' + 'b' * 64)
+        validate_ingestion(self.docs, self.retained)
+
+    def test_existing_role_rejects_broader_controller_permissions(self):
+        role = load_documents(Path(os.environ["OPENLEGAL_DOCUMENT_CONTROLLER_ROLE"]).read_text())
+        validate_document_controller_role(role)
+        for path, value in ((('kind',), 'ClusterRole'),
+                            (('metadata', 'namespace'), 'openlegal-serving'),
+                            (('rules', 0, 'resources'), ['*']),
+                            (('rules', 1, 'resources'), ['secrets']),
+                            (('rules', 2, 'verbs'), ['get', 'update']),
+                            (('rules', 2, 'resourceNames'), [])):
+            changed = copy.deepcopy(role)
+            mapping = changed[0]
+            for key in path[:-1]:
+                mapping = mapping[key]
+            mapping[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(ValidationError):
+                validate_document_controller_role(changed)
+
+    def test_binding_preserves_cross_namespace_subject_and_narrow_role(self):
+        for path, value in ((('metadata', 'namespace'), 'openlegal-serving'),
+                            (('subjects', 0, 'namespace'), 'openlegal-documents'),
+                            (('subjects', 0, 'name'), 'default'),
+                            (('roleRef', 'kind'), 'ClusterRole'),
+                            (('roleRef', 'name'), 'cluster-admin')):
+            changed = copy.deepcopy(self.binding)
+            mapping = changed[0]
+            for key in path[:-1]:
+                mapping = mapping[key]
+            mapping[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(ValidationError):
+                validate_ingestion_rbac(changed)
+
+
 class NetworkValidationTests(unittest.TestCase):
     """Check declared traffic intent, not CNI execution, NAT or host exemptions."""
 
@@ -483,6 +641,21 @@ class NetworkValidationTests(unittest.TestCase):
                                                   address="192.0.2.10"))
                     self.assertFalse(self.permits(docs, workload, "ingress", "TCP", 8080))
 
+    def test_ingestion_allows_only_opted_in_serving_and_explicit_destinations(self):
+        docs = self.combination("postgres-external", "dns-cluster", False)
+        for variant in ("ingestion-api", "ingestion-provider"):
+            docs.extend(self.examples[variant])
+        ingestion = load_documents(Path(os.environ["OPENLEGAL_RENDERED_INGESTION"]).read_text())
+        labels = next(obj for obj in ingestion if obj["kind"] == "Deployment")["spec"]["template"]["metadata"]["labels"]
+        for workload in self.workloads + [labels, {"openlegal.ingestion/enabled": "true"},
+                                          {"app.kubernetes.io/name": "openlegal-document-worker"}]:
+            for address in ("192.0.2.40", "192.0.2.50"):
+                self.assertEqual(self.permits(docs, workload, "egress", "TCP", 443, address=address), workload == labels)
+                self.assertFalse(self.permits(docs, workload, "egress", "UDP", 443, address=address))
+                self.assertFalse(self.permits(docs, workload, "egress", "TCP", 6443, address=address))
+            for address in ("192.0.2.41", "192.0.2.51", "198.51.100.1"):
+                self.assertFalse(self.permits(docs, workload, "egress", "TCP", 443, address=address))
+
     def test_peer_conjunction_ports_and_destination_boundaries(self):
         docs = self.combination("postgres-in-cluster", "dns-cluster", True)
         serving = self.workloads[0]
@@ -540,7 +713,9 @@ class NetworkValidationTests(unittest.TestCase):
                     cases.append((rule + (peers,), [{key: value} for key, value in peer.items()]))
                 else:
                     cases.append((rule + (peers, 0, "ipBlock", "cidr"), "192.0.2.0/24"))
-                if direction == "egress":
+                if variant.startswith("ingestion-"):
+                    cases.append((("spec", "podSelector", "matchLabels"), {"app.kubernetes.io/name": "openlegal-server"}))
+                elif direction == "egress":
                     cases.append((("spec", "podSelector", "matchExpressions", 0, "values"), ["openlegal-server"]))
                 else:
                     cases.append((("spec", "podSelector"), {"matchLabels": {"app.kubernetes.io/name": "openlegal-admin"}}))

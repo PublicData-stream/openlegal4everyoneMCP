@@ -224,6 +224,16 @@ clean-build peak has not been measured on hosted ARM64, so the worker's separate
 Unavailable Docker, architecture support or build inputs leave this gate incomplete.
 Image builds do not publish images. See [server deployment](docs/deployment-kubernetes.md).
 
+The optional ingestion runtime additionally requires the same two image gates with
+`--target runtime-ingestion`; the default `--target runtime` stays minimal. The
+ingestion gate checks the packaged pinned kubectl against an isolated synthetic TLS
+API, including explicit credentials, token-file replacement, discovery and Pod
+creation. It never starts enabled ingestion against a legal provider. This fixture
+does not establish Kubernetes authorization, projected-token delivery, CNI or
+sandbox enforcement. Controller authentication/environment or ingestion deployment
+changes also require `scripts/test-document-worker.sh` and independent Security
+Review. Real-cluster acceptance remains a separate explicitly configured gate.
+
 Serving-manifest and deployment-validation changes require explicit tool provisioning
 with `scripts/setup-deployment-tools.sh`, then `scripts/test-kubernetes-serving.sh`.
 The gate uses pinned kubectl/Kustomize and hash-locked PyYAML with Python 3.11–3.14,
@@ -236,7 +246,10 @@ administrative Job roots, shared configuration/image identity, and separately
 applied Local PV/PVC examples, including fresh rebuild storage. Network
 checks cover the namespace default deny, each standalone allow example,
 all supported database/DNS/monitoring combinations and actual workload selectors.
-The gate also checks the unchanged document namespace denial, quota and prepared-node
+Every invocation additionally renders the opt-in ingestion overlay, its separate
+cross-namespace RoleBinding root and API/provider allow examples, and rejects
+credential leakage into retained serving/admin, broad RBAC, token subPath mounts,
+configuration drift and unscoped egress. The gate also checks the unchanged document namespace denial, quota and prepared-node
 runtime invariants. These are committed-template checks, not admission of arbitrary
 operator overlays or proof of CNI enforcement. Administrative
 command or mount changes require the PostgreSQL gate and both image platforms;

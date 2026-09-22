@@ -174,6 +174,10 @@ transient failures have at most three attempts and honor provider Retry-After.
 No live provider calls occur in ordinary tests. Refer to the
 [Korean provider profile](providers/kr-law-go-kr.md) and
 [document sandbox](document-sandbox.md) for evidence and deployment gates.
+The [Kubernetes ingestion overlay](deployment-kubernetes.md#optional-ingestion-integration)
+supplies the optional image, projected identity and network templates. Its enabled
+startup initiates background traffic; applying it requires separate operator
+authorization after sandbox acceptance. Retained serving remains independent.
 
 Current HEAD data is retained independently of ordinary historical retention.
 Historical bodies are retained for 30 days, with bounded session extensions;
