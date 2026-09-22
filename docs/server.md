@@ -53,7 +53,9 @@ The [production image](deployment-kubernetes.md#production-server-image) include
 all three widget artifacts under `/opt/openlegal/widgets/` and accepts the same
 configuration and administrative arguments. Configuration, TLS keys and persistent
 data are mounted by the operator. It supports Linux x86-64-v3 and generic ARM64;
-see the deployment guide for builds and image acceptance.
+see the operator runbook for builds and image acceptance, the ordered
+[first deployment](deployment-kubernetes.md#first-deployment), and
+[upgrades and Secret rotation](deployment-kubernetes.md#upgrade-and-secret-rotation).
 
 HTTP `/mcp` is private plaintext behind the TLS edge. WebTransport `/mcp-wt/v1`
 always uses TLS/QUIC. Both must bind successfully before readiness becomes true.

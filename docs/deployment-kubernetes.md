@@ -1,56 +1,291 @@
-# Kubernetes deployment design
+# Kubernetes operator runbook
+
+<a id="kubernetes-deployment-design"></a>
 
 ## Status and baseline
 
-Phase 0 records the selected deployment design and existing server contracts.
-Phase 1 adds the production server image, local image acceptance and native
-amd64/ARM64 CI jobs. Phase 2 established hardened text-only serving and offline
-manifest checks. Phase 3 makes retained-corpus serving the default template, adds
-operator-managed storage examples and extends image acceptance to retained data.
-Phase 4 adds the TCP/UDP NodePort Service and a tested OxiBelt handoff example.
-Phase 5 adds suspended migration, cache-maintenance and offline index-rebuild Jobs
-with separate credentials and an operator-controlled maintenance window. Phase 6
-adds namespace-wide default deny, separately selected allow policies and a network
-acceptance runbook. The text-only profile remains a separate test fixture without
-a Service or NetworkPolicy. Phase 7 adds an opt-in ingestion image, projected
-controller identity, separate RBAC/egress templates and offline controller checks.
-Phase 8 adds source-inventory checks and pinned offline Kubernetes 1.36.0/1.37.0
-schema validation to the existing deployment and four native image CI jobs.
-Phase 9 adds a bounded explicit-endpoint smoke client and separately provisioned
-disposable Kubernetes serving acceptance. See the [checklist](#phase-9-serving-acceptance)
-and its [execution record](deployment-acceptance.md) for scoped disposable-cluster
-outcomes and unresolved HTTP stability. Complete production acceptance remains
-pending; no production deployment, live-provider, browser WebTransport or ChatGPT
-acceptance is established.
+Use this guide to prepare and operate the single-replica retained-corpus deployment
+behind a host-managed OxiBelt edge. Image builds, serving/storage/network templates,
+suspended administrative Jobs, opt-in ingestion and deterministic validation are
+implemented. Production deployment and acceptance remain pending.
 
-The original Phase 0 inventory was recorded on `main` at
-`79a8a852916d6fb18f306e5d7541115e1bab87d8`. The earlier design baseline,
-`f4bf5899caa1cc04491b68ddeb7c516b58f93387`, differs only by the commit ignoring
-`.agents/temp/`; those two revisions have identical runtime code. Phase 3 builds
-on the clean Phase 2 revision `f18751caadf2eec490841980a0ee94ba2d9cbaac`.
-The configured `GitHub` remote is
-`https://github.com/PublicData-stream/openlegal4everyoneMCP` for fetch and push;
-this records local configuration, not a remote synchronization check. Recheck with:
+**Production acceptance blocker:** the [Phase 9 execution record](deployment-acceptance.md)
+reports intermittent public HTTP failures through the pinned OxiBelt, including
+after backend replacement. Restarting the edge restored a full smoke run, but the
+cause and lasting fix remain unresolved. Public HTTP stability and seamless
+backend-only upgrades are not accepted. Reassess this issue before accepting
+production traffic or upgrades; backend readiness alone cannot clear it.
 
-```sh
-git rev-parse HEAD
-git status --short
-git remote -v
-```
+| Evidence | Established boundary |
+| --- | --- |
+| Repository and Docker checks | Implemented gates and recorded local outcomes; configured CI jobs do not establish observed hosted CI success |
+| Disposable Kubernetes serving acceptance | The recorded single-node synthetic topology only; see each passed, failed and unexecuted case in the execution record |
+| Production ZFS, firewall and routing | Operator qualification pending; disposable ext4 paths and node firewall rules do not qualify production infrastructure |
+| Document sandbox and live provider | Separate acceptance gates pending; default serving enables neither |
+| Production traffic, browser WebTransport and ChatGPT | Not established by native clients or fixture results |
 
 The [architecture](architecture.md), [server contract](server.md),
-[corpus contract](database.md), [persistence contract](persistence.md) and
-[document sandbox](document-sandbox.md) remain authoritative for their behavior.
-Phase 0 changed documentation only. Phase 1 changes packaging and the Rust CPU
-baseline; public MCP schemas, configuration types and legal-data semantics remain
-unchanged. Phase 2 also rejects empty certificate chains and mismatched TLS keys
-as normal startup errors instead of panicking in the TLS dependency. Valid TLS
-configuration retains ring, TLS 1.3, WebTransport ALPN and existing QUIC limits.
-Phase 3 preserves Rust configuration types and MCP schemas; its default template
-now requires migrated PostgreSQL, prepared storage and a provisioned dictionary.
-Phase 5 preserves production Rust behavior and the configuration contents; serving
-and administration import the same content-hashed ConfigMap from the
-[shared configuration base](../deploy/kubernetes/config/).
+[corpus contract](database.md), [persistence contract](persistence.md),
+[OxiBelt contract](oxibelt.md) and [document sandbox](document-sandbox.md) own their
+technical behavior. This guide owns deployment sequencing and artifact handoff.
+[Implementation history](#implementation-history) records the development phases.
+
+Start with [operator inputs](#operator-handoff), then choose
+[first deployment](#first-deployment), [upgrade/rotation](#upgrade-and-secret-rotation),
+[administration](#administrative-jobs), [index rebuild](#fresh-index-destination-and-recovery)
+or [rollback](#rollback-and-recovery). Finish with
+[observability and acceptance](#observability-and-acceptance).
+
+## Selected topology
+
+```text
+Internet -- TCP/443 + UDP/443 --> Host Docker Compose
+                                  lego (edge certificates)
+                                  OxiBelt
+                                    | TCP /mcp       | UDP /mcp-wt/v1
+                                    v                v
+                              Kubernetes NodePorts TCP :30080 / UDP :30433
+                                    |                |
+Kubernetes                          v                v
+  openlegal-serving             HTTP :8080       QUIC/TLS :4433
+    openlegal-server Deployment: one replica, Recreate
+      |-- private health :9090 (no NodePort or public edge route)
+      |-- PostgreSQL 18 (operator-provisioned endpoint)
+      |-- separate persistent blob/index mounts
+      |-- read-only provisioned dictionary
+      `-- optional ingestion controller, disabled by default
+               | Kubernetes API, separately scoped controller identity
+               v
+  openlegal-documents
+    disposable document-worker Pods, RuntimeClass/openlegal-document
+    deny-all networking, no provider credentials or controller tokens
+```
+
+OxiBelt and lego stay outside Kubernetes to retain host ownership of public
+routing and certificate lifecycle. OxiBelt already provides the required edge;
+this design adds no intermediary reverse proxy. The NodePort handoff carries
+private plaintext HTTP and separately verified WebTransport TLS. Follow the
+[OxiBelt hosting contract](oxibelt.md#adapt-the-configuration-for-hosting): preserve
+caller Origin, retain `preserve_host = false`, allow the actual backend authorities,
+and issue a backend certificate matching the authority trusted by OxiBelt.
+NodePorts alone do not establish privacy; the operator must restrict access to
+the intended host/private path and validate the effective network controls.
+
+The serving Deployment has exactly one desired replica and uses `Recreate`.
+Application budgets and upstream coordination assume one backend, and concurrent
+processes must not share the corpus index. Preserve the existing database advisory
+lease between corpus serving and rebuilding; deployment settings do not replace
+it or the operator's responsibility to stop serving for offline work. Multi-replica
+serving, distributed indexing and automatic failover are outside this design.
+
+Serving uses the normal hardened container runtime, with a non-root user,
+read-only root filesystem, dropped capabilities, no privilege escalation and
+RuntimeDefault seccomp. Document parsing uses its existing separate gVisor domain
+because it processes untrusted XML/HTML and binary documents with native parsers.
+The [existing sandbox artifacts](../deploy/document-sandbox/) remain canonical;
+only document-worker Pods use `RuntimeClass/openlegal-document`. Its quota, RBAC,
+network denial and node prerequisites remain governed by the
+[sandbox acceptance contract](document-sandbox.md#cluster-preparation-and-acceptance).
+
+## Template and operator ownership
+
+The following division covers the full deployment design. The templates are implemented;
+the operator supplies and qualifies each target deployment.
+
+| Repository templates and contracts | Operator-supplied deployment values and actions |
+| --- | --- |
+| Image build, immutable image references, widget locations and source-offer field | Published image digests and a public corresponding-source URL for the exact running server/widget |
+| Serving namespace, one replica, Recreate, security settings and probe definitions | Target cluster/runtime, measured resource sizing and real-cluster acceptance |
+| Fixed TCP 30080 / UDP 30433 NodePorts and OxiBelt handoff example | NodePort availability, private node DNS, backend authorities, allowed origins, firewall rules and host Compose/certificate configuration |
+| Namespace-wide default deny and independently selected allow templates | Enforcing CNI, exact edge/database/DNS/monitoring peers, firewall controls and network acceptance |
+| Separate storage mounts and generic Local PV/PVC examples | ZFS datasets, host paths, node affinity, capacity, ownership/permissions and provisioned dictionary |
+| Secret references and separate serving/migration commands | PostgreSQL endpoint, roles/grants, credentials, CA material and backend TLS certificate/key |
+| Explicit opt-in ingestion overlay and namespace-scoped controller access | Provider credential, digest-pinned worker image and separately configured controller identity after sandbox acceptance |
+
+Commit no credentials, private keys, production kubeconfig, database URL, real
+node identifier or host-specific ZFS path. Private network/storage values and
+production resource sizing remain operator inputs. The ingestion overlay preserves
+explicit kubeconfig/context authentication with a projected rotating token; no
+ambient in-cluster authentication mode is introduced.
+
+## Operator handoff
+
+Before starting, assemble an operator-owned release directory outside Git. Preserve
+the `config`, `serving`, `admin`, `network`, `storage` and optional `ingestion`
+directory relationships when copying templates. The
+[shared server configuration](../deploy/kubernetes/config/server.toml) is the
+retained deployment example; replace its placeholders and render every selected
+root before applying. Do not copy the text-only or fictional corpus fixtures into
+production configuration.
+
+| Required input | Preparation and acceptance checkpoint |
+| --- | --- |
+| Release | Clean source revision, truthful build version, published image digest for each selected platform/target, and matching public corresponding-source URL; follow [image preparation](#production-server-image) |
+| Cluster | Explicit kubeconfig/context, qualified node/CPU, admitted resource kinds, measured resource budget and enforcing CNI; schema tool versions are not a supported-cluster matrix |
+| Database and Secrets | PostgreSQL 18 endpoint, separate DBA-provisioned migration/runtime roles, verified CA, backend TLS identity, and the [Secret names and keys](#operator-prerequisites); keep values private |
+| Storage | Prepared Local PV roots, capacities, node affinity, dictionary identity and recovery material; follow [storage preparation](#storage-and-permissions) |
+| Edge and network | Actual edge path, backend DNS/authorities, allowed Origin, firewall restrictions and selected database/DNS/monitoring policies; follow [NodePort handoff](oxibelt.md#kubernetes-nodeport-handoff) |
+| Maintenance and evidence | Named operator, maintenance window, prior compatible release artifacts, private recovery location, and per-gate acceptance outcomes |
+
+Use a registry from which the workload can pull the published digest. Registry
+publication and any required pull credentials belong to the operator; the
+repository does not provision them. Replace the complete non-pullable image
+sentinel in serving and each selected administrative Job. The optional ingestion
+image differs from the minimal administrative image; follow its dedicated procedure.
+
+All cluster commands below operate on deliberately tailored copies. Set an explicit
+context in the shell used for each procedure; no ambient context is assumed:
+
+```bash
+kube=(kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT)
+```
+
+These are staged operator actions, not a script to run uninterrupted. Stop at each
+checkpoint until its required observation is recorded. Keep credentials, Secret
+values, raw workload dumps and private host details out of shared evidence.
+
+## First deployment
+
+1. Build and separately publish the intended [immutable image](#production-server-image).
+   Verify its platforms and matching source offer. Prepare the release directory,
+   node and PostgreSQL roles before applying workloads.
+2. Establish the [NodePort firewall restrictions](#service-and-private-network-handoff).
+   Create the namespace by itself, then apply default deny and the tailored allow
+   policies through [network bootstrap](#bootstrap-and-policy-changes). Verify the
+   selected paths and enforcement before starting administrative or serving Pods.
+
+   ```bash
+   "${kube[@]}" apply -f /absolute/operator/serving/namespace.yaml
+   ```
+
+3. Provision the [operator Secrets](#operator-prerequisites) in that namespace.
+   Prepare ZFS/Local PV roots and the dictionary using the
+   [storage procedure](#storage-and-permissions), then apply the tailored objects:
+
+   ```bash
+   "${kube[@]}" apply -f /absolute/operator/storage/storage-class.example.yaml
+   "${kube[@]}" apply -f /absolute/operator/storage/local-pv.example.yaml
+   "${kube[@]}" apply -f /absolute/operator/storage/local-pvc.example.yaml
+   ```
+
+   Check claim reservations, node affinity, capacity and private directory ownership.
+   The dictionary must be complete and validated before serving starts. Migration
+   itself needs only its credential and PostgreSQL CA, not these volumes or backend TLS.
+4. Follow [prepare, stop and execute](#prepare-stop-and-execute) to render and apply
+   the migration Job suspended, inspect its image/configuration/credential set, and
+   explicitly activate it. Require successful completion, exit and termination.
+   Have the DBA apply the [runtime grants](persistence.md#configuration-and-startup)
+   after the tables exist. Failed or ambiguous migration keeps serving stopped.
+5. Render retained serving and verify ingestion is absent, only the runtime DB
+   credential is injected, and there is one replica with `Recreate`. Compare its
+   image/configuration with the migration release. Only after the preceding checks:
+
+   ```bash
+   "${kube[@]}" kustomize /absolute/operator/serving > /absolute/operator/serving-rendered.yaml
+   # Inspect the rendered resources before this apply.
+   "${kube[@]}" apply -f /absolute/operator/serving-rendered.yaml
+   "${kube[@]}" -n openlegal-serving rollout status deployment/openlegal-server --timeout=360s
+   ```
+
+   This apply creates both the running Deployment and NodePort Service. Readiness
+   failure is a stop condition; do not relax network or storage validation to bypass it.
+6. Verify private health, then TCP and native UDP transport from the actual OxiBelt
+   container through the trusted NodePorts. Configure the edge using the
+   [authority and TLS mapping](oxibelt.md#kubernetes-nodeport-handoff), then complete
+   [public smoke and acceptance](#observability-and-acceptance), including rejection
+   cases. Apply the public HTTP blocker above to the acceptance decision.
+7. With a new empty database, expect empty retained results; readiness does not
+   imply corpus coverage. For existing retained data, compare known capture identities
+   and bounded search results. Fictional fixture seeding is not a production step.
+8. Leave ingestion disabled for retained serving. If ingestion is required, follow
+   [optional activation](#network-preparation-activation-and-rollback): complete
+   sandbox acceptance, prepare identity/RBAC/networking, and obtain separate bounded
+   live-test authorization **before** activation. Startup immediately initiates
+   provider traffic. Record live acceptance before approving ongoing production
+   ingestion; this runtime has no separate acceptance-only switch.
+
+## Upgrade and Secret rotation
+
+Use a maintenance window; `Recreate` entails downtime. Keep the
+[public HTTP acceptance blocker](#status-and-baseline) in the release decision.
+
+1. Retain the previous release's image/configuration, required Secret recovery
+   material, dictionary and storage recovery references privately. Compare target
+   schema and analyzer/index compatibility using the canonical
+   [persistence](persistence.md#configuration-and-startup) and
+   [rebuild](database.md#offline-index-rebuild) contracts.
+2. Keep the operator serving configuration at zero replicas and prevent automation
+   from restoring it. Follow the [shutdown procedure](#prepare-stop-and-execute),
+   including actual termination of serving, ingestion, retention, prior Jobs and
+   any external/legacy writers. Pod absence alone is insufficient.
+3. Apply required policy/configuration changes while stopped. Run migration only
+   if the release requires it; apply any necessary runtime grants afterward.
+   Run cache maintenance only when deliberately selected, and rebuild only when
+   required for the new analyzer/index. Execute one administrative attempt at a
+   time and require success before proceeding.
+4. Apply the target image, configuration and any successful rebuilt index claim
+   while the operator configuration still specifies zero replicas. Render and
+   inspect it, then set the operator configuration to one replica and apply it.
+   Require readiness, retained capture/search checks and both public transports.
+   Failure keeps the release unaccepted; follow [recovery](#rollback-and-recovery).
+
+Configuration hashes cause replacement, but mounted certificates and environment
+credentials do not hot-reload. For a Secret-only change that needs no schema or
+storage administration, coordinate database credential validity or backend CA/SAN
+trust first, update the operator-managed Secret, then explicitly restart:
+
+```bash
+"${kube[@]}" -n openlegal-serving rollout restart deployment/openlegal-server
+"${kube[@]}" -n openlegal-serving rollout status deployment/openlegal-server --timeout=360s
+```
+
+Recheck private health, retained data and both public transports. Backend certificate
+or CA changes also require the coordinated edge trust/restart procedure in the
+[OxiBelt contract](oxibelt.md#kubernetes-nodeport-handoff). Retain required old trust
+and credential recovery material until the transition is accepted. Do not print
+Secret values to verify rotation.
+
+## Rollback and recovery
+
+Keep serving stopped when migration/rebuild outcomes or storage compatibility are
+uncertain. A prior image alone does not reverse SQL migrations or index acknowledgment.
+Use the compatibility and coordinated-restore requirements in
+[fresh index recovery](#fresh-index-destination-and-recovery) and the
+[canonical rebuild contract](database.md#offline-index-rebuild). Never rewind
+acknowledgment or delete retained evidence to make an older release start.
+
+Retain failed administrative destinations for investigation. A retry needs a new
+Job attempt and, for rebuild, another fresh destination after actual termination
+of the old process. Resume one backend only when the intended release and storage
+are known compatible; repeat the same retained-data and public transport checks.
+
+When private/NodePort serving succeeds but public HTTP fails, preserve the failed
+result and consult the [observed edge recovery](#acceptance-checklist-and-evidence-boundaries).
+The recorded disposable edge restart is a workaround, not a proven diagnosis or
+stable production fix. Production recovery belongs to an explicitly authorized
+maintenance window and requires renewed acceptance.
+
+## Observability and acceptance
+
+The private health listener provides `/live`, `/ready` and aggregate `/metrics`;
+the [server contract](server.md#configure-and-run) owns their semantics. Use an
+already authorized operational network and the selected monitoring policy. There
+is no health Service/NodePort or public edge route. Readiness observes existing
+state; separately verify retained identities and index catch-up when applicable.
+
+Run the [bounded explicit-endpoint smoke](#phase-9-serving-acceptance) and record
+its selected checks individually. Complete the wider
+[acceptance checklist](#acceptance-checklist-and-evidence-boundaries) for networking,
+backend trust, credential placement, storage and lifecycle. Disruptive negatives
+belong in the disposable fixture or a separately authorized maintenance window.
+
+For each release handoff, record revision/image identities, selected configuration
+and storage generations, check commands and outcomes, independent review scope,
+failed/not-run cases and the operator actions still required. Keep a new dated
+operator acceptance record; do not overwrite the historical
+[Phase 9 record](deployment-acceptance.md). Distinguish local Docker, PostgreSQL,
+disposable Kubernetes, observed hosted CI and target-production results. Document
+sandbox, provider and platform acceptance separately.
 
 ## Production server image
 
@@ -247,6 +482,23 @@ included in the serving Kustomization. Local PVs do not provide automatic failov
 `ReadWriteOnce` does not fence concurrent processes on one node. See the
 [Kubernetes Local PV guidance](https://kubernetes.io/docs/concepts/storage/volumes/#local).
 
+For ZFS-backed Local PVs, the operator owns dataset creation, mountpoints, mount
+availability before scheduling, quotas and recovery. A declared PV/PVC capacity
+is not an enforced filesystem quota, and the application's
+[corpus/staging ledger limits](database.md#operator-configuration) do not account
+for PostgreSQL, WAL, indexes, simultaneous rebuild generations, snapshots or
+filesystem overhead. Budget and monitor that additional space within the selected
+storage ceiling; a full pool or dataset can fail writes even when an application
+ledger has room. No ZFS provisioning, tuning, replication or backup job is supplied.
+
+Record which datasets/volumes and database belong to each recovery set. Retain
+compatible release/configuration/dictionary artifacts, and verify an operator-owned
+coordinated database/blob restore procedure on disposable storage before relying
+on it. Independent dataset snapshots alone do not demonstrate a coherent database
+and blob recovery point. Do not roll back a live dataset beneath a running process;
+use the [stopped recovery procedure](#rollback-and-recovery). Local PV `Retain`
+preserves reclaim ownership, not backups or automatic recovery.
+
 On a freshly provisioned volume, prepare its root as `root:10004`, mode `2770`.
 Prepare each writable `data` child as `10004:10004`, mode `0700`; blob files must
 remain `0600`. The Pod uses `fsGroup: 10004` and `fsGroupChangePolicy: OnRootMismatch`.
@@ -316,12 +568,6 @@ has succeeded. For example, after all placeholders and prerequisites have been
 resolved and the selected administrative Jobs have completed:
 
 ```sh
-kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT \
-  apply -f /absolute/operator/storage/storage-class.example.yaml
-kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT \
-  apply -f /absolute/operator/storage/local-pv.example.yaml
-kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT \
-  apply -f /absolute/operator/storage/local-pvc.example.yaml
 kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT \
   apply -k /absolute/operator/serving
 kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT \
@@ -732,20 +978,26 @@ admin modes do not promise serving's graceful SIGTERM handling.
    and perform bounded retained-search/capture checks. Restore exactly one backend.
 
 The following examples are operator actions, not a repository deployment script.
-Substitute all paths and context names first. The first command is for a new
-installation; the shutdown commands require an existing Deployment.
+Substitute all paths and context names first. For a new installation, complete
+[first-deployment prerequisites](#first-deployment) and skip this shutdown block.
+For an existing Deployment, keep the operator overlay at zero replicas before:
 
 ```bash
 kube=(kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT)
-"${kube[@]}" apply -f /absolute/operator/serving/namespace.yaml
-# Complete the network bootstrap above before creating or resuming any Job.
-# Existing deployment only; also keep the operator overlay at replicas: 0.
 "${kube[@]}" -n openlegal-serving scale deployment/openlegal-server --replicas=0
 "${kube[@]}" -n openlegal-serving wait --for=delete pod \
   -l app.kubernetes.io/name=openlegal-server --timeout=360s
 "${kube[@]}" -n openlegal-serving get pods,jobs
-# Confirm all relevant processes stopped, then render and inspect this file.
-kubectl kustomize /absolute/operator/admin/migrate > /absolute/operator/migrate-rendered.yaml
+```
+
+After network/bootstrap prerequisites and, for existing installations, verified
+termination of every relevant process, render the selected Job. This example uses
+the first migration attempt's default name; use a new name for later attempts as
+described below. Inspect the rendered file before applying it:
+
+```bash
+kube=(kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT)
+"${kube[@]}" kustomize /absolute/operator/admin/migrate > /absolute/operator/migrate-rendered.yaml
 "${kube[@]}" apply -f /absolute/operator/migrate-rendered.yaml
 "${kube[@]}" -n openlegal-serving patch job/openlegal-migrate \
   --type=merge -p '{"spec":{"suspend":false}}'
@@ -759,6 +1011,13 @@ not permission to start another attempt or serving. Check Job conditions and all
 associated Pods. There is no automatic restart of serving after an administrative
 failure. Do not reapply a suspended manifest over an active Job: that can terminate
 its Pods. Jobs are outside the ordinary serving apply/reconciliation path.
+
+A changed image, ConfigMap reference or claim requires a **new Job**, because Job
+Pod templates are immutable. An operator overlay may patch only the Job
+`metadata.name` to a unique attempt name; use that rendered name in commands.
+Avoid a root-wide `nameSuffix`, which would also rename the shared ConfigMap. Retain old Job/Pod diagnostics
+until investigated, then explicitly clean up terminated attempts and unreferenced
+ConfigMaps. There is no TTL controller configuration or automatic volume deletion.
 
 ### Cache maintenance window
 
@@ -800,13 +1059,6 @@ or completion metadata alone is not command success. Keep the failed destination
 for investigation and retry with another fresh one only after the old process has
 actually terminated. Do not resume an interrupted Job into its used destination.
 
-A changed image, ConfigMap reference or claim requires a **new Job**, because Job
-Pod templates are immutable. An operator overlay may patch only the Job
-`metadata.name` to a unique attempt name; use that rendered name in commands.
-Avoid a root-wide `nameSuffix`, which would also rename the shared ConfigMap. Retain old Job/Pod diagnostics
-until investigated, then explicitly clean up terminated attempts and unreferenced
-ConfigMaps. There is no TTL controller configuration or automatic volume deletion.
-
 The [canonical rebuild contract](database.md#offline-index-rebuild) governs replay,
 completion and monotonic acknowledgment. Never rewind acknowledgment. A preserved
 old index may be behind the database after rebuilding and cannot simply be selected
@@ -821,57 +1073,6 @@ Repository checks establish rendered relationships and disposable fixture behavi
 Target-cluster Job admission, scheduling, Secret permissions, storage binding,
 shutdown exclusion, failure recovery and resource sizing remain operator acceptance
 gates. These templates do not perform a deployment or live-provider acceptance.
-
-## Selected topology
-
-```text
-Internet -- TCP/443 + UDP/443 --> Host Docker Compose
-                                  lego (edge certificates)
-                                  OxiBelt
-                                    | TCP /mcp       | UDP /mcp-wt/v1
-                                    v                v
-                              Kubernetes NodePorts TCP :30080 / UDP :30433
-                                    |                |
-Kubernetes                          v                v
-  openlegal-serving             HTTP :8080       QUIC/TLS :4433
-    openlegal-server Deployment: one replica, Recreate
-      |-- private health :9090 (no NodePort or public edge route)
-      |-- PostgreSQL 18 (operator-provisioned endpoint)
-      |-- separate persistent blob/index mounts
-      |-- read-only provisioned dictionary
-      `-- optional ingestion controller, disabled by default
-               | Kubernetes API, separately scoped controller identity
-               v
-  openlegal-documents
-    disposable document-worker Pods, RuntimeClass/openlegal-document
-    deny-all networking, no provider credentials or controller tokens
-```
-
-OxiBelt and lego stay outside Kubernetes to retain host ownership of public
-routing and certificate lifecycle. OxiBelt already provides the required edge;
-this design adds no intermediary reverse proxy. The NodePort handoff carries
-private plaintext HTTP and separately verified WebTransport TLS. Follow the
-[OxiBelt hosting contract](oxibelt.md#adapt-the-configuration-for-hosting): preserve
-caller Origin, retain `preserve_host = false`, allow the actual backend authorities,
-and issue a backend certificate matching the authority trusted by OxiBelt.
-NodePorts alone do not establish privacy; the operator must restrict access to
-the intended host/private path and validate the effective network controls.
-
-The serving Deployment has exactly one desired replica and uses `Recreate`.
-Application budgets and upstream coordination assume one backend, and concurrent
-processes must not share the corpus index. Preserve the existing database advisory
-lease between corpus serving and rebuilding; deployment settings do not replace
-it or the operator's responsibility to stop serving for offline work. Multi-replica
-serving, distributed indexing and automatic failover are outside this design.
-
-Serving uses the normal hardened container runtime, with a non-root user,
-read-only root filesystem, dropped capabilities, no privilege escalation and
-RuntimeDefault seccomp. Document parsing uses its existing separate gVisor domain
-because it processes untrusted XML/HTML and binary documents with native parsers.
-The [existing sandbox artifacts](../deploy/document-sandbox/) remain canonical;
-only document-worker Pods use `RuntimeClass/openlegal-document`. Its quota, RBAC,
-network denial and node prerequisites remain governed by the
-[sandbox acceptance contract](document-sandbox.md#cluster-preparation-and-acceptance).
 
 ## Existing runtime inventory
 
@@ -1063,28 +1264,6 @@ not implement or prove Kubernetes RBAC, projected-token delivery, Pod admission,
 gVisor or CNI enforcement. Native ARM64 CI remains distinct from local emulation.
 Real-cluster ingestion, live-provider and production traffic acceptance remain pending.
 
-## Template and operator ownership
-
-The following division covers the full deployment design. Retained-corpus serving
-and separately applied storage examples exist; later-phase production integrations
-remain planned.
-
-| Repository templates and contracts | Operator-supplied deployment values and actions |
-| --- | --- |
-| Image build, immutable image references, widget locations and source-offer field | Published image digests and a public corresponding-source URL for the exact running server/widget |
-| Serving namespace, one replica, Recreate, security settings and probe definitions | Target cluster/runtime, measured resource sizing and real-cluster acceptance |
-| Fixed TCP 30080 / UDP 30433 NodePorts and OxiBelt handoff example | NodePort availability, private node DNS, backend authorities, allowed origins, firewall rules and host Compose/certificate configuration |
-| Namespace-wide default deny and independently selected allow templates | Enforcing CNI, exact edge/database/DNS/monitoring peers, firewall controls and network acceptance |
-| Separate storage mounts and generic Local PV/PVC examples | ZFS datasets, host paths, node affinity, capacity, ownership/permissions and provisioned dictionary |
-| Secret references and separate serving/migration commands | PostgreSQL endpoint, roles/grants, credentials, CA material and backend TLS certificate/key |
-| Explicit opt-in ingestion overlay and namespace-scoped controller access | Provider credential, digest-pinned worker image and separately configured controller identity after sandbox acceptance |
-
-Commit no credentials, private keys, production kubeconfig, database URL, real
-node identifier or host-specific ZFS path. Private network/storage values and
-production resource sizing remain operator inputs. The ingestion overlay preserves
-explicit kubeconfig/context authentication with a projected rotating token; no
-ambient in-cluster authentication mode is introduced.
-
 ## Phase 9 serving acceptance
 
 The routine smoke command performs fixed, bounded serving operations against
@@ -1196,9 +1375,10 @@ both public transports. Record the original failed public request as well as
 recovery; this is an operator workaround, not a proxy fix or seamless-upgrade
 claim. Reassess HTTP stability before accepting production traffic or backend upgrades.
 
-Record every checklist row individually in the [Phase 9 evidence record](deployment-acceptance.md),
+Record every checklist row individually in a new dated operator acceptance record,
 including exact commands, version/digest identities and failed or unexecuted cases.
-Keep raw private run artifacts outside Git. Distinguish implemented, executed in
+Use the [Phase 9 evidence record](deployment-acceptance.md) as a historical example;
+do not overwrite it with later results. Keep raw private run artifacts outside Git. Distinguish implemented, executed in
 Docker, executed against PostgreSQL, executed on the disposable Kubernetes cluster,
 and observed CI results. Document sandbox, production ZFS/firewall, live LAW OPEN
 DATA, browser/ChatGPT and production traffic remain independently pending until
@@ -1206,26 +1386,67 @@ their own gates are performed. Do not infer CI success from a configured job.
 
 ## Validation boundary
 
-Phase 0 acceptance consists of source/document inspection, Markdown/link checks
-and independent review of the documentation patch under
-[CONTRIBUTING.md](../CONTRIBUTING.md#documentation-only-changes). It supplies no
-new runtime, image, manifest or CI validation evidence.
+[Contributor requirements](../CONTRIBUTING.md#testing-and-ci) own the required
+checks for changes to images, deployment templates, validation tools and runtime
+behavior. The [local and CI checks](#local-and-ci-checks) describe deterministic
+rendering and offline schema coverage. These checks do not establish target-cluster
+admission, enforcement, scheduling, resource sizing or production acceptance.
 
-Image acceptance began in Phase 1, rendering/invariant checks in Phase 2, and
-retained configuration/storage/restart checks in Phase 3. Phase 4 adds offline
-Service/example consistency checks and a Docker OxiBelt handoff profile. Phase 5
-adds offline admin-manifest checks and disposable database/image administration
-scenarios. Phase 6 adds offline network-template and document-boundary invariants
-and an operator network acceptance runbook. Phase 7 adds ingestion manifest
-invariants and a synthetic TLS API fixture for the packaged kubectl. These do not validate Job admission,
-scheduling, termination or network enforcement on a real cluster. Real-cluster
-networking, storage, shutdown and sandbox enforcement require operator acceptance;
-live LAW OPEN DATA access and public transport/platform acceptance are separate
-gates. Existing offline fixtures and local integration evidence do not satisfy
-those gates. Deployment, publication and live provider requests are not part of
-Phase 0.
+The [Phase 9 record](deployment-acceptance.md) reports separately executed disposable
+serving-cluster observations and their unresolved public HTTP failure. It does not
+qualify production or the document sandbox. Phase 10 reorganizes documentation and
+operator sequencing; it adds no runtime, image, manifest, hosted CI, cluster or live
+provider validation evidence. Publication, deployment and live provider calls remain
+separate operator actions.
 
-Phase 9 adds separately executed disposable serving-cluster observations in the
-[acceptance record](deployment-acceptance.md). They cover the stated topology and
-retain the unresolved public HTTP failure; they do not qualify production or the
-document sandbox.
+## Implementation history
+
+Phase 0 records the selected deployment design and existing server contracts.
+Phase 1 adds the production server image, local image acceptance and native
+amd64/ARM64 CI jobs. Phase 2 established hardened text-only serving and offline
+manifest checks. Phase 3 makes retained-corpus serving the default template, adds
+operator-managed storage examples and extends image acceptance to retained data.
+Phase 4 adds the TCP/UDP NodePort Service and a tested OxiBelt handoff example.
+Phase 5 adds suspended migration, cache-maintenance and offline index-rebuild Jobs
+with separate credentials and an operator-controlled maintenance window. Phase 6
+adds namespace-wide default deny, separately selected allow policies and a network
+acceptance runbook. The text-only profile remains a separate test fixture without
+a Service or NetworkPolicy. Phase 7 adds an opt-in ingestion image, projected
+controller identity, separate RBAC/egress templates and offline controller checks.
+Phase 8 adds source-inventory checks and pinned offline Kubernetes 1.36.0/1.37.0
+schema validation to the existing deployment and four native image CI jobs.
+Phase 9 adds a bounded explicit-endpoint smoke client and separately provisioned
+disposable Kubernetes serving acceptance. See the [checklist](#phase-9-serving-acceptance)
+and its [execution record](deployment-acceptance.md) for scoped disposable-cluster
+outcomes and unresolved HTTP stability. Complete production acceptance remains
+pending; no production deployment, live-provider, browser WebTransport or ChatGPT
+acceptance is established.
+
+The original Phase 0 inventory was recorded on `main` at
+`79a8a852916d6fb18f306e5d7541115e1bab87d8`. The earlier design baseline,
+`f4bf5899caa1cc04491b68ddeb7c516b58f93387`, differs only by the commit ignoring
+`.agents/temp/`; those two revisions have identical runtime code. Phase 3 builds
+on the clean Phase 2 revision `f18751caadf2eec490841980a0ee94ba2d9cbaac`.
+The configured `GitHub` remote is
+`https://github.com/PublicData-stream/openlegal4everyoneMCP` for fetch and push;
+this records local configuration, not a remote synchronization check. Recheck with:
+
+```sh
+git rev-parse HEAD
+git status --short
+git remote -v
+```
+
+The [architecture](architecture.md), [server contract](server.md),
+[corpus contract](database.md), [persistence contract](persistence.md) and
+[document sandbox](document-sandbox.md) remain authoritative for their behavior.
+Phase 0 changed documentation only. Phase 1 changes packaging and the Rust CPU
+baseline; public MCP schemas, configuration types and legal-data semantics remain
+unchanged. Phase 2 also rejects empty certificate chains and mismatched TLS keys
+as normal startup errors instead of panicking in the TLS dependency. Valid TLS
+configuration retains ring, TLS 1.3, WebTransport ALPN and existing QUIC limits.
+Phase 3 preserves Rust configuration types and MCP schemas; its default template
+now requires migrated PostgreSQL, prepared storage and a provisioned dictionary.
+Phase 5 preserves production Rust behavior and the configuration contents; serving
+and administration import the same content-hashed ConfigMap from the
+[shared configuration base](../deploy/kubernetes/config/).

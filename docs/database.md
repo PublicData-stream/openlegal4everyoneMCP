@@ -188,6 +188,10 @@ index generations/rebuilds, history and filesystem overhead within the deploymen
 
 ## Offline index rebuild
 
+For Kubernetes, follow the [administrative Job sequence](deployment-kubernetes.md#administrative-jobs)
+and [rollback procedure](deployment-kubernetes.md#rollback-and-recovery) alongside
+this index compatibility contract.
+
 Indexes persist format version, analyzer identity, generation and completion state.
 Analyzer identity includes both engine versions, dictionary digests, normalization
 and matching policy. Legacy, mismatched, malformed or incomplete indexes cannot be

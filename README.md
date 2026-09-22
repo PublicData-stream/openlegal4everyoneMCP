@@ -54,13 +54,19 @@ For the runnable fictional provider and interactive widget, follow the
 Node or a widget build. Enabling the legal corpus requires a provisioned MeCab-Ko
 dictionary; see [corpus setup and index upgrades](docs/database.md#operator-configuration).
 
+For hosting, start with the [Kubernetes operator runbook](docs/deployment-kubernetes.md#first-deployment)
+and its [operator handoff](docs/deployment-kubernetes.md#operator-handoff).
+The [recorded serving fixture](docs/deployment-acceptance.md#failures-and-remaining-boundaries)
+left intermittent OxiBelt HTTP failures unresolved; production traffic and seamless
+backend-only upgrades remain unaccepted.
+
 ## Documentation
 
 - [Contributing](CONTRIBUTING.md): workflow, checks, security engineering, and review.
 - [Agent orientation](AGENTS.md): where coding agents should begin.
 - [Architecture](docs/architecture.md): server, legal-data and document-processing responsibilities.
 - [Server contract](docs/server.md): configuration, extension API and transport behavior.
-- [Kubernetes deployment design](docs/deployment-kubernetes.md): minimal and optional ingestion images, retained-corpus serving, storage and NodePort templates, suspended administration Jobs, projected controller identity, scoped RBAC/network policies, OxiBelt handoff, source checks and pinned offline schemas; complete production deployment remains pending.
+- [Kubernetes operator runbook](docs/deployment-kubernetes.md): topology, prerequisites, first deployment, upgrades, storage and index administration, rollback, optional ingestion and operator handoff.
 - [Serving acceptance](docs/deployment-kubernetes.md#phase-9-serving-acceptance): bounded explicit-endpoint smoke, a disposable Kubernetes fixture, and [executed evidence and remaining limits](docs/deployment-acceptance.md).
 - [Dependencies](docs/dependencies.md): admission rationale and check tooling.
 - [Retrieval framework](docs/retrieval.md): processors, caching, evidence and resource limits.

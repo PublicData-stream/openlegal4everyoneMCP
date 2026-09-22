@@ -74,6 +74,11 @@ Database administrators own role provisioning and grants; migrations do not crea
 passwords or roles. Keep both schemas free of untrusted object creators. The adapter
 uses schema-qualified storage SQL and parameterized values.
 
+For Kubernetes, the [first-deployment sequence](deployment-kubernetes.md#first-deployment)
+orders role provisioning, migration completion and runtime grants before serving.
+Use the [rollback and recovery procedure](deployment-kubernetes.md#rollback-and-recovery)
+to coordinate database, blob and index recovery against these persistence contracts.
+
 For an isolated non-persistent demonstration, replace the whole cache configuration
 with:
 

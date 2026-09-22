@@ -127,6 +127,14 @@ backend request deadlines, and shutdown grace as one deployment policy.
 
 ## Kubernetes NodePort handoff
 
+Follow the [first-deployment sequence](deployment-kubernetes.md#first-deployment)
+to prepare the backend before this handoff, then run the
+[observability and acceptance checks](deployment-kubernetes.md#observability-and-acceptance).
+The [Phase 9 record](deployment-acceptance.md#failures-and-remaining-boundaries)
+documents intermittent public HTTP failures and observed recovery after an edge
+restart. That recovery is not a lasting fix; public HTTP stability and seamless
+backend-only upgrades remain unaccepted.
+
 Start with the complete
 [`kubernetes-upstream.example.toml`](../deploy/oxibelt/kubernetes-upstream.example.toml)
 for the pinned revision above. It routes the public host `openlegal4everyone.stream`

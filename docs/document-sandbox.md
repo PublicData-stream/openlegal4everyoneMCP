@@ -29,7 +29,7 @@ that depended on inherited environment variables must be changed by the operator
 The discovery cache is explicitly `/tmp/openlegal-kubectl-cache`. Provide writable,
 bounded temporary storage at `/tmp` when using a read-only controller root.
 
-The opt-in [Kubernetes deployment](deployment-kubernetes.md) preserves this
+The opt-in [Kubernetes ingestion procedure](deployment-kubernetes.md#optional-ingestion-integration) preserves this
 configuration contract using a dedicated read-only kubeconfig and projected
 ServiceAccount identity. The kubeconfig references the rotating token through
 `tokenFile` and the cluster CA through `certificate-authority`, both at explicit
@@ -38,6 +38,9 @@ rotation remains visible. Parser Pods never receive these controller mounts.
 The controller identity is bound only to the existing namespaced Role; the
 acceptance harness uses a separately authorized operator identity because its
 NetworkPolicy and log checks require permissions beyond that Role.
+Follow that procedure for sandbox qualification and separately authorized live
+acceptance before enabling ongoing ingestion; the serving acceptance record does
+not qualify the document sandbox or provider integration.
 
 The application supplies a typed format, at most 100 MiB of already fetched source
 bytes, their SHA-256, and the OCR choice. A fixed `kubectl exec -i` invocation runs

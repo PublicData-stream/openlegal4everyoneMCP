@@ -14,6 +14,12 @@ XML/HTML and binary document parsing runs through disposable document-worker Pod
 live provider and hardened-cluster acceptance remain separate deployment gates. The [server contract](server.md) owns the
 implemented extension interfaces and transport configuration.
 
+The [Kubernetes operator runbook](deployment-kubernetes.md) maps these responsibilities
+to the supported single-backend topology and ordered deployment procedures.
+Its [acceptance guidance](deployment-kubernetes.md#observability-and-acceptance)
+separates implemented support from recorded fixture observations and pending
+production qualification.
+
 A standalone [search-query processor](search-query.md) now parses supplied query
 syntax into domain-owned expressions. The corpus evaluator applies Korean analysis
 and exact quoted source matching; synthetic search retains its separate semantics.
