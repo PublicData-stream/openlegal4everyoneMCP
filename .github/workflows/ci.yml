@@ -151,7 +151,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y python3-venv
       - name: Provision pinned deployment validation tools
         run: scripts/setup-deployment-tools.sh
-      - name: Render and validate serving template offline
+      - name: Check deployment sources, invariants and both Kubernetes schemas offline
         run: scripts/test-kubernetes-serving.sh
   server-image:
     strategy:

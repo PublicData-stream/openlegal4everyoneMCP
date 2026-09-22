@@ -1,0 +1,189 @@
+{
+  "format": 1,
+  "kubeconform": {
+    "version": "0.8.0",
+    "source": "https://github.com/yannh/kubeconform/tree/v0.8.0",
+    "license": "Apache-2.0",
+    "release_checksums": "https://github.com/yannh/kubeconform/releases/download/v0.8.0/CHECKSUMS",
+    "archives": {
+      "amd64": {
+        "url": "https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz",
+        "sha256": "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883",
+        "size": 7534236,
+        "binary": {
+          "sha256": "457722b36e98d7bdbc91525e594951ef5d7ea3a29da2d13b9b28a2fb8a5097b7",
+          "size": 13944911
+        }
+      },
+      "arm64": {
+        "url": "https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-arm64.tar.gz",
+        "sha256": "1f53fc8e81258197a35e8603054162a5af1de8c5af13746c71ab680d9534ed87",
+        "size": 6901136,
+        "binary": {
+          "sha256": "7e77b104b3ae696389f91971c60fd58c72f1f3dc218f139df67a1b070959c012",
+          "size": 12953083
+        }
+      }
+    },
+    "license_file": {
+      "sha256": "1294f9be73faeda3987cb554c1597f599641eebdcd4d4fa88f97bdb6241be275",
+      "size": 11346
+    }
+  },
+  "schemas": {
+    "revision": "491f6d0bac338516572de67fbd5ec4c510f7e657",
+    "source": "https://github.com/yannh/kubernetes-json-schema/tree/491f6d0bac338516572de67fbd5ec4c510f7e657",
+    "license": "Apache-2.0",
+    "versions": [
+      "1.36.0",
+      "1.37.0"
+    ],
+    "license_file": {
+      "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/LICENSE",
+      "sha256": "557176ee78f6a6e9c28ebc0f0037ab9acb887b3b5167e9494195109b05affc14",
+      "size": 652
+    },
+    "files": {
+      "v1.36.0-standalone-strict/namespace-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/namespace-v1.json",
+        "sha256": "324fae677b98d1a6d54340db0c334d053e8ffbafceb3f73326e41de2610d5843",
+        "size": 18892
+      },
+      "v1.36.0-standalone-strict/configmap-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/configmap-v1.json",
+        "sha256": "e0eaddebd677c08aa092b2da2264d86ac4fc34eed112b9fac2945b3f00c1e9b1",
+        "size": 17083
+      },
+      "v1.36.0-standalone-strict/service-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/service-v1.json",
+        "sha256": "8bf019854daed511e7c174896a898173fa65d88ec5937c687a37303d4cc9351b",
+        "size": 43682
+      },
+      "v1.36.0-standalone-strict/serviceaccount-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/serviceaccount-v1.json",
+        "sha256": "8193d6c3561475c6d3d5c44e1faedb1df53905373d904bc17015694326d659cf",
+        "size": 21064
+      },
+      "v1.36.0-standalone-strict/persistentvolume-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/persistentvolume-v1.json",
+        "sha256": "ddff73572bf0965cecf9c160949a1c416f4f9e8ade7f46a649767589a1e2783c",
+        "size": 81055
+      },
+      "v1.36.0-standalone-strict/persistentvolumeclaim-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/persistentvolumeclaim-v1.json",
+        "sha256": "6136871ac0337f11a48da5231a2807407c7386967e3432f344141b902f6a538c",
+        "size": 36227
+      },
+      "v1.36.0-standalone-strict/resourcequota-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/resourcequota-v1.json",
+        "sha256": "9546ed313e622ea84a0ab1ec7ef7e683f05acfbfe97beb746f0b5be6407691df",
+        "size": 20613
+      },
+      "v1.36.0-standalone-strict/deployment-apps-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/deployment-apps-v1.json",
+        "sha256": "3725782fb01e3f27d8be2da565e2d653d7b78bf6debe5440804cea993c87b8f9",
+        "size": 691967
+      },
+      "v1.36.0-standalone-strict/job-batch-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/job-batch-v1.json",
+        "sha256": "f49fee30367890a492146d63c3c433a7853e9088ebfe9e25cc792ec4b1400f18",
+        "size": 709299
+      },
+      "v1.36.0-standalone-strict/networkpolicy-networking-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/networkpolicy-networking-v1.json",
+        "sha256": "f6324cc464f62228b0418f438d167208e4f86c7e3677ba30f608e79a8b26ba79",
+        "size": 47155
+      },
+      "v1.36.0-standalone-strict/runtimeclass-node-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/runtimeclass-node-v1.json",
+        "sha256": "a42beafd78e65ae1986571cd3cd55ea843341a19bec7f198b77ce7985708c7ed",
+        "size": 21297
+      },
+      "v1.36.0-standalone-strict/role-rbac-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/role-rbac-v1.json",
+        "sha256": "dfe8fb03b1642f985b57b12edd1727b6867c13ed4b6761ef81bdd51b1d236711",
+        "size": 18914
+      },
+      "v1.36.0-standalone-strict/rolebinding-rbac-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/rolebinding-rbac-v1.json",
+        "sha256": "b12ea4163fc37df2e02192b4291b1b7c28836e3e7665d989dd538bfcffa10076",
+        "size": 18581
+      },
+      "v1.36.0-standalone-strict/storageclass-storage-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.36.0-standalone-strict/storageclass-storage-v1.json",
+        "sha256": "9704bb88ec73ed37f8d565dbd2d2ee1e8ee61b5ec63c96a5a61926d6971ef3c9",
+        "size": 19906
+      },
+      "v1.37.0-standalone-strict/namespace-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/namespace-v1.json",
+        "sha256": "324fae677b98d1a6d54340db0c334d053e8ffbafceb3f73326e41de2610d5843",
+        "size": 18892
+      },
+      "v1.37.0-standalone-strict/configmap-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/configmap-v1.json",
+        "sha256": "fed751af12c2873a7db2b4cd1294c2959497fda8520f1fc8e5d21adf967ad72e",
+        "size": 17230
+      },
+      "v1.37.0-standalone-strict/service-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/service-v1.json",
+        "sha256": "8bf019854daed511e7c174896a898173fa65d88ec5937c687a37303d4cc9351b",
+        "size": 43682
+      },
+      "v1.37.0-standalone-strict/serviceaccount-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/serviceaccount-v1.json",
+        "sha256": "8193d6c3561475c6d3d5c44e1faedb1df53905373d904bc17015694326d659cf",
+        "size": 21064
+      },
+      "v1.37.0-standalone-strict/persistentvolume-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/persistentvolume-v1.json",
+        "sha256": "ddff73572bf0965cecf9c160949a1c416f4f9e8ade7f46a649767589a1e2783c",
+        "size": 81055
+      },
+      "v1.37.0-standalone-strict/persistentvolumeclaim-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/persistentvolumeclaim-v1.json",
+        "sha256": "71ef77ba30d96ec6d07bcfd8af9884ab83f4d877484579cad7f517804216bc1c",
+        "size": 38955
+      },
+      "v1.37.0-standalone-strict/resourcequota-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/resourcequota-v1.json",
+        "sha256": "9546ed313e622ea84a0ab1ec7ef7e683f05acfbfe97beb746f0b5be6407691df",
+        "size": 20613
+      },
+      "v1.37.0-standalone-strict/deployment-apps-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/deployment-apps-v1.json",
+        "sha256": "0b64451c0b8c36ea06dfebf952718810ae24a07779fb0ed2a6b03f1cc8735a54",
+        "size": 717937
+      },
+      "v1.37.0-standalone-strict/job-batch-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/job-batch-v1.json",
+        "sha256": "1dbe7c98d227ab2614d85d4e70c2d04872239bb91c4ed30abc2cfadccef40e4b",
+        "size": 742483
+      },
+      "v1.37.0-standalone-strict/networkpolicy-networking-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/networkpolicy-networking-v1.json",
+        "sha256": "f6324cc464f62228b0418f438d167208e4f86c7e3677ba30f608e79a8b26ba79",
+        "size": 47155
+      },
+      "v1.37.0-standalone-strict/runtimeclass-node-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/runtimeclass-node-v1.json",
+        "sha256": "a42beafd78e65ae1986571cd3cd55ea843341a19bec7f198b77ce7985708c7ed",
+        "size": 21297
+      },
+      "v1.37.0-standalone-strict/role-rbac-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/role-rbac-v1.json",
+        "sha256": "09e6af32ea82c8ed3ca322261d67de0a776ec79da15635a599e43e63afbec4af",
+        "size": 18914
+      },
+      "v1.37.0-standalone-strict/rolebinding-rbac-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/rolebinding-rbac-v1.json",
+        "sha256": "005bd663d1ffdf7434209ea0808f9101a537f3d1bbba86c7dc97e062927b7fcf",
+        "size": 18581
+      },
+      "v1.37.0-standalone-strict/storageclass-storage-v1.json": {
+        "url": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/491f6d0bac338516572de67fbd5ec4c510f7e657/v1.37.0-standalone-strict/storageclass-storage-v1.json",
+        "sha256": "9704bb88ec73ed37f8d565dbd2d2ee1e8ee61b5ec63c96a5a61926d6971ef3c9",
+        "size": 19906
+      }
+    }
+  }
+}

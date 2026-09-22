@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Offline template invariants, not Kubernetes API admission or cluster acceptance.
+# Offline source, invariant and schema checks; not API admission or cluster acceptance.
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 config_args=()
 admin_output_dir=
@@ -36,24 +37,33 @@ if [[ ! -f "$tools_dir/bin/kubectl" ]] || ! printf '%s  %s\n' "$checksum" "$tool
     exit 1
 fi
 "$tools_dir/bin/python" -c 'import yaml; assert yaml.__version__ == "6.0.3", "Run scripts/setup-deployment-tools.sh"'
+"$tools_dir/bin/python" "$repo/scripts/deployment_sources.py" "$repo"
+"$tools_dir/bin/python" "$repo/scripts/deployment_schemas.py" verify --tools-dir "$tools_dir"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
-# Kustomize build is local: no cluster, credentials, discovery or API schema fetch.
-"$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/serving" > "$scratch/retained.yaml"
-"$tools_dir/bin/kubectl" kustomize "$repo/test-support/deployment/text-only" > "$scratch/text-only.yaml"
+# Inputs were checked before any renderer runs. Do not forward renderer errors:
+# they can include credential-bearing snippets from malformed source files.
+render() {
+    if ! "$tools_dir/bin/kubectl" kustomize "$repo/$1" > "$2" 2> "$scratch/render-error"; then
+        echo "Deployment rendering failed: $1 (renderer diagnostics suppressed)." >&2
+        exit 1
+    fi
+}
+render deploy/kubernetes/serving "$scratch/retained.yaml"
+render test-support/deployment/text-only "$scratch/text-only.yaml"
 mkdir "$scratch/network"
 for variant in base edge postgres-in-cluster postgres-external dns-cluster dns-fixed monitoring ingestion-api ingestion-provider; do
-    "$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/network/$variant" > "$scratch/network/$variant.yaml"
+    render "deploy/kubernetes/network/$variant" "$scratch/network/$variant.yaml"
 done
-"$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/ingestion" > "$scratch/ingestion.yaml"
-"$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/ingestion/rbac" > "$scratch/ingestion-rbac.yaml"
+render deploy/kubernetes/ingestion "$scratch/ingestion.yaml"
+render deploy/kubernetes/ingestion/rbac "$scratch/ingestion-rbac.yaml"
 admin_args=()
 for operation in migrate maintain rebuild; do
-    "$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/admin/$operation" > "$scratch/$operation.yaml"
+    render "deploy/kubernetes/admin/$operation" "$scratch/$operation.yaml"
     admin_args+=(--admin-manifest "$operation=$scratch/$operation.yaml")
 done
-# Storage examples intentionally contain operator capacity placeholders and are
-# parsed directly, not passed to Kubernetes schema/admission or attached to serving.
+# Validate untouched operator examples first. Schema validation uses separate
+# temporary copies with exact, synthetic storage substitutions only.
 for example in storage-class local-pv local-pvc local-rebuild-pv local-rebuild-pvc; do
     printf '%s\n' '---' >> "$scratch/storage.yaml"
     cat "$repo/deploy/kubernetes/storage/$example.example.yaml" >> "$scratch/storage.yaml"
@@ -77,6 +87,9 @@ for checked_profile in retained text-only; do
         --document-controller-role "$repo/deploy/document-sandbox/controller-role.yaml" \
         --storage-manifest "$scratch/storage.yaml" "${edge_args[@]}" "${output_args[@]}" "${operation_args[@]}"
 done
+"$tools_dir/bin/python" "$repo/scripts/deployment_schemas.py" validate \
+    --tools-dir "$tools_dir" --rendered-dir "$scratch" --repo "$repo"
+OPENLEGAL_DEPLOY_TOOLS="$tools_dir" OPENLEGAL_SCHEMA_RENDERED_DIR="$scratch" \
 OPENLEGAL_RENDERED_INGESTION="$scratch/ingestion.yaml" \
     OPENLEGAL_RENDERED_INGESTION_RBAC="$scratch/ingestion-rbac.yaml" \
     OPENLEGAL_RENDERED_SERVING="$scratch/retained.yaml" \
@@ -87,7 +100,7 @@ OPENLEGAL_RENDERED_INGESTION="$scratch/ingestion.yaml" \
     OPENLEGAL_RENDERED_NETWORK_DIR="$scratch/network" \
     OPENLEGAL_DOCUMENT_BOUNDARY="$repo/deploy/document-sandbox/namespace.yaml" \
     OPENLEGAL_DOCUMENT_CONTROLLER_ROLE="$repo/deploy/document-sandbox/controller-role.yaml" \
-    "$tools_dir/bin/python" -m unittest discover -s "$repo/scripts/tests" -p test_deployment_validation.py
+    "$tools_dir/bin/python" -m unittest discover -s "$repo/scripts/tests" -p 'test_deployment*.py'
 if [[ -n $admin_output_dir ]]; then
     mkdir -p "$admin_output_dir"
     for operation in migrate maintain rebuild; do

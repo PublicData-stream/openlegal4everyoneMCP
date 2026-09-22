@@ -14,6 +14,8 @@ adds namespace-wide default deny, separately selected allow policies and a netwo
 acceptance runbook. The text-only profile remains a separate test fixture without
 a Service or NetworkPolicy. Phase 7 adds an opt-in ingestion image, projected
 controller identity, separate RBAC/egress templates and offline controller checks.
+Phase 8 adds source-inventory checks and pinned offline Kubernetes 1.36.0/1.37.0
+schema validation to the existing deployment and four native image CI jobs.
 Complete production acceptance remains pending. This document does not establish a running deployment
 or successful real-cluster, live-provider, browser WebTransport or ChatGPT acceptance.
 
@@ -566,12 +568,43 @@ scripts/test-server-image.sh --platform linux/amd64
 scripts/test-server-image.sh --platform linux/arm64
 ```
 
-The manifest gate defaults to `--profile retained`; `--config-output PATH` still
-exports rendered TOML. Provisioning requires Python 3.11–3.14 with venv/ensurepip,
+Every manifest invocation validates both profiles and both Kubernetes schema versions.
+`--profile` defaults to `retained` and selects which TOML `--config-output PATH`
+exports. Provisioning requires Python 3.11–3.14 with venv/ensurepip,
 curl and SHA-256 utilities. It downloads pinned verification tools explicitly;
 validation is offline with no kubeconfig, discovery or client dry-run.
 `OPENLEGAL_DEPLOY_TOOLS` selects the provisioned directory (default
 `target/deployment-tools`). See [tool provenance](dependencies.md#deployment-validation-tools).
+
+Before rendering, the gate checks an explicit inventory of all Kubernetes template
+and text-only fixture files, plus the document namespace/controller Role and OxiBelt
+handoff sources. Missing, unexpected and symlinked inputs fail. Every file has a
+validation owner; local Kustomize references must resolve within that inventory.
+Remote references, unreviewed generators, plugins and secret generators are rejected
+before kubectl runs. Adding a source requires extending its reviewed validation
+coverage, not merely listing its filename.
+
+Raw source checks reject high-confidence credential patterns, including private-key
+markers and credential-bearing URLs in comments, and forbidden inline credentials.
+Secret references, token-file paths and documented placeholders remain supported.
+These checks are scoped guards, not a general secret-scanning guarantee. Failures
+report rules and locations without source excerpts or credential values.
+
+Explicit setup provisions kubeconform and the 28 required schema files with committed
+checksums. Validation verifies the local bundle and uses only its strict schemas;
+missing schemas, changed assets, external schema references and skipped resources
+fail without a network fallback. To repair a corrupt installation, remove only
+`schema-validation/` inside the selected deployment-tools directory and rerun setup.
+Do not remove unrelated caches or data.
+
+The current 47 resource documents cover 14 Kubernetes resource types. Storage
+examples first pass their existing exact placeholder checks. Only temporary schema
+copies replace their five PV/PVC capacity pairs with `1Gi`, five local paths with
+distinct `/var/lib/openlegal/schema-fixture/` paths and node affinity with
+`schema-fixture-node`. Each replacement requires the exact expected field and old
+value. These values are synthetic, are never exported as operator configuration and
+do not recommend production sizing. Embedded TOML/kubeconfig and Kustomize inputs
+retain their dedicated semantic checks rather than being treated as workload APIs.
 
 The fast gate validates rendered YAML/TOML relationships, profile-specific security,
 lifecycle and storage invariants, and rejection of unsafe mutations. It validates
@@ -591,14 +624,16 @@ combinations, workload selectors and the unchanged document-sandbox network, quo
 and prepared-node RuntimeClass invariants. Duplicate, missing or unexpected resources
 and broadened peers/ports fail validation. This gate checks committed templates,
 not arbitrary operator overlays or production values. These are repository checks,
-not API schema admission or enforcement proof.
+not API-server admission or enforcement proof. Schema validation is additive to
+the project-specific invariants; it does not establish scheduling, authorization,
+CNI enforcement, storage availability or correctness of operator substitutions.
 
 The image gate consumes rendered configurations with the same runtime paths,
 using disposable values for authorities, corresponding source and certificates.
 It exercises both HTTP MCP revisions, Host/Origin denial, packaged widgets and
 text workers, then retained search/restart and startup failures described above.
 Fixtures use named Docker volume subdirectories; no host ports are published.
-Both native CI image jobs provision the required tools and full dictionary.
+All four native CI image jobs provision the required tools and full dictionary.
 
 The two OxiBelt profiles exercise the pinned edge with disposable identities.
 The Kubernetes profile consumes the committed handoff example and connects to a

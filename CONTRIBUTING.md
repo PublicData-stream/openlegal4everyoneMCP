@@ -236,12 +236,17 @@ Review. Real-cluster acceptance remains a separate explicitly configured gate.
 
 Serving-manifest and deployment-validation changes require explicit tool provisioning
 with `scripts/setup-deployment-tools.sh`, then `scripts/test-kubernetes-serving.sh`.
-The gate uses pinned kubectl/Kustomize and hash-locked PyYAML with Python 3.11–3.14,
-without cluster access. It checks rendered project invariants, not Kubernetes API
-schema admission. A dedicated CI job runs the same gate; both native image jobs
-provision these tools and consume both rendered profiles. The manifest gate defaults
-to retained; also run `scripts/test-kubernetes-serving.sh --profile text-only` to
-validate the separate fixture. Every invocation also validates all three suspended
+The gate uses pinned kubectl/Kustomize, hash-locked PyYAML with Python 3.11–3.14,
+and checksum-verified kubeconform with local Kubernetes 1.36.0 and 1.37.0 schemas.
+It checks inventoried source files before rendering, rendered project invariants,
+and both strict schema versions without cluster access or validation-time downloads.
+Missing, modified or incomplete schema assets fail; rerun explicit setup after
+removing only the invalid schema-validation bundle. Schema checks do not establish
+API-server admission or cluster enforcement. A dedicated CI job runs the same gate;
+all four native image jobs provision these tools and consume both rendered profiles.
+Every invocation validates retained and text-only profiles; `--profile` selects
+which configuration is exported by `--config-output`, defaulting to retained.
+Every invocation also validates all three suspended
 administrative Job roots, shared configuration/image identity, and separately
 applied Local PV/PVC examples, including fresh rebuild storage. Network
 checks cover the namespace default deny, each standalone allow example,
@@ -257,6 +262,12 @@ the image gate exercises cache maintenance, fresh index rebuild and interruption
 recovery with disposable storage. Run both image platforms when changing the
 serving configuration, container contract or image smoke harness. Retained deployment/storage changes
 also require the Rust baseline, PostgreSQL, Korean tokenization and OxiBelt gates.
+Source inventory additions must identify their validation owner and local render
+coverage; new resource kinds need reviewed schemas for both versions. Raw source
+checks reject high-confidence credential patterns, including in comments, but do
+not constitute a general secret scanner. Keep failures free of source excerpts and
+credential values. Deployment-tool updates require the four image target/platform
+checks and independent Security Review of the affected validation boundary.
 Run `shellcheck` on changed shell scripts and `actionlint` when the workflow changes. Do not describe these checks as real-cluster acceptance.
 
 CI introduced with Rust must match these documented checks and test supported

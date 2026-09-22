@@ -356,6 +356,32 @@ The provisioner supports Linux amd64/ARM64 CPython 3.11–3.14, rejects source b
 and installs no transitive dependencies. Safe YAML loading and standard-library
 `tomllib` parse repository-controlled rendered artifacts; no custom YAML parser or
 application dependency is introduced. The validator also rejects duplicate YAML
-keys. Full Kubernetes schema validation would require a separately pinned schema
-bundle/validator and remains later work. Tool updates require renewed hash/source
-verification, negative validator tests and both image gates; do not fetch `latest`.
+keys. Tool updates require renewed hash/source verification, negative validator
+tests and all four image target/platform gates; do not fetch `latest`.
+
+[kubeconform v0.8.0](https://github.com/yannh/kubeconform/releases/tag/v0.8.0) adds
+strict offline resource schema checks beyond the existing project-specific
+invariants. Its Linux amd64/ARM64 release archives and extracted binaries are
+checksum-pinned. It is an Apache-2.0 development tool, not a server/image runtime
+dependency; installing release binaries avoids adding a Go build toolchain or
+unlocked build scripts. Existing Kustomize rendering alone cannot validate resource
+schemas, while cluster dry-run would require API access and operator credentials.
+
+The [Kubernetes JSON Schema collection](https://github.com/yannh/kubernetes-json-schema/tree/491f6d0bac338516572de67fbd5ec4c510f7e657)
+is pinned at revision `491f6d0bac338516572de67fbd5ec4c510f7e657`. Only the 14 required
+standalone strict resource schemas for each of Kubernetes 1.36.0 and 1.37.0 are
+downloaded (28 files, approximately 3.6 MB). The Apache-2.0 attribution/license
+assets are retained with the provisioned bundle. Each file has a committed SHA-256;
+the gate also rejects external schema references so the resolver cannot download
+additional definitions. Unknown resource kinds require explicit schema admission.
+
+Only explicit setup downloads these assets over verified HTTPS. Setup verifies the
+complete staged bundle before publishing it; verified installations are reused.
+Every validation checks the installed assets, uses a fixed local schema location
+and rejects missing schemas and skips. No tool/schema is fetched from a moving
+branch or `latest` during setup or tests. Review future tool/schema updates together
+with their source, licenses, upstream maintenance and regression evidence. These
+downloaded executables and schemas form a CI trust boundary and require independent
+Security Review when changed. The tool's [documented limits](https://github.com/yannh/kubeconform#limits-of-kubeconform-validation)
+still apply: schema validation does not replace server-side admission, authorization
+or real-cluster acceptance, and it does not prove byte-identical image reproduction.

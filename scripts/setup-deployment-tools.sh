@@ -32,4 +32,6 @@ python3 -m venv "$tools_dir"
 "$tools_dir/bin/python" -m pip --isolated --disable-pip-version-check install \
     --index-url https://pypi.org/simple --require-hashes --only-binary=:all: --no-deps \
     -r "$repo/scripts/deployment-requirements.txt"
+PYTHONDONTWRITEBYTECODE=1 "$tools_dir/bin/python" "$repo/scripts/deployment_schemas.py" setup \
+    --tools-dir "$tools_dir"
 printf 'Deployment tools provisioned in %s\n' "$tools_dir"
