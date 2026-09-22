@@ -5,7 +5,8 @@ import { readFile } from 'node:fs/promises';
 
 const modern = '2026-07-28';
 const legacy = '2025-11-25';
-const { source, authority } = JSON.parse(await readFile('/fixture/client.json', 'utf8'));
+const { source, authority, retained = false } = JSON.parse(await readFile('/fixture/client.json', 'utf8'));
+const expected = retained ? JSON.parse(await readFile('/fixture/expected.json', 'utf8')) : undefined;
 const maxBody = 16 * 1024 * 1024;
 
 function exchange(path, body, protocol = legacy, session, overrides = {}) {
@@ -69,7 +70,8 @@ function exchange(path, body, protocol = legacy, session, overrides = {}) {
   });
 }
 
-const readinessDeadline = Date.now() + 60000;
+const started = Date.now();
+const readinessDeadline = started + (retained ? 300000 : 60000);
 let ready = false;
 while (Date.now() < readinessDeadline) {
   try {
@@ -81,6 +83,7 @@ while (Date.now() < readinessDeadline) {
   await new Promise((resolve) => setTimeout(resolve, 500));
 }
 assert.ok(ready, 'server did not become live and ready');
+console.log(`Server live and ready after ${Date.now() - started} ms (${retained ? 'retained' : 'text-only'})`);
 
 const rejectedRequest = { jsonrpc: '2.0', id: 1, method: 'initialize', params: {
   protocolVersion: legacy, capabilities: {}, clientInfo: { name: 'image-smoke', version: '1' },
@@ -145,5 +148,33 @@ for (const protocol of [legacy, modern]) {
   assert.equal(resource.contents[0].mimeType, 'text/html;profile=mcp-app');
   const packaged = await readFile('/fixture/text-diff.html', 'utf8');
   assert.equal(resource.contents[0].text, packaged.replace('__OPENLEGAL_SOURCE_URL__', source));
+  if (retained) {
+    for (const name of ['database.query', 'database.get', 'database.history']) {
+      assert.ok(listed.tools.some((tool) => tool.name === name), `missing ${name}`);
+    }
+    const page = await call('database.get', { object: expected.object });
+    assert.equal(page.metadata.capture_id, expected.head_capture_id);
+    assert.equal(page.metadata.freshness.state, 'fresh');
+    assert.equal(page.text, expected.body);
+    const history = await call('database.history', { object: expected.object, kind: 'captures' });
+    assert.deepEqual(new Set(history.entries.map((entry) => entry.capture_id)), new Set(expected.captures));
+    // Readiness and asynchronous index convergence have separate bounded gates.
+    const indexDeadline = Date.now() + 60000;
+    let caughtUp = false;
+    while (Date.now() < indexDeadline) {
+      const result = await call('database.query', { query: expected.query });
+      if (result.index_lag === 0 && result.hits.length === 1) {
+        assert.equal(result.hits[0].capture_id, expected.head_capture_id);
+        caughtUp = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    assert.ok(caughtUp, 'retained corpus index did not converge in 60 seconds');
+    const databaseWidget = await rpc('resources/read', { uri: 'ui://openlegal/database-v1.html' });
+    assert.equal(databaseWidget.contents[0].text,
+      (await readFile('/fixture/database.html', 'utf8')).replace('__OPENLEGAL_SOURCE_URL__', source));
+    console.log(`HTTP ${protocol}: fictional retained search, capture history and widget passed`);
+  }
   console.log(`HTTP ${protocol}: identity, packaged widget, text.diff subprocess passed`);
 }

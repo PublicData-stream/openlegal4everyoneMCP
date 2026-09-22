@@ -204,10 +204,16 @@ also require `scripts/test-server-image.sh --platform linux/amd64` and
 tests one architecture; omitting `--platform` selects the host architecture.
 Native image jobs run on both hosted runners. Local ARM64 emulation is useful
 evidence but does not replace native ARM64 CI acceptance. The gate uses disposable
-rendered serving configuration/disposable certificates and an internal Docker network to verify image contents,
-read-only execution, health, MCP text comparison and graceful shutdown. It needs
-no database, provider credentials or published host ports. Allow space for native
-build caches and image layers; the hosted job reports available disk space. Its
+rendered text-only and retained-corpus configurations, disposable certificates and
+an internal Docker network to verify image contents, read-only execution, health,
+MCP text comparison, retained search, graceful restart and storage identity. It
+provisions disposable PostgreSQL 18 with verified TLS, separate migration/runtime
+roles, isolated volumes and the full pinned dictionary. It requires no production
+or provider credentials and publishes no host ports. Dictionary provisioning may
+download the pinned source; `MECAB_SOURCE_ARCHIVE` or
+`OPENLEGAL_TEST_MECAB_DICTIONARY` permits explicit verified reuse. Missing dictionary,
+startup timeout and OOM are failures, not successful negative cases. Allow space
+for native build caches and image layers; the hosted job reports available disk space. Its
 clean-build peak has not been measured on hosted ARM64, so the worker's separate
 20 GiB requirement is not imposed on the server job.
 Unavailable Docker, architecture support or build inputs leave this gate incomplete.
@@ -218,10 +224,13 @@ with `scripts/setup-deployment-tools.sh`, then `scripts/test-kubernetes-serving.
 The gate uses pinned kubectl/Kustomize and hash-locked PyYAML with Python 3.11–3.14,
 without cluster access. It checks rendered project invariants, not Kubernetes API
 schema admission. A dedicated CI job runs the same gate; both native image jobs
-provision these tools and consume the generated text-only configuration. Run both
-image platforms when changing the serving configuration, container contract or image
-smoke harness. Run `shellcheck` on changed shell scripts and `actionlint` when the
-workflow changes. Do not describe these checks as real-cluster acceptance.
+provision these tools and consume both rendered profiles. The manifest gate defaults
+to retained; also run `scripts/test-kubernetes-serving.sh --profile text-only` to
+validate the separate fixture. It checks the separately applied Local PV/PVC
+examples as well. Run both image platforms when changing the serving configuration,
+container contract or image smoke harness. Retained deployment/storage changes
+also require the Rust baseline, PostgreSQL, Korean tokenization and OxiBelt gates.
+Run `shellcheck` on changed shell scripts and `actionlint` when the workflow changes. Do not describe these checks as real-cluster acceptance.
 
 CI introduced with Rust must match these documented checks and test supported
 feature combinations on a declared toolchain/platform baseline. Run advisory checks

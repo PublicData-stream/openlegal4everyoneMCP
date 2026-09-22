@@ -201,4 +201,5 @@ docker stop --signal SIGTERM --timeout 30 "$server" >/dev/null
 (( SECONDS - shutdown_started < 30 )) || { echo 'Server exceeded termination grace' >&2; exit 1; }
 [[ $(docker inspect --format '{{.State.ExitCode}}' "$server") == 0 ]] || { echo 'Server failed graceful SIGTERM exit' >&2; exit 1; }
 [[ $(docker inspect --format '{{.State.OOMKilled}}' "$server") == false ]]
+scripts/test-retained-server-image.sh --image "$image" --platform "$platform"
 printf 'Production image acceptance passed for %s (%s).\n' "$platform" "$cpu_baseline"
