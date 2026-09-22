@@ -5,16 +5,16 @@ import { readFile } from 'node:fs/promises';
 
 const modern = '2026-07-28';
 const legacy = '2025-11-25';
-const source = 'https://example.org/openlegal/image-smoke-source';
+const { source, authority } = JSON.parse(await readFile('/fixture/client.json', 'utf8'));
 const maxBody = 16 * 1024 * 1024;
 
-function exchange(path, body, protocol = legacy, session) {
+function exchange(path, body, protocol = legacy, session, overrides = {}) {
   return new Promise((resolve, reject) => {
     const headers = {};
     if (body) {
       Object.assign(headers, {
         'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',
-        'MCP-Protocol-Version': protocol,
+        'MCP-Protocol-Version': protocol, Host: authority,
       });
       if (session) headers['Mcp-Session-Id'] = session;
       if (protocol === modern) {
@@ -23,6 +23,7 @@ function exchange(path, body, protocol = legacy, session) {
         if (name) headers['Mcp-Name'] = name;
       }
     }
+    Object.assign(headers, overrides);
     const request = http.request({
       hostname: 'server', port: body ? 8080 : 9090, path,
       method: body ? 'POST' : 'GET', headers,
@@ -80,6 +81,14 @@ while (Date.now() < readinessDeadline) {
   await new Promise((resolve) => setTimeout(resolve, 500));
 }
 assert.ok(ready, 'server did not become live and ready');
+
+const rejectedRequest = { jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+  protocolVersion: legacy, capabilities: {}, clientInfo: { name: 'image-smoke', version: '1' },
+} };
+for (const headers of [{ Host: 'untrusted.example:8080' }, { Origin: 'https://untrusted.example' }]) {
+  const reply = await exchange('/mcp', rejectedRequest, legacy, undefined, headers);
+  assert.equal(reply.status, 403, 'untrusted Host/Origin must be rejected');
+}
 
 let nextId = 0;
 for (const protocol of [legacy, modern]) {

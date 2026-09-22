@@ -204,7 +204,7 @@ also require `scripts/test-server-image.sh --platform linux/amd64` and
 tests one architecture; omitting `--platform` selects the host architecture.
 Native image jobs run on both hosted runners. Local ARM64 emulation is useful
 evidence but does not replace native ARM64 CI acceptance. The gate uses disposable
-configuration/certificates and an internal Docker network to verify image contents,
+rendered serving configuration/disposable certificates and an internal Docker network to verify image contents,
 read-only execution, health, MCP text comparison and graceful shutdown. It needs
 no database, provider credentials or published host ports. Allow space for native
 build caches and image layers; the hosted job reports available disk space. Its
@@ -212,6 +212,16 @@ clean-build peak has not been measured on hosted ARM64, so the worker's separate
 20 GiB requirement is not imposed on the server job.
 Unavailable Docker, architecture support or build inputs leave this gate incomplete.
 Image builds do not publish images. See [server deployment](docs/deployment-kubernetes.md).
+
+Serving-manifest and deployment-validation changes require explicit tool provisioning
+with `scripts/setup-deployment-tools.sh`, then `scripts/test-kubernetes-serving.sh`.
+The gate uses pinned kubectl/Kustomize and hash-locked PyYAML with Python 3.11–3.14,
+without cluster access. It checks rendered project invariants, not Kubernetes API
+schema admission. A dedicated CI job runs the same gate; both native image jobs
+provision these tools and consume the generated text-only configuration. Run both
+image platforms when changing the serving configuration, container contract or image
+smoke harness. Run `shellcheck` on changed shell scripts and `actionlint` when the
+workflow changes. Do not describe these checks as real-cluster acceptance.
 
 CI introduced with Rust must match these documented checks and test supported
 feature combinations on a declared toolchain/platform baseline. Run advisory checks

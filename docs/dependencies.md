@@ -320,3 +320,24 @@ or invoke hot-reload APIs. Removing the dependency requires an upstream graph ch
 not enabling a different first-party feature. Owner: PiQuark6046; review by
 **2026-12-19**, or on MeCab-Ko/notify changes. This is a narrow license admission,
 not a general CC0 allowlist or an advisory exception.
+
+## Deployment validation tools
+
+Development-only deployment checks use Kubernetes `kubectl` v1.37.0 (embedded
+Kustomize v5.8.1), with committed architecture-specific SHA-256 checksums from the
+[official release artifacts](https://kubernetes.io/releases/download/).
+[Official installation guidance](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+describes release checksum verification. Only `kubectl kustomize` runs in the
+manifest gate; no cluster discovery or ambient credentials are needed. Kubernetes
+and Kustomize are Apache-2.0. Reusing the standard renderer avoids a new template
+engine and does not claim an API-server validation result.
+
+[PyYAML 6.0.3](https://pypi.org/project/PyYAML/6.0.3/) is MIT-licensed and installed
+from hash-locked binary wheels into an isolated development virtual environment.
+The provisioner supports Linux amd64/ARM64 CPython 3.11–3.14, rejects source builds
+and installs no transitive dependencies. Safe YAML loading and standard-library
+`tomllib` parse repository-controlled rendered artifacts; no custom YAML parser or
+application dependency is introduced. The validator also rejects duplicate YAML
+keys. Full Kubernetes schema validation would require a separately pinned schema
+bundle/validator and remains later work. Tool updates require renewed hash/source
+verification, negative validator tests and both image gates; do not fetch `latest`.

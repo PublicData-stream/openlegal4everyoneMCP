@@ -134,6 +134,19 @@ jobs:
           test "$available_kib" -ge 20971520
       - name: Build and validate confined native document processing
         run: scripts/test-document-worker.sh
+  kubernetes-serving:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Python virtual environment support
+        run: sudo apt-get update && sudo apt-get install -y python3-venv
+      - name: Provision pinned deployment validation tools
+        run: scripts/setup-deployment-tools.sh
+      - name: Render and validate serving template offline
+        run: scripts/test-kubernetes-serving.sh
   server-image:
     strategy:
       fail-fast: false
@@ -154,5 +167,9 @@ jobs:
         run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
       - name: Report available image-build storage
         run: df -h /
+      - name: Install Python virtual environment support
+        run: sudo apt-get update && sudo apt-get install -y python3-venv
+      - name: Provision pinned deployment validation tools
+        run: scripts/setup-deployment-tools.sh
       - name: Build and test the production server image
         run: scripts/test-server-image.sh --platform '${{ matrix.platform }}'

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build and accept one production platform. Requires Docker, Git, OpenSSL and tar.
+# Build and accept one production platform. Provision deployment tools first.
+# Requires Docker, Git, OpenSSL, tar and scripts/setup-deployment-tools.sh inputs.
 # Docker may use a host rootless daemon: fixtures are streamed into a named volume.
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -52,6 +53,21 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 cd "$repo"
+mkdir -p "$scratch/fixture/config" "$scratch/fixture/tls" "$scratch/fixture/invalid-tls"
+scripts/test-kubernetes-serving.sh --config-output "$scratch/fixture/config/server.toml"
+deploy_tools=${OPENLEGAL_DEPLOY_TOOLS:-$repo/target/deployment-tools}
+"$deploy_tools/bin/python" - "$scratch/fixture" <<'PYTHON'
+import json
+from pathlib import Path
+import sys
+import tomllib
+fixture = Path(sys.argv[1])
+config = tomllib.loads((fixture / "config/server.toml").read_text())
+(fixture / "client.json").write_text(json.dumps({
+    "source": config["source"]["url"],
+    "authority": config["http"]["allowed_hosts"][0],
+}))
+PYTHON
 revision=$(git rev-parse HEAD)
 version="image-smoke-${revision:0:12}"
 docker build --platform "$platform" --file apps/server/Dockerfile \
@@ -73,8 +89,9 @@ expect_image '{{index .Config.Labels "org.opencontainers.image.version"}}' "$ver
 expect_image '{{index .Config.Labels "org.opencontainers.image.licenses"}}' AGPL-3.0-only
 expect_image '{{index .Config.Labels "org.openlegal.cpu-baseline"}}' "$cpu_baseline"
 hardening=(--read-only --cap-drop ALL --security-opt no-new-privileges \
-    --memory 1g --cpus 2 --pids-limit 128 --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777")
+    --memory 2g --cpus 2 --pids-limit 128)
 docker run --rm --name "$probe" --platform "$platform" --network none "${hardening[@]}" \
+    --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777" \
     --entrypoint /bin/sh "$image" -exc '
     test "$(id -u):$(id -g)" = 10004:10004
     test -x /usr/local/bin/openlegal-server
@@ -111,36 +128,15 @@ docker run --rm --name "$probe" --platform "$platform" --network none "${hardeni
     done
     touch /tmp/allowed-write
     '
-mkdir "$scratch/fixture"
 cp scripts/server-image-smoke.mjs "$scratch/fixture/"
-# Synthetic self-signed certificate is only for the disposable required WT listener.
+# Synthetic certificate for the required WT listener, never production trust.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
-    -subj /CN=server -addext subjectAltName=DNS:server \
-    -keyout "$scratch/fixture/key.pem" -out "$scratch/fixture/cert.pem" >/dev/null 2>&1
-cat > "$scratch/fixture/server.toml" <<'TOML'
-[source]
-url = "https://example.org/openlegal/image-smoke-source"
-[http]
-bind = "0.0.0.0:8080"
-allowed_hosts = ["server:8080"]
-allowed_origins = ["https://example.test"]
-[webtransport]
-bind = "0.0.0.0:4433"
-certificate = "/fixture/cert.pem"
-private_key = "/fixture/key.pem"
-allowed_hosts = ["server:4433"]
-allowed_origins = ["https://example.test"]
-[health]
-bind = "0.0.0.0:9090"
-[limits]
-max_message_bytes = 16777216
-max_buffer_bytes = 268435456
-shutdown_timeout_secs = 10
-[text_diff]
-widget_html = "/opt/openlegal/widgets/text-diff.html"
-TOML
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+    -keyout "$scratch/fixture/tls/tls.key" -out "$scratch/fixture/tls/tls.crt" >/dev/null 2>&1
 printf '%s\n' 'not valid TOML [' > "$scratch/fixture/invalid.toml"
-chmod 444 "$scratch/fixture/"*
+printf '%s\n' 'not a certificate' > "$scratch/fixture/invalid-tls/tls.crt"
+cp "$scratch/fixture/tls/tls.key" "$scratch/fixture/invalid-tls/tls.key"
+chmod 444 "$scratch/fixture/"*.* "$scratch/fixture/config/server.toml"
 docker network create --internal "$network" >/dev/null
 docker volume create "$fixture_volume" >/dev/null
 tar -c -C "$scratch/fixture" . | docker run --rm -i --name "$initializer" \
@@ -150,24 +146,59 @@ tar -c -C "$scratch/fixture" . | docker run --rm -i --name "$initializer" \
 # Capture the exact packaged widget for client-side response comparison.
 docker run --rm --name "$initializer" --platform "$platform" --network none --user 0:0 \
     --mount "type=volume,source=$fixture_volume,target=/fixture" \
-    --entrypoint /bin/sh "$image" -ec 'cp /opt/openlegal/widgets/text-diff.html /fixture/text-diff.html; chmod 444 /fixture/text-diff.html'
+    --entrypoint /bin/sh "$image" -ec '
+    cp /opt/openlegal/widgets/text-diff.html /fixture/text-diff.html
+    chmod 444 /fixture/text-diff.html
+    chown -R 0:10004 /fixture/tls /fixture/invalid-tls
+    chmod 750 /fixture/tls /fixture/invalid-tls
+    chmod 440 /fixture/tls/* /fixture/invalid-tls/*
+    '
 fixture=(--mount "type=volume,source=$fixture_volume,target=/fixture,readonly")
-docker run -d --name "$invalid" --platform "$platform" --network none \
-    "${hardening[@]}" "${fixture[@]}" "$image" /fixture/invalid.toml >/dev/null
-for _attempt in {1..20}; do
-    [[ $(docker inspect --format '{{.State.Running}}' "$invalid") == false ]] && break
-    sleep 1
-done
-[[ $(docker inspect --format '{{.State.Running}}' "$invalid") == false ]] || { echo 'Malformed configuration did not exit' >&2; exit 1; }
-invalid_code=$(docker inspect --format '{{.State.ExitCode}}' "$invalid")
-[[ $invalid_code == 1 ]] || { echo "Malformed configuration exited $invalid_code, expected 1" >&2; exit 1; }
-[[ $(docker inspect --format '{{.State.OOMKilled}}' "$invalid") == false ]]
+config_mount=(--mount "type=volume,source=$fixture_volume,target=/etc/openlegal,volume-subpath=config,readonly")
+tls_mount=(--mount "type=volume,source=$fixture_volume,target=/run/secrets/backend-tls,volume-subpath=tls,readonly")
+expect_startup_failure() {
+    local label=$1
+    shift
+    docker run -d --name "$invalid" --platform "$platform" --network none \
+        "${hardening[@]}" "$@" >/dev/null
+    for _attempt in {1..20}; do
+        [[ $(docker inspect --format '{{.State.Running}}' "$invalid") == false ]] && break
+        sleep 1
+    done
+    [[ $(docker inspect --format '{{.State.Running}}' "$invalid") == false ]] || { echo "$label did not exit" >&2; exit 1; }
+    local invalid_code
+    invalid_code=$(docker inspect --format '{{.State.ExitCode}}' "$invalid")
+    [[ $invalid_code == 1 ]] || { echo "$label exited $invalid_code, expected 1" >&2; exit 1; }
+    [[ $(docker inspect --format '{{.State.OOMKilled}}' "$invalid") == false ]]
+    docker rm "$invalid" >/dev/null
+}
+expect_startup_failure 'Missing configuration' "$image"
+expect_startup_failure 'Malformed configuration' "${fixture[@]}" "$image" /fixture/invalid.toml
+expect_startup_failure 'Missing TLS' "${config_mount[@]}" "$image"
+expect_startup_failure 'Invalid TLS' "${config_mount[@]}" \
+    --mount "type=volume,source=$fixture_volume,target=/run/secrets/backend-tls,volume-subpath=invalid-tls,readonly" "$image"
+# Use the default entrypoint/arguments and exact committed mount paths; no /tmp.
 docker run -d --name "$server" --platform "$platform" --network "$network" --network-alias server \
-    "${hardening[@]}" "${fixture[@]}" "$image" /fixture/server.toml >/dev/null
+    "${hardening[@]}" "${config_mount[@]}" "${tls_mount[@]}" "$image" >/dev/null
+docker exec "$server" /bin/sh -ec '
+    test "$(id -u):$(id -g)" = 10004:10004
+    grep -Eq "^CapEff:[[:space:]]+0+$" /proc/1/status
+    grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/1/status
+    grep -Eq "^Seccomp:[[:space:]]+2$" /proc/1/status
+    test -r /run/secrets/backend-tls/tls.key
+    test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token
+    for directory in /tmp /etc/openlegal /run/secrets/backend-tls; do
+        if touch "$directory/image-smoke-write" 2>/dev/null; then
+            echo "Unexpected write access to $directory" >&2; exit 1
+        fi
+    done
+    '
 docker run --rm --name "$client" --platform "$native_platform" --network "$network" \
     --user 10004:10004 "${hardening[@]}" "${fixture[@]}" \
     --entrypoint node "$node_image" /fixture/server-image-smoke.mjs
-docker stop --signal SIGTERM --timeout 20 "$server" >/dev/null
+shutdown_started=$SECONDS
+docker stop --signal SIGTERM --timeout 30 "$server" >/dev/null
+(( SECONDS - shutdown_started < 30 )) || { echo 'Server exceeded termination grace' >&2; exit 1; }
 [[ $(docker inspect --format '{{.State.ExitCode}}' "$server") == 0 ]] || { echo 'Server failed graceful SIGTERM exit' >&2; exit 1; }
 [[ $(docker inspect --format '{{.State.OOMKilled}}' "$server") == false ]]
 printf 'Production image acceptance passed for %s (%s).\n' "$platform" "$cpu_baseline"

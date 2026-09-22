@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openlegal-server
+spec:
+  # Multiple replicas are unsupported until provider, job and index coordination
+  # are designed. Recreate orders upgrades; manual Pod deletion is not fencing.
+  replicas: 1
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openlegal-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openlegal-server
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        kubernetes.io/os: linux
+        # Operator qualification includes x86-64-v3 on amd64; see deployment guide.
+        openlegal.server/ready: "true"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [amd64, arm64]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10004
+        runAsGroup: 10004
+        fsGroup: 10004
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: server
+          # Non-pullable template sentinel. Replace registry AND digest before use.
+          image: registry.example/openlegal-server@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: webtransport
+              containerPort: 4433
+              protocol: UDP
+            - name: health
+              containerPort: 9090
+              protocol: TCP
+          # Provisional TEXT-ONLY budget. Re-measure before enabling corpus/ingestion.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+          volumeMounts:
+            - name: config
+              mountPath: /etc/openlegal
+              readOnly: true
+            - name: backend-tls
+              mountPath: /run/secrets/backend-tls
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: openlegal-server-config
+            defaultMode: 0444
+        - name: backend-tls
+          secret:
+            secretName: openlegal-backend-tls
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key

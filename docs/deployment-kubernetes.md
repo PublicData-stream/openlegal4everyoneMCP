@@ -4,8 +4,10 @@
 
 Phase 0 records the selected deployment design and existing server contracts.
 Phase 1 adds the production server image, local image acceptance and native
-amd64/ARM64 CI jobs. Kubernetes serving manifests and complete operator runbooks
-remain planned. This document does not establish a running deployment or
+amd64/ARM64 CI jobs. Phase 2 adds a hardened text-only serving template, offline
+manifest checks and image acceptance using its rendered configuration. Retained
+corpus configuration/storage, Services, NetworkPolicy, ingestion integration and
+complete production operator runbooks remain planned. This document does not establish a running deployment or
 successful real-cluster, live-provider, browser WebTransport or ChatGPT acceptance.
 
 The inventory was checked on `main` at
@@ -27,7 +29,9 @@ The [architecture](architecture.md), [server contract](server.md),
 [document sandbox](document-sandbox.md) remain authoritative for their behavior.
 Phase 0 changed documentation only. Phase 1 changes packaging and the Rust CPU
 baseline; public MCP schemas, configuration types and legal-data semantics remain
-unchanged.
+unchanged. Phase 2 also rejects empty certificate chains and mismatched TLS keys
+as normal startup errors instead of panicking in the TLS dependency. Valid TLS
+configuration retains ring, TLS 1.3, WebTransport ALPN and existing QUIC limits.
 
 ## Production server image
 
@@ -126,6 +130,139 @@ real-cluster isolation, retained-corpus startup, live provider or public transpo
 acceptance. Existing PostgreSQL, Korean analyzer, OxiBelt and document-worker gates
 remain separate. Record actual check outcomes with the implementation handoff.
 
+## Phase 2 text-only serving template
+
+The [serving Kustomization](../deploy/kubernetes/serving/) generates a Namespace,
+Deployment and content-hashed ConfigMap from `server.toml`. It enables supplied-text
+comparison without database, corpus, synthetic retrieval or ingestion. It changes
+no MCP schemas or Rust configuration types. This is a runnable example after
+operator provisioning, not a completed production deployment.
+
+### Operator prerequisites
+
+- Publish the matching server image separately. Replace the entire
+  `registry.example/openlegal-server@sha256:000...000` reference with its real
+  registry and SHA-256 digest. The all-zero digest is an intentionally non-pullable
+  template sentinel; the repository check accepts only that exact placeholder or
+  a real-shaped nonzero digest. Neither proves an image exists or was published.
+- Replace `[source].url` with free corresponding source for the exact running
+  server and widgets. The example.org URL is only a fixture/example.
+- Qualify Linux amd64 or ARM64 nodes before applying `openlegal.server/ready=true`.
+  On amd64, verify the [x86-64-v3 CPU baseline](../CONTRIBUTING.md#rust-baseline)
+  on the actual node. ARM64 uses the generic CPU baseline. Confirm memory/CPU
+  availability and Restricted Pod Security support. The label is an operator
+  assertion, not automatic hardware detection or an attestation. An unqualified
+  node leaves this workload Pending; do not remove the affinity to work around it.
+- Create namespace `openlegal-serving`, then an operator-managed TLS Secret named
+  `openlegal-backend-tls` there, with keys `tls.crt` and `tls.key`. Keep private keys
+  outside Git and build contexts. The volume exposes only those two keys at
+  `/run/secrets/backend-tls`, read-only with mode `0440`; Pod fsGroup `10004`
+  supplies group access. Verify effective ownership on the target cluster.
+  Issue a certificate for the actual client/backend authority and retain client
+  certificate verification. The initial authorities are localhost/127.0.0.1.
+
+Use an operator-owned copy/overlay for environment values. Render it before applying
+and select an explicit kubeconfig and context for every cluster command. Namespace
+labels use the cluster's `latest` Restricted policy; review admission on Kubernetes
+upgrades. Local rendering is independent of the target cluster version, and the
+validation tool's version is not a claimed cluster compatibility matrix.
+
+For example, after supplying the above values and creating the Secret:
+
+```sh
+kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT \
+  apply -k /absolute/operator/serving
+kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT \
+  -n openlegal-serving rollout status deployment/openlegal-server --timeout=120s
+kubectl --kubeconfig /absolute/operator/kubeconfig --context OPERATOR_CONTEXT \
+  -n openlegal-serving port-forward --address 127.0.0.1 deployment/openlegal-server 8080:8080
+```
+
+A native HTTP MCP client can use `http://localhost:8080/mcp` through this explicit
+local forwarding session. Empty Origin allowlists reject every present Origin;
+this profile does not enable browser access. `kubectl port-forward` does not carry
+UDP, so this is not WebTransport acceptance. Later OxiBelt integration must replace
+backend authorities and configure the intended origins and verified TLS trust.
+
+There is no Service, NodePort, Ingress or NetworkPolicy in Phase 2. Health port
+9090 is a private operational listener used by kubelet, not a public route.
+Absence of a Service does **not** isolate Pod networking: cluster peers may still
+reach Pod IPs, including health. NetworkPolicy and real network-enforcement
+acceptance remain Phase 6. Do not present this template as network-isolated.
+
+### Runtime and lifecycle contract
+
+The Pod uses normal container runtime isolation, UID/GID/fsGroup `10004`, no
+capabilities, no privilege escalation, RuntimeDefault seccomp and a read-only
+root filesystem. ConfigMap and TLS mounts are read-only; there is no writable
+`/tmp`, service-account token, controller identity, provider credential or database
+credential. Application startup and text workers are tested without scratch space.
+Document-worker isolation remains a separate trust domain.
+
+Requests of 500m CPU/512Mi and limits of two CPUs/2Gi are provisional **text-only**
+budgets, not measured production capacity. Before enabling the corpus, budget and
+measure all four MeCab dictionary copies, Lindera, index readers and concurrent
+server work; revisit startup probes at that stage. The 256 MiB transport buffer is
+not a process-RSS ceiling. No corpus sizing claim follows from this smoke test.
+
+Kubelet HTTP probes target the named health port directly: `/live` has a 30-second
+initial delay and 10-second period; `/ready` has no initial delay and a five-second
+period. Both use a two-second timeout and three failures. No startup probe is
+needed for this text-only fixture. Readiness observes existing state; it is not a
+fresh upstream/database check. The image entrypoint receives SIGTERM directly,
+with a 15-second configured drain and 30-second termination grace, without a
+sleeping preStop hook. SIGTERM during early initialization precedes registration
+of the normal serving shutdown handler; the smoke's graceful-exit evidence covers
+an already-ready server.
+
+Exactly one desired replica and `Recreate` order Deployment upgrades. Kubernetes
+[does not guarantee non-overlap for manual Pod deletion](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#recreate-deployment).
+Do not add replicas or treat Deployment settings as fencing. Retained-corpus work
+must preserve its existing lease and stop-before-maintenance procedure.
+
+Kustomize's ConfigMap hash changes the Pod template when configuration changes,
+so keep the generated suffix. The process does not hot-reload configuration or
+certificates. Secret rotation requires an explicit Deployment rollout restart;
+wait for completion and verify readiness. `Recreate` entails downtime. Retain the
+previous image/configuration and any necessary prior Secret material for rollback;
+old generated ConfigMaps are not automatically garbage-collected by `apply -k`.
+
+### Local and CI checks
+
+```sh
+scripts/setup-deployment-tools.sh
+scripts/test-kubernetes-serving.sh
+scripts/test-server-image.sh --platform linux/amd64
+scripts/test-server-image.sh --platform linux/arm64
+```
+
+Provisioning requires Python 3.11–3.14 with its venv/ensurepip package (on
+Debian/Ubuntu, `python3-venv`), curl and SHA-256 utilities. It explicitly downloads
+pinned verification tools; the manifest gate
+itself is offline and does not use kubeconfig, cluster discovery or client dry-run.
+`OPENLEGAL_DEPLOY_TOOLS` selects an alternative provisioned directory (default
+`target/deployment-tools`). Dependency pins and provenance are described in
+[dependency admission](dependencies.md#deployment-validation-tools).
+
+The fast gate renders the actual Kustomization, validates its YAML and TOML
+relationships and security/lifecycle invariants, and tests rejection of unsafe
+mutations. It intentionally checks the repository's Phase 2 profile; future phases
+must update the validator and its negative cases alongside their reviewed changes.
+It is not Kubernetes API schema validation or proof of Pod Security enforcement.
+
+The image gate consumes the rendered ConfigMap without rewriting its runtime paths,
+uses disposable group-readable TLS material, and tests the default image command,
+non-root/read-only execution without `/tmp`, missing/invalid configuration and TLS,
+health, Host/Origin denial, both HTTP MCP revisions, packaged widget, text worker
+and bounded SIGTERM exit. Fixtures travel through named Docker volume subdirectories
+so a host rootless daemon need not see the checkout. No host ports are published.
+
+CI runs a fast manifest job and reuses the existing native amd64/ARM64 image jobs.
+Local emulated ARM64 evidence does not establish native ARM64 CI success. Real-cluster
+admission, scheduling, Secret permissions, probe timing, rollout ordering and runtime
+enforcement remain operator gates. No cluster, public traffic or live provider
+acceptance is implied by these checks.
+
 ## Selected topology
 
 ```text
@@ -161,7 +298,7 @@ and issue a backend certificate matching the authority trusted by OxiBelt.
 NodePorts alone do not establish privacy; the operator must restrict access to
 the intended host/private path and validate the effective network controls.
 
-The serving Deployment will have exactly one replica and use `Recreate`.
+The serving Deployment has exactly one desired replica and uses `Recreate`.
 Application budgets and upstream coordination assume one backend, and concurrent
 processes must not share the corpus index. Preserve the existing database advisory
 lease between corpus serving and rebuilding; deployment settings do not replace
@@ -222,8 +359,8 @@ there is no runtime download or ambient dictionary discovery.
 
 ## Template and operator ownership
 
-The following division guides later implementation; it does not imply these
-production templates already exist.
+The following division covers the full deployment design. The text-only serving
+template exists; later-phase production integrations remain planned.
 
 | Repository templates and contracts | Operator-supplied deployment values and actions |
 | --- | --- |
@@ -235,8 +372,8 @@ production templates already exist.
 | Explicit opt-in ingestion overlay and namespace-scoped controller access | Provider credential, digest-pinned worker image and separately configured controller identity after sandbox acceptance |
 
 Commit no credentials, private keys, production kubeconfig, database URL, real
-node identifier or host-specific ZFS path. Exact network/storage values, resource
-limits and later ingestion authentication integration remain future-phase work.
+node identifier or host-specific ZFS path. Exact network/storage values, production
+resource sizing and later ingestion authentication integration remain future-phase work.
 The current controller requires explicit kubeconfig and context; any in-cluster
 authentication alternative needs a deliberate contract change and Security Review.
 
@@ -247,9 +384,8 @@ and independent review of the documentation patch under
 [CONTRIBUTING.md](../CONTRIBUTING.md#documentation-only-changes). It supplies no
 new runtime, image, manifest or CI validation evidence.
 
-Image acceptance is available in Phase 1; Kubernetes deployment validation remains
-later work. Real-cluster
-networking, storage, shutdown and sandbox enforcement require operator acceptance;
+Image acceptance is available in Phase 1 and rendering/invariant checks in Phase 2.
+Real-cluster networking, storage, shutdown and sandbox enforcement require operator acceptance;
 live LAW OPEN DATA access and public transport/platform acceptance are separate
 gates. Existing offline fixtures and local integration evidence do not satisfy
 those gates. Deployment, publication and live provider requests are not part of
