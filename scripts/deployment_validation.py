@@ -685,8 +685,13 @@ def main():
             validate_storage(load_documents(args.storage_manifest.read_text()))
         if args.config_output:
             args.config_output.write_text(raw)
-    except (ValidationError, yaml.YAMLError, tomllib.TOMLDecodeError, OSError, ValueError) as error:
-        parser.exit(1, f"Deployment template validation failed: {error}\n")
+    except (ValidationError, yaml.YAMLError, tomllib.TOMLDecodeError, OSError,
+            ValueError, KeyError, TypeError, RecursionError) as error:
+        # Parser exceptions can quote credential-bearing source text. Invariant
+        # messages can also contain input-derived resource names. Never forward
+        # either through the deployment gate's diagnostics.
+        parser.exit(1, f"Deployment template validation failed ({type(error).__name__}); "
+                    "check the selected template against its documented contract.\n")
     print("Deployment template invariants passed (offline; no Kubernetes API admission or cluster acceptance).")
 
 

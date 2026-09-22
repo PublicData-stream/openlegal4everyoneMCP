@@ -1,0 +1,364 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "path": "deploy/document-sandbox/controller-role.yaml",
+      "role": "standalone",
+      "owners": [
+        "document-controller-role"
+      ]
+    },
+    {
+      "path": "deploy/document-sandbox/namespace.yaml",
+      "role": "standalone",
+      "owners": [
+        "document-boundary"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/admin/maintain/job.yaml",
+      "role": "resource",
+      "owners": [
+        "admin-maintain"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/admin/maintain/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "admin-maintain"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/admin/migrate/job.yaml",
+      "role": "resource",
+      "owners": [
+        "admin-migrate"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/admin/migrate/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "admin-migrate"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/admin/rebuild/job.yaml",
+      "role": "resource",
+      "owners": [
+        "admin-rebuild"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/admin/rebuild/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "admin-rebuild"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/config/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "admin-maintain",
+        "admin-migrate",
+        "admin-rebuild",
+        "ingestion",
+        "serving"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/config/server.toml",
+      "role": "configuration",
+      "owners": [
+        "admin-maintain",
+        "admin-migrate",
+        "admin-rebuild",
+        "ingestion",
+        "serving"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/ingestion/deployment-patch.yaml",
+      "role": "patch",
+      "owners": [
+        "ingestion"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/ingestion/kubeconfig",
+      "role": "configuration",
+      "owners": [
+        "ingestion"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/ingestion/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "ingestion"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/ingestion/rbac/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "ingestion-rbac"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/ingestion/rbac/role-binding.yaml",
+      "role": "resource",
+      "owners": [
+        "ingestion-rbac"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/ingestion/server.toml",
+      "role": "configuration",
+      "owners": [
+        "ingestion"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/ingestion/service-account.yaml",
+      "role": "resource",
+      "owners": [
+        "ingestion"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/base/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "ingestion",
+        "network-base",
+        "serving"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/base/policy.yaml",
+      "role": "resource",
+      "owners": [
+        "ingestion",
+        "network-base",
+        "serving"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/dns-cluster/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "network-dns-cluster"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/dns-cluster/policy.yaml",
+      "role": "resource",
+      "owners": [
+        "network-dns-cluster"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/dns-fixed/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "network-dns-fixed"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/dns-fixed/policy.yaml",
+      "role": "resource",
+      "owners": [
+        "network-dns-fixed"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/edge/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "network-edge"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/edge/policy.yaml",
+      "role": "resource",
+      "owners": [
+        "network-edge"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/ingestion-api/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "network-ingestion-api"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/ingestion-api/policy.yaml",
+      "role": "resource",
+      "owners": [
+        "network-ingestion-api"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/ingestion-provider/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "network-ingestion-provider"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/ingestion-provider/policy.yaml",
+      "role": "resource",
+      "owners": [
+        "network-ingestion-provider"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/monitoring/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "network-monitoring"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/monitoring/policy.yaml",
+      "role": "resource",
+      "owners": [
+        "network-monitoring"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/postgres-external/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "network-postgres-external"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/postgres-external/policy.yaml",
+      "role": "resource",
+      "owners": [
+        "network-postgres-external"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/postgres-in-cluster/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "network-postgres-in-cluster"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/postgres-in-cluster/policy.yaml",
+      "role": "resource",
+      "owners": [
+        "network-postgres-in-cluster"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/serving/deployment.yaml",
+      "role": "resource",
+      "owners": [
+        "ingestion",
+        "serving"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/serving/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "ingestion",
+        "serving"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/serving/namespace.yaml",
+      "role": "resource",
+      "owners": [
+        "ingestion",
+        "serving"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/serving/service.yaml",
+      "role": "resource",
+      "owners": [
+        "ingestion",
+        "serving"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/storage/local-pv.example.yaml",
+      "role": "standalone",
+      "owners": [
+        "storage"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/storage/local-pvc.example.yaml",
+      "role": "standalone",
+      "owners": [
+        "storage"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/storage/local-rebuild-pv.example.yaml",
+      "role": "standalone",
+      "owners": [
+        "storage"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/storage/local-rebuild-pvc.example.yaml",
+      "role": "standalone",
+      "owners": [
+        "storage"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/storage/storage-class.example.yaml",
+      "role": "standalone",
+      "owners": [
+        "storage"
+      ]
+    },
+    {
+      "path": "deploy/oxibelt/kubernetes-upstream.example.toml",
+      "role": "standalone",
+      "owners": [
+        "oxibelt"
+      ]
+    },
+    {
+      "path": "test-support/deployment/text-only/deployment.yaml",
+      "role": "resource",
+      "owners": [
+        "text-only"
+      ]
+    },
+    {
+      "path": "test-support/deployment/text-only/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "text-only"
+      ]
+    },
+    {
+      "path": "test-support/deployment/text-only/namespace.yaml",
+      "role": "resource",
+      "owners": [
+        "text-only"
+      ]
+    },
+    {
+      "path": "test-support/deployment/text-only/server.toml",
+      "role": "configuration",
+      "owners": [
+        "text-only"
+      ]
+    }
+  ]
+}

@@ -4,7 +4,9 @@ import copy
 import ipaddress
 import itertools
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -38,6 +40,26 @@ class ServingValidationTests(unittest.TestCase):
     def rejected(self):
         with self.assertRaises(ValidationError):
             validate(self.docs)
+
+    def test_cli_diagnostics_do_not_echo_source(self):
+        sentinel = "synthetic-credential-must-not-appear"
+        malformed_config = copy.deepcopy(self.documents)
+        configmap = next(obj for obj in malformed_config if obj["kind"] == "ConfigMap")
+        configmap["data"]["server.toml"] = f'[{sentinel}\n'
+        for payload in (f"resource: [{sentinel}\n", yaml.safe_dump_all(malformed_config)):
+            with self.subTest(payload_kind="yaml" if payload.startswith("resource:") else "toml"):
+                with tempfile.TemporaryDirectory() as directory:
+                    manifest = Path(directory) / "invalid.yaml"
+                    manifest.write_text(payload)
+                    result = subprocess.run(
+                        [sys.executable, str(Path(__file__).resolve().parents[1]
+                                             / "deployment_validation.py"), str(manifest)],
+                        capture_output=True, text=True, check=False,
+                    )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Deployment template validation failed", result.stderr)
+                self.assertNotIn(sentinel, result.stdout + result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_real_template_and_published_digest(self):
         validate(self.docs)
