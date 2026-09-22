@@ -11,6 +11,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo install cargo-deny --version 0.20.2 --locked
 WORKDIR /src
 COPY Cargo.toml Cargo.lock LICENSE ./
+COPY .cargo/config.toml ./.cargo/config.toml
 COPY crates ./crates
 COPY apps/server ./apps/server
 COPY apps/document-worker ./apps/document-worker

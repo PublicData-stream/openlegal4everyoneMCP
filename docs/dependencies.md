@@ -1,10 +1,19 @@
 # Rust dependency admission
 
-Baseline: Rust 1.98.1, edition 2024, Linux x86_64 GNU. There is one supported
+Baseline: Rust 1.98.1, edition 2024, Linux GNU on x86_64 (x86-64-v3) and ARM64
+(generic CPU). The separate document-worker graph remains x86_64-only.
+There is one supported
 production feature configuration: both transports are compiled together with
 the features in `apps/server/Cargo.toml`. No optional first-party features exist.
 Commit `Cargo.lock` and use locked resolution for builds and tests. Dependencies
 come from crates.io; unreviewed Git dependencies and registries fail `cargo deny`.
+
+The architecture-scoped compiler and rustdoc flags in `.cargo/config.toml` select
+x86-64-v3 for all repository x86_64 Rust builds, including the server image and
+document worker. ARM64 receives no x86-specific flag. `deny.toml` checks both
+supported server target graphs; the worker retains its separate admission policy.
+See [the contributor baseline](../CONTRIBUTING.md#rust-baseline) for host support
+and Cargo environment-variable precedence.
 
 ## Direct dependencies and alternatives
 

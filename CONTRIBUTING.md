@@ -123,8 +123,10 @@ as well. Do not create Rust tests that merely assert policy wording or headings.
 
 ### Rust baseline
 
-The baseline is Rust 1.98.1 on Linux x86_64 GNU, with both transports compiled
-together and no optional first-party features. Required checks are:
+The baseline is Rust 1.98.1 on Linux GNU, with x86-64-v3 on x86_64 and the
+generic Rust CPU baseline on ARM64. Both transports compile together with no
+optional first-party features. The separate document worker remains
+x86_64-only and also requires x86-64-v3. Required checks are:
 
 ```sh
 cargo fmt --all -- --check
@@ -133,6 +135,17 @@ cargo test --workspace --locked
 cargo audit
 cargo deny check
 ```
+
+The repository's `.cargo/config.toml` applies `target-cpu=x86-64-v3` to x86_64
+Rust builds and rustdoc/doctests without changing native artifact paths. Check
+the build and execution host's CPU support before running x86_64 binaries; on
+GNU Linux, `/lib64/ld-linux-x86-64.so.2 --help` must list
+`x86-64-v3 (supported, searched)`. An incompatible host is unsupported; compilation
+success alone does not establish execution compatibility. Cargo environment
+overrides such as `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `RUSTDOCFLAGS` and
+`CARGO_ENCODED_RUSTDOCFLAGS` take precedence over the repository flags, including
+when set to an empty value. Clear these overrides for baseline checks, or retain
+the CPU flag when adding flags. See [Cargo configuration precedence](https://doc.rust-lang.org/cargo/reference/config.html#buildrustflags).
 
 Install `cargo-audit` 0.22.2 and `cargo-deny` 0.20.2 using the locked commands in
 [dependency admission](docs/dependencies.md). Both require current advisory-data

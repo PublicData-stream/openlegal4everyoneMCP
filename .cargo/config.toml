@@ -1,0 +1,5 @@
+# Keep Cargo's native artifact paths; do not set build.target. ARM64 retains
+# Rust's generic CPU baseline. See CONTRIBUTING.md for environment overrides.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustdocflags = ["-C", "target-cpu=x86-64-v3"]

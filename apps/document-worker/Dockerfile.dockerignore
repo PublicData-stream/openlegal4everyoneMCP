@@ -2,6 +2,8 @@
 !Cargo.toml
 !Cargo.lock
 !LICENSE
+!.cargo/
+!.cargo/config.toml
 !crates/
 !crates/**
 !apps/
