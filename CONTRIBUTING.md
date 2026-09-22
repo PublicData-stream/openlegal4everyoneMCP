@@ -123,11 +123,14 @@ as well. Do not create Rust tests that merely assert policy wording or headings.
 
 ### Rust baseline
 
-The baseline is Rust 1.98.1 on Linux GNU, with x86-64-v3 on x86_64 and the
+The development baseline is Rust 1.98.1 on Linux GNU, with x86-64-v3 on x86_64 and the
 generic Rust CPU baseline on ARM64. Both transports compile together with no
 optional first-party features. Native CI runs the Rust baseline on both
 `ubuntu-24.04` and `ubuntu-24.04-arm`. The separate document worker remains
-x86_64-only and also requires x86-64-v3. Required checks are:
+x86_64-only and also requires x86-64-v3. Production images use Alpine 3.24
+and dynamically linked musl builds with the same CPU baselines; image-local
+linker flags must preserve these architecture flags. Dependency admission covers
+GNU development and musl production targets. Required checks are:
 
 ```sh
 cargo fmt --all -- --check
@@ -203,10 +206,10 @@ The dedicated hosted worker job removes unused preinstalled Android/.NET SDKs an
 requires at least 20 GiB free build space; local runs must provision that space
 without deleting unrelated host data.
 
-Changes to snapshot package installation also require
-`scripts/test-snapshot-packages.sh`. Its isolated signed HTTPS repository tests
+Changes to Alpine package installation also require
+`scripts/test-alpine-packages.sh`. Its isolated signed HTTPS repository tests
 bounded retries, timeouts, strict metadata handling and integrity failures with
-the pinned APT. CI requires this gate before the worker and server image jobs;
+the base image's APK. CI requires this gate before the worker and server image jobs;
 see [dependency admission](docs/dependencies.md) for prerequisites and limits.
 
 Changes to the production server image, its build inputs or packaged widgets

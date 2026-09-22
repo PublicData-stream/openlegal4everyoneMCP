@@ -1,7 +1,8 @@
 # Disposable serving acceptance fixture
 
 This fixture prepares one real Kubernetes node with an enforcing Calico CNI.
-It is a development fixture within the 7 GiB `dev` host budget. It does not
+Its default profile fits the 7 GiB `dev` host budget; the explicit expanded
+profile requires the approved 21 GiB allocation and guest RAM preflight below. It does not
 qualify production storage, cross-node routing, document-worker isolation or live
 legal providers. The serving checklist belongs to
 [deployment acceptance](../../docs/deployment-kubernetes.md).
@@ -83,9 +84,17 @@ can resolve each reference before applying the `Never` pull-policy manifest.
 
 The API binds only to loopback. No application NodePort is published on the host.
 Edge and test clients join the named private Docker network explicitly. After
-creation the node has a 6 GiB cgroup ceiling; bootstrap relies on the enclosing
-dev VM's 7 GiB physical RAM limit. This script does not enforce an aggregate
-cgroup ceiling. Record VM memory and peak usage, bound external edge/client
+creation the node has a 6 GiB cgroup ceiling by default. Explicitly set
+`ACCEPTANCE_NODE_MEMORY_GIB=18` for the approved 21 GiB development allocation;
+the expanded profile requires at least 19.5 GiB of guest-visible `MemTotal` before
+any cluster mutation, leaving at least 1.5 GiB outside the node. The default
+requires 6.5 GiB, allowing kernel reservations
+on the existing 7 GiB guest. Swap and ballooned memory do not count. The script
+does not resize the VM or adjust ballooning. Deletion remains available even if
+the selected profile or guest capacity changes.
+
+Bootstrap relies on the enclosing dev VM's physical RAM limit. This script does
+not enforce an aggregate cgroup ceiling. Record VM memory and peak usage, bound external edge/client
 containers, run sequentially, and do not raise the approved host budget to force
 a passing result.
 Serving retains its canonical 4 GiB limit. The Local PV directories are separate

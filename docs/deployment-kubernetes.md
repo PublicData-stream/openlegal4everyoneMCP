@@ -290,7 +290,7 @@ sandbox, provider and platform acceptance separately.
 ## Production server image
 
 Build from the repository root with Docker BuildKit. The production platforms are
-Linux GNU x86_64 with **x86-64-v3 required**, and generic AArch64. An amd64 manifest
+Alpine 3.24 Linux musl x86_64 with **x86-64-v3 required**, and generic AArch64. An amd64 manifest
 does not itself communicate the stronger CPU requirement: check deployment nodes
 as described in the [contributor baseline](../CONTRIBUTING.md#rust-baseline).
 The same x86 CPU requirement applies to local Rust builds and the separate
@@ -313,10 +313,12 @@ these commands. The Rust build defaults to two jobs; `--build-arg BUILD_JOBS=N`
 can adjust build resource use. Provision space for native build caches and image
 layers; hosted jobs report available disk space, and their clean-build peak still
 requires measurement. Empty BuildKit
-caches are supported; compiled caches are separated by architecture. All base
-images and the frontend are digest-pinned, native build/runtime packages use a
-dated Debian snapshot, and application graphs use their committed lockfiles.
-This is pinned-input reproducibility, not a byte-identical-image guarantee.
+caches are supported; compiled caches are separated by architecture, libc and
+toolchain. All production stages use digest-pinned Alpine 3.24 variants; the
+frontend is also digest-pinned. Native build/runtime packages come from signed,
+moving v3.24 repositories, and application graphs use committed lockfiles.
+Package selection can change between builds. Preserve the installed APK inventory
+and accepted image digest; rebuilding old source is not an image rollback.
 
 OCI labels record the source repository, revision, version, license and CPU
 baseline. Defaults are `unknown` revision and `development` version; set truthful
@@ -345,7 +347,8 @@ time; the image never downloads a dictionary at startup. Ingestion stays opt-in
 and requires the explicit `runtime-ingestion` image target; the default image
 contains no `kubectl`.
 
-The image contains the CA trust bundle and runtime GNU libraries, but no compiler,
+The image contains the CA trust bundle, musl runtime libraries and standard Alpine
+BusyBox/APK utilities, but no compiler,
 Cargo, Node, pnpm, Git or build cache. Application files are root-owned and the
 image creates no writable application directory for UID 10004. Run with read-only
 root, dropped capabilities, no privilege escalation, the default seccomp policy

@@ -119,14 +119,19 @@ the fixture executable. Rustfmt/Clippy follow the pinned toolchain; cargo-audit
 0.22.2 and cargo-deny 0.20.2 are installed with their locked dependencies. Advisory
 data is intentionally refreshed when this validation stage executes.
 
-The Dockerfile pins Rust 1.98.1 and Debian base digests and uses the dated Debian
-snapshot `20260915T000000Z` for native Tesseract/Leptonica libraries. The standalone
-lockfile fixes Rust dependencies. Both native build and runtime package
-installation use the
-shared [bounded snapshot download policy](dependencies.md#production-image-build-inputs),
+The Dockerfile pins Rust 1.98.1 and Alpine 3.24 base digests and builds a native,
+dynamically linked musl executable. Signed moving Alpine v3.24 repositories supply
+Tesseract/Leptonica/Fontconfig; `/opt/notices/alpine-packages.txt` records installed
+runtime versions. The standalone lockfile fixes Rust dependencies. Both native
+build and runtime package installation use the
+shared [bounded Alpine download policy](dependencies.md#production-image-build-inputs),
 including strict metadata failure and a 15-minute package transaction deadline.
-Run `scripts/test-snapshot-packages.sh` for its isolated failure-injection gate;
+Run `scripts/test-alpine-packages.sh` for its isolated failure-injection gate;
 the full worker gate above remains required for native extraction and OCR.
+Moving native package versions can change extraction results between rebuilds.
+Record the accepted image digest and native inventory alongside qualification
+evidence; previous image digests, not rebuilt source alone, identify rollback
+artifacts. Existing retained captures are not rewritten by this image migration.
 
 The following source/version selections were verified on 2026-09-16:
 
@@ -183,6 +188,10 @@ unsoundness advisories. The root serving policy is unchanged.
 implemented format set uses rhwp and Xberg instead of adding redundant parsers.
 
 ## Cluster preparation and acceptance
+
+The [Alpine qualification record](alpine-cluster-qualification.md) identifies an
+AppArmor incompatibility in the inspected gVisor release. The requirements below
+remain mandatory; Alpine image acceptance does not qualify that runtime.
 
 Provision a dedicated namespace with `deploy/document-sandbox/namespace.yaml` and
 bind `controller-role.yaml` to a separately managed trusted controller identity.

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 # These are multi-platform index digests, not single-architecture manifest digests.
-FROM --platform=$BUILDPLATFORM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS widgets
+FROM --platform=$BUILDPLATFORM node:24.21.0-alpine3.24@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS widgets
 RUN npm install --global --ignore-scripts pnpm@12.3.4
 WORKDIR /src
 COPY LICENSE ./
@@ -12,10 +12,10 @@ COPY apps/widget/scripts/build.mjs ./apps/widget/scripts/build.mjs
 COPY apps/widget/THIRD_PARTY_NOTICES.md ./apps/widget/
 RUN pnpm --dir apps/widget build
 
-FROM rust:1.98.1-slim-trixie@sha256:f47a8de237dcbb0b0ce1099901e60a89728e3d51f24e664b40e947171538ade7 AS build
+FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
 # Native build helpers only; nothing from this toolchain is installed at runtime.
-RUN --mount=type=bind,source=scripts/install-snapshot-packages.sh,target=/tmp/install-snapshot-packages.sh \
-    timeout --kill-after=10s 15m /bin/sh /tmp/install-snapshot-packages.sh cmake pkg-config python3
+RUN --mount=type=bind,source=scripts/install-alpine-packages.sh,target=/tmp/install-alpine-packages.sh \
+    timeout -k 10 900 /bin/sh /tmp/install-alpine-packages.sh build-base binutils cmake pkgconf python3
 WORKDIR /src
 COPY Cargo.toml Cargo.lock LICENSE ./
 COPY .cargo/config.toml ./.cargo/config.toml
@@ -30,8 +30,15 @@ ENV CARGO_TARGET_DIR=/build
 ARG TARGETARCH
 ARG BUILD_JOBS=2
 RUN --mount=type=cache,id=openlegal-server-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=openlegal-server-build-${TARGETARCH},target=/build,sharing=locked \
-    cargo build --locked --release -p openlegal-server -j "$BUILD_JOBS" \
+    --mount=type=cache,id=openlegal-server-musl-rust-1.98.1-${TARGETARCH},target=/build,sharing=locked \
+    case "$TARGETARCH" in \
+        amd64) export RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=-crt-static"; interpreter=/lib/ld-musl-x86_64.so.1 ;; \
+        arm64) export RUSTFLAGS="-C target-feature=-crt-static"; interpreter=/lib/ld-musl-aarch64.so.1 ;; \
+        *) exit 1 ;; \
+    esac \
+    && cargo build --locked --release -p openlegal-server -j "$BUILD_JOBS" \
+    && readelf -l /build/release/openlegal-server | grep -F "[Requesting program interpreter: $interpreter]" \
+    && ! readelf -d /build/release/openlegal-server | grep -F 'libc.so.6' \
     && mkdir -p /assets/notices \
     && cp /build/release/openlegal-server /assets/openlegal-server \
     && cargo metadata --locked --format-version 1 --filter-platform "$(rustc -vV | sed -n 's/^host: //p')" > /assets/metadata.json \
@@ -40,11 +47,12 @@ RUN --mount=type=cache,id=openlegal-server-registry,target=/usr/local/cargo/regi
     && cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" /assets/notices/rust-standard-library/ \
     && cp -r "$(rustc --print sysroot)/share/doc/rust/licenses" /assets/notices/rust-standard-library/
 
-FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime-base
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime-base
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-RUN --mount=type=bind,source=scripts/install-snapshot-packages.sh,target=/tmp/install-snapshot-packages.sh \
-    timeout --kill-after=10s 15m /bin/sh /tmp/install-snapshot-packages.sh ca-certificates libgcc-s1 \
-    && mkdir -p /etc/openlegal /opt/openlegal/widgets /opt/openlegal/notices
+RUN --mount=type=bind,source=scripts/install-alpine-packages.sh,target=/tmp/install-alpine-packages.sh \
+    timeout -k 10 900 /bin/sh /tmp/install-alpine-packages.sh ca-certificates libgcc \
+    && mkdir -p /etc/openlegal /opt/openlegal/widgets /opt/openlegal/notices \
+    && apk info -v | LC_ALL=C sort > /opt/openlegal/notices/alpine-packages.txt
 COPY --from=build /assets/openlegal-server /usr/local/bin/openlegal-server
 COPY --from=build /assets/notices/ /opt/openlegal/notices/dependencies/
 COPY --from=widgets /src/apps/widget/dist/ /opt/openlegal/widgets/
@@ -71,7 +79,9 @@ LABEL org.opencontainers.image.source="https://github.com/PublicData-stream/open
     org.opencontainers.image.licenses="AGPL-3.0-only"
 
 # Download on the builder architecture; only verified artifacts reach runtime.
-FROM --platform=$BUILDPLATFORM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS kubectl
+FROM --platform=$BUILDPLATFORM node:24.21.0-alpine3.24@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS kubectl
+RUN --mount=type=bind,source=scripts/install-alpine-packages.sh,target=/tmp/install-alpine-packages.sh \
+    timeout -k 10 900 /bin/sh /tmp/install-alpine-packages.sh tar
 ARG TARGETARCH
 COPY scripts/deployment-kubectl.sha256 /pins/kubectl.sha256
 RUN mkdir /artifacts && TARGETARCH="$TARGETARCH" node --input-type=module -e '\

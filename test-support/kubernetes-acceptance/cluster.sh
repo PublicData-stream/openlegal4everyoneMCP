@@ -51,6 +51,9 @@ if [[ $operation == delete ]]; then
     exit 0
 fi
 [[ ! -e $run_dir ]] || { echo 'RUN_DIR must not exist; each run gets a fresh directory.' >&2; exit 1; }
+# Validate guest-visible RAM before creating run state, networks or containers.
+# Deletion deliberately does not depend on the current memory profile/capacity.
+node_memory=$(python3 "$repo/test-support/kubernetes-acceptance/memory.py" "${ACCEPTANCE_NODE_MEMORY_GIB:-6}")
 for image in "${pins[@]:1}"; do
     docker image inspect "$image" >/dev/null 2>&1 || { echo 'A locked image is missing; preload before creation.' >&2; exit 1; }
 done
@@ -92,10 +95,10 @@ printf 'Creating owned fixture %s; failure leaves explicit cleanup state.\n' "$n
 KIND_EXPERIMENTAL_DOCKER_NETWORK=$name timeout 360 "$kind" create cluster \
     --name "$name" --image "${pins[1]}" --config "$run_dir/kind.yaml" \
     --kubeconfig "$run_dir/kubeconfig" --retain --wait 0s
-# Bootstrap is bounded by the enclosing dev VM (7 GiB physical RAM); kind has
+# Bootstrap is bounded by the enclosing dev VM; kind has
 # no supported per-node memory option. This cap applies after node creation.
 # Record VM memory/peak separately; this is not an aggregate cgroup guarantee.
-docker update --memory 6g --memory-swap 6g "$name-control-plane" >/dev/null
+docker update --memory "$node_memory" --memory-swap "$node_memory" "$name-control-plane" >/dev/null
 for image in "${pins[@]:2}"; do
     # docker save cannot portably export a repo@digest reference. Give the
     # already inspected immutable source a run-owned tag, load it, and register

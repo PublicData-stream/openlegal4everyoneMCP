@@ -4,7 +4,7 @@
 !LICENSE
 !scripts/
 !scripts/deployment-kubectl.sha256
-!scripts/install-snapshot-packages.sh
+!scripts/install-alpine-packages.sh
 !.cargo/
 !.cargo/config.toml
 !crates/

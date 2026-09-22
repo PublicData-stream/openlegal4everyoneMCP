@@ -1,7 +1,8 @@
 # Rust dependency admission
 
-Baseline: Rust 1.98.1, edition 2024, Linux GNU on x86_64 (x86-64-v3) and ARM64
-(generic CPU). The separate document-worker graph remains x86_64-only.
+Baseline: Rust 1.98.1, edition 2024, Linux GNU development and Alpine 3.24 musl
+production images on x86_64 (x86-64-v3) and ARM64 (generic CPU). The separate
+document-worker graph remains x86_64-only.
 There is one supported
 production feature configuration: both transports are compiled together with
 the features in `apps/server/Cargo.toml`. No optional first-party features exist.
@@ -17,36 +18,47 @@ and Cargo environment-variable precedence.
 
 ## Production image build inputs
 
-The server image uses official Rust 1.98.1 slim-trixie and Node 24.21.0 images for
-builds and Debian trixie-slim for runtime, pinned by multi-platform manifest
-digests in `apps/server/Dockerfile`. The Dockerfile frontend is digest-pinned too.
-pnpm 12.3.4 installs the frozen widget graph. Native compiler dependencies use a
-dated Debian snapshot; compilers and language package managers stay in build stages.
-These inputs reuse the admitted toolchain and frontend baselines. A Debian
-runtime supplies the standard GNU libraries and CA trust store needed by the
-existing native dependencies without introducing a separate libc target or
-cross-compilation toolchain.
+Every production Dockerfile stage uses Alpine 3.24: official Rust 1.98.1 and
+Node 24.21.0 builders and the Alpine runtime, pinned by multi-platform index
+digests. The Dockerfile frontend is digest-pinned too. pnpm 12.3.4 installs the
+frozen widget graph. Native musl builds explicitly select dynamic C-runtime
+linking while retaining the CPU baseline. GNU development remains supported;
+admission includes both libc target graphs and compiled caches keep them separate.
+Build-only GNU utilities support notice collection and archive extraction without
+adding compilers, Node or language package managers to runtime images.
+The worker uses Alpine's Tesseract, Leptonica and Fontconfig packages and their
+development headers, with Clang for generated bindings and OpenSSL headers for
+the existing native dependency graph. Distribution musl builds avoid adding a
+glibc compatibility loader. The selected Rust parsers, OCR models and font assets
+retain their existing versions, licenses and admission policy.
 
-Server and document-worker package installation shares
-`scripts/install-snapshot-packages.sh`. It retains snapshot `20260915T000000Z`,
-uses five APT acquisition retries with native backoff, 30-second connection/data
-timeouts, and disables request pipelining to reduce concurrent requests to the
-snapshot service. Each Dockerfile invocation has a 15-minute total deadline and
-a 10-second termination grace period. Metadata errors, exhausted retries,
-timeouts, TLS errors, invalid signatures and package hash mismatches fail the
-build; there is no fallback to a moving mirror. HTTPS and APT authentication
-remain enabled. Options apply only to the build command, and the helper is
-mounted temporarily rather than shipped in the image.
+Server and worker builds share `scripts/install-alpine-packages.sh`, using only
+verified HTTPS Alpine v3.24 main/community repositories. This deliberately replaces
+the dated Debian snapshot with moving stable packages. Base digests and Rust/Node
+graphs remain pinned, but installed native versions can change between builds.
+The images retain an `alpine-packages.txt` inventory under their notices directory.
+Keep accepted immutable image digests for rollback; rebuilding a source revision
+does not reproduce its previous native package selection.
 
-Run `scripts/test-snapshot-packages.sh` to exercise the pinned APT against an
-isolated synthetic HTTPS repository with disposable signing and TLS keys.
-The fixture verifies transient failure recovery, retry exhaustion, acquisition
-and transaction timeouts, stale-metadata failure and integrity rejection. CI
-runs it before worker and server image jobs. It requires Docker, Python 3,
-OpenSSL, GnuPG (including `gpgconf`), `dpkg-deb` and `tar`; it does not contact the
-real snapshot service after
-pulling the pinned fixture images. These checks establish bounded recovery from
-temporary failures, not availability during a persistent snapshot-service outage.
+The helper permits at most six acquisition attempts for recognized transient
+transport errors, with 1/2/4/8/16-second backoff and APK's 30-second network timeout.
+Each metadata/package acquisition also has a 120-second watchdog with ten-second
+termination grace: APK's native timeout does not reliably bound response-header
+stalls. Dockerfile callers enforce a 15-minute transaction deadline and ten-second
+termination grace. Packages are downloaded into a private cache before a single
+offline installation; installation itself is never retried. Failed
+fresh metadata acquisition cannot fall back to an older cached index. TLS,
+signature, package integrity and unclassified errors fail without retry; no
+alternate release, untrusted-package mode or TLS downgrade is allowed. Signed
+moving indexes do not by themselves provide timestamp freshness or replay protection.
+The helper is mounted for builds only. Standard Alpine BusyBox and APK remain in
+runtime images, subject to their nonroot, read-only and network restrictions.
+
+Run `scripts/test-alpine-packages.sh` against an isolated synthetic HTTPS repository
+with disposable signing and TLS keys. It verifies success, transient recovery,
+retry exhaustion, network/transaction timeouts, failed fresh metadata acquisition
+and integrity rejection. CI requires this gate before server and worker images.
+These checks establish bounded failure handling, not continuous mirror availability.
 
 The final image retains the first-party AGPL license, bundled widget notices,
 Rust dependency and standard-library notices, and embedded Korean dictionary
@@ -57,9 +69,10 @@ records immutable upstream sources and hashes for crates whose archives omit
 license files; the image includes a per-package inventory. The embedded
 Lindera dictionary keeps its existing build-time download contract; the separately
 provisioned MeCab dictionary is neither shipped nor downloaded at runtime.
-Pinned inputs and locked dependency resolution are the reproducibility boundary;
-byte-identical image reproduction is not claimed. Updating a base digest, package
-snapshot or toolchain requires image acceptance and renewed relevant admission.
+Base-image pins, locked application dependencies and recorded native inventories
+are the build evidence boundary; byte-identical image reproduction is not claimed.
+Updating a base digest or toolchain requires image acceptance and renewed relevant
+admission. Rebuilds against moving native packages require the same image gates.
 
 ## Direct dependencies and alternatives
 
@@ -368,7 +381,9 @@ checksums and redistribution scope are recorded in
 [kubectl notice provenance](../apps/server/kubectl-notices.md). The full upstream
 LICENSES bundle is retained conservatively, including notices for components not
 necessarily linked into kubectl. Node is used only in the download build stage;
-neither Node nor a download/package-management tool is added to the final image.
+Node is not added to the final image. The Alpine base retains its standard APK and
+BusyBox utilities, including download-capable applets; runtime restrictions, not
+their absence, enforce the serving and document-sandbox boundaries.
 No runtime download, mutable version selection or TLS downgrade is permitted.
 
 [PyYAML 6.0.3](https://pypi.org/project/PyYAML/6.0.3/) is MIT-licensed and installed

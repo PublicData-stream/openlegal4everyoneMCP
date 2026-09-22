@@ -1,7 +1,7 @@
 # Isolated parser graph only; the serving workspace keeps the root deny.toml.
 # All additions below require independent review with the parser boundary.
 [graph]
-targets = ["x86_64-unknown-linux-gnu"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
 all-features = false
 
 [advisories]

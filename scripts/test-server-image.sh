@@ -98,12 +98,22 @@ docker run --rm --name "$probe" --platform "$platform" --network none "${hardeni
     --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777" \
     --env "OPENLEGAL_IMAGE_TARGET=$image_target" --entrypoint /bin/sh "$image" -exc '
     test "$(id -u):$(id -g)" = 10004:10004
+    . /etc/os-release
+    test "$ID" = alpine
+    case "$VERSION_ID" in 3.24|3.24.*) ;; *) exit 1 ;; esac
+    for package in gcompat libc6-compat; do
+      if apk info -e "$package"; then echo "glibc compatibility package present: $package" >&2; exit 1; fi
+    done
+    test -s /opt/openlegal/notices/alpine-packages.txt
+    apk info -v | LC_ALL=C sort > /tmp/alpine-packages.txt
+    cmp /tmp/alpine-packages.txt /opt/openlegal/notices/alpine-packages.txt
     test -x /usr/local/bin/openlegal-server
     test -s /etc/ssl/certs/ca-certificates.crt
     test "$(stat -c %u:%g /usr/local/bin/openlegal-server)" = 0:0
-    ldd /usr/local/bin/openlegal-server > /tmp/ldd
+    ldd /usr/local/bin/openlegal-server > /tmp/ldd 2>&1
     cat /tmp/ldd
-    if grep -q "not found" /tmp/ldd; then
+    grep -q "ld-musl-" /tmp/ldd
+    if grep -Eq "not found|Error loading|Error relocating|libc\.so\.6" /tmp/ldd; then
         echo "Unresolved runtime library" >&2; exit 1
     fi
     for tool in cargo rustc cc gcc clang node npm pnpm git; do
@@ -134,7 +144,7 @@ docker run --rm --name "$probe" --platform "$platform" --network none "${hardeni
     test -s /opt/openlegal/notices/dependencies/supplemental-sources.json
     test -s /opt/openlegal/notices/dependencies/rust-standard-library/COPYRIGHT-library.html
     test -n "$(find /opt/openlegal/notices/dependencies -path "*/lindera-ko-dic-*/NOTICE.txt" -type f -print -quit)"
-    test -z "$(find /opt/openlegal /usr/local/bin/openlegal-server -perm /022 -print)"
+    test -z "$(find /opt/openlegal /usr/local/bin/openlegal-server \( -perm -020 -o -perm -002 \) -print)"
     for directory in / /opt/openlegal /opt/openlegal/widgets /usr/local/bin /etc; do
         if touch "$directory/image-smoke-write" 2>/dev/null; then
             echo "Unexpected write access to $directory" >&2; exit 1

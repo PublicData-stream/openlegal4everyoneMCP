@@ -1,14 +1,19 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
-FROM rust:1.98.1-slim-trixie@sha256:a2de23e559fd8afd260d22beb00f3987073ea0dcc2ba2646cccdaeda6a62a095 AS toolchain
-# A dated Debian snapshot fixes native Tesseract/Leptonica and compiler libraries.
-RUN --mount=type=bind,source=scripts/install-snapshot-packages.sh,target=/tmp/install-snapshot-packages.sh \
-    timeout --kill-after=10s 15m /bin/sh /tmp/install-snapshot-packages.sh \
-        ca-certificates curl git clang libclang-dev pkg-config libtesseract-dev libleptonica-dev libfontconfig1-dev
+FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS toolchain
+# Native musl build; APK signatures and branch admission are enforced by the helper.
+RUN --mount=type=bind,source=scripts/install-alpine-packages.sh,target=/tmp/install-alpine-packages.sh \
+    timeout -k 10 900 /bin/sh /tmp/install-alpine-packages.sh \
+        ca-certificates curl git build-base binutils cmake clang-dev pkgconf openssl-dev \
+        tesseract-ocr-dev leptonica-dev fontconfig-dev coreutils findutils tar
+# The document worker remains amd64-only with the repository CPU baseline.
+RUN test "$(apk --print-arch)" = x86_64
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=-crt-static" \
+    RUSTDOCFLAGS="-C target-cpu=x86-64-v3 -C target-feature=-crt-static"
 FROM toolchain AS build
 RUN rustup component add clippy rustfmt
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo install cargo-audit --version 0.22.2 --locked \
-    && cargo install cargo-deny --version 0.20.2 --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    cargo install cargo-audit --version 0.22.2 --locked -j 2 \
+    && cargo install cargo-deny --version 0.20.2 --locked -j 2
 WORKDIR /src
 COPY Cargo.toml Cargo.lock LICENSE ./
 COPY .cargo/config.toml ./.cargo/config.toml
@@ -17,8 +22,10 @@ COPY apps/server ./apps/server
 COPY apps/document-worker ./apps/document-worker
 ENV CARGO_TARGET_DIR=/build
 ARG ADMISSION_REFRESH=manual
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/build,sharing=locked \
-    test -n "$ADMISSION_REFRESH" \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=type=cache,target=/usr/local/cargo/git,sharing=locked --mount=type=cache,id=openlegal-worker-musl-rust-1.98.1-amd64,target=/build,sharing=locked \
+    export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name libclang.so -print -quit)")" \
+    && test -f "$LIBCLANG_PATH/libclang.so" \
+    && test -n "$ADMISSION_REFRESH" \
     && cargo fmt --manifest-path apps/document-worker/Cargo.toml --check \
     && cargo audit --file apps/document-worker/Cargo.lock \
     && cargo deny --manifest-path apps/document-worker/Cargo.toml --config apps/document-worker/deny.toml check \
@@ -27,6 +34,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,targe
     && find /build/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable -delete \
     && cargo test --manifest-path apps/document-worker/Cargo.toml --locked --release --test binary_formats --no-run -j 2 \
     && cargo build --manifest-path apps/document-worker/Cargo.toml --locked --release -j 2 \
+    && readelf -l /build/release/openlegal-document-worker | grep -F '[Requesting program interpreter: /lib/ld-musl-x86_64.so.1]' \
+    && ! readelf -d /build/release/openlegal-document-worker | grep -F 'libc.so.6' \
     && mkdir -p /assets/notices \
     && cp /build/release/openlegal-document-worker /assets/openlegal-document-worker \
     && test "$(find /build/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable | wc -l)" -eq 1 \
@@ -42,13 +51,14 @@ RUN curl -fsSLO https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/65
     && curl -fsSL https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/65727574dfcd264acbb0c3e07860e4e9e9b22185/LICENSE -o TESSDATA-LICENSE \
     && curl -fsSL https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/LICENSE -o NOTO-LICENSE
 
-FROM debian:trixie-slim@sha256:abc9cb88a5587630d7f915f47b23b0668fe250fbfc6457aa4d52b534c1bbf73f AS runtime
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime
 COPY --from=toolchain /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-RUN --mount=type=bind,source=scripts/install-snapshot-packages.sh,target=/tmp/install-snapshot-packages.sh \
-    timeout --kill-after=10s 15m /bin/sh /tmp/install-snapshot-packages.sh \
-        libtesseract5 libleptonica6 libfontconfig1 \
+RUN --mount=type=bind,source=scripts/install-alpine-packages.sh,target=/tmp/install-alpine-packages.sh \
+    timeout -k 10 900 /bin/sh /tmp/install-alpine-packages.sh \
+        tesseract-ocr leptonica fontconfig libgcc libstdc++ \
     && mkdir -p /scratch /opt/probe /opt/fonts /opt/tessdata /opt/notices /usr/share/fonts/truetype/nanum \
-    && chown 65532:65532 /scratch /opt/probe
+    && chown 65532:65532 /scratch /opt/probe \
+    && apk info -v | LC_ALL=C sort > /opt/notices/alpine-packages.txt
 COPY --from=build /assets/openlegal-document-worker /usr/local/bin/openlegal-document-worker
 COPY --from=build /assets/*.traineddata /opt/tessdata/
 COPY --from=build /assets/NotoSansCJKkr-Regular.otf /opt/fonts/

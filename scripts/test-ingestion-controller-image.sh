@@ -148,12 +148,13 @@ docker run --rm --name "$initializer" --platform "$native_platform" --network no
     'printf "%s\n" synthetic-second > /fixture/token-next; chmod 444 /fixture/token-next; mv /fixture/token-next /fixture/token'
 kubectl kubeconfig get resourcequota document-budget -o json >/dev/null
 expect_failure 'Expired token' 'Unauthorized|logged in|provide credentials' kubectl stale get resourcequota document-budget
-cache_bytes=$(docker exec "$client" /usr/bin/du -sb /tmp/openlegal-kubectl-cache | cut -f1)
-[[ $cache_bytes =~ ^[0-9]+$ ]] && (( cache_bytes < 64 * 1024 * 1024 ))
+# BusyBox du reports allocated KiB; compare the same bounded tmpfs consumption.
+cache_kib=$(docker exec "$client" du -sk /tmp/openlegal-kubectl-cache | cut -f1)
+[[ $cache_kib =~ ^[0-9]+$ ]] && (( cache_kib < 64 * 1024 ))
 docker exec "$api" cat /tmp/events.jsonl > "$scratch/events.jsonl"
 python3 "$repo/test-support/ingestion-image/assert-events.py" "$scratch/events.jsonl"
 for container in "$api" "$client"; do
     [[ $(docker inspect --format '{{.State.OOMKilled}}' "$container") == false ]]
     [[ $(docker inspect --format '{{.State.Running}}' "$container") == true ]]
 done
-printf 'Packaged kubectl TLS fixture passed for %s; cache size %s bytes (synthetic data only).\n' "$platform" "$cache_bytes"
+printf 'Packaged kubectl TLS fixture passed for %s; cache allocation %s KiB (synthetic data only).\n' "$platform" "$cache_kib"
