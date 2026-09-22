@@ -2,3 +2,4 @@
 *.pem
 *.key
 .env
+.agents/temp/
