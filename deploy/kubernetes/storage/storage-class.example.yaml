@@ -1,0 +1,10 @@
+# Apply separately after substituting operator storage details. Never default.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openlegal-local
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain

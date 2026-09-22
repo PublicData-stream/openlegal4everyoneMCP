@@ -1,0 +1,97 @@
+# Operator template: replace all capacities, host paths and node placeholders.
+# Prepare root:10004 2770 volume roots before use; see deployment guide.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: openlegal-cache-blobs
+spec:
+  capacity:
+    storage: REPLACE_WITH_CACHE_BLOBS_CAPACITY
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: openlegal-local
+  claimRef:
+    namespace: openlegal-serving
+    name: openlegal-cache-blobs
+  local:
+    path: /REPLACE_WITH_CACHE_BLOBS_HOST_PATH
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [REPLACE_WITH_STORAGE_NODE]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: openlegal-corpus-blobs
+spec:
+  capacity:
+    storage: REPLACE_WITH_CORPUS_BLOBS_CAPACITY
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: openlegal-local
+  claimRef:
+    namespace: openlegal-serving
+    name: openlegal-corpus-blobs
+  local:
+    path: /REPLACE_WITH_CORPUS_BLOBS_HOST_PATH
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [REPLACE_WITH_STORAGE_NODE]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: openlegal-corpus-index
+spec:
+  capacity:
+    storage: REPLACE_WITH_CORPUS_INDEX_CAPACITY
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: openlegal-local
+  claimRef:
+    namespace: openlegal-serving
+    name: openlegal-corpus-index
+  local:
+    path: /REPLACE_WITH_CORPUS_INDEX_HOST_PATH
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [REPLACE_WITH_STORAGE_NODE]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: openlegal-mecab-dictionary
+spec:
+  capacity:
+    storage: REPLACE_WITH_MECAB_DICTIONARY_CAPACITY
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: openlegal-local
+  claimRef:
+    namespace: openlegal-serving
+    name: openlegal-mecab-dictionary
+  local:
+    path: /REPLACE_WITH_MECAB_DICTIONARY_HOST_PATH
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [REPLACE_WITH_STORAGE_NODE]

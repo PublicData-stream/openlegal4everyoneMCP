@@ -1,19 +1,19 @@
-# Phase 2 text-only example. See docs/deployment-kubernetes.md before deployment.
+# Retained-corpus serving template. See docs/deployment-kubernetes.md before deployment.
 # Replace with free corresponding source for the exact running server and widget.
 [source]
-url = "https://example.org/openlegal/source"
+url = "https://github.com/PublicData-stream/openlegal4everyoneMCP/tree/REPLACE_WITH_RELEASE_REVISION"
 
 [http]
 bind = "0.0.0.0:8080"
-allowed_hosts = ["localhost:8080", "127.0.0.1:8080"]
-allowed_origins = []
+allowed_hosts = ["REPLACE_WITH_OXIBELT_BACKEND_AUTHORITY"]
+allowed_origins = ["https://openlegal4everyone.stream"]
 
 [webtransport]
 bind = "0.0.0.0:4433"
 certificate = "/run/secrets/backend-tls/tls.crt"
 private_key = "/run/secrets/backend-tls/tls.key"
-allowed_hosts = ["localhost:4433", "127.0.0.1:4433"]
-allowed_origins = []
+allowed_hosts = ["REPLACE_WITH_OXIBELT_WEBTRANSPORT_AUTHORITY"]
+allowed_origins = ["https://openlegal4everyone.stream"]
 
 [health]
 bind = "0.0.0.0:9090"
@@ -25,3 +25,23 @@ shutdown_timeout_secs = 15
 
 [text_diff]
 widget_html = "/opt/openlegal/widgets/text-diff.html"
+
+[cache]
+mode = "persistent"
+
+[cache.postgres]
+url_env = "OPENLEGAL_DATABASE_URL"
+# Name only: the serving Pod must never receive this credential.
+migration_url_env = "OPENLEGAL_MIGRATION_DATABASE_URL"
+tls_mode = "verify-full"
+ca_file = "/run/secrets/postgres-ca/ca.crt"
+
+[cache.blob]
+kind = "filesystem"
+path = "/var/lib/openlegal/cache-blobs/data"
+
+[database]
+blob_path = "/var/lib/openlegal/corpus-blobs/data"
+index_path = "/var/lib/openlegal/corpus-index/data"
+widget_html = "/opt/openlegal/widgets/database.html"
+mecab_dictionary_path = "/var/lib/openlegal/mecab-ko-dictionary/data"

@@ -3,13 +3,21 @@
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 config_args=()
-if (( $# )); then
-    if [[ $# != 2 || $1 != --config-output || -z $2 ]]; then
-        echo "usage: $0 [--config-output FILE]" >&2
-        exit 2
-    fi
-    config_args=(--config-output "$2")
-fi
+profile=retained
+while (( $# )); do
+    case "$1" in
+        --profile)
+            [[ $# -ge 2 ]] || { echo '--profile needs retained or text-only' >&2; exit 2; }
+            profile=$2
+            shift 2 ;;
+        --config-output)
+            [[ $# -ge 2 && -n $2 ]] || { echo '--config-output needs FILE' >&2; exit 2; }
+            config_args=(--config-output "$2")
+            shift 2 ;;
+        *) echo "usage: $0 [--profile retained|text-only] [--config-output FILE]" >&2; exit 2 ;;
+    esac
+done
+case "$profile" in retained|text-only) ;; *) echo 'Invalid profile' >&2; exit 2 ;; esac
 tools_dir=${OPENLEGAL_DEPLOY_TOOLS:-$repo/target/deployment-tools}
 case "$(uname -s)/$(uname -m)" in
     Linux/x86_64) arch=amd64 ;;
@@ -26,8 +34,24 @@ fi
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 # Kustomize build is local: no cluster, credentials, discovery or API schema fetch.
-"$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/serving" > "$scratch/serving.yaml"
-PYTHONDONTWRITEBYTECODE=1 "$tools_dir/bin/python" "$repo/scripts/deployment_validation.py" \
-    "$scratch/serving.yaml" "${config_args[@]}"
-OPENLEGAL_RENDERED_SERVING="$scratch/serving.yaml" PYTHONDONTWRITEBYTECODE=1 \
+"$tools_dir/bin/kubectl" kustomize "$repo/deploy/kubernetes/serving" > "$scratch/retained.yaml"
+"$tools_dir/bin/kubectl" kustomize "$repo/test-support/deployment/text-only" > "$scratch/text-only.yaml"
+# Storage examples intentionally contain operator capacity placeholders and are
+# parsed directly, not passed to Kubernetes schema/admission or attached to serving.
+for example in storage-class local-pv local-pvc; do
+    printf '%s\n' '---' >> "$scratch/storage.yaml"
+    cat "$repo/deploy/kubernetes/storage/$example.example.yaml" >> "$scratch/storage.yaml"
+done
+for checked_profile in retained text-only; do
+    output_args=()
+    if [[ $checked_profile == "$profile" ]]; then
+        output_args=("${config_args[@]}")
+    fi
+    PYTHONDONTWRITEBYTECODE=1 "$tools_dir/bin/python" "$repo/scripts/deployment_validation.py" \
+        "$scratch/$checked_profile.yaml" --profile "$checked_profile" \
+        --storage-manifest "$scratch/storage.yaml" "${output_args[@]}"
+done
+OPENLEGAL_RENDERED_SERVING="$scratch/retained.yaml" \
+    OPENLEGAL_RENDERED_TEXT_ONLY="$scratch/text-only.yaml" \
+    OPENLEGAL_STORAGE_EXAMPLES="$scratch/storage.yaml" PYTHONDONTWRITEBYTECODE=1 \
     "$tools_dir/bin/python" -m unittest discover -s "$repo/scripts/tests" -p test_deployment_validation.py

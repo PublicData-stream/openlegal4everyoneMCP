@@ -1,0 +1,56 @@
+# Apply separately from serving, after substituting capacities to match PVs.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openlegal-cache-blobs
+  namespace: openlegal-serving
+spec:
+  accessModes: [ReadWriteOnce]
+  volumeMode: Filesystem
+  storageClassName: openlegal-local
+  volumeName: openlegal-cache-blobs
+  resources:
+    requests:
+      storage: REPLACE_WITH_CACHE_BLOBS_CAPACITY
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openlegal-corpus-blobs
+  namespace: openlegal-serving
+spec:
+  accessModes: [ReadWriteOnce]
+  volumeMode: Filesystem
+  storageClassName: openlegal-local
+  volumeName: openlegal-corpus-blobs
+  resources:
+    requests:
+      storage: REPLACE_WITH_CORPUS_BLOBS_CAPACITY
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openlegal-corpus-index
+  namespace: openlegal-serving
+spec:
+  accessModes: [ReadWriteOnce]
+  volumeMode: Filesystem
+  storageClassName: openlegal-local
+  volumeName: openlegal-corpus-index
+  resources:
+    requests:
+      storage: REPLACE_WITH_CORPUS_INDEX_CAPACITY
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openlegal-mecab-dictionary
+  namespace: openlegal-serving
+spec:
+  accessModes: [ReadWriteOnce]
+  volumeMode: Filesystem
+  storageClassName: openlegal-local
+  volumeName: openlegal-mecab-dictionary
+  resources:
+    requests:
+      storage: REPLACE_WITH_MECAB_DICTIONARY_CAPACITY

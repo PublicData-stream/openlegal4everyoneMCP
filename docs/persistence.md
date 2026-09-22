@@ -204,6 +204,15 @@ recovery requires older failed or blocked jobs to drain. The adapter is not an
 index, history manifest, transaction journal, or exclusive cache-root database
 owner.
 
+Keep filesystem blob roots owned by the serving UID with mode `0700`, and blob
+files private (`0600`). When Kubernetes mounts a volume, use a separately prepared
+parent volume root and configure the private `data` child as the blob path.
+`fsGroup` must not recursively relax retained blob permissions. The
+[Kubernetes preparation contract](deployment-kubernetes.md#storage-and-permissions)
+uses a matching `root:10004` parent, mode `2770`, and `OnRootMismatch`; verify the
+actual storage driver/kubelet behavior before admitting retained evidence. Never
+weaken blob validation or recursively repair retained data at serving startup.
+
 Retention first commits reference removal and enqueues retired physical generations
 in PostgreSQL, then deletes their blob objects. A failed deletion leaves reclaimable
 garbage. Generation-specific keys keep a delayed deletion from deleting a later

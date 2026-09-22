@@ -54,7 +54,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 cd "$repo"
 mkdir -p "$scratch/fixture/config" "$scratch/fixture/tls" "$scratch/fixture/invalid-tls"
-scripts/test-kubernetes-serving.sh --config-output "$scratch/fixture/config/server.toml"
+scripts/test-kubernetes-serving.sh --profile text-only --config-output "$scratch/fixture/config/server.toml"
 deploy_tools=${OPENLEGAL_DEPLOY_TOOLS:-$repo/target/deployment-tools}
 "$deploy_tools/bin/python" - "$scratch/fixture" <<'PYTHON'
 import json

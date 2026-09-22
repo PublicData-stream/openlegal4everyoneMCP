@@ -9,13 +9,15 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from deployment_validation import ValidationError, load_documents, validate
+from deployment_validation import ValidationError, load_documents, validate, validate_storage
 
 
 class ServingValidationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.documents = load_documents(Path(os.environ["OPENLEGAL_RENDERED_SERVING"]).read_text())
+        cls.text_only = load_documents(Path(os.environ["OPENLEGAL_RENDERED_TEXT_ONLY"]).read_text())
+        cls.storage = load_documents(Path(os.environ["OPENLEGAL_STORAGE_EXAMPLES"]).read_text())
 
     def setUp(self):
         self.docs = copy.deepcopy(self.documents)
@@ -61,7 +63,7 @@ class ServingValidationTests(unittest.TestCase):
         cases = [(self.pod, "hostNetwork", True), (self.pod, "runtimeClassName", "document-worker"),
                  (self.pod, "initContainers", [{"name": "extra", "image": "busybox"}]),
                  (self.container, "command", ["/bin/sh"]),
-                 (self.container, "env", [{"name": "SECRET", "value": "unwanted"}])]
+                 (self.container, "envFrom", [{"secretRef": {"name": "unwanted"}}])]
         for mapping, key, value in cases:
             with self.subTest(key=key):
                 mapping[key] = value
@@ -103,12 +105,98 @@ class ServingValidationTests(unittest.TestCase):
     def test_database_ingestion_and_extra_config(self):
         data = self.objects["ConfigMap"]["data"]
         original = data["server.toml"]
-        for section in ("database", "ingest", "demo", "cache"):
+        for section in ("ingest", "demo", "database.ingestion"):
             with self.subTest(section=section):
                 data["server.toml"] = original + f'\n[{section}]\nenabled = true\n'
                 self.rejected()
-        data["server.toml"] = original.replace('allowed_origins = []', 'allowed_origins = ["https://unreviewed.test"]')
+        data["server.toml"] = original.replace('https://openlegal4everyone.stream', 'https://unreviewed.test')
         self.rejected()
+
+    def test_secret_environment_is_runtime_only(self):
+        original = copy.deepcopy(self.container["env"])
+        for env in (
+            [{"name": "OPENLEGAL_DATABASE_URL", "value": "postgres://inline-credential"}],
+            original + [{"name": "OPENLEGAL_MIGRATION_DATABASE_URL", "valueFrom": {
+                "secretKeyRef": {"name": "migration", "key": "url"}}}],
+            original + [{"name": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "value": "provider"}],
+        ):
+            with self.subTest(env=env):
+                self.container["env"] = env
+                self.rejected()
+        self.container["env"] = original
+        self.container["env"][0]["valueFrom"]["secretKeyRef"]["name"] = "migration"
+        self.rejected()
+
+    def test_retained_storage_and_startup_policy(self):
+        for mapping, key, value in (
+            (self.pod["securityContext"], "fsGroupChangePolicy", "Always"),
+            (self.container["startupProbe"], "failureThreshold", 3),
+            (self.container["volumeMounts"][-1], "readOnly", False),
+            (self.pod["volumes"][-1]["persistentVolumeClaim"], "readOnly", False),
+            (self.pod["volumes"][-2]["persistentVolumeClaim"], "claimName", "openlegal-corpus-blobs"),
+            (self.pod["volumes"][2]["secret"], "defaultMode", 0o444),
+        ):
+            original = mapping[key]
+            with self.subTest(key=key):
+                mapping[key] = value
+                self.rejected()
+            mapping[key] = original
+        del self.pod["securityContext"]["fsGroupChangePolicy"]
+        self.rejected()
+
+    def test_retained_configuration_failures(self):
+        data = self.objects["ConfigMap"]["data"]
+        original = data["server.toml"]
+        for old, new in (
+            ('tls_mode = "verify-full"', 'tls_mode = "plaintext"'),
+            ('url_env = "OPENLEGAL_DATABASE_URL"', 'url = "postgres://inline-credential"'),
+            ('/var/lib/openlegal/corpus-index/data', '/var/lib/openlegal/corpus-blobs/data/index'),
+            ('/var/lib/openlegal/mecab-ko-dictionary/data', '/var/lib/openlegal/corpus-index/data'),
+            ('REPLACE_WITH_RELEASE_REVISION', 'main'),
+            ('REPLACE_WITH_OXIBELT_BACKEND_AUTHORITY', '*'),
+        ):
+            with self.subTest(new=new):
+                data["server.toml"] = original.replace(old, new)
+                self.rejected()
+        for section in ('[cache]', '[database]'):
+            data["server.toml"] = original[:original.index(section)]
+            self.rejected()
+
+    def test_text_only_fixture_remains_separate(self):
+        validate(self.text_only, "text-only")
+        with self.assertRaises(ValidationError):
+            validate(self.text_only)
+        with self.assertRaises(ValidationError):
+            validate(self.docs, "text-only")
+        docs = copy.deepcopy(self.text_only)
+        deployment = next(item for item in docs if item["kind"] == "Deployment")
+        deployment["spec"]["template"]["spec"]["containers"][0]["env"] = self.container["env"]
+        with self.assertRaises(ValidationError):
+            validate(docs, "text-only")
+
+    def test_storage_examples_and_reservations(self):
+        validate_storage(self.storage)
+        cases = (
+            ("StorageClass", ("volumeBindingMode",), "Immediate"),
+            ("StorageClass", ("metadata", "annotations", "storageclass.kubernetes.io/is-default-class"), "true"),
+            ("PersistentVolume", ("spec", "persistentVolumeReclaimPolicy"), "Delete"),
+            ("PersistentVolume", ("spec", "claimRef", "name"), "other-claim"),
+            ("PersistentVolume", ("spec", "nodeAffinity"), {}),
+            ("PersistentVolume", ("spec", "local", "path"), "/host/real-path"),
+            ("PersistentVolumeClaim", ("spec", "volumeName"), "other-volume"),
+            ("PersistentVolumeClaim", ("spec", "accessModes"), ["ReadWriteMany"]),
+        )
+        for kind, path, value in cases:
+            with self.subTest(kind=kind, path=path):
+                docs = copy.deepcopy(self.storage)
+                mapping = next(item for item in docs if item["kind"] == kind)
+                for key in path[:-1]:
+                    mapping = mapping[key]
+                mapping[path[-1]] = value
+                with self.assertRaises(ValidationError):
+                    validate_storage(docs)
+        with self.assertRaises(ValidationError):
+            validate_storage(self.storage[:-1])
 
     def test_duplicate_yaml_keys_and_malformed_objects(self):
         with self.assertRaises(ValidationError):

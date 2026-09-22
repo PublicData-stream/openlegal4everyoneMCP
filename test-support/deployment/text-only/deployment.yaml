@@ -37,7 +37,6 @@ spec:
         runAsUser: 10004
         runAsGroup: 10004
         fsGroup: 10004
-        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -60,28 +59,14 @@ spec:
             - name: health
               containerPort: 9090
               protocol: TCP
-          env:
-            - name: OPENLEGAL_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: openlegal-runtime-db
-                  key: OPENLEGAL_DATABASE_URL
-          # Provisional retained-corpus budget; measure with the complete dictionary.
+          # Provisional TEXT-ONLY budget. Re-measure before enabling corpus/ingestion.
           resources:
             requests:
-              cpu: "1"
-              memory: 2Gi
+              cpu: 500m
+              memory: 512Mi
             limits:
               cpu: "2"
-              memory: 4Gi
-          startupProbe:
-            httpGet:
-              path: /live
-              port: health
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 60
-            successThreshold: 1
+              memory: 2Gi
           livenessProbe:
             httpGet:
               path: /live
@@ -107,21 +92,6 @@ spec:
             - name: backend-tls
               mountPath: /run/secrets/backend-tls
               readOnly: true
-            - name: postgres-ca
-              mountPath: /run/secrets/postgres-ca
-              readOnly: true
-            - name: cache-blobs
-              mountPath: /var/lib/openlegal/cache-blobs
-              readOnly: false
-            - name: corpus-blobs
-              mountPath: /var/lib/openlegal/corpus-blobs
-              readOnly: false
-            - name: corpus-index
-              mountPath: /var/lib/openlegal/corpus-index
-              readOnly: false
-            - name: mecab-ko-dictionary
-              mountPath: /var/lib/openlegal/mecab-ko-dictionary
-              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -136,26 +106,3 @@ spec:
                 path: tls.crt
               - key: tls.key
                 path: tls.key
-        - name: postgres-ca
-          secret:
-            secretName: openlegal-postgres-ca
-            defaultMode: 0440
-            items:
-              - key: ca.crt
-                path: ca.crt
-        - name: cache-blobs
-          persistentVolumeClaim:
-            claimName: openlegal-cache-blobs
-            readOnly: false
-        - name: corpus-blobs
-          persistentVolumeClaim:
-            claimName: openlegal-corpus-blobs
-            readOnly: false
-        - name: corpus-index
-          persistentVolumeClaim:
-            claimName: openlegal-corpus-index
-            readOnly: false
-        - name: mecab-ko-dictionary
-          persistentVolumeClaim:
-            claimName: openlegal-mecab-dictionary
-            readOnly: true
