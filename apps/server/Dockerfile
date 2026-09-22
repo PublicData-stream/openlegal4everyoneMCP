@@ -68,10 +68,47 @@ FROM runtime-base AS runtime-arm64
 LABEL org.openlegal.cpu-baseline="generic-arm64"
 
 # Only the two supported CPU architectures have a runtime stage.
-FROM runtime-${TARGETARCH} AS runtime
+FROM runtime-${TARGETARCH} AS runtime-serving
 ARG REVISION=unknown
 ARG VERSION=development
 LABEL org.opencontainers.image.source="https://github.com/PublicData-stream/openlegal4everyoneMCP" \
     org.opencontainers.image.revision="$REVISION" \
     org.opencontainers.image.version="$VERSION" \
     org.opencontainers.image.licenses="AGPL-3.0-only"
+
+# Download on the builder architecture; only verified artifacts reach runtime.
+FROM --platform=$BUILDPLATFORM node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe AS kubectl
+ARG TARGETARCH
+COPY scripts/deployment-kubectl.sha256 /pins/kubectl.sha256
+RUN mkdir /artifacts && TARGETARCH="$TARGETARCH" node --input-type=module -e '\
+    import {readFileSync, writeFileSync} from "node:fs"; \
+    import {createHash} from "node:crypto"; \
+    const arch = process.env.TARGETARCH; \
+    if (!["amd64", "arm64"].includes(arch)) throw Error("Unsupported architecture"); \
+    const pin = readFileSync("/pins/kubectl.sha256", "utf8").split("\n").find(line => line.endsWith("  " + arch))?.split(" ")[0]; \
+    if (!/^[a-f0-9]{64}$/.test(pin ?? "")) throw Error("Missing checksum"); \
+    const artifacts = [ \
+      ["kubectl", `https://dl.k8s.io/release/v1.37.0/bin/linux/${arch}/kubectl`, pin], \
+      ["kubernetes.tar.gz", "https://codeload.github.com/kubernetes/kubernetes/tar.gz/refs/tags/v1.37.0", "956ddae3b12acc08a715aea0411a168a36d5989b3e7185deeb6bf46b7dac19cf"], \
+      ["GO-LICENSE", "https://raw.githubusercontent.com/golang/go/go1.26.6/LICENSE", "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"] \
+    ]; \
+    for (const [name, url, checksum] of artifacts) { \
+      const response = await fetch(url, {signal: AbortSignal.timeout(300000)}); \
+      if (!response.ok) throw Error(`Download failed: ${response.status}`); \
+      const bytes = Buffer.from(await response.arrayBuffer()); \
+      if (createHash("sha256").update(bytes).digest("hex") !== checksum) throw Error(`${name} checksum mismatch`); \
+      writeFileSync(`/artifacts/${name}`, bytes, {mode: name === "kubectl" ? 0o755 : 0o644}); \
+    }' \
+    && tar -xzf /artifacts/kubernetes.tar.gz -C /artifacts --wildcards '*/LICENSES/*' \
+    && mv /artifacts/kubernetes-1.37.0/LICENSES /artifacts/notices \
+    && mv /artifacts/GO-LICENSE /artifacts/notices/GO-LICENSE \
+    && find /artifacts/notices -name OWNERS -delete \
+    && chmod -R a+rX,go-w /artifacts/notices
+
+FROM runtime-serving AS runtime-ingestion
+COPY --from=kubectl --chmod=0755 /artifacts/kubectl /usr/local/bin/kubectl
+COPY --from=kubectl /artifacts/notices/ /opt/openlegal/notices/kubectl/
+COPY --chmod=0644 apps/server/kubectl-notices.md /opt/openlegal/notices/kubectl/provenance.md
+
+# The final/default target must continue to exclude controller tooling.
+FROM runtime-serving AS runtime

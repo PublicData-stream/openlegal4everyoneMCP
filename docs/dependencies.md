@@ -323,7 +323,7 @@ not a general CC0 allowlist or an advisory exception.
 
 ## Deployment validation tools
 
-Development-only deployment checks use Kubernetes `kubectl` v1.37.0 (embedded
+Deployment checks and the optional ingestion image use Kubernetes `kubectl` v1.37.0 (embedded
 Kustomize v5.8.1), with committed architecture-specific SHA-256 checksums from the
 [official release artifacts](https://kubernetes.io/releases/download/).
 [Official installation guidance](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
@@ -331,6 +331,24 @@ describes release checksum verification. Only `kubectl kustomize` runs in the
 manifest gate; no cluster discovery or ambient credentials are needed. Kubernetes
 and Kustomize are Apache-2.0. Reusing the standard renderer avoids a new template
 engine and does not claim an API-server validation result.
+
+The ingestion runtime reuses the same committed binary checksums and installs only
+`/usr/local/bin/kubectl`; the default server image still excludes it. This trusted
+controller executable implements quota inspection and Pod create/wait/exec/delete.
+Keeping the existing command adapter avoids introducing a second Kubernetes client
+and changing its lifecycle contract. Only explicitly configured kubeconfig/context
+credentials are used; inherited server credentials and proxy variables are cleared.
+Initial cluster targets are 1.36–1.37, within Kubernetes' documented one-minor
+kubectl/API-server skew; this is compatibility targeting, not cluster acceptance.
+
+The image build verifies binary hashes before installation, and verifies the pinned
+Kubernetes source notice archive and Go 1.26.6 license before packaging. Sources,
+checksums and redistribution scope are recorded in
+[kubectl notice provenance](../apps/server/kubectl-notices.md). The full upstream
+LICENSES bundle is retained conservatively, including notices for components not
+necessarily linked into kubectl. Node is used only in the download build stage;
+neither Node nor a download/package-management tool is added to the final image.
+No runtime download, mutable version selection or TLS downgrade is permitted.
 
 [PyYAML 6.0.3](https://pypi.org/project/PyYAML/6.0.3/) is MIT-licensed and installed
 from hash-locked binary wheels into an isolated development virtual environment.

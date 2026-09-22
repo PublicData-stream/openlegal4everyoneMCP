@@ -13,12 +13,15 @@ case $(docker info --format '{{.Architecture}}') in
     *) echo 'Unsupported host architecture' >&2; exit 1 ;;
 esac
 platform=$native_platform
-if (( $# )); then
-    if [[ $# != 2 || $1 != --platform ]]; then
-        echo "Usage: $0 [--platform linux/amd64|linux/arm64]" >&2; exit 2
-    fi
-    platform=$2
-fi
+image_target=runtime
+while (( $# )); do
+    case "$1" in
+        --platform) [[ $# -ge 2 ]] || exit 2; platform=$2; shift 2 ;;
+        --target) [[ $# -ge 2 ]] || exit 2; image_target=$2; shift 2 ;;
+        *) echo "Usage: $0 [--platform linux/amd64|linux/arm64] [--target runtime|runtime-ingestion]" >&2; exit 2 ;;
+    esac
+done
+case "$image_target" in runtime|runtime-ingestion) ;; *) echo 'Invalid image target' >&2; exit 2 ;; esac
 case $platform in
     linux/amd64) cpu_baseline=x86-64-v3 ;;
     linux/arm64) cpu_baseline=generic-arm64 ;;
@@ -71,6 +74,7 @@ PYTHON
 revision=$(git rev-parse HEAD)
 version="image-smoke-${revision:0:12}"
 docker build --platform "$platform" --file apps/server/Dockerfile \
+    --target "$image_target" \
     --build-arg "REVISION=$revision" --build-arg "VERSION=$version" --tag "$image" .
 # Pull while network access is available; execution below is isolated.
 docker pull --platform "$native_platform" "$node_image" >/dev/null
@@ -92,7 +96,7 @@ hardening=(--read-only --cap-drop ALL --security-opt no-new-privileges \
     --memory 2g --cpus 2 --pids-limit 128)
 docker run --rm --name "$probe" --platform "$platform" --network none "${hardening[@]}" \
     --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777" \
-    --entrypoint /bin/sh "$image" -exc '
+    --env "OPENLEGAL_IMAGE_TARGET=$image_target" --entrypoint /bin/sh "$image" -exc '
     test "$(id -u):$(id -g)" = 10004:10004
     test -x /usr/local/bin/openlegal-server
     test -s /etc/ssl/certs/ca-certificates.crt
@@ -102,11 +106,21 @@ docker run --rm --name "$probe" --platform "$platform" --network none "${hardeni
     if grep -q "not found" /tmp/ldd; then
         echo "Unresolved runtime library" >&2; exit 1
     fi
-    for tool in cargo rustc cc gcc clang node npm pnpm git kubectl; do
+    for tool in cargo rustc cc gcc clang node npm pnpm git; do
         if command -v "$tool"; then
             echo "Build tool present: $tool" >&2; exit 1
         fi
     done
+    if test "$OPENLEGAL_IMAGE_TARGET" = runtime-ingestion; then
+        test -x /usr/local/bin/kubectl
+        test "$(stat -c %u:%g /usr/local/bin/kubectl)" = 0:0
+        /usr/local/bin/kubectl version --client -o json > /tmp/kubectl-version
+        grep -q '\''"gitVersion": "v1.37.0"'\'' /tmp/kubectl-version
+        test -s /opt/openlegal/notices/kubectl/LICENSE
+        test -s /opt/openlegal/notices/kubectl/provenance.md
+    else
+        ! command -v kubectl
+    fi
     for widget in index text-diff database; do
         file="/opt/openlegal/widgets/$widget.html"
         test -s "$file"
@@ -202,4 +216,7 @@ docker stop --signal SIGTERM --timeout 30 "$server" >/dev/null
 [[ $(docker inspect --format '{{.State.ExitCode}}' "$server") == 0 ]] || { echo 'Server failed graceful SIGTERM exit' >&2; exit 1; }
 [[ $(docker inspect --format '{{.State.OOMKilled}}' "$server") == false ]]
 scripts/test-retained-server-image.sh --image "$image" --platform "$platform"
-printf 'Production image acceptance passed for %s (%s).\n' "$platform" "$cpu_baseline"
+if [[ $image_target == runtime-ingestion ]]; then
+    scripts/test-ingestion-controller-image.sh --image "$image" --platform "$platform"
+fi
+printf 'Production image acceptance passed for %s (%s, %s).\n' "$platform" "$cpu_baseline" "$image_target"

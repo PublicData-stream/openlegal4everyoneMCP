@@ -2,6 +2,8 @@
 !Cargo.toml
 !Cargo.lock
 !LICENSE
+!scripts/
+!scripts/deployment-kubectl.sha256
 !.cargo/
 !.cargo/config.toml
 !crates/
@@ -12,6 +14,7 @@
 !apps/server/src/
 !apps/server/src/**
 !apps/server/collect-notices.py
+!apps/server/kubectl-notices.md
 !apps/server/notices/
 !apps/server/notices/**
 !apps/server/tests/
