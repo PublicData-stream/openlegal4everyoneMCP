@@ -16,8 +16,18 @@ From a Linux checkout with the pinned Rust toolchain, Git, OpenSSL, Python 3,
 and a working rootless Docker daemon:
 
 ```sh
-scripts/test-oxibelt.sh
+scripts/test-oxibelt.sh --profile fixture
+scripts/test-oxibelt.sh --profile kubernetes
 ```
+
+The default profile is `fixture`, using the original synthetic edge/backend
+configuration. The `kubernetes` profile reads the committed
+[NodePort handoff example](../deploy/oxibelt/kubernetes-upstream.example.toml),
+substitutes disposable hostnames/certificates, and uses a backend listening directly
+on TCP 30080 and UDP 30433. It retains those upstream ports from the example.
+Both profiles run the same protocol and rejection checks, and both run in CI.
+Neither profile creates a cluster or verifies Kubernetes NodePort translation,
+node reachability, firewall enforcement or production certificates.
 
 The first run downloads the pinned OxiBelt source and Docker runtime image and
 builds the server, native client, and OxiBelt with locked dependencies. The
@@ -69,12 +79,15 @@ The test fails unless all of these checks pass:
   MCP revisions; the client handles bounded JSON or SSE responses.
 - The same native WebTransport tool calls for both revisions, including a fresh
   connection and explicit allowed Origin.
-- Rejection of wrong routes, HTTP authority, disallowed Origin, and untrusted
-  downstream certificates.
+- Rejection of wrong routes, public `/live`, `/ready` and `/metrics`, HTTP
+  authority, disallowed Origin, and untrusted downstream certificates.
 - Rejection when only OxiBelt's backend CA trust changes, followed by a successful
   reconnect after restoring trust.
+- Rejection of a backend certificate signed by the trusted CA but issued for the
+  wrong DNS name, followed by successful recovery with the matching certificate.
 
-A successful run prints `OxiBelt HTTP and WebTransport integration checks passed.`
+A successful run reports that the OxiBelt HTTP and WebTransport integration checks
+passed for the selected profile.
 This is an opt-in integration gate; ordinary Rust tests remain deterministic and
 independent of Docker. These checks establish native client interoperability for
 this pinned edge configuration. They do not establish browser or ChatGPT platform
@@ -111,3 +124,77 @@ matching the backend DNS name. Never disable certificate verification to fix
 routing. The HTTP route disables response buffering, caching, and compression
 so MCP streaming can pass through. Treat proxy timeouts, connection budgets,
 backend request deadlines, and shutdown grace as one deployment policy.
+
+## Kubernetes NodePort handoff
+
+Start with the complete
+[`kubernetes-upstream.example.toml`](../deploy/oxibelt/kubernetes-upstream.example.toml)
+for the pinned revision above. It routes the public host `openlegal4everyone.stream`
+on exact `/mcp` and CONNECT `/mcp-wt/v1` paths. The container listens on 8443;
+the operator's host Compose must publish `443:8443/tcp` and `443:8443/udp`.
+Remove the existing `openlegal4everyone` nginx service from that operator-owned
+Compose configuration and retain OxiBelt and lego. No host Compose file is shipped
+in this repository, and no additional proxy is needed between OxiBelt and the
+Kubernetes Service.
+
+Replace every `replace-with-private-node.invalid` occurrence with a private node
+DNS name reachable from the OxiBelt container. The reserved placeholder will not
+work unchanged. Use the same hostname for both upstreams and configure these
+identities together:
+
+| Setting | Operator value, where `NODE_DNS` is the private node hostname |
+| --- | --- |
+| OxiBelt HTTP origin | `http://NODE_DNS:30080` |
+| Backend `[http].allowed_hosts` | `["NODE_DNS:30080"]` |
+| OxiBelt WebTransport origin | `https://NODE_DNS:30433` |
+| Backend `[webtransport].allowed_hosts` | `["NODE_DNS:30433"]` |
+| Backend certificate DNS SAN | `NODE_DNS` without a port |
+| Both backend `allowed_origins` | `["https://openlegal4everyone.stream"]`, extended only for intended callers |
+
+The backend still listens on 8080/TCP and 4433/UDP. Kubernetes translates the
+NodePorts; it does not rewrite HTTP Host or WebTransport authority. Because
+`preserve_host = false`, the backend receives the upstream hostname and NodePort,
+not its Pod listener port. Replace both existing authority placeholders in the
+[serving configuration](../deploy/kubernetes/serving/server.toml) accordingly.
+Caller Origin must pass through unchanged. Retain HTTP/1 upstream forwarding,
+HTTP/3 WebTransport, the 16 MiB HTTP request limit, streaming request/response
+bodies, disabled caching/compression and the example's connection/request/idle
+timeouts. Upstream URLs remain origins without base paths.
+
+Public edge TLS and private backend TLS have separate ownership. Mount the
+lego/ACME edge certificate and key as `cert/edge.pem` and `cert/edge-key.pem`
+beside OxiBelt's `config/` directory. Mount the backend issuing CA certificate as
+`cert/backend-ca.pem`, as selected by `proxy.trusted_ca_certs`. Put only the
+issued backend certificate and private key into Kubernetes Secret
+`openlegal-backend-tls` (`tls.crt` and `tls.key`). Keep the CA private key outside
+both OxiBelt and Kubernetes. Do not disable chain or hostname verification, and
+do not reuse the public edge certificate identity as the backend identity by
+assumption. The example disables hot reload; coordinate edge restart and backend
+rollout when replacing certificates, allowing for `Recreate` downtime and
+preserving current trust.
+
+Private node DNS is the primary path. When OxiBelt and Kubernetes share a physical
+host, an operator may instead use a stable hostname explicitly mapped to the host
+gateway in Compose, for example:
+
+```yaml
+services:
+  oxibelt:
+    extra_hosts:
+      - "openlegal-node.internal:host-gateway"
+```
+
+This is a fragment for the operator's existing service, not a complete Compose
+file. Use `openlegal-node.internal` consistently as `NODE_DNS` in the table above
+and issue the matching backend certificate. Do not hard-code a Docker bridge IP.
+Verify what `host-gateway` resolves to in the selected daemon/network setup and
+whether both NodePorts are reachable from the actual OxiBelt container; a rootless
+daemon does not by itself establish that route. See
+[Compose host mappings](https://docs.docker.com/reference/compose-file/services/#extra_hosts).
+
+Complete the [NodePort firewall prerequisites](deployment-kubernetes.md#service-and-private-network-handoff)
+before applying the Service. Port 9090 and `/live`, `/ready`, `/metrics` have no
+Service or public edge route. Pod-network isolation, real TCP/UDP routing, source
+translation, firewall enforcement, public edge access and browser/ChatGPT platform
+acceptance require their own operator checks; the isolated harness supplies no
+real-cluster acceptance evidence.

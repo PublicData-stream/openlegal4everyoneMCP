@@ -4,6 +4,7 @@ namespace: openlegal-serving
 resources:
   - namespace.yaml
   - deployment.yaml
+  - service.yaml
 configMapGenerator:
   - name: openlegal-server-config
     files:

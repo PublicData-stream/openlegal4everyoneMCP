@@ -44,14 +44,19 @@ for example in storage-class local-pv local-pvc; do
 done
 for checked_profile in retained text-only; do
     output_args=()
+    edge_args=()
+    if [[ $checked_profile == retained ]]; then
+        edge_args=(--oxibelt-config "$repo/deploy/oxibelt/kubernetes-upstream.example.toml")
+    fi
     if [[ $checked_profile == "$profile" ]]; then
         output_args=("${config_args[@]}")
     fi
     PYTHONDONTWRITEBYTECODE=1 "$tools_dir/bin/python" "$repo/scripts/deployment_validation.py" \
         "$scratch/$checked_profile.yaml" --profile "$checked_profile" \
-        --storage-manifest "$scratch/storage.yaml" "${output_args[@]}"
+        --storage-manifest "$scratch/storage.yaml" "${edge_args[@]}" "${output_args[@]}"
 done
 OPENLEGAL_RENDERED_SERVING="$scratch/retained.yaml" \
     OPENLEGAL_RENDERED_TEXT_ONLY="$scratch/text-only.yaml" \
     OPENLEGAL_STORAGE_EXAMPLES="$scratch/storage.yaml" PYTHONDONTWRITEBYTECODE=1 \
+    OPENLEGAL_OXIBELT_EXAMPLE="$repo/deploy/oxibelt/kubernetes-upstream.example.toml" \
     "$tools_dir/bin/python" -m unittest discover -s "$repo/scripts/tests" -p test_deployment_validation.py

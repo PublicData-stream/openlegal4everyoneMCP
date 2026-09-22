@@ -44,9 +44,10 @@ cargo test --workspace --locked
 ```
 
 The binary requires both data transports and a private health listener. For a
-complete local edge/CA fixture, run `scripts/test-oxibelt.sh` with Docker; see
-[OxiBelt setup](docs/oxibelt.md). Contributor validation and independent review
-requirements are in [Contributing](CONTRIBUTING.md).
+complete local edge/CA fixture, run `scripts/test-oxibelt.sh` with Docker; use
+`--profile kubernetes` to exercise the committed NodePort handoff example with
+disposable Docker endpoints. See [OxiBelt setup](docs/oxibelt.md). Contributor
+validation and independent review requirements are in [Contributing](CONTRIBUTING.md).
 
 For the runnable fictional provider and interactive widget, follow the
 [synthetic demo guide](docs/demo.md). Ordinary server startup does not require
@@ -59,7 +60,7 @@ dictionary; see [corpus setup and index upgrades](docs/database.md#operator-conf
 - [Agent orientation](AGENTS.md): where coding agents should begin.
 - [Architecture](docs/architecture.md): server, legal-data and document-processing responsibilities.
 - [Server contract](docs/server.md): configuration, extension API and transport behavior.
-- [Kubernetes deployment design](docs/deployment-kubernetes.md): production image, retained-corpus serving and storage templates, local/CI checks and operator boundaries; complete production deployment remains pending.
+- [Kubernetes deployment design](docs/deployment-kubernetes.md): production image, retained-corpus serving, storage and NodePort templates, OxiBelt handoff, local/CI checks and operator boundaries; complete production deployment remains pending.
 - [Dependencies](docs/dependencies.md): admission rationale and check tooling.
 - [Retrieval framework](docs/retrieval.md): processors, caching, evidence and resource limits.
 - [Search-query syntax](docs/search-query.md): standalone parser, operators, diagnostics, and bounds.

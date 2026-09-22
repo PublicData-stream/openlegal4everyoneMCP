@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from deployment_validation import ValidationError, load_documents, validate, validate_storage
+from deployment_validation import ValidationError, load_documents, validate, validate_oxibelt, validate_storage
 
 
 class ServingValidationTests(unittest.TestCase):
@@ -18,6 +18,7 @@ class ServingValidationTests(unittest.TestCase):
         cls.documents = load_documents(Path(os.environ["OPENLEGAL_RENDERED_SERVING"]).read_text())
         cls.text_only = load_documents(Path(os.environ["OPENLEGAL_RENDERED_TEXT_ONLY"]).read_text())
         cls.storage = load_documents(Path(os.environ["OPENLEGAL_STORAGE_EXAMPLES"]).read_text())
+        cls.oxibelt = Path(os.environ["OPENLEGAL_OXIBELT_EXAMPLE"]).read_text()
 
     def setUp(self):
         self.docs = copy.deepcopy(self.documents)
@@ -43,6 +44,67 @@ class ServingValidationTests(unittest.TestCase):
         self.spec["replicas"] = 1
         self.spec["strategy"] = {"type": "RollingUpdate"}
         self.rejected()
+
+    def test_service_exposes_only_selected_transports(self):
+        service = self.objects["Service"]["spec"]
+        for mapping, key, value in (
+            (service, "type", "LoadBalancer"),
+            (service, "externalTrafficPolicy", "Local"),
+            (service, "selector", {"app.kubernetes.io/name": "other"}),
+            (service["ports"][0], "nodePort", 30081),
+            (service["ports"][1], "protocol", "TCP"),
+            (service["ports"][0], "targetPort", 9090),
+            (service["ports"][1], "port", 9090),
+        ):
+            original = mapping[key]
+            with self.subTest(key=key, value=value):
+                mapping[key] = value
+                self.rejected()
+            mapping[key] = original
+        for key, value in (("externalIPs", ["192.0.2.1"]),
+                           ("publishNotReadyAddresses", True),
+                           ("healthCheckNodePort", 30909)):
+            with self.subTest(key=key):
+                service[key] = value
+                self.rejected()
+            del service[key]
+        original = copy.deepcopy(service["ports"])
+        for ports in (original[:1], original + [{"name": "health", "protocol": "TCP",
+                       "port": 9090, "targetPort": 9090, "nodePort": 30909}]):
+            with self.subTest(ports=ports):
+                service["ports"] = ports
+                self.rejected()
+        self.docs.remove(self.objects["Service"])
+        self.rejected()
+
+    def test_oxibelt_handoff_transport_and_trust(self):
+        service = self.objects["Service"]
+        validate_oxibelt(self.oxibelt, service)
+        for old, new in (
+            (":30080", ":8080"), (":30433", ":4433"),
+            ('https://replace-with-private-node', 'http://replace-with-private-node'),
+            ('preserve_host = false', 'preserve_host = true'),
+            ('webtransport = true', 'webtransport = false'),
+            ('max_http_version = "h3"', 'max_http_version = "h2"'),
+            ('trusted_ca_certs = ["backend-ca.pem"]', 'trusted_ca_certs = []'),
+            ('response = "streaming"', 'response = "buffered"'),
+            ('[cache]\nenabled = false', '[cache]\nenabled = true'),
+            ('[compression]\nenabled = false', '[compression]\nenabled = true'),
+            ('max_request_body_bytes = 16777216', 'max_request_body_bytes = 10485760'),
+            ('hosts = ["openlegal4everyone.stream"]', 'hosts = ["*"]'),
+            ('exact = "/mcp"', 'prefix = "/"'),
+            ('exact = "/mcp-wt/v1"', 'exact = "/ready"'),
+            ('methods = ["CONNECT"]', 'methods = ["GET"]'),
+        ):
+            with self.subTest(new=new):
+                self.assertIn(old, self.oxibelt)
+                with self.assertRaises(ValidationError):
+                    validate_oxibelt(self.oxibelt.replace(old, new), service)
+        with self.assertRaises(ValidationError):
+            validate_oxibelt(self.oxibelt + '\n[[routes]]\nname = "health"\n', service)
+        with self.assertRaises(ValidationError):
+            validate_oxibelt(self.oxibelt.replace('[upstreams.tls.ech]',
+                            '[upstreams.tls]\ninsecure = true\n[upstreams.tls.ech]'), service)
 
     def test_security_weakening(self):
         cases = [(self.pod["securityContext"], "runAsUser", 0),

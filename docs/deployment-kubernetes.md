@@ -7,10 +7,11 @@ Phase 1 adds the production server image, local image acceptance and native
 amd64/ARM64 CI jobs. Phase 2 established hardened text-only serving and offline
 manifest checks. Phase 3 makes retained-corpus serving the default template, adds
 operator-managed storage examples and extends image acceptance to retained data.
-The text-only profile remains a separate test fixture. Services, NetworkPolicy,
-migration Jobs, ingestion integration and complete production runbooks remain
-planned. This document does not establish a running deployment or successful
-real-cluster, live-provider, browser WebTransport or ChatGPT acceptance.
+Phase 4 adds the TCP/UDP NodePort Service and a tested OxiBelt handoff example.
+The text-only profile remains a separate test fixture without a Service.
+NetworkPolicy, migration Jobs, ingestion integration and complete production
+runbooks remain planned. This document does not establish a running deployment
+or successful real-cluster, live-provider, browser WebTransport or ChatGPT acceptance.
 
 The original Phase 0 inventory was recorded on `main` at
 `79a8a852916d6fb18f306e5d7541115e1bab87d8`. The earlier design baseline,
@@ -156,8 +157,8 @@ check outcomes with the implementation handoff.
 ## Retained-corpus serving template
 
 The [serving Kustomization](../deploy/kubernetes/serving/) generates a Namespace,
-Deployment and content-hashed ConfigMap. It enables supplied-text comparison and
-retained-corpus serving with persistent PostgreSQL, two blob stores and a corpus
+Deployment, content-hashed ConfigMap and NodePort Service. It enables supplied-text
+comparison and retained-corpus serving with persistent PostgreSQL, two blob stores and a corpus
 index. Ingestion is omitted. There is no provider credential, controller identity
 or document-worker access. Retained serving still writes index events and performs
 retention maintenance. The former text-only configuration is now a
@@ -172,10 +173,13 @@ retention maintenance. The former text-only configuration is now a
 - Replace `[source].url`'s release revision with free corresponding source for the
   exact running server and widgets, including modifications and build material.
 - Replace both backend authority placeholders with the authorities sent by
-  OxiBelt. HTTP and WebTransport authorities depend on the respective upstream
-  configuration and can differ. The intended browser Origin is
+  OxiBelt: `NODE_DNS:30080` for HTTP and `NODE_DNS:30433` for WebTransport,
+  where `NODE_DNS` is the selected private node hostname. The intended browser
+  Origin is
   `https://openlegal4everyone.stream`; retain explicit Origin validation. Follow
   the [OxiBelt hosting contract](oxibelt.md#adapt-the-configuration-for-hosting).
+- Establish and verify the [NodePort firewall restrictions](#service-and-private-network-handoff)
+  before applying the serving Kustomization, which creates the Service.
 - Qualify Linux amd64 or ARM64 nodes before applying `openlegal.server/ready=true`.
   Verify the [x86-64-v3 baseline](../CONTRIBUTING.md#rust-baseline) on amd64, resource
   availability, Restricted Pod Security and storage suitability. ARM64 uses the
@@ -284,7 +288,8 @@ follow the documented monotonic acknowledgment/rebuild constraints.
 
 Use an operator-owned copy/overlay, render it before applying, and select an explicit
 kubeconfig/context for every cluster command. Create the namespace, Secrets and
-prepared storage first, and require migration success before starting the Deployment.
+prepared storage first, establish the NodePort firewall restrictions below, and
+require migration success before starting the Deployment.
 For example, after all placeholders and prerequisites have been resolved:
 
 ```sh
@@ -305,11 +310,12 @@ PV/PVC pairs can bind before a consumer because `volumeName` fixes the selection
 The scheduler still enforces the Local PV node affinity. Namespace labels use the cluster's `latest` Restricted policy; review admission on Kubernetes
 upgrades. Validation-tool versions are not a cluster compatibility matrix.
 
-There is no Service, NodePort, Ingress or NetworkPolicy in this phase. Health port
-9090 remains an operational listener with no public route. Absence of a Service
-**does not isolate Pod networking**; cluster peers may still reach Pod IPs. Network
-policy and real enforcement remain later gates. `kubectl port-forward` cannot
-validate UDP/WebTransport; a forwarded HTTP client must still send an allowed Host.
+The retained template exposes only the data transports through the Service
+described below. Health port 9090 has no Service port or public route. There is no
+Ingress or NetworkPolicy in this phase; cluster peers may still reach Pod IPs,
+including health. NetworkPolicy and its real enforcement remain Phase 6 gates.
+`kubectl port-forward` cannot validate UDP/WebTransport; a forwarded HTTP client
+must still send an allowed Host.
 
 The Pod uses UID/GID/fsGroup `10004`, dropped capabilities, no privilege escalation,
 RuntimeDefault seccomp, a read-only root and read-only configuration/Secret mounts.
@@ -339,12 +345,51 @@ verification. `Recreate` entails downtime. Retain compatible previous image/conf
 Secrets, dictionary and storage recovery material; `apply -k` does not automatically
 garbage-collect old generated ConfigMaps.
 
+### Service and private network handoff
+
+[`Service/openlegal-server`](../deploy/kubernetes/serving/service.yaml) in
+`openlegal-serving` selects the existing single-replica Deployment. Its two ports
+are fixed and named; the health listener is excluded.
+
+| Port name | Protocol | NodePort | Service / Pod port |
+| --- | --- | --- | --- |
+| `mcp-http` | TCP | `30080` | `8080` |
+| `mcp-webtransport` | UDP | `30433` | `4433` |
+
+The Service uses `externalTrafficPolicy: Cluster`, allowing a reachable node to
+forward to the serving Pod even when it runs elsewhere. This does not add replicas
+or storage failover. The cluster must admit these fixed NodePorts without a port
+collision. Use the selected private node DNS name in both upstream URLs in the
+[OxiBelt handoff example](../deploy/oxibelt/kubernetes-upstream.example.toml).
+The [hosting instructions](oxibelt.md#kubernetes-nodeport-handoff) cover the matching
+backend authorities, certificate identity and same-host gateway alternative.
+
+**Before applying the Service**, restrict TCP 30080 and UDP 30433 to the intended
+OxiBelt host/private path on every node/interface where the Service is reachable.
+A private DNS record does not limit NodePort exposure. Inspect the cluster's actual
+service-proxy implementation and effective address selection; where kube-proxy is
+used, review `nodePortAddresses` and its proxy-mode behavior. Do not assume a
+loopback or private-only binding. Cluster routing and Docker networking may change
+the source address, so verify the effective firewall path and do not treat the
+backend-observed source IP as client authentication. See the
+[Kubernetes NodePort guidance](https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport).
+
+After applying, operator acceptance must demonstrate HTTP through TCP 30080 and
+WebTransport through UDP 30433 from the OxiBelt container, and denial from unintended
+networks across all exposed nodes/interfaces. Verify backend certificate trust and
+hostname validation, allowed Host/Origin behavior, and absence of public health
+routes. Run these checks again after service-proxy, CNI, Docker, firewall or node
+changes. Offline rendering and Docker fixtures do not establish these properties
+on a real cluster. This handoff adds no intermediary proxy or serving NetworkPolicy.
+
 ### Local and CI checks
 
 ```sh
 scripts/setup-deployment-tools.sh
 scripts/test-kubernetes-serving.sh --profile retained
 scripts/test-kubernetes-serving.sh --profile text-only
+scripts/test-oxibelt.sh --profile fixture
+scripts/test-oxibelt.sh --profile kubernetes
 scripts/test-server-image.sh --platform linux/amd64
 scripts/test-server-image.sh --platform linux/arm64
 ```
@@ -358,7 +403,9 @@ validation is offline with no kubeconfig, discovery or client dry-run.
 
 The fast gate validates rendered YAML/TOML relationships, profile-specific security,
 lifecycle and storage invariants, and rejection of unsafe mutations. It validates
-Local PV/PVC examples without applying them. It rejects serving migration/provider
+Local PV/PVC examples without applying them, requires four objects for retained
+serving and three for text-only, and checks the Service port/selector contract
+against the OxiBelt example. It rejects serving migration/provider
 credentials, inline connection URLs, insecure TLS, overlapping storage paths,
 reused claims, writable dictionaries, missing ownership policy and mutable images.
 Rust configuration tests exercise the rendered TOML through existing validation.
@@ -370,6 +417,12 @@ It exercises both HTTP MCP revisions, Host/Origin denial, packaged widgets and
 text workers, then retained search/restart and startup failures described above.
 Fixtures use named Docker volume subdirectories; no host ports are published.
 Both native CI image jobs provision the required tools and full dictionary.
+
+The two OxiBelt profiles exercise the pinned edge with disposable identities.
+The Kubernetes profile consumes the committed handoff example and connects to a
+fixture backend listening directly on 30080/30433. It does not create a Kubernetes
+Service or test NodePort translation, firewalls or real-cluster routing. See the
+[OxiBelt gate](oxibelt.md#run-the-isolated-integration-test) for covered failures.
 
 Changes to this storage/image boundary also require the Rust baseline, PostgreSQL,
 Korean tokenization and OxiBelt gates in [CONTRIBUTING](../CONTRIBUTING.md#testing-and-ci),
@@ -386,7 +439,7 @@ Internet -- TCP/443 + UDP/443 --> Host Docker Compose
                                   OxiBelt
                                     | TCP /mcp       | UDP /mcp-wt/v1
                                     v                v
-                              Private Kubernetes NodePorts
+                              Kubernetes NodePorts TCP :30080 / UDP :30433
                                     |                |
 Kubernetes                          v                v
   openlegal-serving             HTTP :8080       QUIC/TLS :4433
@@ -482,14 +535,14 @@ remain planned.
 | --- | --- |
 | Image build, immutable image references, widget locations and source-offer field | Published image digests and a public corresponding-source URL for the exact running server/widget |
 | Serving namespace, one replica, Recreate, security settings and probe definitions | Target cluster/runtime, measured resource sizing and real-cluster acceptance |
-| TCP/UDP Service structure and OxiBelt handoff example | Concrete NodePorts, private addresses, backend authority, allowed origins, firewall rules and host Compose/certificate configuration |
+| Fixed TCP 30080 / UDP 30433 NodePorts and OxiBelt handoff example | NodePort availability, private node DNS, backend authorities, allowed origins, firewall rules and host Compose/certificate configuration |
 | Separate storage mounts and generic Local PV/PVC examples | ZFS datasets, host paths, node affinity, capacity, ownership/permissions and provisioned dictionary |
 | Secret references and separate serving/migration commands | PostgreSQL endpoint, roles/grants, credentials, CA material and backend TLS certificate/key |
 | Explicit opt-in ingestion overlay and namespace-scoped controller access | Provider credential, digest-pinned worker image and separately configured controller identity after sandbox acceptance |
 
 Commit no credentials, private keys, production kubeconfig, database URL, real
-node identifier or host-specific ZFS path. Exact network/storage values, production
-resource sizing and later ingestion authentication integration remain future-phase work.
+node identifier or host-specific ZFS path. Private network/storage values and
+production resource sizing remain operator inputs; later ingestion authentication integration remains future-phase work.
 The current controller requires explicit kubeconfig and context; any in-cluster
 authentication alternative needs a deliberate contract change and Security Review.
 
@@ -501,8 +554,9 @@ and independent review of the documentation patch under
 new runtime, image, manifest or CI validation evidence.
 
 Image acceptance began in Phase 1, rendering/invariant checks in Phase 2, and
-retained configuration/storage/restart checks in Phase 3. Real-cluster networking,
-storage, shutdown and sandbox enforcement require operator acceptance;
+retained configuration/storage/restart checks in Phase 3. Phase 4 adds offline
+Service/example consistency checks and a Docker OxiBelt handoff profile.
+Real-cluster networking, storage, shutdown and sandbox enforcement require operator acceptance;
 live LAW OPEN DATA access and public transport/platform acceptance are separate
 gates. Existing offline fixtures and local integration evidence do not satisfy
 those gates. Deployment, publication and live provider requests are not part of

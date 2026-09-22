@@ -129,15 +129,20 @@ def validate_config(raw, profile="retained"):
 
 def validate(documents, profile="retained"):
     require(profile in ("retained", "text-only"), "unsupported profile")
-    require(isinstance(documents, list) and len(documents) == 3,
-            "expected only Namespace, ConfigMap and Deployment")
+    kinds = ("Namespace", "ConfigMap", "Deployment")
+    if profile == "retained":
+        kinds += ("Service",)
+    require(isinstance(documents, list) and len(documents) == len(kinds),
+            f"expected only {', '.join(kinds)}")
     objects = {}
     for obj in documents:
         require(isinstance(obj, dict), "manifest document must be a mapping")
         kind = obj.get("kind")
         require(isinstance(kind, str) and kind not in objects, "duplicate/missing kind")
         objects[kind] = obj
-    keys(objects, ("Namespace", "ConfigMap", "Deployment"), "rendered objects")
+    keys(objects, kinds, "rendered objects")
+    if profile == "retained":
+        validate_service(objects["Service"])
     namespace, cm, deployment = (objects[k] for k in ("Namespace", "ConfigMap", "Deployment"))
     labels = {f"pod-security.kubernetes.io/{mode}{suffix}": value
               for mode in ("enforce", "audit", "warn")
@@ -282,15 +287,83 @@ def validate_storage(documents):
         equal(objects[identity], obj, f"{identity[0]}/{identity[1]}")
 
 
+def validate_service(service):
+    equal(service, {
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": "openlegal-server", "namespace": "openlegal-serving"},
+        "spec": {
+            "type": "NodePort", "externalTrafficPolicy": "Cluster",
+            "selector": {"app.kubernetes.io/name": "openlegal-server"},
+            "ports": [
+                {"name": "mcp-http", "protocol": "TCP", "port": 8080,
+                 "targetPort": 8080, "nodePort": 30080},
+                {"name": "mcp-webtransport", "protocol": "UDP", "port": 4433,
+                 "targetPort": 4433, "nodePort": 30433},
+            ],
+        },
+    }, "Service")
+
+
+def validate_oxibelt(raw, service):
+    """Check the committed handoff, not arbitrary operator OxiBelt configurations."""
+    validate_service(service)
+    config = tomllib.loads(raw)
+    keys(config, ("config", "logging", "runtime", "quic", "listeners", "tls", "proxy",
+                  "compression", "cache", "waf", "upstreams", "routes"), "OxiBelt example")
+    equal(config["config"], {"strict_unknown_fields": True}, "OxiBelt schema policy")
+    equal(config["listeners"], {"https_bind": "0.0.0.0:8443", "http1": True,
+                                "http2": True, "http3": True}, "edge listeners")
+    equal(config["tls"], {"cert_chain": "edge.pem", "private_key": "edge-key.pem",
+                          "ocsp": {"mode": "disabled"}}, "edge TLS")
+    equal(config["proxy"], {
+        "trusted_ca_certs": ["backend-ca.pem"],
+        "auto_upgrade": {"enabled": True, "max_http_version": "h3"},
+        "buffering": {"request": "streaming", "response": "streaming"},
+    }, "backend trust and streaming")
+    for section in ("compression", "cache"):
+        equal(config[section], {"enabled": False}, section)
+    upstreams = []
+    for port in service["spec"]["ports"]:
+        webtransport = port["protocol"] == "UDP"
+        scheme = "https" if webtransport else "http"
+        upstream = {
+            "name": port["name"],
+            "origin": f"{scheme}://replace-with-private-node.invalid:{port['nodePort']}",
+            "max_http_version": "h3" if webtransport else "h1",
+            "preserve_host": False, "connect_timeout_ms": 3000, "request_timeout_ms": 40000,
+        }
+        if webtransport:
+            upstream.update(webtransport=True, idle_timeout_ms=65000,
+                            tls={"ech": {"mode": "disabled"}})
+        upstreams.append(upstream)
+    equal(config["upstreams"], upstreams, "NodePort upstreams")
+    equal(config["routes"], [
+        {"name": "mcp-http", "hosts": ["openlegal4everyone.stream"],
+         "upstream": "mcp-http", "compression": "off",
+         "limits": {"max_request_body_bytes": 16 * 1024 * 1024},
+         "match": {"path": {"exact": "/mcp"}}},
+        {"name": "mcp-webtransport", "hosts": ["openlegal4everyone.stream"],
+         "upstream": "mcp-webtransport",
+         "match": {"methods": ["CONNECT"], "protocols": ["webtransport"],
+                   "path": {"exact": "/mcp-wt/v1"}}},
+    ], "public MCP routes")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--config-output", type=Path)
     parser.add_argument("--profile", choices=("retained", "text-only"), default="retained")
     parser.add_argument("--storage-manifest", type=Path)
+    parser.add_argument("--oxibelt-config", type=Path)
     args = parser.parse_args()
     try:
-        raw = validate(load_documents(args.manifest.read_text()), args.profile)
+        documents = load_documents(args.manifest.read_text())
+        raw = validate(documents, args.profile)
+        if args.oxibelt_config:
+            require(args.profile == "retained", "OxiBelt handoff requires retained profile")
+            service = next(obj for obj in documents if obj["kind"] == "Service")
+            validate_oxibelt(args.oxibelt_config.read_text(), service)
         if args.storage_manifest:
             validate_storage(load_documents(args.storage_manifest.read_text()))
         if args.config_output:

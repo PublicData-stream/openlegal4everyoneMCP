@@ -1,0 +1,106 @@
+# Kubernetes handoff example; read docs/oxibelt.md before use.
+# Replace the reserved node DNS name and provision certificates outside Git.
+# Container :8443 maps to host :443 on TCP and UDP.
+# Schema/source pin: 72564d165dfd05cb29a64aeebd19fccd7944ea6f.
+[config]
+strict_unknown_fields = true
+
+[logging]
+level = "warn"
+
+[runtime]
+linux_only = true
+read_only_rootfs_compatible = true
+memory_only_state = true
+unprivileged_mode = true
+worker_threads = 2
+
+[runtime.accept]
+workers = 1
+reuse_port = false
+
+[quic.socket]
+workers = 1
+reuse_port = false
+
+[runtime.hot_reload]
+mode = "off"
+
+[listeners]
+https_bind = "0.0.0.0:8443"
+http1 = true
+http2 = true
+http3 = true
+
+[tls]
+cert_chain = "edge.pem"
+private_key = "edge-key.pem"
+
+[tls.ocsp]
+mode = "disabled"
+
+[proxy]
+trusted_ca_certs = ["backend-ca.pem"]
+
+[proxy.auto_upgrade]
+enabled = true
+max_http_version = "h3"
+
+[proxy.buffering]
+request = "streaming"
+response = "streaming"
+
+[compression]
+enabled = false
+
+[cache]
+enabled = false
+
+# This transport example does not define a complete host WAF/security policy.
+[waf]
+enabled = false
+
+# Backend HTTP allowed_hosts must contain NODE_DNS:30080.
+[[upstreams]]
+name = "mcp-http"
+origin = "http://replace-with-private-node.invalid:30080"
+max_http_version = "h1"
+preserve_host = false
+connect_timeout_ms = 3000
+request_timeout_ms = 40000
+
+# Backend WebTransport allowed_hosts must contain NODE_DNS:30433.
+# Its certificate DNS SAN must match NODE_DNS; never disable verification.
+[[upstreams]]
+name = "mcp-webtransport"
+origin = "https://replace-with-private-node.invalid:30433"
+max_http_version = "h3"
+preserve_host = false
+webtransport = true
+connect_timeout_ms = 3000
+request_timeout_ms = 40000
+idle_timeout_ms = 65000
+
+[upstreams.tls.ech]
+mode = "disabled"
+
+[[routes]]
+name = "mcp-http"
+hosts = ["openlegal4everyone.stream"]
+upstream = "mcp-http"
+compression = "off"
+[routes.limits]
+# Two 1 MiB texts can occupy approximately 12 MiB after JSON escaping.
+max_request_body_bytes = 16777216
+[routes.match.path]
+exact = "/mcp"
+
+[[routes]]
+name = "mcp-webtransport"
+hosts = ["openlegal4everyone.stream"]
+upstream = "mcp-webtransport"
+[routes.match]
+methods = ["CONNECT"]
+protocols = ["webtransport"]
+[routes.match.path]
+exact = "/mcp-wt/v1"
