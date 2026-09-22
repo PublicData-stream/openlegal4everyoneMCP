@@ -1,4 +1,7 @@
 //! Native reference client: wt_client URL CA_PATH REVISION [ORIGIN] [--demo] [--text-diff].
+//! Deployment profile: wt_client URL CA_PATH REVISION ORIGIN --serving-smoke.
+
+mod serving_smoke;
 
 use openlegal_server::{
     ServerError,
@@ -16,6 +19,13 @@ use wtransport::{
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--serving-smoke") {
+        let passed = serving_smoke::run(&args).await;
+        if !passed {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let demo = args.iter().any(|arg| arg == "--demo");
     let text_diff = args.iter().any(|arg| arg == "--text-diff");
     args.retain(|arg| arg != "--demo" && arg != "--text-diff");

@@ -93,7 +93,7 @@ cp "$server_binary" "$scratch/bin/openlegal-server"
 cp "$client_binary" "$scratch/bin/wt_client"
 cp "$mock_binary" "$scratch/bin/mock_upstream"
 cp "$oxibelt_binary" "$scratch/bin/oxibelt"
-cp deploy/oxibelt/backend.toml scripts/http_smoke.py "$scratch/fixture/"
+cp deploy/oxibelt/backend.toml scripts/http_smoke.py scripts/serving_smoke.py "$scratch/fixture/"
 if [[ -n ${DEMO_WIDGET_HTML:-} ]]; then
     cp "$DEMO_WIDGET_HTML" "$scratch/fixture/widget.html"
 else
@@ -243,6 +243,11 @@ reject_client() {
 }
 start_edge /fixture/config/oxibelt.toml
 docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/http_smoke.py /fixture/cert/ca.pem
+# The deployed-endpoint profile must work without demo/provider operations. This
+# remains Docker fixture evidence, including when the profile is kubernetes.
+docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/serving_smoke.py \
+    --http-url https://edge:8443/mcp --webtransport-url https://edge:8443/mcp-wt/v1 \
+    --origin https://example.test --ca-file /fixture/cert/ca.pem --wt-client /usr/local/bin/wt_client
 for protocol in 2026-07-28 2025-11-25; do
     client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$protocol" --demo --text-diff
     # A fresh process creates a fresh QUIC connection, checking reconnection too.
