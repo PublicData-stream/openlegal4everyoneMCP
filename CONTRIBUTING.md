@@ -152,8 +152,13 @@ Install `cargo-audit` 0.22.2 and `cargo-deny` 0.20.2 using the locked commands i
 [dependency admission](docs/dependencies.md). Both require current advisory-data
 access; unavailable/stale advisory data is not a successful current check.
 The separate `scripts/test-oxibelt.sh` Docker gate verifies both transports through
-the pinned edge and runs in CI. `scripts/test-postgres.sh` provisions the pinned
-PostgreSQL 18 image and explicitly executes the ignored real-database persistence,
+the pinned edge and runs in CI. Edge, NodePort handoff, and OxiBelt harness changes
+require both `scripts/test-oxibelt.sh --profile fixture` and
+`scripts/test-oxibelt.sh --profile kubernetes`; the default remains `fixture`.
+The Kubernetes profile exercises the committed edge example with a Docker backend
+listening on the NodePort numbers; it does not validate Kubernetes routing or
+firewall enforcement. CI runs both profiles. `scripts/test-postgres.sh` provisions
+the pinned PostgreSQL 18 image and explicitly executes the ignored real-database persistence,
 history and transport tests. Both gates are required for persistence changes and
 run in CI. An unavailable Docker/database environment is an incomplete gate, not a
 passed or silently skipped check. Ordinary Rust tests and compilation require

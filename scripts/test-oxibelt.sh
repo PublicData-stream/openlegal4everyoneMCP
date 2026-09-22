@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 # Local, opt-in integration. Requires Linux, Cargo, Git, OpenSSL, Python, rootless Docker.
 set -euo pipefail
+profile=fixture
+while (( $# )); do
+    case "$1" in
+        --profile)
+            [[ $# -ge 2 ]] || { echo '--profile requires fixture or kubernetes' >&2; exit 2; }
+            profile=$2
+            shift 2
+            ;;
+        --help|-h)
+            echo 'Usage: scripts/test-oxibelt.sh [--profile fixture|kubernetes]'
+            echo 'The kubernetes profile tests the production OxiBelt example in Docker, not Kubernetes routing.'
+            exit 0
+            ;;
+        *) echo "Unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+case "$profile" in
+    fixture|kubernetes) ;;
+    *) echo "Unknown profile: $profile" >&2; exit 2 ;;
+esac
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 revision=72564d165dfd05cb29a64aeebd19fccd7944ea6f
 scratch=$(mktemp -d)
@@ -113,7 +133,27 @@ tls_mode = "plaintext"
 kind = "filesystem"
 path = "/blobs"
 TOML
-cp deploy/oxibelt/oxibelt.toml "$scratch/fixture/config/"
+if [[ $profile == kubernetes ]]; then
+    # Exercise the committed handoff with disposable identities. The backend
+    # listens on NodePort numbers directly; this does not test Service translation.
+    python3 - "$scratch/fixture" <<'PYPROFILE'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+source = pathlib.Path("deploy/oxibelt/kubernetes-upstream.example.toml").read_text()
+for before, after in (
+    ("replace-with-private-node.invalid", "backend"),
+    ("openlegal4everyone.stream", "edge"),
+    ('["backend-ca.pem"]', '["ca.pem"]'),
+):
+    assert before in source, f"missing handoff substitution: {before}"
+    source = source.replace(before, after)
+(root / "config/oxibelt.toml").write_text(source)
+backend = root / "backend.toml"
+backend.write_text(backend.read_text().replace(":8080", ":30080").replace(":4433", ":30433"))
+PYPROFILE
+else
+    cp deploy/oxibelt/oxibelt.toml "$scratch/fixture/config/"
+fi
 cp deploy/oxibelt/Dockerfile.harness "$scratch/Dockerfile"
 printf '*\n!Dockerfile\n!bin/\n!bin/**\n' > "$scratch/.dockerignore"
 # Synthetic two-day certificates are generated solely for this disposable network.
@@ -125,7 +165,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
     -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
     -subj /CN=OpenLegal-Untrusted-CA -keyout "$scratch/wrong-ca-key.pem" \
     -out "$scratch/fixture/cert/wrong-ca.pem" >/dev/null 2>&1
-for name in edge backend; do
+for name in edge backend wrong-backend; do
     openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
         -subj "/CN=$name" -keyout "$scratch/fixture/cert/$name-key.pem" \
         -out "$scratch/$name.csr" >/dev/null 2>&1
@@ -134,13 +174,24 @@ for name in edge backend; do
         -CAkey "$scratch/ca-key.pem" -CAcreateserial -days 2 \
         -extfile "$scratch/$name.ext" -out "$scratch/fixture/cert/$name.pem" >/dev/null 2>&1
 done
+# Verify the negative fixture isolates identity from trust before using it.
+openssl verify -CAfile "$scratch/fixture/cert/ca.pem" "$scratch/fixture/cert/wrong-backend.pem"
+if openssl verify -CAfile "$scratch/fixture/cert/ca.pem" -verify_hostname backend \
+    "$scratch/fixture/cert/wrong-backend.pem" >"$scratch/wrong-san-verification.log" 2>&1; then
+    echo 'Wrong-SAN fixture unexpectedly identifies backend' >&2
+    exit 1
+fi
 # Container's unprivileged user must read these disposable keys.
 chmod 444 "$scratch/fixture/cert/"*.pem
-python3 - "$scratch/fixture/config/oxibelt.toml" <<'PY'
+python3 - "$scratch/fixture/config/oxibelt.toml" "$scratch/fixture/backend.toml" <<'PY'
 import pathlib, sys
 source = pathlib.Path(sys.argv[1])
 (source.parent / "oxibelt-untrusted.toml").write_text(source.read_text().replace(
     'trusted_ca_certs = ["ca.pem"]', 'trusted_ca_certs = ["wrong-ca.pem"]'))
+backend = pathlib.Path(sys.argv[2])
+(backend.parent / "backend-wrong-san.toml").write_text(backend.read_text().replace(
+    '/cert/backend.pem', '/cert/wrong-backend.pem').replace(
+    '/cert/backend-key.pem', '/cert/wrong-backend-key.pem'))
 PY
 docker build -t "$image" "$scratch"
 docker network create --internal "$network" >/dev/null
@@ -169,10 +220,13 @@ docker run --rm "${hardening[@]}" -e OPENLEGAL_MIGRATION_DATABASE_URL="$database
 # Initializer is root only within the rootless daemon; serving owns a private blob root.
 docker run --rm --network none --user 0:0 --mount "type=volume,source=$blob_volume,target=/blobs" \
     --entrypoint /bin/sh "$image" -c 'chown 65532:65532 /blobs && chmod 700 /blobs'
-docker run -d --name "$backend" --network-alias backend "${hardening[@]}" --memory 1g \
-    --mount "type=volume,source=$blob_volume,target=/blobs" \
-    -e OPENLEGAL_DATABASE_URL="$database_url" "$image" >/dev/null
-docker exec -d "$backend" /usr/local/bin/mock_upstream 127.0.0.1:8081
+start_backend() {
+    docker run -d --name "$backend" --network-alias backend "${hardening[@]}" --memory 1g \
+        --mount "type=volume,source=$blob_volume,target=/blobs" \
+        -e OPENLEGAL_DATABASE_URL="$database_url" "$image" "$1" >/dev/null
+    docker exec -d "$backend" /usr/local/bin/mock_upstream 127.0.0.1:8081
+}
+start_backend /fixture/backend.toml
 start_edge() {
     docker run -d --name "$edge" --network-alias edge "${hardening[@]}" --memory 1g --ulimit stack=67108864:67108864 \
         --entrypoint /usr/local/bin/oxibelt "$image" --config "$1" >/dev/null
@@ -205,4 +259,15 @@ reject_client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
 docker rm -f "$edge" >/dev/null
 start_edge /fixture/config/oxibelt.toml
 client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
-printf '%s\n' 'OxiBelt HTTP and WebTransport integration checks passed.'
+# Restart both endpoints to rule out reuse of an already authenticated QUIC
+# connection, then change only the backend certificate identity (same trusted CA).
+docker rm -f "$edge" "$backend" >/dev/null
+start_backend /fixture/backend-wrong-san.toml
+start_edge /fixture/config/oxibelt.toml
+reject_client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
+# Restore the valid identity and prove both HTTP readiness and QUIC recovery.
+docker rm -f "$edge" "$backend" >/dev/null
+start_backend /fixture/backend.toml
+start_edge /fixture/config/oxibelt.toml
+client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
+printf 'OxiBelt HTTP and WebTransport integration checks passed (profile: %s).\n' "$profile"

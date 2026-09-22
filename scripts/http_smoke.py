@@ -225,6 +225,15 @@ def smoke():
     assert exchange(probe, origin="https://rejected.test")[0] == 403
     assert exchange(probe, path="/mcp-other")[0] == 404
     assert exchange(probe, host="rejected.test")[0] == 404
+    for path in ("/live", "/ready", "/metrics"):
+        connection = http.client.HTTPSConnection("edge", 8443, context=CONTEXT, timeout=10)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            assert response.status == 404, (path, response.status)
+            assert len(response.read(MAX_BODY + 1)) <= MAX_BODY, "response exceeded bound"
+        finally:
+            connection.close()
     untrusted = http.client.HTTPSConnection("edge", 8443, context=ssl.create_default_context(), timeout=10)
     try:
         untrusted.connect()
@@ -234,7 +243,7 @@ def smoke():
         raise AssertionError("untrusted edge certificate accepted")
     finally:
         untrusted.close()
-    print("HTTP: wrong Origin/path/authority and untrusted certificate rejected", flush=True)
+    print("HTTP: wrong Origin/path/authority and untrusted certificate rejected; health/metrics unavailable", flush=True)
 
 
 if __name__ == "__main__":
