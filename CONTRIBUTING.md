@@ -126,7 +126,7 @@ as well. Do not create Rust tests that merely assert policy wording or headings.
 The development baseline is Rust 1.98.1 on Linux GNU, with x86-64-v3 on x86_64 and the
 generic Rust CPU baseline on ARM64. Both transports compile together with no
 optional first-party features. Native CI runs the Rust baseline on both
-`ubuntu-24.04` and `ubuntu-24.04-arm`. The separate document worker remains
+`ubuntu-26.04` and `ubuntu-26.04-arm`. The separate document worker remains
 x86_64-only and also requires x86-64-v3. Production images use Alpine 3.24
 and dynamically linked musl builds with the same CPU baselines; image-local
 linker flags must preserve these architecture flags. Dependency admission covers

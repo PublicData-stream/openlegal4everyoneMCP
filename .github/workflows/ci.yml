@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        runner: [ubuntu-26.04, ubuntu-26.04-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -36,7 +36,7 @@ jobs:
       - run: cargo test --locked -p openlegal-server --example wt_client serving_smoke
       - run: git diff --check
   korean-tokenization:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,7 +49,7 @@ jobs:
       - name: Provision and test the complete Korean dictionary
         run: scripts/test-korean-tokenization.sh
   postgres:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,7 +62,7 @@ jobs:
       - name: Test PostgreSQL 18 persistence and history transports
         run: scripts/test-postgres.sh
   dependencies:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,7 +77,7 @@ jobs:
       - run: cargo audit
       - run: cargo deny check
   oxibelt:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -106,7 +106,7 @@ jobs:
           DEMO_WIDGET_HTML: apps/widget/dist/index.html
           TEXT_DIFF_WIDGET_HTML: apps/widget/dist/text-diff.html
   widget:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,7 +125,7 @@ jobs:
       - run: pnpm --dir apps/widget test:browser
       - run: pnpm --dir apps/widget check:dependencies
   alpine-packages:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -137,7 +137,7 @@ jobs:
         run: scripts/test-alpine-packages.sh
   document-worker:
     needs: alpine-packages
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -154,7 +154,7 @@ jobs:
       - name: Build and validate confined native document processing
         run: scripts/test-document-worker.sh
   kubernetes-serving:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -176,16 +176,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: ubuntu-26.04
             platform: linux/amd64
             target: runtime
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-26.04-arm
             platform: linux/arm64
             target: runtime
-          - runner: ubuntu-24.04
+          - runner: ubuntu-26.04
             platform: linux/amd64
             target: runtime-ingestion
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-26.04-arm
             platform: linux/arm64
             target: runtime-ingestion
     runs-on: ${{ matrix.runner }}

@@ -401,7 +401,7 @@ Dictionary provisioning may download the pinned source archive. Set
 Ordinary tests never contact legal providers. An absent dictionary is an incomplete
 gate, not a skipped success.
 
-The CI image jobs use native `ubuntu-24.04` and `ubuntu-24.04-arm` runners, with no
+The CI image jobs use native `ubuntu-26.04` and `ubuntu-26.04-arm` runners, with no
 publication credentials. Label local ARM emulation and native CI evidence separately.
 Docker acceptance does not establish kubelet ownership behavior, real-cluster
 isolation, live provider or public transport acceptance. Existing PostgreSQL,
