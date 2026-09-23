@@ -44,7 +44,7 @@ jobs:
       - name: Check x86-64-v3 support
         if: runner.arch == 'X64'
         run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
-      - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - name: Provision and test the complete Korean dictionary
         run: scripts/test-korean-tokenization.sh
   postgres:
@@ -89,7 +89,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Check GHCR release event and source invariants
-        run: python3 -m unittest scripts.tests.test_release_image_contract
+        run: python3 -m unittest scripts.tests.test_release_image_contract scripts.tests.test_select_release_ci
   oxibelt:
     permissions:
       contents: read
@@ -230,7 +230,7 @@ jobs:
       - name: Provision pinned deployment validation tools
         run: scripts/setup-deployment-tools.sh
       - name: Install pinned dictionary provisioning toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - name: Provision the complete pinned Korean dictionary
         run: scripts/prepare-korean-dictionary.sh "$RUNNER_TEMP/retained-image-dictionary"
       - name: Build and test production image target and offline controller fixture

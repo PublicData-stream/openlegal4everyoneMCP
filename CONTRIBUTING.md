@@ -306,9 +306,15 @@ privileged publication actions. CI or check-policy changes update this section.
 The [image publication workflow](.github/workflows/publish-images.yml) publishes
 `ghcr.io/publicdata-stream/openlegal-server` and
 `ghcr.io/publicdata-stream/openlegal-server-ingestion` for amd64 and arm64, and
-`ghcr.io/publicdata-stream/openlegal-document-worker` for amd64 only. It runs the
-full CI workflow and publishes only the exact images that passed their native
-image gates. Failures, cancellations or unexpected skips block publication.
+`ghcr.io/publicdata-stream/openlegal-document-worker` for amd64 only. Before
+publishing, it reuses a complete successful `ci.yml` main-push attempt for the
+exact release commit only when that attempt began within 24 hours and every
+expected job passed. Complete reruns qualify; partial reruns, missing or
+ambiguous results, and unavailable or stale API evidence run the full CI
+workflow instead. At lookup time, a newer failed attempt cannot be bypassed
+by an older pass.
+It publishes only the exact images that passed their native image gates.
+Failures, cancellations or unexpected skips block publication.
 Pull-request checks retain read-only permissions; only release jobs receive
 package-write and attestation permissions. Publication does not deploy a workload
 or contact a legal-data provider.

@@ -302,11 +302,13 @@ The [release pipeline](../CONTRIBUTING.md#ghcr-image-publication) publishes
 `X.Y.Z-build.<8-hex-commit-prefix>` tags follow an annotated tag push. There
 are no `latest` or major-version aliases. Each architecture is smoke-tested
 before its tested image is pushed; a final server or ingestion multi-platform
-reference is assembled only after both native gates pass. The workflow runs
-full CI on the committed `0.0.0` Rust placeholder, then stamps the validated
-full tag into each image job's Rust build inputs before locked compilation and
-smoke testing. The tagged source includes the stamping script needed to
-reproduce those build inputs. The workflow attests platform and final digests, and uploads
+reference is assembled only after both native gates pass. The workflow uses
+a complete recent main-push CI attempt for the exact release commit, or runs
+full CI when that evidence is unavailable; both check the committed `0.0.0`
+Rust placeholder. It then stamps the validated full tag into each image job's
+Rust build inputs before locked compilation and smoke testing. The tagged
+source includes the stamping script needed to reproduce those build inputs.
+The workflow attests platform and final digests, and uploads
 `ghcr-release-digests` with exact digest references and the matching public
 corresponding-source URL.
 

@@ -38,17 +38,67 @@ jobs:
           RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
         run: python3 scripts/release_image_contract.py
 
+  discover-ci:
+    name: Find recent complete CI for release revision
+    needs: contract
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      reuse: ${{ steps.lookup.outputs.reuse }}
+      run_id: ${{ steps.lookup.outputs.run_id }}
+      attempt: ${{ steps.lookup.outputs.attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.contract.outputs.revision }}
+          persist-credentials: false
+      - name: Verify recent complete main-push CI
+        id: lookup
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_REVISION: ${{ needs.contract.outputs.revision }}
+        run: python3 scripts/select_release_ci.py
+
   ci:
     name: Validate complete release revision
-    needs: contract
+    needs: [contract, discover-ci]
+    if: needs.discover-ci.outputs.reuse != 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
 
+  ci-gate:
+    name: Require verified or fresh complete CI
+    needs: [contract, discover-ci, ci]
+    if: ${{ !cancelled() && needs.contract.result == 'success' && needs.discover-ci.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require one successful CI path
+        env:
+          REUSE_CI: ${{ needs.discover-ci.outputs.reuse }}
+          REUSED_RUN: ${{ needs.discover-ci.outputs.run_id }}
+          REUSED_ATTEMPT: ${{ needs.discover-ci.outputs.attempt }}
+          FRESH_CI_RESULT: ${{ needs.ci.result }}
+        run: |
+          if [[ "$REUSE_CI" == true ]]; then
+            test "$FRESH_CI_RESULT" = skipped
+            echo "Reused complete CI run $REUSED_RUN attempt $REUSED_ATTEMPT"
+          else
+            test "$REUSE_CI" = false
+            test "$FRESH_CI_RESULT" = success
+            echo 'Fresh complete CI passed'
+          fi
+
   release-platform:
     name: Test and publish ${{ matrix.package }} (${{ matrix.arch }})
-    needs: [contract, ci]
-    if: github.repository == 'PublicData-stream/openlegal4everyoneMCP'
+    needs: [contract, ci-gate]
+    if: ${{ !cancelled() && github.repository == 'PublicData-stream/openlegal4everyoneMCP' && needs.contract.result == 'success' && needs['ci-gate'].result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -95,7 +145,7 @@ jobs:
           RELEASE_REVISION: ${{ needs.contract.outputs.revision }}
         run: test "$(git rev-parse HEAD)" = "$RELEASE_REVISION"
       - name: Provision pinned Rust toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - name: Stamp validated tag into Rust release definitions
         env:
           RELEASE_VERSION: ${{ needs.contract.outputs.version }}
@@ -160,7 +210,7 @@ jobs:
   release-indexes:
     name: Publish and verify version digests
     needs: [contract, release-platform]
-    if: github.repository == 'PublicData-stream/openlegal4everyoneMCP'
+    if: ${{ !cancelled() && github.repository == 'PublicData-stream/openlegal4everyoneMCP' && needs.contract.result == 'success' && needs['release-platform'].result == 'success' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
