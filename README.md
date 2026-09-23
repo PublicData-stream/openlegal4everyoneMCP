@@ -14,7 +14,9 @@ through LAW OPEN DATA, with live acceptance and deployment still separate gates.
 Production server, ingestion and document-worker images use Alpine Linux 3.24
 with native musl builds. Base images are digest-pinned; signed native packages
 follow the v3.24 repositories. See [image build inputs](docs/dependencies.md#production-image-build-inputs)
-for package inventories and the rebuild/rollback boundary.
+for package inventories and the rebuild/rollback boundary, and the
+[Alpine acceptance record](docs/alpine-image-acceptance.md) for executed checks and
+remaining qualification limits.
 
 The Rust server exposes pluggable read-only tools through Streamable HTTP and
 WebTransport, with `server_info` as its initial diagnostic tool. Both transports

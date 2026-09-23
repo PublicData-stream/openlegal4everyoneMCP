@@ -283,7 +283,9 @@ For each release handoff, record revision/image identities, selected configurati
 and storage generations, check commands and outcomes, independent review scope,
 failed/not-run cases and the operator actions still required. Keep a new dated
 operator acceptance record; do not overwrite the historical
-[Phase 9 record](deployment-acceptance.md). Distinguish local Docker, PostgreSQL,
+[Phase 9 record](deployment-acceptance.md). The
+[Alpine migration record](alpine-image-acceptance.md) records the later image and
+disposable-cluster checks, including failed qualification. Distinguish local Docker, PostgreSQL,
 disposable Kubernetes, observed hosted CI and target-production results. Document
 sandbox, provider and platform acceptance separately.
 
