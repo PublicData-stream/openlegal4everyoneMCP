@@ -30,7 +30,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate tag, event, main ancestry and package version
+      - name: Validate tag, event, main ancestry and Rust version placeholder
         id: source
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -94,6 +94,16 @@ jobs:
         env:
           RELEASE_REVISION: ${{ needs.contract.outputs.revision }}
         run: test "$(git rev-parse HEAD)" = "$RELEASE_REVISION"
+      - name: Provision pinned Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Stamp validated tag into Rust release definitions
+        env:
+          RELEASE_VERSION: ${{ needs.contract.outputs.version }}
+        run: |
+          python3 scripts/sync_release_version.py "$RELEASE_VERSION"
+          cargo +1.98.1 metadata --locked --no-deps --format-version 1 >/dev/null
+          cargo +1.98.1 metadata --manifest-path apps/document-worker/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
+          git diff --check
       - name: Check x86-64-v3 support
         if: matrix.arch == 'amd64'
         run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
@@ -109,9 +119,6 @@ jobs:
       - name: Provision deployment validation tools
         if: matrix.target != 'worker'
         run: scripts/setup-deployment-tools.sh
-      - name: Provision pinned Korean dictionary toolchain
-        if: matrix.target != 'worker'
-        run: rustup toolchain install 1.98.1 --profile minimal
       - name: Provision complete Korean dictionary
         if: matrix.target != 'worker'
         run: scripts/prepare-korean-dictionary.sh "$RUNNER_TEMP/retained-image-dictionary"

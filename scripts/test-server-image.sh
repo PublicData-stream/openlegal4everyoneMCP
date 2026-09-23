@@ -241,13 +241,15 @@ docker exec "$server" /bin/sh -ec '
     '
 docker run --rm --name "$client" --platform "$native_platform" --network "$network" \
     --user 10004:10004 "${hardening[@]}" "${fixture[@]}" \
+    --env "EXPECTED_SERVER_VERSION=${release_version:-0.0.0}" \
     --entrypoint node "$node_image" /fixture/server-image-smoke.mjs
 shutdown_started=$SECONDS
 docker stop --signal SIGTERM --timeout 30 "$server" >/dev/null
 (( SECONDS - shutdown_started < 30 )) || { echo 'Server exceeded termination grace' >&2; exit 1; }
 [[ $(docker inspect --format '{{.State.ExitCode}}' "$server") == 0 ]] || { echo 'Server failed graceful SIGTERM exit' >&2; exit 1; }
 [[ $(docker inspect --format '{{.State.OOMKilled}}' "$server") == false ]]
-scripts/test-retained-server-image.sh --image "$image" --platform "$platform"
+OPENLEGAL_EXPECTED_SERVER_VERSION="${release_version:-0.0.0}" \
+    scripts/test-retained-server-image.sh --image "$image" --platform "$platform"
 if [[ $image_target == runtime-ingestion ]]; then
     scripts/test-ingestion-controller-image.sh --image "$image" --platform "$platform"
 fi

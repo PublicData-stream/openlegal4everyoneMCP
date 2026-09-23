@@ -2497,7 +2497,7 @@ checksum = "269bca4c2591a28585d6bf10d9ed0332b7d76900a1b02bec41bdc3a2cdcda107"
 
 [[package]]
 name = "openlegal-adapters"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "axum",
  "csv",
@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "openlegal-application"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "futures",
  "openlegal-domain",
@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "openlegal-domain"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "schemars",
  "serde",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "openlegal-normalization"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "openlegal-domain",
  "serde",
@@ -2563,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "openlegal-server"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "axum",
  "futures",

@@ -1,6 +1,6 @@
 [package]
 name = "openlegal-document-worker"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.98.1"
 license = "AGPL-3.0-only"
@@ -20,7 +20,7 @@ default = ["documents"]
 documents = ["dep:rhwp", "dep:xberg", "dep:xberg-native-pdf", "dep:resvg"]
 
 [dependencies]
-openlegal-application = { path = "../../crates/application", version = "0.1.0" }
+openlegal-application = { path = "../../crates/application", version = "0.0.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

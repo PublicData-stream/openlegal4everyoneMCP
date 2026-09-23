@@ -115,6 +115,7 @@ for (const protocol of [legacy, modern]) {
       protocolVersion: protocol, capabilities: {}, clientInfo: { name: 'image-smoke', version: '1' },
     });
     assert.equal(initialized.protocolVersion, protocol);
+    assert.equal(initialized.serverInfo.version, process.env.EXPECTED_SERVER_VERSION);
     const reply = await exchange('/mcp', {
       jsonrpc: '2.0', method: 'notifications/initialized',
     }, protocol, session);
@@ -134,6 +135,7 @@ for (const protocol of [legacy, modern]) {
     return result.structuredContent;
   }
   const info = await call('server_info', {});
+  assert.equal(info.version, process.env.EXPECTED_SERVER_VERSION);
   assert.equal(info.license, 'AGPL-3.0-only');
   assert.equal(info.sourceUrl, source);
   const diff = await call('text.diff', { before: 'first\nold\n', after: 'first\nnew\n' });

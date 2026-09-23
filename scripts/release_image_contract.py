@@ -8,12 +8,9 @@ import subprocess
 import sys
 import tomllib
 
+from sync_release_version import PLACEHOLDER, TAG, load_documents, validate_documents
 
 REPOSITORY = "PublicData-stream/openlegal4everyoneMCP"
-TAG = re.compile(
-    r"(?P<base>(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))"
-    r"(?:(?P<beta>-beta\.[1-9][0-9]*)|(?P<build>-build\.[0-9a-f]{8}))?\Z"
-)
 
 
 def git(root: Path, *args: str) -> str:
@@ -33,7 +30,7 @@ def validate(root: Path, env: dict[str, str]) -> dict[str, str]:
         raise ValueError("release must run from a tag ref")
     version = ref.removeprefix("refs/tags/")
     match = TAG.fullmatch(version)
-    if match is None:
+    if match is None or version == PLACEHOLDER:
         raise ValueError("release tag has an unsupported format")
     kind = "beta" if match.group("beta") else "build" if match.group("build") else "stable"
     event = env.get("GITHUB_EVENT_NAME")
@@ -63,12 +60,7 @@ def validate(root: Path, env: dict[str, str]) -> dict[str, str]:
     )
     if ancestor.returncode:
         raise ValueError("release commit is not on main")
-    with (root / "Cargo.toml").open("rb") as stream:
-        server_version = tomllib.load(stream)["workspace"]["package"]["version"]
-    with (root / "apps/document-worker/Cargo.toml").open("rb") as stream:
-        worker_version = tomllib.load(stream)["package"]["version"]
-    if match.group("base") != server_version or match.group("base") != worker_version:
-        raise ValueError("release base version differs from Rust package versions")
+    validate_documents(load_documents(root), PLACEHOLDER)
     return {
         "version": version,
         "revision": revision,

@@ -9,9 +9,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-openlegal-domain = { version = "0.1.0", path = "../domain" }
-openlegal-normalization = { version = "0.1.0", path = "../normalization" }
-openlegal-application = { version = "0.1.0", path = "../application" }
+openlegal-domain = { version = "0.0.0", path = "../domain" }
+openlegal-normalization = { version = "0.0.0", path = "../normalization" }
+openlegal-application = { version = "0.0.0", path = "../application" }
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 tokio = { version = "1", features = ["net", "time", "process", "fs", "io-util"] }

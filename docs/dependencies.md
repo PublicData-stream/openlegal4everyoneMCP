@@ -121,8 +121,10 @@ dependency requires renewed relevant review and transport tests, not only a buil
   are preserved without shortening the provider floor; unrepresentable cooldowns
   pause the provider. It already existed transitively. MIT OR Apache-2.0, crates.io.
 
-Workspace path dependencies specify version `0.1.0`; no wildcard-policy exception
-is needed. React, TypeScript, esbuild, the MCP Apps SDK and Playwright use exact npm
+Workspace path dependencies specify the committed `0.0.0` placeholder; the release
+job stamps the validated full tag into their constraints, lockfiles and exact
+first-party license exceptions before building. No wildcard-policy exception is
+needed. React, TypeScript, esbuild, the MCP Apps SDK and Playwright use exact npm
 versions and a committed pnpm lockfile. The [widget admission rationale](../apps/widget/README.md#dependency-admission)
 documents alternatives, licenses, enabled build scripts and boundary implications.
 Only esbuild's installation script is enabled. The production resource bundles

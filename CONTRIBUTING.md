@@ -317,13 +317,19 @@ Protect release tag creation, updates and deletion with an active GitHub tag
 ruleset before first publication. Use annotated tags on main with one of these
 forms: `X.Y.Z` for stable, `X.Y.Z-beta.N` for beta, or
 `X.Y.Z-build.<8-hex-commit-prefix>` for a build candidate. The stable version
-must match both server and document-worker Rust package versions. A published
-GitHub Release for a stable or beta tag starts publication; pushing a build tag
-starts candidate publication. For example, after updating the package versions
-and preparing release notes, an authorized maintainer can run:
+is derived from the tag; committed first-party Rust package versions, path
+dependency constraints, lockfiles and license exceptions use `0.0.0`. The
+release contract verifies this placeholder, then each release image job stamps
+the full tag into those definitions before its locked build and smoke test.
+Ordinary CI checks the committed `0.0.0` source. The commit-specific source
+archive contains the deterministic stamping script; reproduce the release
+source by running `python3 scripts/sync_release_version.py "$version"` from
+that checkout. A published GitHub Release for a stable or beta tag starts
+publication; pushing a build tag starts candidate publication. For example,
+after preparing release notes, an authorized maintainer can run:
 
 ```sh
-version=0.1.0 # replace with the intended matching package version
+version=1.0.0 # replace with the intended release tag
 git tag -a "$version" -m "Release $version"
 git push origin "refs/tags/$version"
 gh release create "$version" --verify-tag --title "$version" --notes-file release-notes.md

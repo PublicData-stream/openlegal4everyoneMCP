@@ -10,10 +10,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-openlegal-domain = { version = "0.1.0", path = "../../crates/domain" }
-openlegal-normalization = { version = "0.1.0", path = "../../crates/normalization" }
-openlegal-application = { version = "0.1.0", path = "../../crates/application" }
-openlegal-adapters = { version = "0.1.0", path = "../../crates/adapters" }
+openlegal-domain = { version = "0.0.0", path = "../../crates/domain" }
+openlegal-normalization = { version = "0.0.0", path = "../../crates/normalization" }
+openlegal-application = { version = "0.0.0", path = "../../crates/application" }
+openlegal-adapters = { version = "0.0.0", path = "../../crates/adapters" }
 axum = "0.8"
 futures = "0.3"
 http = "1"

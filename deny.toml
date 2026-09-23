@@ -22,11 +22,11 @@ exceptions = [
     # Owner: PiQuark6046. Review by 2026-12-19 or on MeCab-Ko/notify changes.
     { crate = "notify@6.1.1", allow = ["CC0-1.0"] },
     { crate = "webpki-roots@1.0.9", allow = ["CDLA-Permissive-2.0"] },
-    { crate = "openlegal-server@0.1.0", allow = ["AGPL-3.0-only"] },
-    { crate = "openlegal-domain@0.1.0", allow = ["AGPL-3.0-only"] },
-    { crate = "openlegal-normalization@0.1.0", allow = ["AGPL-3.0-only"] },
-    { crate = "openlegal-application@0.1.0", allow = ["AGPL-3.0-only"] },
-    { crate = "openlegal-adapters@0.1.0", allow = ["AGPL-3.0-only"] },
+    { crate = "openlegal-server@0.0.0", allow = ["AGPL-3.0-only"] },
+    { crate = "openlegal-domain@0.0.0", allow = ["AGPL-3.0-only"] },
+    { crate = "openlegal-normalization@0.0.0", allow = ["AGPL-3.0-only"] },
+    { crate = "openlegal-application@0.0.0", allow = ["AGPL-3.0-only"] },
+    { crate = "openlegal-adapters@0.0.0", allow = ["AGPL-3.0-only"] },
 ]
 
 [bans]

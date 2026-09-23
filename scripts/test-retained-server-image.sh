@@ -301,7 +301,9 @@ acceptance_cycle() {
     local cycle=$1
     start_server --env-file "$scratch/runtime.env"
     docker run --rm --name "$client" --platform "$native_platform" --network "$network" \
-        --user 10004:10004 "${hardening[@]}" "${fixture_ro[@]}" --entrypoint node "$node_image" /fixture/server-image-smoke.mjs
+        --user 10004:10004 "${hardening[@]}" "${fixture_ro[@]}" \
+        --env "EXPECTED_SERVER_VERSION=${OPENLEGAL_EXPECTED_SERVER_VERSION:-0.0.0}" \
+        --entrypoint node "$node_image" /fixture/server-image-smoke.mjs
     docker exec "$server" sh -ec '
         test "$(id -u):$(id -g)" = 10004:10004
         test -z "${OPENLEGAL_MIGRATION_DATABASE_URL+x}"
