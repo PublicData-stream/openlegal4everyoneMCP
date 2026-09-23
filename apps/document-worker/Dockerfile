@@ -80,3 +80,10 @@ ENTRYPOINT ["/usr/local/bin/document-format-tests"]
 CMD ["--ignored", "--test-threads=1"]
 
 FROM runtime AS worker
+ARG REVISION=unknown
+ARG VERSION=development
+LABEL org.opencontainers.image.source="https://github.com/PublicData-stream/openlegal4everyoneMCP" \
+    org.opencontainers.image.revision="$REVISION" \
+    org.opencontainers.image.version="$VERSION" \
+    org.opencontainers.image.licenses="AGPL-3.0-only" \
+    org.openlegal.cpu-baseline="x86-64-v3"

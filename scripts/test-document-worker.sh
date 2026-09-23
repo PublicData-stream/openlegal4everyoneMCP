@@ -4,7 +4,21 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 image="openlegal-document-fixture-tests:local"
 production_image="openlegal-document-worker:local"
+release_version=
+while (( $# )); do
+  case "$1" in
+    --output-image) [[ $# -ge 2 ]] || exit 2; production_image=$2; shift 2 ;;
+    --version) [[ $# -ge 2 ]] || exit 2; release_version=$2; shift 2 ;;
+    *) echo "Usage: $0 [--output-image IMAGE --version VERSION]" >&2; exit 2 ;;
+  esac
+done
+if [[ -n $release_version || $production_image != openlegal-document-worker:local ]]; then
+  [[ -n $release_version && $production_image =~ ^ghcr\.io/publicdata-stream/openlegal-document-worker:[a-zA-Z0-9_.-]+$ ]] || { echo 'Invalid release image arguments' >&2; exit 2; }
+  [[ $release_version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+|-build\.[0-9a-f]{8})?$ ]] || { echo 'Invalid release version' >&2; exit 2; }
+  [[ $production_image == "ghcr.io/publicdata-stream/openlegal-document-worker:$release_version-amd64" ]] || { echo 'Output image does not match version and architecture' >&2; exit 2; }
+fi
 admission_refresh=$(date -u +%Y%m%dT%H%M%SZ)
+revision=$(git rev-parse HEAD)
 container="openlegal-document-smoke-$$"
 trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
 trap 'exit 130' INT
@@ -52,9 +66,22 @@ docker run --pull never --rm --network none --read-only --cap-drop ALL \
   --tmpfs /scratch:rw,size=2g,uid=65532,gid=65532 \
   "$image"
 # Build the shipped target from the same admitted layers; never ship the test binary.
-docker build --platform linux/amd64 --target worker \
+# Keep the release architecture tag as a single manifest for registry verification.
+docker build --provenance=false --platform linux/amd64 --target worker \
   --build-arg "ADMISSION_REFRESH=$admission_refresh" \
+  --build-arg "REVISION=$revision" --build-arg "VERSION=${release_version:-development}" \
   -f apps/document-worker/Dockerfile -t "$production_image" .
+for label in org.opencontainers.image.source org.opencontainers.image.revision org.opencontainers.image.version org.opencontainers.image.licenses org.openlegal.cpu-baseline; do
+  actual=$(docker image inspect --format "{{index .Config.Labels \"$label\"}}" "$production_image")
+  case "$label" in
+    org.opencontainers.image.source) expected=https://github.com/PublicData-stream/openlegal4everyoneMCP ;;
+    org.opencontainers.image.revision) expected=$revision ;;
+    org.opencontainers.image.version) expected=${release_version:-development} ;;
+    org.opencontainers.image.licenses) expected=AGPL-3.0-only ;;
+    org.openlegal.cpu-baseline) expected=x86-64-v3 ;;
+  esac
+  [[ $actual == "$expected" ]] || { echo "Worker image label $label was $actual, expected $expected" >&2; exit 1; }
+done
 docker run --pull never -d --name "$container" --network none --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   --security-opt "seccomp=$PWD/deploy/document-sandbox/seccomp.json" \

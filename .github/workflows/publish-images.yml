@@ -1,0 +1,232 @@
+name: Publish GHCR release images
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - '*.*.*-build.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ghcr-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  contract:
+    name: Validate immutable release source
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+      revision: ${{ steps.source.outputs.revision }}
+      kind: ${{ steps.source.outputs.kind }}
+      source_url: ${{ steps.source.outputs.source_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag, event, main ancestry and package version
+        id: source
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: python3 scripts/release_image_contract.py
+
+  ci:
+    name: Validate complete release revision
+    needs: contract
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  release-platform:
+    name: Test and publish ${{ matrix.package }} (${{ matrix.arch }})
+    needs: [contract, ci]
+    if: github.repository == 'PublicData-stream/openlegal4everyoneMCP'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: openlegal-server
+            target: runtime
+            runner: ubuntu-26.04
+            platform: linux/amd64
+            arch: amd64
+          - package: openlegal-server
+            target: runtime
+            runner: ubuntu-26.04-arm
+            platform: linux/arm64
+            arch: arm64
+          - package: openlegal-server-ingestion
+            target: runtime-ingestion
+            runner: ubuntu-26.04
+            platform: linux/amd64
+            arch: amd64
+          - package: openlegal-server-ingestion
+            target: runtime-ingestion
+            runner: ubuntu-26.04-arm
+            platform: linux/arm64
+            arch: arm64
+          - package: openlegal-document-worker
+            target: worker
+            runner: ubuntu-26.04
+            platform: linux/amd64
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.contract.outputs.revision }}
+          persist-credentials: false
+      - name: Confirm checked-out release commit
+        env:
+          RELEASE_REVISION: ${{ needs.contract.outputs.revision }}
+        run: test "$(git rev-parse HEAD)" = "$RELEASE_REVISION"
+      - name: Check x86-64-v3 support
+        if: matrix.arch == 'amd64'
+        run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
+      - name: Reserve worker build space
+        if: matrix.target == 'worker'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+          available_kib=$(df -Pk / | awk 'NR == 2 {print $4}')
+          test "$available_kib" -ge 20971520
+      - name: Install Python virtual environment support
+        if: matrix.target != 'worker'
+        run: sudo apt-get update && sudo apt-get install -y python3-venv
+      - name: Provision deployment validation tools
+        if: matrix.target != 'worker'
+        run: scripts/setup-deployment-tools.sh
+      - name: Provision pinned Korean dictionary toolchain
+        if: matrix.target != 'worker'
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Provision complete Korean dictionary
+        if: matrix.target != 'worker'
+        run: scripts/prepare-korean-dictionary.sh "$RUNNER_TEMP/retained-image-dictionary"
+      - name: Build and smoke-test exact release image
+        env:
+          RELEASE_VERSION: ${{ needs.contract.outputs.version }}
+          OPENLEGAL_TEST_MECAB_DICTIONARY: ${{ runner.temp }}/retained-image-dictionary
+          IMAGE_PACKAGE: ${{ matrix.package }}
+          IMAGE_TARGET: ${{ matrix.target }}
+          IMAGE_PLATFORM: ${{ matrix.platform }}
+          IMAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          image="ghcr.io/publicdata-stream/$IMAGE_PACKAGE:$RELEASE_VERSION-$IMAGE_ARCH"
+          if [[ "$IMAGE_TARGET" == worker ]]; then
+            scripts/test-document-worker.sh --output-image "$image" --version "$RELEASE_VERSION"
+          else
+            scripts/test-server-image.sh --platform "$IMAGE_PLATFORM" --target "$IMAGE_TARGET" \
+              --output-image "$image" --version "$RELEASE_VERSION"
+          fi
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.37.1
+      - name: Push exact tested architecture image
+        id: push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ needs.contract.outputs.version }}
+          RELEASE_REVISION: ${{ needs.contract.outputs.revision }}
+          IMAGE_PACKAGE: ${{ matrix.package }}
+          IMAGE_ARCH: ${{ matrix.arch }}
+        run: scripts/publish_ghcr_images.sh push-platform "$IMAGE_PACKAGE" "$IMAGE_ARCH"
+      - name: Attest architecture image provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/publicdata-stream/${{ matrix.package }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  release-indexes:
+    name: Publish and verify version digests
+    needs: [contract, release-platform]
+    if: github.repository == 'PublicData-stream/openlegal4everyoneMCP'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.contract.outputs.revision }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.37.1
+      - name: Assemble immutable release references and record digests
+        id: images
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ needs.contract.outputs.version }}
+          RELEASE_REVISION: ${{ needs.contract.outputs.revision }}
+          RELEASE_KIND: ${{ needs.contract.outputs.kind }}
+          RELEASE_SOURCE_URL: ${{ needs.contract.outputs.source_url }}
+          RELEASE_DIGESTS_FILE: ${{ runner.temp }}/ghcr-release-digests.json
+        run: scripts/publish_ghcr_images.sh assemble
+      - name: Attest server index provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/publicdata-stream/openlegal-server
+          subject-digest: ${{ steps.images.outputs.server_digest }}
+          push-to-registry: true
+      - name: Attest ingestion index provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/publicdata-stream/openlegal-server-ingestion
+          subject-digest: ${{ steps.images.outputs.ingestion_digest }}
+          push-to-registry: true
+      - name: Attest document worker provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/publicdata-stream/openlegal-document-worker
+          subject-digest: ${{ steps.images.outputs.worker_digest }}
+          push-to-registry: true
+      - name: Verify registry provenance and anonymous public pulls
+        env:
+          RELEASE_VERSION: ${{ needs.contract.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_DIGESTS_FILE: ${{ runner.temp }}/ghcr-release-digests.json
+        run: |
+          anonymous_config=$(mktemp -d)
+          trap 'rm -rf -- "$anonymous_config"' EXIT
+          for image in openlegal-server openlegal-server-ingestion openlegal-document-worker; do
+            ref="ghcr.io/publicdata-stream/$image:$RELEASE_VERSION"
+            for attempt in 1 2 3; do
+              if gh attestation verify "oci://$ref" --repo PublicData-stream/openlegal4everyoneMCP; then break; fi
+              [[ $attempt != 3 ]] || exit 1
+              sleep 5
+            done
+            DOCKER_CONFIG="$anonymous_config" docker buildx imagetools inspect "$ref" >/dev/null
+          done
+          platform_refs=$(jq -er '[.images[] | .name as $name | .platforms[] | "\($name)@\(.)"] | if length == 5 then .[] else error("expected five platform digests") end' "$RELEASE_DIGESTS_FILE")
+          while IFS= read -r ref; do
+            for attempt in 1 2 3; do
+              if gh attestation verify "oci://$ref" --repo PublicData-stream/openlegal4everyoneMCP; then break; fi
+              [[ $attempt != 3 ]] || exit 1
+              sleep 5
+            done
+            DOCKER_CONFIG="$anonymous_config" docker buildx imagetools inspect "$ref" >/dev/null
+          done <<<"$platform_refs"
+      - name: Upload accepted immutable digest record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghcr-release-digests
+          path: ${{ runner.temp }}/ghcr-release-digests.json
+          if-no-files-found: error
+          overwrite: true

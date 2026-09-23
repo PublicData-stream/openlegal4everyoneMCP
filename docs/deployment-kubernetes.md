@@ -94,7 +94,7 @@ the operator supplies and qualifies each target deployment.
 
 | Repository templates and contracts | Operator-supplied deployment values and actions |
 | --- | --- |
-| Image build, immutable image references, widget locations and source-offer field | Published image digests and a public corresponding-source URL for the exact running server/widget |
+| GHCR image publication, immutable image references, widget locations and source-offer field | Selected published image digests and a public corresponding-source URL for the exact running server/widget |
 | Serving namespace, one replica, Recreate, security settings and probe definitions | Target cluster/runtime, measured resource sizing and real-cluster acceptance |
 | Fixed TCP 30080 / UDP 30433 NodePorts and OxiBelt handoff example | NodePort availability, private node DNS, backend authorities, allowed origins, firewall rules and host Compose/certificate configuration |
 | Namespace-wide default deny and independently selected allow templates | Enforcing CNI, exact edge/database/DNS/monitoring peers, firewall controls and network acceptance |
@@ -127,11 +127,12 @@ production configuration.
 | Edge and network | Actual edge path, backend DNS/authorities, allowed Origin, firewall restrictions and selected database/DNS/monitoring policies; follow [NodePort handoff](oxibelt.md#kubernetes-nodeport-handoff) |
 | Maintenance and evidence | Named operator, maintenance window, prior compatible release artifacts, private recovery location, and per-gate acceptance outcomes |
 
-Use a registry from which the workload can pull the published digest. Registry
-publication and any required pull credentials belong to the operator; the
-repository does not provision them. Replace the complete non-pullable image
-sentinel in serving and each selected administrative Job. The optional ingestion
-image differs from the minimal administrative image; follow its dedicated procedure.
+Use a registry from which the workload can pull the published digest. The GHCR
+release pipeline publishes the supported images; any alternate registry and
+required pull credentials belong to the operator. Replace the complete
+non-pullable image sentinel in serving and each selected administrative Job.
+The optional ingestion image differs from the minimal administrative image;
+follow its dedicated procedure.
 
 All cluster commands below operate on deliberately tailored copies. Set an explicit
 context in the shell used for each procedure; no ambient context is assumed:
@@ -146,7 +147,7 @@ values, raw workload dumps and private host details out of shared evidence.
 
 ## First deployment
 
-1. Build and separately publish the intended [immutable image](#production-server-image).
+1. Select the intended [published immutable image](#ghcr-release-images).
    Verify its platforms and matching source offer. Prepare the release directory,
    node and PostgreSQL roles before applying workloads.
 2. Establish the [NodePort firewall restrictions](#service-and-private-network-handoff).
@@ -291,6 +292,40 @@ sandbox, provider and platform acceptance separately.
 
 ## Production server image
 
+### GHCR release images
+
+The [release pipeline](../CONTRIBUTING.md#ghcr-image-publication) publishes
+`ghcr.io/publicdata-stream/openlegal-server` and
+`ghcr.io/publicdata-stream/openlegal-server-ingestion` for amd64 and arm64, and
+`ghcr.io/publicdata-stream/openlegal-document-worker` for amd64 only. Stable
+`X.Y.Z` and beta `X.Y.Z-beta.N` tags follow publication of a GitHub Release;
+`X.Y.Z-build.<8-hex-commit-prefix>` tags follow an annotated tag push. There
+are no `latest` or major-version aliases. Each architecture is smoke-tested
+before its tested image is pushed; a final server or ingestion multi-platform
+reference is assembled only after both native gates pass. The workflow runs
+full CI before publication, attests platform and final digests, and uploads
+`ghcr-release-digests` with exact digest references and the matching public
+corresponding-source URL.
+
+Use the digest from that release artifact and verify the registry manifest before
+replacing the non-pullable image sentinel in an operator copy. For example:
+
+```text
+ghcr.io/publicdata-stream/openlegal-server@sha256:<published-manifest-digest>
+ghcr.io/publicdata-stream/openlegal-server-ingestion@sha256:<published-manifest-digest>
+ghcr.io/publicdata-stream/openlegal-document-worker@sha256:<published-image-digest>
+```
+
+The worker has no arm64 image. Qualify amd64 nodes for x86-64-v3 before running
+server or worker there; the manifest's amd64 label alone does not prove CPU
+compatibility. Before the first public release is accepted, a package admin must
+make all three GHCR packages public and verify anonymous pulls for each supported
+platform. Keep Kubernetes templates as digest placeholders until the operator
+selects an accepted release. GHCR publication does not deploy, qualify a target
+cluster, enable ingestion, or authorize live provider traffic.
+
+### Local image builds
+
 Build from the repository root with Docker BuildKit. The production platforms are
 Alpine 3.24 Linux musl x86_64 with **x86-64-v3 required**, and generic AArch64. An amd64 manifest
 does not itself communicate the stronger CPU requirement: check deployment nodes
@@ -327,7 +362,7 @@ baseline. Defaults are `unknown` revision and `development` version; set truthfu
 values when producing an operator artifact. Build from a clean committed tree
 before identifying an image as that revision. Local tags above are disposable
 build handles; deployments must use the digest of the published immutable image.
-Publishing an image remains a separate operator action.
+Custom-registry publication remains a separate operator action.
 
 The image runs `/usr/local/bin/openlegal-server` directly as `10004:10004` and
 defaults to `/etc/openlegal/server.toml`. Supply that file and WebTransport TLS
@@ -401,8 +436,9 @@ Dictionary provisioning may download the pinned source archive. Set
 Ordinary tests never contact legal providers. An absent dictionary is an incomplete
 gate, not a skipped success.
 
-The CI image jobs use native `ubuntu-26.04` and `ubuntu-26.04-arm` runners, with no
-publication credentials. Label local ARM emulation and native CI evidence separately.
+The ordinary CI image jobs use native `ubuntu-26.04` and `ubuntu-26.04-arm` runners
+with read-only permissions. The separate release jobs publish the same images
+after full CI succeeds. Label local ARM emulation and native CI evidence separately.
 Docker acceptance does not establish kubelet ownership behavior, real-cluster
 isolation, live provider or public transport acceptance. Existing PostgreSQL,
 Korean analyzer, OxiBelt and document-worker gates remain separate. Record actual
@@ -422,7 +458,7 @@ retention maintenance. The former text-only configuration is now a
 
 ### Operator prerequisites
 
-- Publish the matching server image separately. Replace the entire
+- Select the matching [published server digest](#ghcr-release-images). Replace the entire
   `registry.example/openlegal-server@sha256:000...000` reference with its real
   registry and immutable SHA-256 digest. The all-zero digest is an intentionally
   non-pullable sentinel; a validated reference does not prove an image exists.
@@ -1156,7 +1192,9 @@ support does not imply ARM64 document-worker support.
 The overlay replaces the generated server ConfigMap with retained configuration
 plus `[database.ingestion]`. Its fixed context is `openlegal-document-controller`,
 its namespace is `openlegal-documents`, and history-body ingestion remains disabled.
-Replace both non-pullable server/worker digest sentinels and the corresponding-source
+Replace both non-pullable server/worker digest sentinels with the accepted
+`openlegal-server-ingestion` and `openlegal-document-worker` digests from the
+[release artifact](#ghcr-release-images), and set the corresponding-source
 revision in an operator copy. Keep all retained configuration fields consistent
 with the shared serving/admin base when changing endpoints or storage.
 Administrative Jobs keep their original minimal image and ingestion-free ConfigMap;

@@ -14,22 +14,40 @@ case $(docker info --format '{{.Architecture}}') in
 esac
 platform=$native_platform
 image_target=runtime
+output_image=
+release_version=
 while (( $# )); do
     case "$1" in
         --platform) [[ $# -ge 2 ]] || exit 2; platform=$2; shift 2 ;;
         --target) [[ $# -ge 2 ]] || exit 2; image_target=$2; shift 2 ;;
-        *) echo "Usage: $0 [--platform linux/amd64|linux/arm64] [--target runtime|runtime-ingestion]" >&2; exit 2 ;;
+        --output-image) [[ $# -ge 2 ]] || exit 2; output_image=$2; shift 2 ;;
+        --version) [[ $# -ge 2 ]] || exit 2; release_version=$2; shift 2 ;;
+        *) echo "Usage: $0 [--platform linux/amd64|linux/arm64] [--target runtime|runtime-ingestion] [--output-image IMAGE --version VERSION]" >&2; exit 2 ;;
     esac
 done
 case "$image_target" in runtime|runtime-ingestion) ;; *) echo 'Invalid image target' >&2; exit 2 ;; esac
+if [[ -n $output_image || -n $release_version ]]; then
+    [[ -n $output_image && -n $release_version ]] || { echo 'Output image and version must be supplied together' >&2; exit 2; }
+    [[ $output_image =~ ^ghcr\.io/publicdata-stream/openlegal-server(-ingestion)?:[a-zA-Z0-9_.-]+$ ]] || { echo 'Invalid release image name' >&2; exit 2; }
+    [[ $release_version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+|-build\.[0-9a-f]{8})?$ ]] || { echo 'Invalid release version' >&2; exit 2; }
+fi
 case $platform in
     linux/amd64) cpu_baseline=x86-64-v3 ;;
     linux/arm64) cpu_baseline=generic-arm64 ;;
     *) echo 'Platform must be linux/amd64 or linux/arm64' >&2; exit 2 ;;
 esac
+if [[ -n $output_image ]]; then
+    arch=${platform#linux/}
+    case "$image_target:$output_image" in
+        "runtime:ghcr.io/publicdata-stream/openlegal-server:$release_version-$arch"|\
+        "runtime-ingestion:ghcr.io/publicdata-stream/openlegal-server-ingestion:$release_version-$arch") ;;
+        *) echo 'Output image does not match target, version and architecture' >&2; exit 2 ;;
+    esac
+fi
 scratch=$(mktemp -d)
 run_id="openlegal-image-$(basename "$scratch" | tr '[:upper:]' '[:lower:]')-$$"
 image="$run_id:local"
+if [[ -n $output_image ]]; then image=$output_image; fi
 network="$run_id"
 fixture_volume="$run_id-fixture"
 server="$run_id-server"
@@ -48,7 +66,9 @@ cleanup() {
     docker rm -fv "$server" "$client" "$initializer" "$probe" "$invalid" >/dev/null 2>&1 || true
     docker network rm "$network" >/dev/null 2>&1 || true
     docker volume rm "$fixture_volume" >/dev/null 2>&1 || true
-    docker image rm "$image" >/dev/null 2>&1 || true
+    if (( status != 0 )) || [[ -z $output_image ]]; then
+        docker image rm "$image" >/dev/null 2>&1 || true
+    fi
     rm -rf -- "$scratch"
     exit "$status"
 }
@@ -73,7 +93,9 @@ config = tomllib.loads((fixture / "config/server.toml").read_text())
 PYTHON
 revision=$(git rev-parse HEAD)
 version="image-smoke-${revision:0:12}"
-docker build --platform "$platform" --file apps/server/Dockerfile \
+if [[ -n $release_version ]]; then version=$release_version; fi
+# Keep architecture tags as single manifests; the release workflow attests pushed digests.
+docker build --provenance=false --platform "$platform" --file apps/server/Dockerfile \
     --target "$image_target" \
     --build-arg "REVISION=$revision" --build-arg "VERSION=$version" --tag "$image" .
 # Pull while network access is available; execution below is isolated.

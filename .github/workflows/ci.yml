@@ -2,8 +2,10 @@ name: Rust and transport checks
 
 on:
   push:
+    branches: ['**']
   pull_request:
   workflow_dispatch:
+  workflow_call:
   schedule:
     - cron: '23 4 * * 1'
 
@@ -77,6 +79,17 @@ jobs:
       - run: cargo install cargo-deny --version 0.20.2 --locked
       - run: cargo audit
       - run: cargo deny check
+  release-contract:
+    permissions:
+      contents: read
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check GHCR release event and source invariants
+        run: python3 -m unittest scripts.tests.test_release_image_contract
   oxibelt:
     permissions:
       contents: read
@@ -224,3 +237,27 @@ jobs:
         run: scripts/test-server-image.sh --platform '${{ matrix.platform }}' --target '${{ matrix.target }}'
         env:
           OPENLEGAL_TEST_MECAB_DICTIONARY: ${{ runner.temp }}/retained-image-dictionary
+  ci-summary:
+    permissions:
+      contents: read
+    if: always()
+    needs:
+      - rust
+      - korean-tokenization
+      - postgres
+      - dependencies
+      - release-contract
+      - oxibelt
+      - widget
+      - alpine-packages
+      - document-worker
+      - kubernetes-serving
+      - server-image
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation job to pass
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          jq -e 'all(.[]; .result == "success")' <<<"$NEEDS_JSON"

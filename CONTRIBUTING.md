@@ -301,6 +301,54 @@ skips must not be reported as successful validation. Make checks reproducible fr
 a clean checkout and keep untrusted PR jobs free of production credentials and
 privileged publication actions. CI or check-policy changes update this section.
 
+### GHCR image publication
+
+The [image publication workflow](.github/workflows/publish-images.yml) publishes
+`ghcr.io/publicdata-stream/openlegal-server` and
+`ghcr.io/publicdata-stream/openlegal-server-ingestion` for amd64 and arm64, and
+`ghcr.io/publicdata-stream/openlegal-document-worker` for amd64 only. It runs the
+full CI workflow and publishes only the exact images that passed their native
+image gates. Failures, cancellations or unexpected skips block publication.
+Pull-request checks retain read-only permissions; only release jobs receive
+package-write and attestation permissions. Publication does not deploy a workload
+or contact a legal-data provider.
+
+Protect release tag creation, updates and deletion with an active GitHub tag
+ruleset before first publication. Use annotated tags on main with one of these
+forms: `X.Y.Z` for stable, `X.Y.Z-beta.N` for beta, or
+`X.Y.Z-build.<8-hex-commit-prefix>` for a build candidate. The stable version
+must match both server and document-worker Rust package versions. A published
+GitHub Release for a stable or beta tag starts publication; pushing a build tag
+starts candidate publication. For example, after updating the package versions
+and preparing release notes, an authorized maintainer can run:
+
+```sh
+version=0.1.0 # replace with the intended matching package version
+git tag -a "$version" -m "Release $version"
+git push origin "refs/tags/$version"
+gh release create "$version" --verify-tag --title "$version" --notes-file release-notes.md
+```
+
+For a beta, use a `-beta.N` tag and add `--prerelease` to `gh release create`.
+For a build candidate, append `-build.$(git rev-parse HEAD | cut -c1-8)` to
+the base version, then create and push that annotated tag without creating a
+GitHub Release. Tag and GitHub writes require the maintainer's authorized
+account; routine PR validation cannot publish.
+
+Version and version-architecture tags are immutable; there is no `latest` or
+major-version alias. If a failed run already pushed an architecture tag, it
+cannot rebuild and replace that tag; prepare a new release version after fixing
+the failure. The workflow attests platform and final digests, verifies
+registry readback, and uploads `ghcr-release-digests` with digest references and
+the commit-specific public corresponding-source URL. Deploy by a recorded digest,
+not a version tag. Before calling the first publication complete, a package admin
+must make all three GHCR packages public and verify anonymous pulls of every
+published platform. New GHCR packages may start private: if the first run reaches
+the anonymous-pull gate and fails, make the three packages public, then rerun only
+the failed `release-indexes` job. Do not rerun successful architecture jobs,
+because their tags cannot be replaced. The [deployment guide](docs/deployment-kubernetes.md#ghcr-release-images)
+keeps cluster qualification and rollout as separate operator actions.
+
 ### React MCP Apps widget
 
 Node 24.21.0 and pnpm 12.3.4 are the frontend baseline. For widget changes, run:

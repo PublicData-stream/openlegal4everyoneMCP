@@ -96,6 +96,20 @@ Neither source content nor extracted content is sent to container logs.
 
 ## Image and dependency admission
 
+The release pipeline publishes the amd64-only worker at
+`ghcr.io/publicdata-stream/openlegal-document-worker`. Stable `X.Y.Z` and beta
+`X.Y.Z-beta.N` versions follow a published GitHub Release; build candidates use
+`X.Y.Z-build.<8-hex-commit-prefix>` annotated tags. It publishes the image that
+passed the native smoke gate and records its digest and provenance in the
+`ghcr-release-digests` artifact. There is no `latest` or major-version alias.
+Use the accepted `ghcr.io/publicdata-stream/openlegal-document-worker@sha256:<digest>`
+reference for `DOCUMENT_IMAGE` and the ingestion overlay; the worker requires an
+amd64 node with x86-64-v3 support. The first public release also requires package
+visibility and anonymous-pull verification. Publication alone does not qualify
+the worker's real-cluster sandbox or authorize provider traffic; follow the
+[release image procedure](deployment-kubernetes.md#ghcr-release-images) and the
+cluster gate below.
+
 Build from the repository root:
 
 ```sh

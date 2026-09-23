@@ -35,6 +35,11 @@ The LAW OPEN DATA adapter and disposable document worker have offline fixtures;
 live provider acceptance, hardened document-worker cluster acceptance and user accounts remain pending. Local browser tests use a simulated
 host; the product domain does not imply deployment or verified live ChatGPT access.
 
+A [GHCR release pipeline](CONTRIBUTING.md#ghcr-image-publication) publishes
+versioned server and ingestion images for amd64 and arm64, plus an amd64 document
+worker, after full CI and image acceptance. Deployments still select recorded
+digests and require separate [operator qualification](docs/deployment-kubernetes.md#ghcr-release-images).
+
 A standalone [search-query processor](docs/search-query.md) parses Boolean
 expressions, field scopes, exact phrases, word groups, and prefixes. The corpus search evaluator combines Lindera and MeCab-Ko Korean morphology with
 exact quoted substrings;
@@ -74,6 +79,7 @@ backend-only upgrades remain unaccepted.
 - [Architecture](docs/architecture.md): server, legal-data and document-processing responsibilities.
 - [Server contract](docs/server.md): configuration, extension API and transport behavior.
 - [Kubernetes operator runbook](docs/deployment-kubernetes.md): topology, prerequisites, first deployment, upgrades, storage and index administration, rollback, optional ingestion and operator handoff.
+- [GHCR image releases](CONTRIBUTING.md#ghcr-image-publication): tag and release commands, publication gates, and first-publication checks.
 - [Serving acceptance](docs/deployment-kubernetes.md#phase-9-serving-acceptance): bounded explicit-endpoint smoke, a disposable Kubernetes fixture, and [executed evidence and remaining limits](docs/deployment-acceptance.md).
 - [Dependencies](docs/dependencies.md): admission rationale and check tooling.
 - [Retrieval framework](docs/retrieval.md): processors, caching, evidence and resource limits.
