@@ -21,7 +21,7 @@ production traffic or upgrades; backend readiness alone cannot clear it.
 | Repository and Docker checks | Implemented gates and recorded local outcomes; configured CI jobs do not establish observed hosted CI success |
 | Disposable Kubernetes serving acceptance | The recorded single-node synthetic topology only; see each passed, failed and unexecuted case in the execution record |
 | Production ZFS, firewall and routing | Operator qualification pending; disposable ext4 paths and node firewall rules do not qualify production infrastructure |
-| Document sandbox and live provider | Same-host `runc` synthetic sandbox gate passed on 2026-09-26; independent security review and live-provider acceptance remain pending; default serving enables neither |
+| Document sandbox and live provider | Same-host `runc` synthetic sandbox and independent security review completed on 2026-09-26; shared-kernel residual risk and live-provider acceptance remain; default serving enables neither |
 | Production traffic, browser WebTransport and ChatGPT | Not established by native clients or fixture results |
 
 The [architecture](architecture.md), [server contract](server.md),

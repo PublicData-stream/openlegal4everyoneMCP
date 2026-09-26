@@ -299,7 +299,10 @@ framing, empty logs, memory exhaustion, deadline and cleanup all passed.
 
 The worker-ready node label was removed after the test; no worker Pod remains.
 This establishes the listed controls for a disposable synthetic Pod, not
-independent review of the shared-kernel architecture or live-provider parsing.
+live-provider parsing. Independent security review found no confirmed Pod isolation
+bypass and identified the shared-kernel escape impact and resource-pressure risks;
+the selected same-host design accepts that kernel boundary, subject to the
+resource and policy checks below.
 The CNI deny-all egress check separately used identical short-lived BusyBox Pods:
 TCP connection to the Kubernetes API Service succeeded from the default namespace
 and failed from `openlegal-documents`. Both probe Pods were deleted afterward.

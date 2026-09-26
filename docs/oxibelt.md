@@ -192,23 +192,36 @@ rollout when replacing certificates, allowing for `Recreate` downtime and
 preserving current trust.
 
 Private node DNS is the primary path. When OxiBelt and Kubernetes share a physical
-host, an operator may instead use a stable hostname explicitly mapped to the host
+host, an operator may instead use a stable hostname explicitly mapped to a verified
 gateway in Compose, for example:
 
 ```yaml
 services:
   oxibelt:
     extra_hosts:
-      - "openlegal-node.internal:host-gateway"
+      - "openlegal-node.internal:REPLACE_WITH_VERIFIED_GATEWAY"
 ```
 
 This is a fragment for the operator's existing service, not a complete Compose
 file. Use `openlegal-node.internal` consistently as `NODE_DNS` in the table above
-and issue the matching backend certificate. Do not hard-code a Docker bridge IP.
-Verify what `host-gateway` resolves to in the selected daemon/network setup and
-whether both NodePorts are reachable from the actual OxiBelt container; a rootless
-daemon does not by itself establish that route. See
+and issue the matching backend certificate. A fixed gateway address is acceptable
+only in the operator copy when Compose pins the bridge subnet and gateway, the
+NodePort proxy binds that gateway, and the firewall admits only the intended edge
+container. Verify the actual address and reachability from that container after
+network recreation. On the selected same-host deployment, Docker's `host-gateway`
+resolved to the default bridge rather than the pinned service-network gateway;
+that mismatch produced public HTTP 502 until the mapping was corrected. Keep the
+shared OxiBelt network available for future service-specific routes. A rootless
+daemon does not by itself establish the gateway path. See
 [Compose host mappings](https://docs.docker.com/reference/compose-file/services/#extra_hosts).
+For the shared bridge, verify TCP and UDP NodePort success from OxiBelt and deny
+the same ports from an unrelated container on that bridge. Check firewall drop
+counters for UDP because a local UDP send returning success does not prove delivery.
+Repeat both controls after a bridge, edge container, firewall or K3s change.
+On the 2026-09-26 selected host, the edge container connected to TCP 30080 and
+passed public HTTP/WebTransport smoke. An unrelated container on the same bridge
+failed TCP 30080, while the nftables UDP 30433 drop counter increased from one to
+two after its probe. That container was removed.
 
 Complete the [NodePort firewall prerequisites](deployment-kubernetes.md#service-and-private-network-handoff)
 before applying the Service. Apply the [default-deny baseline and tailored network
