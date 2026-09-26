@@ -111,8 +111,17 @@ impl PgCorpusStore {
         }
         if let Some(job)=sqlx::query("SELECT id,expected_version,attempts,install_head,source_metadata FROM openlegal.corpus_job WHERE object_key=$1 AND revision_id=$2 AND effective_date=$3 AND status IN ('pending','running')").bind(&k).bind(&revision_id).bind(date).fetch_optional(&mut *tx).await.map_err(db)? {
             let id:Uuid=job.try_get("id").map_err(db)?;
-            let head=install_head||job.try_get::<bool,_>("install_head").map_err(db)?;
-            sqlx::query("UPDATE openlegal.corpus_job SET install_head=$2 WHERE id=$1").bind(id).bind(head).execute(&mut *tx).await.map_err(db)?;
+            let old_head:bool=job.try_get("install_head").map_err(db)?;
+            if install_head && !old_head {
+                // A claimed manual revision hint may still be using its old
+                // metadata. Fence that attempt and queue a fresh list-backed
+                // HEAD job with the current observation's metadata.
+                sqlx::query("UPDATE openlegal.corpus_job SET install_head=true,source_metadata=$2,expected_version=$3,status='pending',attempts=0,created_at=$4::text::numeric,lease_until=NULL,error_category=NULL WHERE id=$1")
+                    .bind(id).bind(serde_json::to_value(&source_metadata).map_err(corrupt)?).bind(version).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
+                tx.commit().await.map_err(db)?;
+                return Ok(Job{source_metadata,id:id.to_string(),object,revision_id,effective_date,install_head:true,expected_version:version.try_into().map_err(corrupt)?,attempts:0});
+            }
+            let head=install_head||old_head;
             sqlx::query("UPDATE openlegal.corpus_object SET pending=pending OR $2 WHERE object_key=$1").bind(&k).bind(mark_head_pending).execute(&mut *tx).await.map_err(db)?;
             tx.commit().await.map_err(db)?;
             return Ok(Job{source_metadata:serde_json::from_value(job.try_get("source_metadata").map_err(db)?).map_err(corrupt)?,id:id.to_string(),object,revision_id,effective_date,install_head:head,expected_version:job.try_get::<i64,_>("expected_version").map_err(db)?.try_into().map_err(corrupt)?,attempts:job.try_get::<i32,_>("attempts").map_err(db)?.try_into().map_err(corrupt)?});
@@ -210,7 +219,7 @@ impl PgCorpusStore {
         {
             return Err(DatabaseError::InvalidInput);
         }
-        if object.dataset == Dataset::Precedent {
+        if !object.dataset.has_provider_revisions() {
             return Err(DatabaseError::UnsupportedHistory);
         }
         let mut tx = self.pool.begin().await.map_err(db)?;
@@ -292,7 +301,7 @@ impl PgCorpusStore {
         complete: bool,
     ) -> Result<(), DatabaseError> {
         self.gate().await?;
-        if dataset == Dataset::Precedent {
+        if !dataset.has_provider_revisions() {
             return Err(DatabaseError::UnsupportedHistory);
         }
         let dataset = serde_json::to_value(dataset)
@@ -306,6 +315,22 @@ impl PgCorpusStore {
     pub async fn fail_claim(&self, job: &Job, retry: bool) -> Result<(), DatabaseError> {
         let id = Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
         sqlx::query("UPDATE openlegal.corpus_job SET status=CASE WHEN $2 AND attempts<3 THEN 'pending' ELSE 'failed' END,lease_until=NULL,error_category='processing_failed' WHERE id=$1 AND expected_version=$3 AND attempts=$4 AND status='running'").bind(id).bind(retry).bind(i64::try_from(job.expected_version).map_err(|_|DatabaseError::InvalidInput)?).bind(job.attempts as i32).execute(&self.pool).await.map_err(db)?;
+        Ok(())
+    }
+    /// A daily upstream cap is admission policy, not a failed processing
+    /// attempt. Keep the claim leased until the next UTC day across restarts.
+    pub async fn defer_budget_claim(&self, job: &Job, resume_at: u64) -> Result<(), DatabaseError> {
+        let id = Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
+        if job.attempts == 0 || resume_at == 0 {
+            return Err(DatabaseError::InvalidInput);
+        }
+        let rows = sqlx::query("UPDATE openlegal.corpus_job SET attempts=attempts-1,lease_until=$1::text::numeric,error_category='budget_wait' WHERE id=$2 AND expected_version=$3 AND attempts=$4 AND status='running'")
+            .bind(resume_at.to_string()).bind(id)
+            .bind(i64::try_from(job.expected_version).map_err(|_|DatabaseError::InvalidInput)?)
+            .bind(job.attempts as i32).execute(&self.pool).await.map_err(db)?.rows_affected();
+        if rows != 1 {
+            return Err(DatabaseError::Conflict);
+        }
         Ok(())
     }
     pub async fn mark_inventory_complete(
@@ -464,7 +489,7 @@ impl PgCorpusStore {
         if state.withdrawn {
             return Err(DatabaseError::Withdrawn);
         }
-        if object.dataset == Dataset::Precedent && matches!(kind, HistoryKind::Revisions) {
+        if !object.dataset.has_provider_revisions() && matches!(kind, HistoryKind::Revisions) {
             return Err(DatabaseError::UnsupportedHistory);
         }
         let k = key(&object)?;

@@ -21,7 +21,7 @@ production traffic or upgrades; backend readiness alone cannot clear it.
 | Repository and Docker checks | Implemented gates and recorded local outcomes; configured CI jobs do not establish observed hosted CI success |
 | Disposable Kubernetes serving acceptance | The recorded single-node synthetic topology only; see each passed, failed and unexecuted case in the execution record |
 | Production ZFS, firewall and routing | Operator qualification pending; disposable ext4 paths and node firewall rules do not qualify production infrastructure |
-| Document sandbox and live provider | Separate acceptance gates pending; default serving enables neither |
+| Document sandbox and live provider | Same-host `runc` synthetic sandbox gate passed on 2026-09-26; independent security review and live-provider acceptance remain pending; default serving enables neither |
 | Production traffic, browser WebTransport and ChatGPT | Not established by native clients or fixture results |
 
 The [architecture](architecture.md), [server contract](server.md),
@@ -80,7 +80,7 @@ serving, distributed indexing and automatic failover are outside this design.
 
 Serving uses the normal hardened container runtime, with a non-root user,
 read-only root filesystem, dropped capabilities, no privilege escalation and
-RuntimeDefault seccomp. Document parsing uses its existing separate gVisor domain
+RuntimeDefault seccomp. Document parsing requires a separately qualified runtime domain
 because it processes untrusted XML/HTML and binary documents with native parsers.
 The [existing sandbox artifacts](../deploy/document-sandbox/) remain canonical;
 only document-worker Pods use `RuntimeClass/openlegal-document`. Its quota, RBAC,
@@ -200,10 +200,12 @@ values, raw workload dumps and private host details out of shared evidence.
    and bounded search results. Fictional fixture seeding is not a production step.
 8. Leave ingestion disabled for retained serving. If ingestion is required, follow
    [optional activation](#network-preparation-activation-and-rollback): complete
-   sandbox acceptance, prepare identity/RBAC/networking, and obtain separate bounded
-   live-test authorization **before** activation. Startup immediately initiates
-   provider traffic. Record live acceptance before approving ongoing production
-   ingestion; this runtime has no separate acceptance-only switch.
+   sandbox acceptance and independent review, prepare identity/RBAC/networking,
+   then use `mode = "pilot"` for the bounded first live pass. Enabling the overlay
+   immediately initiates provider traffic. The durable pilot ledger allows 100
+   attempts over 30 minutes and never resets automatically. Verify an actual
+   provider detail, source and search result for every public category before
+   selecting `mode = "continuous"`; continuous collection remains incomplete.
 
 ## Upgrade and Secret rotation
 
@@ -848,8 +850,8 @@ alone does not prove network denial. Use fresh connections after policy converge
   Record CNI/firewall evidence for any node-address exemptions.
 
 The [document namespace](document-sandbox.md) remains a separate trust boundary:
-its deny-all ingress/egress, two-Pod quota and prepared-node gVisor RuntimeClass are
-unchanged. No serving policy grants parser access or a fetch role. Its existing
+its deny-all ingress/egress, two-Pod quota and qualified `runc` RuntimeClass
+remain required. No serving policy grants parser access or a fetch role. Its existing
 real-cluster sandbox acceptance remains independently pending. Offline manifests,
 Docker OxiBelt tests and synthetic controls do not establish completed production,
 live-provider, browser or ChatGPT acceptance.
@@ -1197,6 +1199,24 @@ support does not imply ARM64 document-worker support.
 The overlay replaces the generated server ConfigMap with retained configuration
 plus `[database.ingestion]`. Its fixed context is `openlegal-document-controller`,
 its namespace is `openlegal-documents`, and history-body ingestion remains disabled.
+The same ConfigMap mounts `pilot-candidates.json` at the explicit
+`manual_candidates_path`. Its committed default is empty. To use operator-held
+list exports, run:
+
+```bash
+python3 scripts/prepare-law-pilot-candidates.py \
+  --input-dir /absolute/operator/list-exports \
+  --output /absolute/operator/ingestion/pilot-candidates.json \
+  --allow-incomplete
+```
+
+Inspect the reported skips and file hashes. The
+generator selects at most two untrusted IDs per category; a missing category
+falls back to a bounded live list query. Replace only the JSON in the tailored
+ingestion overlay. It does not seed public records or imply inventory coverage;
+the running adapter fetches and checks live detail before revision-only
+publication. A fresh live current-list observation is required before a
+manual candidate can become public HEAD.
 Replace both non-pullable server/worker digest sentinels with the accepted
 `openlegal-server-ingestion` and `openlegal-document-worker` digests from the
 [release artifact](#ghcr-release-images), and set the corresponding-source
@@ -1309,7 +1329,7 @@ the packaged kubectl against a synthetic TLS API on an internal Docker network.
 It checks quota/Pod command compatibility, token-file replacement and authentication
 failures without legal-provider traffic. Tests use disposable credentials and do
 not implement or prove Kubernetes RBAC, projected-token delivery, Pod admission,
-gVisor or CNI enforcement. Native ARM64 CI remains distinct from local emulation.
+runc user namespaces, AppArmor or CNI enforcement. Native ARM64 CI remains distinct from local emulation.
 Real-cluster ingestion, live-provider and production traffic acceptance remain pending.
 
 ## Phase 9 serving acceptance

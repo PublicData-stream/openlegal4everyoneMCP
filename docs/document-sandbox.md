@@ -215,10 +215,14 @@ to the single named quota; it does not need Pod-log
 read access. The acceptance harness's operator needs log read access to verify
 that source bytes do not reach logs.
 
-Configure dedicated worker nodes before labeling them ready:
+The selected same-host K3s worker Pod uses the node's existing `runc` handler.
+This shares the host kernel with serving and therefore requires independent
+security review of the changed isolation boundary and the complete real-cluster
+acceptance gate below before live documents are processed:
 
-- Install gVisor and the supplied dedicated containerd handler with networking
-  disabled. Require actual `hostUsers: false` user-namespace support.
+- Verify the generated containerd `runc` handler and require actual
+  `hostUsers: false` user-namespace support. Do not label the node based on the
+  RuntimeClass object alone.
 - Merge `podPidsLimit: 128` into the actual kubelet configuration.
 - Install the seccomp profile as `openlegal-document.json` under the kubelet's
   seccomp root and load the named AppArmor profile in enforce mode.
@@ -246,7 +250,11 @@ scripts/test-document-sandbox.sh
 The gate creates/deletes synthetic worker Pods and checks user mapping,
 privilege/capability restrictions, AppArmor/seccomp, network EPERM/EACCES (not mere unreachability),
 read-only root (EROFS at an image-owned writable probe path), absent tokens, actual CPU/memory/PID cgroups, XML exec framing,
-absence of document logs, PID/memory exhaustion and deadline enforcement. It
+absence of document logs, PID/memory exhaustion and deadline enforcement. On
+the selected user-namespaced `runc` Pod, the container-local `pids.max` can
+report a wider ancestor; the gate verifies effective PID denial with the
+exhaustion probe, and the operator separately verifies kubelet `podPidsLimit=128`.
+It
 uses a shortened deadline probe for the same kubelet enforcement mechanism.
 Manifest inspection and local Docker tests cannot establish those Kubernetes
 properties. Full format/OCR fixture acceptance and actual cluster acceptance must
@@ -275,5 +283,32 @@ probe reported both network denial and root-readonly as false; the constrained
 probe required actual EPERM/EACCES and EROFS, respectively. These negative controls
 prevent unreachable networks or ordinary filesystem permissions from posing as
 sandbox evidence. Controller tests verify quota scope rejection, worker identity
-validation and Pod cleanup after cancellation. Full Kubernetes/AppArmor/gVisor
-acceptance remains pending an explicitly configured cluster.
+validation and Pod cleanup after cancellation.
+
+## Same-host K3s qualification (2026-09-26)
+
+The real-cluster synthetic gate passed on the selected single-node K3s 1.36.4
+cluster with containerd 2.3.4, `runc` 1.4.2 and the immutable worker image
+`sha256:e60c5f55445031acecf6a0602bbd78115b9a90f62c650b985b19649950a676d7`.
+The node's effective kubelet configuration reported `podPidsLimit=128`; a worker
+probe could create 125 threads before denial. The worker's local `pids.max`
+reported a wider value, so the gate uses the actual denial result. AppArmor
+enforce, seccomp, user namespaces, network denial, non-root credentials,
+capability drop, read-only root, absent token, CPU and memory limits, XML
+framing, empty logs, memory exhaustion, deadline and cleanup all passed.
+
+The worker-ready node label was removed after the test; no worker Pod remains.
+This establishes the listed controls for a disposable synthetic Pod, not
+independent review of the shared-kernel architecture or live-provider parsing.
+The CNI deny-all egress check separately used identical short-lived BusyBox Pods:
+TCP connection to the Kubernetes API Service succeeded from the default namespace
+and failed from `openlegal-documents`. Both probe Pods were deleted afterward.
+The installed seccomp file at `/var/lib/kubelet/seccomp/openlegal-document.json`
+matched this repository's `seccomp.json` SHA-256
+`f7e707dfd75b2a421f8ae18ff6e3b060e428fa74dff1a476b8003a074cbc1f9d`;
+the installed `/etc/apparmor.d/openlegal-document` matched `apparmor.profile`
+SHA-256 `8f6579dad3e99efdb1734c76af035dac7afbe1159aaa42d43fe5f0beff30dc3f`.
+On this 40-core, 251 GiB node, Kubernetes reported no memory or disk pressure,
+2,779 MiB node memory use and 1.7 TiB free on the kubelet filesystem. These
+point-in-time measurements establish ample current headroom for the two 4 GiB
+worker limits, but do not replace concurrent OCR load and eviction observation.

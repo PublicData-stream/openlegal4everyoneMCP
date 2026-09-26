@@ -168,6 +168,12 @@ Caller Origin must pass through unchanged. Retain HTTP/1 upstream forwarding,
 HTTP/3 WebTransport, the 16 MiB HTTP request limit, streaming request/response
 bodies, disabled caching/compression and the example's connection/request/idle
 timeouts. Upstream URLs remain origins without base paths.
+The Kubernetes HTTP handoff sets `pool_max_idle_per_host = 0`, which prevents
+reuse of idle upstream H1 connections across backend replacement. The Docker
+gate keeps OxiBelt running while replacing the backend and repeats public MCP
+smoke checks. This is an operational mitigation for the recorded intermittent
+`channel closed` symptom; a passing fixture does not establish production edge
+stability. Record immediate public and backend-restart smoke before cutover.
 
 Public edge TLS and private backend TLS have separate ownership. Mount the
 lego/ACME edge certificate and key as `cert/edge.pem` and `cert/edge-key.pem`

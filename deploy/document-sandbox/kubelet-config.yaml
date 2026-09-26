@@ -1,4 +1,4 @@
-# Merge into the dedicated worker nodes' actual kubelet configuration. This is
+# Merge into the selected K3s node's actual kubelet configuration. This is
 # not a Pod field. The cluster acceptance probe checks the applied cgroup value.
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration

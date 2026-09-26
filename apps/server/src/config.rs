@@ -677,8 +677,18 @@ pub struct IngestionConfig {
     pub worker_image: String,
     /// Explicit operator authorization for managed background upstream traffic.
     pub enabled: bool,
+    /// A pilot is a single bounded sample pass; continuous mode revisits full inventories.
+    pub mode: IngestionMode,
+    /// Explicit nonsecret manual-list candidate manifest for a bounded pilot.
+    pub manual_candidates_path: Option<PathBuf>,
     #[serde(default)]
     pub retain_history_bodies: bool,
+}
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionMode {
+    Pilot,
+    Continuous,
 }
 impl DatabaseConfig {
     pub fn validate(&self) -> Result<(), ServerError> {
@@ -701,7 +711,11 @@ impl DatabaseConfig {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 || !i.kubectl.is_absolute()
-                || !i.kubeconfig.is_absolute())
+                || !i.kubeconfig.is_absolute()
+                || i.manual_candidates_path
+                    .as_ref()
+                    .is_some_and(|p| !p.is_absolute())
+                || (i.manual_candidates_path.is_some() && i.mode != IngestionMode::Pilot))
         {
             return Err("ingestion requires explicit executable, kubeconfig and credential environment name".into());
         }

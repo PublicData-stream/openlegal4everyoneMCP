@@ -143,7 +143,7 @@ impl DatabaseService {
         if !(1..=100).contains(&limit) || cursor.as_ref().is_some_and(|v| v.len() > 512) {
             return Err(DatabaseError::InvalidInput);
         }
-        if matches!(kind, HistoryKind::Revisions) && object.dataset == Dataset::Precedent {
+        if matches!(kind, HistoryKind::Revisions) && !object.dataset.has_provider_revisions() {
             return Err(DatabaseError::UnsupportedHistory);
         }
         self.store

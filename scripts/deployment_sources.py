@@ -336,7 +336,7 @@ def validate_sources(repo: Path):
             require(role == "standalone", path, "standalone-role")
         elif path.endswith("/kustomization.yaml"):
             require(role == "kustomization", path, "kustomization-role")
-        elif path.endswith(".toml") or path.endswith("/kubeconfig"):
+        elif path.endswith((".toml", ".json")) or path.endswith("/kubeconfig"):
             require(role == "configuration", path, "configuration-role")
         else:
             require(role in ("resource", "patch"), path, "resource-role")

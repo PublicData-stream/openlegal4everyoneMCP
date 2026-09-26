@@ -129,6 +129,8 @@ async fn offline_rebuild_preserves_ack_retirement_withdrawal_and_previous_index(
         namespace: "fixture".into(),
         worker_image: "fixture@sha256:unused".into(),
         enabled: true,
+        mode: openlegal_server::config::IngestionMode::Pilot,
+        manual_candidates_path: None,
         retain_history_bodies: false,
     });
     let lease = store.acquire_runtime_lease().await.unwrap();

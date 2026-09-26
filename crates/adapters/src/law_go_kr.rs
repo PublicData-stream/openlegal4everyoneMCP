@@ -5,17 +5,23 @@ use openlegal_application::document::{
     DocumentError, DocumentFormat, DocumentInput, DocumentNode, DocumentOutput, DocumentProcessor,
 };
 use openlegal_domain::legal::*;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Row};
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{sync::Semaphore, time::Instant};
 use tokio_util::sync::CancellationToken;
 use url::Url;
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InventoryItem {
     pub object: ObjectId,
     pub revision_id: String,
@@ -24,6 +30,30 @@ pub struct InventoryItem {
     pub title: String,
     pub data_source: Option<String>,
     pub case_number: Option<String>,
+    pub treaty_class_code: Option<String>,
+}
+impl InventoryItem {
+    /// Validate an operator-supplied identity hint before it can queue a live
+    /// detail request. Publication still requires exact provider response checks.
+    pub fn validate_for_detail(&self) -> Result<(), DatabaseError> {
+        self.object.validate()?;
+        revision_parts(self)?;
+        if self
+            .effective_date
+            .as_deref()
+            .is_some_and(|d| !valid_date(d))
+            || self
+                .publication_date
+                .as_deref()
+                .is_some_and(|d| !valid_date(d))
+            || self.title.len() > 512
+            || self.data_source.as_deref().is_some_and(|s| s.len() > 512)
+            || self.case_number.as_deref().is_some_and(|s| s.len() > 512)
+        {
+            return Err(DatabaseError::InvalidInput);
+        }
+        Ok(())
+    }
 }
 pub struct ProviderDetail {
     pub retrieved_at: u64,
@@ -39,7 +69,14 @@ pub struct LawClient {
     resolver: hickory_resolver::TokioResolver,
     admission: Arc<Semaphore>,
     next_request: Arc<Mutex<Option<Instant>>>,
+    operator_suspended: Arc<AtomicBool>,
     clock: Arc<dyn openlegal_application::Clock>,
+    budget: Option<(PgPool, RequestBudgetMode)>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestBudgetMode {
+    Pilot,
+    Continuous,
 }
 impl LawClient {
     pub fn new(
@@ -70,7 +107,163 @@ impl LawClient {
             admission: Arc::new(Semaphore::new(1)),
             clock: Arc::new(openlegal_application::SystemClock::default()),
             next_request: Arc::new(Mutex::new(Some(Instant::now()))),
+            operator_suspended: Arc::new(AtomicBool::new(false)),
+            budget: None,
         })
+    }
+    /// The database migration must be applied before an enabled client starts.
+    /// Every outbound attempt reserves its allowance before DNS resolution.
+    pub fn with_request_budget(mut self, pool: PgPool, mode: RequestBudgetMode) -> Self {
+        self.budget = Some((pool, mode));
+        self
+    }
+    async fn reserve_request(&self, cancel: &CancellationToken) -> Result<(), DatabaseError> {
+        if self.operator_suspended.load(Ordering::Acquire) {
+            return Err(DatabaseError::BudgetExhausted);
+        }
+        let Some((pool, mode)) = &self.budget else {
+            return Ok(());
+        };
+        Self::reserve_provider_request_budget(pool, mode, cancel).await
+    }
+    async fn pause_provider_requests(&self, delay: u64) -> Result<(), DatabaseError> {
+        let suspended = delay > 7 * 86_400;
+        self.operator_suspended.store(true, Ordering::Release);
+        *self
+            .next_request
+            .lock()
+            .map_err(|_| DatabaseError::StorageUnavailable)? =
+            Instant::now().checked_add(Duration::from_secs(delay.min(7 * 86_400)));
+        if let Some((pool, _)) = &self.budget {
+            let durable_delay = i64::try_from(delay)
+                .unwrap_or(i64::MAX / 4)
+                .min(i64::MAX / 4);
+            sqlx::query("UPDATE openlegal.provider_request_budget SET next_allowed_at=GREATEST(next_allowed_at, floor(extract(epoch from clock_timestamp()))::bigint + $1),operator_suspended=operator_suspended OR $2,unresolved_response=false WHERE singleton")
+                .bind(durable_delay).bind(suspended)
+                .execute(pool).await.map_err(|_| DatabaseError::StorageUnavailable)?;
+        }
+        self.operator_suspended.store(suspended, Ordering::Release);
+        Ok(())
+    }
+    async fn complete_request(&self) -> Result<(), DatabaseError> {
+        if let Some((pool, _)) = &self.budget
+            && sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false WHERE singleton")
+                .execute(pool).await.is_err() {
+            self.operator_suspended.store(true, Ordering::Release);
+            return Err(DatabaseError::StorageUnavailable);
+        }
+        Ok(())
+    }
+    /// A transient pause is durable for configured ingestion; the job worker
+    /// uses this timestamp without burning another attempt while it waits.
+    pub async fn next_admissible_epoch(&self) -> Result<u64, DatabaseError> {
+        let Some((pool, _)) = &self.budget else {
+            return Err(DatabaseError::InvalidInput);
+        };
+        let row = sqlx::query("SELECT utc_day,daily_used,next_allowed_at,operator_suspended,unresolved_response,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton")
+            .fetch_one(pool).await.map_err(|_| DatabaseError::StorageUnavailable)?;
+        let now: i64 = row
+            .try_get("now")
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        let day = now / 86_400;
+        let used: i32 = row
+            .try_get("daily_used")
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        let stored_day: i64 = row
+            .try_get("utc_day")
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        let next: i64 = row
+            .try_get("next_allowed_at")
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        if row
+            .try_get::<bool, _>("operator_suspended")
+            .map_err(|_| DatabaseError::StorageUnavailable)?
+            || row
+                .try_get::<bool, _>("unresolved_response")
+                .map_err(|_| DatabaseError::StorageUnavailable)?
+        {
+            return u64::try_from(now.saturating_add(3600))
+                .map_err(|_| DatabaseError::StorageUnavailable);
+        }
+        let daily = if stored_day == day && used >= 1000 {
+            (day + 1) * 86_400 + 10
+        } else {
+            now + 10
+        };
+        u64::try_from(next.max(daily)).map_err(|_| DatabaseError::StorageUnavailable)
+    }
+    /// Reserve a provider attempt without transmitting it. Exposed for the
+    /// explicit PostgreSQL integration gate; callers must not split one
+    /// outbound attempt into multiple reservations.
+    pub async fn reserve_provider_request_budget(
+        pool: &PgPool,
+        mode: &RequestBudgetMode,
+        cancel: &CancellationToken,
+    ) -> Result<(), DatabaseError> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(DatabaseError::Cancelled);
+            }
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+            let row = sqlx::query("SELECT utc_day,daily_used,next_allowed_at,operator_suspended,unresolved_response,pilot_started_at,pilot_used,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
+                .fetch_one(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
+            let now: i64 = row
+                .try_get("now")
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+            let day = now / 86_400;
+            let previous_day: i64 = row
+                .try_get("utc_day")
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+            let daily_used: i32 = if previous_day == day {
+                row.try_get("daily_used")
+                    .map_err(|_| DatabaseError::StorageUnavailable)?
+            } else {
+                0
+            };
+            let next: i64 = row
+                .try_get("next_allowed_at")
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+            let pilot_started: Option<i64> = row
+                .try_get("pilot_started_at")
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+            let pilot_used: i32 = row
+                .try_get("pilot_used")
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+            if row
+                .try_get::<bool, _>("operator_suspended")
+                .map_err(|_| DatabaseError::StorageUnavailable)?
+                || row
+                    .try_get::<bool, _>("unresolved_response")
+                    .map_err(|_| DatabaseError::StorageUnavailable)?
+                || daily_used >= 1000
+                || (*mode == RequestBudgetMode::Pilot
+                    && (pilot_used >= 100
+                        || pilot_started
+                            .is_some_and(|started| now.saturating_sub(started) >= 1800)))
+            {
+                return Err(DatabaseError::BudgetExhausted);
+            }
+            if next > now {
+                drop(tx);
+                if next - now > 30 {
+                    return Err(DatabaseError::BudgetExhausted);
+                }
+                let delay = (next - now).min(30) as u64;
+                tokio::select! {_ = cancel.cancelled() => return Err(DatabaseError::Cancelled), _ = tokio::time::sleep(Duration::from_secs(delay)) => {}}
+                continue;
+            }
+            sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=$1,daily_used=$2,next_allowed_at=$3,unresolved_response=true,pilot_started_at=CASE WHEN $4 THEN COALESCE(pilot_started_at,$5) ELSE pilot_started_at END,pilot_used=pilot_used+CASE WHEN $4 THEN 1 ELSE 0 END WHERE singleton")
+                .bind(day).bind(daily_used + 1).bind(now.saturating_add(6))
+                .bind(*mode == RequestBudgetMode::Pilot).bind(now)
+                .execute(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
+            tx.commit()
+                .await
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+            return Ok(());
+        }
     }
     pub async fn inventory(
         &self,
@@ -101,13 +294,35 @@ impl LawClient {
         object_id: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<(Vec<InventoryItem>, bool, u64), DatabaseError> {
+        self.inventory_page_class(dataset, page, historical, object_id, None, cancel)
+            .await
+    }
+    /// The provider's treaty list exposes one `trty` target with a documented
+    /// bilateral/multilateral filter. It remains one stored dataset.
+    pub async fn inventory_page_class(
+        &self,
+        dataset: Dataset,
+        page: u32,
+        historical: bool,
+        object_id: Option<&str>,
+        treaty_class: Option<u8>,
+        cancel: CancellationToken,
+    ) -> Result<(Vec<InventoryItem>, bool, u64), DatabaseError> {
+        if treaty_class.is_some_and(|c| dataset != Dataset::Treaty || !matches!(c, 1 | 2)) {
+            return Err(DatabaseError::InvalidInput);
+        }
         if page == 0
             || page > 1_000_000
             || object_id.is_some_and(|id| !openlegal_domain::valid_identifier(id, 128))
         {
             return Err(DatabaseError::InvalidInput);
         }
-        if historical && dataset == Dataset::Precedent {
+        if historical
+            && !matches!(
+                dataset,
+                Dataset::NationalStatute | Dataset::Ordinance | Dataset::AdministrativeRule
+            )
+        {
             return Err(DatabaseError::UnsupportedHistory);
         }
         if object_id.is_some() && dataset != Dataset::NationalStatute {
@@ -115,13 +330,21 @@ impl LawClient {
         }
         let target = match dataset {
             Dataset::NationalStatute => "eflaw",
+            Dataset::AdministrativeRule => "admrul",
             Dataset::Ordinance => "ordin",
+            Dataset::Treaty => "trty",
             Dataset::Precedent => "prec",
+            Dataset::ConstitutionalDecision => "detc",
+            Dataset::LegalInterpretation => "expc",
+            Dataset::AdministrativeAppeal => "decc",
         };
         let mut url = self.api("lawSearch.do", target)?;
         url.query_pairs_mut()
             .append_pair("display", "100")
             .append_pair("page", &page.to_string());
+        if let Some(class) = treaty_class {
+            url.query_pairs_mut().append_pair("cls", &class.to_string());
+        }
         match dataset {
             Dataset::NationalStatute => {
                 url.query_pairs_mut()
@@ -130,11 +353,11 @@ impl LawClient {
                     url.query_pairs_mut().append_pair("LID", id);
                 }
             }
-            Dataset::Ordinance => {
+            Dataset::Ordinance | Dataset::AdministrativeRule => {
                 url.query_pairs_mut()
                     .append_pair("nw", if historical { "2" } else { "1" });
             }
-            Dataset::Precedent => {}
+            _ => {}
         }
         let (parsed, _) = self
             .fetch_parse(url, DocumentFormat::Xml, false, cancel)
@@ -142,8 +365,13 @@ impl LawClient {
         let tree = parsed.tree.as_ref().ok_or(DatabaseError::StorageCorrupt)?;
         let item_name = match dataset {
             Dataset::NationalStatute => "law",
+            Dataset::AdministrativeRule => "admrul",
             Dataset::Ordinance => "law",
+            Dataset::Treaty => "trty",
             Dataset::Precedent => "prec",
+            Dataset::ConstitutionalDecision => "detc",
+            Dataset::LegalInterpretation => "expc",
+            Dataset::AdministrativeAppeal => "decc",
         };
         let mut nodes = Vec::new();
         elements(tree, item_name, &mut nodes);
@@ -155,25 +383,44 @@ impl LawClient {
         for node in nodes {
             let idfield = match dataset {
                 Dataset::NationalStatute => "법령ID",
+                Dataset::AdministrativeRule => "행정규칙ID",
                 Dataset::Ordinance => "자치법규ID",
+                Dataset::Treaty => "조약일련번호",
                 Dataset::Precedent => "판례일련번호",
+                Dataset::ConstitutionalDecision => "헌재결정례일련번호",
+                Dataset::LegalInterpretation => "법령해석례일련번호",
+                Dataset::AdministrativeAppeal => "행정심판재결례일련번호",
             };
             let revfield = match dataset {
                 Dataset::NationalStatute => "법령일련번호",
+                Dataset::AdministrativeRule => "행정규칙일련번호",
                 Dataset::Ordinance => "자치법규일련번호",
+                Dataset::Treaty => "조약일련번호",
                 Dataset::Precedent => "판례일련번호",
+                Dataset::ConstitutionalDecision => "헌재결정례일련번호",
+                Dataset::LegalInterpretation => "법령해석례일련번호",
+                Dataset::AdministrativeAppeal => "행정심판재결례일련번호",
             };
             let id = first(node, idfield).ok_or(DatabaseError::StorageCorrupt)?;
             let master = first(node, revfield).ok_or(DatabaseError::StorageCorrupt)?;
-            if !numeric_id(&master) {
+            if dataset == Dataset::AdministrativeAppeal && (master == "0" || id == "0") {
+                // This list includes placeholder rows without a usable detail ID.
+                continue;
+            }
+            if !numeric_id(&master) || !numeric_id(&id) || master == "0" || id == "0" {
                 return Err(DatabaseError::StorageCorrupt);
             }
             let title = first(
                 node,
                 match dataset {
                     Dataset::NationalStatute => "법령명한글",
+                    Dataset::AdministrativeRule => "행정규칙명",
                     Dataset::Ordinance => "자치법규명",
+                    Dataset::Treaty => "조약명",
                     Dataset::Precedent => "사건명",
+                    Dataset::ConstitutionalDecision => "사건명",
+                    Dataset::LegalInterpretation => "안건명",
+                    Dataset::AdministrativeAppeal => "사건명",
                 },
             )
             .unwrap_or_default();
@@ -184,7 +431,13 @@ impl LawClient {
                 id,
             };
             object.validate()?;
-            let effective_date = date(first(node, "시행일자"))?;
+            let effective_date = match dataset {
+                Dataset::NationalStatute | Dataset::AdministrativeRule | Dataset::Ordinance => {
+                    date(first(node, "시행일자"))?
+                }
+                Dataset::Treaty => date(first(node, "발효일자"))?,
+                _ => None,
+            };
             let revision_id = if dataset == Dataset::NationalStatute {
                 format!(
                     "{master}:{}",
@@ -196,19 +449,35 @@ impl LawClient {
                 master
             };
             items.push(InventoryItem {
-                publication_date: date(first(node, "공포일자"))?,
+                publication_date: if matches!(
+                    dataset,
+                    Dataset::NationalStatute | Dataset::Ordinance
+                ) {
+                    date(first(node, "공포일자"))?
+                } else {
+                    None
+                },
                 object,
                 revision_id,
                 effective_date,
                 title,
                 data_source: first(node, "데이터출처명"),
                 case_number: first(node, "사건번호"),
+                treaty_class_code: if dataset == Dataset::Treaty {
+                    first(node, "조약구분코드")
+                } else {
+                    None
+                },
             });
         }
         let total = first(tree, "totalCnt")
             .and_then(|v| v.parse::<u64>().ok())
             .ok_or(DatabaseError::StorageCorrupt)?;
-        if items.len() > 100 || (items.is_empty() && (page as u64 - 1) * 100 < total) {
+        if items.len() > 100
+            || (dataset != Dataset::AdministrativeAppeal
+                && items.is_empty()
+                && (page as u64 - 1) * 100 < total)
+        {
             return Err(DatabaseError::StorageCorrupt);
         }
         Ok((items, (page as u64) * 100 >= total, total))
@@ -222,8 +491,16 @@ impl LawClient {
         let (master, effective) = revision_parts(item)?;
         let target = target(item.object.dataset);
         let mut url = self.api("lawService.do", target)?;
-        if item.object.dataset == Dataset::Precedent {
-            url.query_pairs_mut().append_pair("ID", &item.object.id);
+        if matches!(
+            item.object.dataset,
+            Dataset::Precedent
+                | Dataset::Treaty
+                | Dataset::ConstitutionalDecision
+                | Dataset::LegalInterpretation
+                | Dataset::AdministrativeAppeal
+                | Dataset::AdministrativeRule
+        ) {
+            url.query_pairs_mut().append_pair("ID", &master);
         } else {
             url.query_pairs_mut().append_pair("MST", &master);
         }
@@ -231,6 +508,9 @@ impl LawClient {
             url.query_pairs_mut()
                 .append_pair("efYd", &date)
                 .append_pair("chrClsCd", "010201");
+        }
+        if item.object.dataset == Dataset::Treaty {
+            url.query_pairs_mut().append_pair("chrClsCd", "010202");
         }
         let html = item.object.dataset == Dataset::Precedent
             && item
@@ -375,7 +655,11 @@ impl LawClient {
             .map_err(|_| DatabaseError::StorageUnavailable)?)
         .ok_or(DatabaseError::Capacity)?;
         if next.saturating_duration_since(Instant::now()) > Duration::from_secs(30) {
-            return Err(DatabaseError::Capacity);
+            return Err(if self.budget.is_some() {
+                DatabaseError::BudgetExhausted
+            } else {
+                DatabaseError::Capacity
+            });
         }
         if next > Instant::now() {
             tokio::select! {_=cancel.cancelled()=>return Err(DatabaseError::Cancelled),_=tokio::time::sleep_until(next)=>{}}
@@ -384,7 +668,13 @@ impl LawClient {
             .next_request
             .lock()
             .map_err(|_| DatabaseError::StorageUnavailable)? =
-            Instant::now().checked_add(Duration::from_secs(1));
+            Instant::now().checked_add(Duration::from_secs(if self.budget.is_some() {
+                5
+            } else {
+                1
+            }));
+        self.reserve_request(&cancel).await?;
+        let fetched = async {
         let host = url.host_str().ok_or(DatabaseError::InvalidInput)?;
         let ips = tokio::select! {_=cancel.cancelled()=>return Err(DatabaseError::Cancelled),r=self.resolver.lookup_ip(format!("{host}."))=>r.map_err(|_|DatabaseError::StorageUnavailable)?};
         let mut addresses = Vec::new();
@@ -424,12 +714,12 @@ impl LawClient {
                     .and_then(crate::retry_after)
                     .unwrap_or(60)
                     .max(1);
-                *self
-                    .next_request
-                    .lock()
-                    .map_err(|_| DatabaseError::StorageUnavailable)? =
-                    Instant::now().checked_add(Duration::from_secs(delay));
-                return Err(DatabaseError::Capacity);
+                self.pause_provider_requests(delay).await?;
+                return Err(if self.budget.is_some() {
+                    DatabaseError::BudgetExhausted
+                } else {
+                    DatabaseError::Capacity
+                });
             }
             if let Some(error) = http_status_error(response.status()) {
                 return Err(error);
@@ -462,7 +752,12 @@ impl LawClient {
             }
             Ok(raw)
         };
-        let raw = tokio::select! {_ = cancel.cancelled()=>return Err(DatabaseError::Cancelled),result=fetch=>result?};
+        tokio::select! {_ = cancel.cancelled()=>Err(DatabaseError::Cancelled),result=fetch=>result}
+        }.await;
+        if !self.operator_suspended.load(Ordering::Acquire) {
+            self.complete_request().await?;
+        }
+        let raw = fetched?;
         let retrieved_at = self.clock.now();
         drop(permit);
         let digest = Sha256::digest(&raw)
@@ -621,8 +916,13 @@ fn numeric_id(value: &str) -> bool {
 fn target(dataset: Dataset) -> &'static str {
     match dataset {
         Dataset::NationalStatute => "eflaw",
+        Dataset::AdministrativeRule => "admrul",
         Dataset::Ordinance => "ordin",
+        Dataset::Treaty => "trty",
         Dataset::Precedent => "prec",
+        Dataset::ConstitutionalDecision => "detc",
+        Dataset::LegalInterpretation => "expc",
+        Dataset::AdministrativeAppeal => "decc",
     }
 }
 fn revision_parts(item: &InventoryItem) -> Result<(String, Option<String>), DatabaseError> {
@@ -644,7 +944,9 @@ fn revision_parts(item: &InventoryItem) -> Result<(String, Option<String>), Data
             return Err(DatabaseError::InvalidInput);
         }
         Ok((master.into(), Some(effective.into())))
-    } else if numeric_id(&item.revision_id) {
+    } else if numeric_id(&item.revision_id)
+        && (item.object.dataset.has_provider_revisions() || item.revision_id == item.object.id)
+    {
         Ok((item.revision_id.clone(), None))
     } else {
         Err(DatabaseError::InvalidInput)
@@ -668,6 +970,16 @@ fn content_field(name: &str) -> bool {
             | "참조판례"
             | "판례내용"
             | "조문참고자료"
+            | "조약내용"
+            | "결정요지"
+            | "전문"
+            | "심판대상조문"
+            | "질의요지"
+            | "회답"
+            | "이유"
+            | "주문"
+            | "청구취지"
+            | "재결요지"
     )
 }
 fn content_parts(node: &DocumentNode, out: &mut Vec<String>) {
@@ -757,12 +1069,19 @@ pub fn project(
     item: &InventoryItem,
     output: &DocumentOutput,
 ) -> Result<LegalRecord, DatabaseError> {
+    if !matches!(
+        item.object.dataset,
+        Dataset::NationalStatute | Dataset::Ordinance | Dataset::Precedent
+    ) {
+        return project_additional(item, output);
+    }
     let tree = output.tree.as_ref().ok_or(DatabaseError::StorageCorrupt)?;
     let (master, effective) = revision_parts(item)?;
     let (idfield, titlefield) = match item.object.dataset {
         Dataset::NationalStatute => ("법령ID", "법령명_한글"),
         Dataset::Ordinance => ("자치법규ID", "자치법규명"),
         Dataset::Precedent => ("판례정보일련번호", "사건명"),
+        _ => unreachable!("additional provider projection is handled above"),
     };
     let html = output.format == DocumentFormat::Html;
     let mut metadata = BTreeMap::new();
@@ -812,6 +1131,7 @@ pub fn project(
                 Dataset::NationalStatute => "법령일련번호",
                 Dataset::Ordinance => "자치법규일련번호",
                 Dataset::Precedent => "판례정보일련번호",
+                _ => unreachable!("additional provider projection is handled above"),
             },
         ) && returned != master
         {
@@ -916,8 +1236,141 @@ pub fn project(
             Dataset::NationalStatute => "provider_effective_original",
             Dataset::Ordinance => "provider_current",
             Dataset::Precedent => "provider_record",
+            _ => unreachable!("additional provider projection is handled above"),
         }
         .into(),
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+/// These API families expose a provider record number, not a documented
+/// revision history. Only administrative rules additionally expose a stable ID.
+fn project_additional(
+    item: &InventoryItem,
+    output: &DocumentOutput,
+) -> Result<LegalRecord, DatabaseError> {
+    if output.format != DocumentFormat::Xml {
+        return Err(DatabaseError::StorageCorrupt);
+    }
+    let tree = output.tree.as_ref().ok_or(DatabaseError::StorageCorrupt)?;
+    let (number, _) = revision_parts(item)?;
+    let (number_field, title_field) = match item.object.dataset {
+        Dataset::AdministrativeRule => ("행정규칙일련번호", "행정규칙명"),
+        Dataset::Treaty => ("조약일련번호", "조약명_한글"),
+        Dataset::ConstitutionalDecision => ("헌재결정례일련번호", "사건명"),
+        Dataset::LegalInterpretation => ("법령해석례일련번호", "안건명"),
+        Dataset::AdministrativeAppeal => ("행정심판례일련번호", "사건명"),
+        _ => return Err(DatabaseError::InvalidInput),
+    };
+    let mut serials = Vec::new();
+    elements(tree, number_field, &mut serials);
+    if serials.len() != 1 || first(tree, number_field).as_deref() != Some(number.as_str()) {
+        return Err(DatabaseError::StorageCorrupt);
+    }
+    if item.object.dataset == Dataset::AdministrativeRule {
+        let mut ids = Vec::new();
+        elements(tree, "행정규칙ID", &mut ids);
+        if ids.len() != 1 || first(tree, "행정규칙ID").as_deref() != Some(item.object.id.as_str())
+        {
+            return Err(DatabaseError::StorageCorrupt);
+        }
+    }
+    let title = first(tree, title_field)
+        .filter(|s| !s.is_empty())
+        .ok_or(DatabaseError::StorageCorrupt)?;
+    let mut source_sections = Vec::new();
+    sections(tree, &mut source_sections);
+    if source_sections.is_empty() {
+        return Err(DatabaseError::StorageCorrupt);
+    }
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "projection_version".into(),
+        "law_go_kr_additional_v1".into(),
+    );
+    metadata.insert("provider_record_number".into(), number.clone());
+    metadata.insert("section_locator_semantics".into(), "source_ordinal".into());
+    for (original, key) in [
+        ("행정규칙종류", "document_type"),
+        ("소관부처명", "authority"),
+        ("조약구분코드", "document_type_code"),
+        ("사건번호", "case_number"),
+        ("해석기관명", "authority"),
+        ("재결청", "authority"),
+    ] {
+        if let Some(value) = first(tree, original).filter(|s| !s.is_empty()) {
+            metadata.insert(key.into(), value);
+        }
+    }
+    if item.object.dataset == Dataset::Treaty {
+        if let Some(expected) = &item.treaty_class_code
+            && metadata.get("document_type_code") != Some(expected)
+        {
+            return Err(DatabaseError::StorageCorrupt);
+        }
+        let kind = match metadata.get("document_type_code").map(String::as_str) {
+            Some("440101") => "bilateral_treaty",
+            Some("440102") => "multilateral_treaty",
+            _ => return Err(DatabaseError::StorageCorrupt),
+        };
+        metadata.insert("document_type".into(), kind.into());
+        metadata.insert("character_view".into(), "010202".into());
+    }
+    if item.object.dataset == Dataset::ConstitutionalDecision
+        && let Some(raw) = first(tree, "종국일자").filter(|v| !v.is_empty())
+    {
+        metadata.insert("final_disposition_date_raw".into(), raw.clone());
+        if valid_date(&raw) {
+            metadata.insert("final_disposition_date".into(), raw);
+        }
+    }
+    for (original, key) in [
+        ("해석일자", "interpretation_date"),
+        ("의결일자", "decision_date"),
+        ("발령일자", "issuance_date"),
+    ] {
+        if let Some(raw) = first(tree, original).filter(|v| !v.is_empty()) {
+            metadata.insert(format!("{key}_raw"), raw.clone());
+            if valid_date(&raw) {
+                metadata.insert(key.into(), raw);
+            }
+        }
+    }
+    let effective_date = match item.object.dataset {
+        Dataset::AdministrativeRule => date(first(tree, "시행일자"))?,
+        Dataset::Treaty => date(first(tree, "발효일자"))?,
+        _ => None,
+    };
+    if item.effective_date.is_some() && effective_date != item.effective_date {
+        return Err(DatabaseError::StorageCorrupt);
+    }
+    let mut source = Url::parse("https://www.law.go.kr/DRF/lawService.do")
+        .map_err(|_| DatabaseError::InvalidInput)?;
+    source
+        .query_pairs_mut()
+        .append_pair("target", target(item.object.dataset))
+        .append_pair("type", "XML")
+        .append_pair("ID", &number);
+    if item.object.dataset == Dataset::Treaty {
+        source.query_pairs_mut().append_pair("chrClsCd", "010202");
+    }
+    let body = source_sections
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let record = LegalRecord {
+        object: item.object.clone(),
+        revision_id: item.revision_id.clone(),
+        title,
+        body,
+        sections: source_sections,
+        metadata,
+        publication_date: None,
+        effective_date,
+        source_url: source.into(),
+        representation: "provider_record".into(),
     };
     record.validate()?;
     Ok(record)
@@ -956,6 +1409,7 @@ mod tests {
             title: "Fictional statute".into(),
             data_source: None,
             case_number: None,
+            treaty_class_code: None,
         }
     }
     fn output(tree: DocumentNode) -> DocumentOutput {
@@ -969,6 +1423,116 @@ mod tests {
             ocr_pages: vec![],
             diagnostics: vec![],
         }
+    }
+    #[test]
+    fn additional_provider_records_keep_exact_identity_and_classification() {
+        let cases = [
+            (
+                Dataset::AdministrativeRule,
+                "행정규칙일련번호",
+                "행정규칙명",
+                "조문내용",
+            ),
+            (Dataset::Treaty, "조약일련번호", "조약명_한글", "조약내용"),
+            (
+                Dataset::ConstitutionalDecision,
+                "헌재결정례일련번호",
+                "사건명",
+                "전문",
+            ),
+            (
+                Dataset::LegalInterpretation,
+                "법령해석례일련번호",
+                "안건명",
+                "회답",
+            ),
+            (
+                Dataset::AdministrativeAppeal,
+                "행정심판례일련번호",
+                "사건명",
+                "주문",
+            ),
+        ];
+        for (dataset, number_field, title_field, body_field) in cases {
+            let mut i = item();
+            i.object.dataset = dataset;
+            i.object.id = if dataset == Dataset::AdministrativeRule {
+                "1"
+            } else {
+                "100"
+            }
+            .into();
+            i.revision_id = "100".into();
+            i.effective_date = None;
+            let mut fields = vec![
+                field(number_field, "100"),
+                field(title_field, "Fictional record"),
+                field(body_field, "Fictional body"),
+            ];
+            if dataset == Dataset::AdministrativeRule {
+                fields.push(field("행정규칙ID", "1"));
+            }
+            if dataset == Dataset::Treaty {
+                fields.push(field("조약구분코드", "440102"));
+                i.treaty_class_code = Some("440102".into());
+            }
+            if dataset == Dataset::ConstitutionalDecision {
+                fields.push(field("종국일자", "20260101"));
+            }
+            if dataset == Dataset::LegalInterpretation {
+                fields.push(field("해석일자", "2026"));
+            }
+            let data = output(branch("Service", fields));
+            let record = project(&i, &data).unwrap();
+            assert_eq!(record.body, "Fictional body");
+            assert!(!record.source_url.contains("OC="));
+            assert!(record.source_url.contains("ID=100"));
+            if dataset == Dataset::Treaty {
+                assert_eq!(record.metadata["document_type"], "multilateral_treaty");
+                i.treaty_class_code = Some("440101".into());
+                assert!(project(&i, &data).is_err());
+            }
+            if dataset == Dataset::ConstitutionalDecision {
+                assert_eq!(record.metadata["final_disposition_date"], "20260101");
+                assert!(!record.metadata.contains_key("judgment_date"));
+            }
+            if dataset == Dataset::LegalInterpretation {
+                assert_eq!(record.metadata["interpretation_date_raw"], "2026");
+                assert!(!record.metadata.contains_key("interpretation_date"));
+            }
+            i.revision_id = "101".into();
+            assert!(project(&i, &data).is_err());
+        }
+    }
+    #[test]
+    fn additional_detail_rejects_multiple_records_in_one_document() {
+        let mut i = item();
+        i.object.dataset = Dataset::Treaty;
+        i.object.id = "100".into();
+        i.revision_id = "100".into();
+        i.effective_date = None;
+        let data = output(branch(
+            "Service",
+            vec![
+                branch(
+                    "Record",
+                    vec![
+                        field("조약일련번호", "100"),
+                        field("조약명_한글", "First"),
+                        field("조약내용", "First body"),
+                    ],
+                ),
+                branch(
+                    "Record",
+                    vec![
+                        field("조약일련번호", "101"),
+                        field("조약명_한글", "Second"),
+                        field("조약내용", "Second body"),
+                    ],
+                ),
+            ],
+        ));
+        assert_eq!(project(&i, &data), Err(DatabaseError::StorageCorrupt));
     }
     #[test]
     fn national_preserves_ordered_paragraph_subparagraph_and_supplementary_text() {

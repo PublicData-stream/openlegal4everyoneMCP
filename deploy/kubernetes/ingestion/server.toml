@@ -55,4 +55,6 @@ context = "openlegal-document-controller"
 namespace = "openlegal-documents"
 worker_image = "registry.example/openlegal-document-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 enabled = true
+mode = "pilot"
+manual_candidates_path = "/etc/openlegal/pilot-candidates.json"
 retain_history_bodies = false

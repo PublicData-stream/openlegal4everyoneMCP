@@ -1,8 +1,3 @@
-# Merge into the dedicated nodes' containerd 2.x configuration. No host-network
-# fallback is acceptable. Qualify this handler with hostUsers:false before labeling
-# a node openlegal.document-sandbox/ready=true.
-[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc-document]
-runtime_type = "io.containerd.runsc.v1"
-[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc-document.options]
-TypeUrl = "io.containerd.runsc.v1.options"
-ConfigPath = "/etc/containerd/runsc-document.toml"
+# The selected K3s node already provides the `runc` CRI handler. No additional
+# containerd handler is merged. Verify the generated config and RuntimeClass
+# handler on the real node before applying the worker admission label.

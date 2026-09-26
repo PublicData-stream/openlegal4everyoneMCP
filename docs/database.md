@@ -182,7 +182,7 @@ authorization after sandbox acceptance. Retained serving remains independent.
 Current HEAD data is retained independently of ordinary historical retention.
 Historical bodies are retained for 30 days, with bounded session extensions;
 revision catalog metadata survives body eviction. Current corpus raw evidence has a
-1 TiB ledger cap and staging a 16 GiB cap. Reserve additional space for PostgreSQL,
+480 GiB ledger cap and staging a 16 GiB cap. Reserve additional space for PostgreSQL,
 index generations/rebuilds, history and filesystem overhead within the deployment's
 1.5 TiB managed-storage ceiling. These software bounds are not ZFS configuration.
 

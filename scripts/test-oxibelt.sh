@@ -248,6 +248,22 @@ docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/http_sm
 docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/serving_smoke.py \
     --http-url https://edge:8443/mcp --webtransport-url https://edge:8443/mcp-wt/v1 \
     --origin https://example.test --ca-file /fixture/cert/ca.pem --wt-client /usr/local/bin/wt_client
+if [[ $profile == kubernetes ]]; then
+    # The edge stays up while the backend is replaced. Repeated fresh MCP
+    # sessions exercise the stale-H1-connection failure seen in acceptance.
+    docker rm -f "$backend" >/dev/null
+    start_backend /fixture/backend.toml
+    for attempt in {1..60}; do
+        if docker exec "$backend" python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:9090/ready", timeout=2)' >/dev/null 2>&1; then break; fi
+        if (( attempt == 60 )); then echo 'Replacement backend did not become Ready' >&2; exit 1; fi
+        sleep 1
+    done
+    for attempt in 1 2 3; do
+        docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/serving_smoke.py \
+            --http-url https://edge:8443/mcp --webtransport-url https://edge:8443/mcp-wt/v1 \
+            --origin https://example.test --ca-file /fixture/cert/ca.pem --wt-client /usr/local/bin/wt_client
+    done
+fi
 for protocol in 2026-07-28 2025-11-25; do
     client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$protocol" --demo --text-diff
     # A fresh process creates a fresh QUIC connection, checking reconnection too.

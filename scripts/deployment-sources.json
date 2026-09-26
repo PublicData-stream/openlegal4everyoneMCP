@@ -101,6 +101,13 @@
       ]
     },
     {
+      "path": "deploy/kubernetes/ingestion/pilot-candidates.json",
+      "role": "configuration",
+      "owners": [
+        "ingestion"
+      ]
+    },
+    {
       "path": "deploy/kubernetes/ingestion/rbac/kustomization.yaml",
       "role": "kustomization",
       "owners": [

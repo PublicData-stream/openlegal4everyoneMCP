@@ -68,7 +68,7 @@ class DeploymentSourceTests(unittest.TestCase):
         # Includes secretKeyRef, secret volumes, tokenFile, projected token path,
         # private-key paths, env names, and ../ / ../../ local resource references.
         validate_sources(self.repo)
-        self.assertEqual(len(self.inventory()["sources"]), 49)
+        self.assertEqual(len(self.inventory()["sources"]), 50)
 
     def test_unknown_file_cannot_escape_even_without_known_extension(self):
         self.write("deploy/kubernetes/operator-credentials", SENTINEL)

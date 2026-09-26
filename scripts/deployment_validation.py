@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import json
 import re
 import sys
 import tomllib
@@ -181,7 +182,7 @@ def validate_document_boundary(documents):
     equal(field("ResourceQuota", "spec", "hard", "pods"), "2", "document Pod quota")
     equal(field("Namespace", "metadata", "labels", "pod-security.kubernetes.io/enforce"),
           "restricted", "document Pod Security")
-    equal(field("RuntimeClass", "handler"), "runsc-document", "document runtime handler")
+    equal(field("RuntimeClass", "handler"), "runc", "document runtime handler")
     equal(field("RuntimeClass", "scheduling"), {"nodeSelector": {"openlegal.document-sandbox/ready": "true"}},
           "document prepared-node scheduling")
 
@@ -382,9 +383,20 @@ def validate_ingestion(documents, retained_documents):
                        (controller_cm, "openlegal-document-controller-config")):
         require(re.fullmatch(prefix + r"-[a-z0-9]{10}", cm["metadata"]["name"]),
                 "ingestion ConfigMap must retain content hash")
-        keys(cm.get("data"), ("server.toml",) if cm is server_cm else ("kubeconfig",), "ingestion ConfigMap data")
+        keys(cm.get("data"), ("server.toml", "pilot-candidates.json") if cm is server_cm else ("kubeconfig",), "ingestion ConfigMap data")
     raw = server_cm["data"]["server.toml"]
     require(isinstance(raw, str), "ingestion server.toml must be text")
+    candidate_raw = server_cm["data"]["pilot-candidates.json"]
+    require(isinstance(candidate_raw, str) and len(candidate_raw.encode()) <= 32 * 1024,
+            "ingestion pilot candidate manifest size")
+    try:
+        candidate_manifest = json.loads(candidate_raw)
+    except (ValueError, TypeError):
+        raise ValidationError("ingestion pilot candidate manifest syntax") from None
+    require(isinstance(candidate_manifest, dict) and candidate_manifest.get("version") == 1
+            and isinstance(candidate_manifest.get("candidates"), list)
+            and len(candidate_manifest["candidates"]) <= 18,
+            "ingestion pilot candidate manifest shape")
     config = tomllib.loads(raw)
     require(isinstance(config.get("database"), dict), "ingestion database configuration required")
     ingestion = config["database"].pop("ingestion", None)
@@ -396,7 +408,9 @@ def validate_ingestion(documents, retained_documents):
         "credential_env": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "kubectl": "/usr/local/bin/kubectl",
         "kubeconfig": "/run/secrets/document-controller/config/kubeconfig",
         "context": "openlegal-document-controller", "namespace": "openlegal-documents",
-        "worker_image": worker, "enabled": True, "retain_history_bodies": False,
+        "worker_image": worker, "enabled": True, "mode": "pilot",
+        "manual_candidates_path": "/etc/openlegal/pilot-candidates.json",
+        "retain_history_bodies": False,
     }, "ingestion configuration")
     identity = "/run/secrets/document-controller/identity"
     kubeconfig = {
@@ -423,6 +437,7 @@ def validate_ingestion(documents, retained_documents):
     require(base_cm["metadata"]["name"] != server_cm["metadata"]["name"], "ingestion needs a distinct configuration hash")
     base_cm["metadata"]["name"] = server_cm["metadata"]["name"]
     base_cm["data"]["server.toml"] = raw
+    base_cm["data"]["pilot-candidates.json"] = candidate_raw
     template = next(obj for obj in expected_documents if obj["kind"] == "Deployment")["spec"]["template"]
     template["metadata"]["labels"]["openlegal.ingestion/enabled"] = "true"
     pod = template["spec"]
@@ -624,6 +639,8 @@ def validate_oxibelt(raw, service):
         if webtransport:
             upstream.update(webtransport=True, idle_timeout_ms=65000,
                             tls={"ech": {"mode": "disabled"}})
+        else:
+            upstream["pool_max_idle_per_host"] = 0
         upstreams.append(upstream)
     equal(config["upstreams"], upstreams, "NodePort upstreams")
     equal(config["routes"], [

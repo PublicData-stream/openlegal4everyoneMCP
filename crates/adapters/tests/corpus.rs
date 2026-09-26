@@ -1,7 +1,11 @@
 //! PostgreSQL corpus contracts, using exclusively fictional legal-shaped records.
 #[path = "../../../test-support/postgres.rs"]
 mod support;
-use openlegal_adapters::{blob::FsBlobStore, corpus::PgCorpusStore};
+use openlegal_adapters::{
+    blob::FsBlobStore,
+    corpus::PgCorpusStore,
+    law_go_kr::{LawClient, RequestBudgetMode},
+};
 use openlegal_application::{
     database::{DatabaseStore, Publication},
     persistence::PersistentStore,
@@ -18,6 +22,261 @@ impl openlegal_application::Clock for FixtureClock {
 }
 fn token() -> CancellationToken {
     CancellationToken::new()
+}
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn historical_revalidation_deduplicates_bytes_but_captures_corrections() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("historical-revalidation"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(
+        base.pool(),
+        blobs,
+        std::sync::Arc::new(FixtureClock),
+    );
+    let publish_history = |body: &'static str, now: u64| {
+        let store = store.clone();
+        async move {
+            let state = store.state(&object()).await.unwrap();
+            store
+                .publish(
+                    Publication {
+                        additional_evidence: Vec::new(),
+                        record: record("r1", body),
+                        raw: body.as_bytes().to_vec(),
+                        processor_version: "fixture_v1".into(),
+                        retrieved_at: now,
+                        now,
+                        expected_version: state.version,
+                        install_head: false,
+                        job_id: None,
+                    },
+                    token(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let first = publish_history("original", 100).await;
+    let watermark = store.watermark().await.unwrap();
+    let unchanged = publish_history("original", 3700).await;
+    assert_eq!(unchanged.capture_id, first.capture_id);
+    assert_eq!(store.watermark().await.unwrap(), watermark);
+    assert!(
+        store
+            .revision_capture_recent(&object(), "r1", 3700)
+            .await
+            .unwrap()
+    );
+    let revision = store
+        .resolve(
+            object(),
+            RevisionSelector::Revision { id: "r1".into() },
+            3700,
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revision.validated_at, 3700);
+    let original_capture = store
+        .resolve(
+            object(),
+            RevisionSelector::Capture {
+                id: first.capture_id.clone(),
+            },
+            3700,
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(original_capture.validated_at, 100);
+    let corrected = publish_history("corrected", 7300).await;
+    assert_ne!(corrected.capture_id, first.capture_id);
+    assert_eq!(store.watermark().await.unwrap(), watermark + 1);
+    base.close().await.unwrap();
+}
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn provider_budget_and_inventory_cursor_are_durable() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let pool = base.pool();
+    let mode = RequestBudgetMode::Pilot;
+    LawClient::reserve_provider_request_budget(&pool, &mode, &token())
+        .await
+        .unwrap();
+    let counts: (i32, i32) = sqlx::query_as(
+        "SELECT daily_used,pilot_used FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1));
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &mode, &token()).await,
+        Err(DatabaseError::BudgetExhausted)
+    );
+    sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false,next_allowed_at=floor(extract(epoch from clock_timestamp()))::bigint+120")
+        .execute(&pool).await.unwrap();
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &mode, &token()).await,
+        Err(DatabaseError::BudgetExhausted)
+    );
+    let paused: (i32, i32) = sqlx::query_as(
+        "SELECT daily_used,pilot_used FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(paused, (1, 1));
+    sqlx::query(
+        "UPDATE openlegal.provider_request_budget SET operator_suspended=true,next_allowed_at=0",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &mode, &token()).await,
+        Err(DatabaseError::BudgetExhausted)
+    );
+    sqlx::query("UPDATE openlegal.provider_request_budget SET operator_suspended=false,unresolved_response=false,daily_used=999,pilot_used=99,next_allowed_at=0")
+        .execute(&pool).await.unwrap();
+    LawClient::reserve_provider_request_budget(&pool, &mode, &token())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &mode, &token()).await,
+        Err(DatabaseError::BudgetExhausted)
+    );
+    let counts: (i32, i32) = sqlx::query_as(
+        "SELECT daily_used,pilot_used FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1000, 100));
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("budget-corpus"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(
+        pool.clone(),
+        blobs,
+        std::sync::Arc::new(FixtureClock),
+    );
+    assert_eq!(
+        store
+            .inventory_cursor(Dataset::Treaty, false)
+            .await
+            .unwrap(),
+        1
+    );
+    store
+        .advance_inventory_cursor(Dataset::Treaty, false, 1, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .inventory_cursor(Dataset::Treaty, false)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store.inventory_cursor(Dataset::Treaty, true).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .advance_inventory_cursor(Dataset::Treaty, false, 1, false)
+            .await,
+        Err(DatabaseError::Conflict)
+    );
+    store
+        .advance_inventory_cursor(Dataset::Treaty, false, 2, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .inventory_cursor(Dataset::Treaty, false)
+            .await
+            .unwrap(),
+        1
+    );
+    publish(&store, "r1", "synthetic body", 100).await;
+    store
+        .enqueue_job(object(), "r1".into(), None, true, false, 100)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .head_revision_ready(&object(), "r1", 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .head_revision_ready(&object(), "r2", 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .head_revision_ready(&object(), "r1", 3701)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .revision_capture_recent(&object(), "r1", 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .revision_capture_recent(&object(), "r1", 3701)
+            .await
+            .unwrap()
+    );
+    let old_head_job = store.claim_job(101).await.unwrap().unwrap();
+    store.fail_claim(&old_head_job, false).await.unwrap();
+    let mut manual = BTreeMap::new();
+    manual.insert("title".into(), "untrusted manual title".into());
+    store
+        .enqueue_job_with_metadata(object(), "r2".into(), None, false, false, 200, manual)
+        .await
+        .unwrap();
+    let old_manual_job = store.claim_job(201).await.unwrap().unwrap();
+    let mut live = BTreeMap::new();
+    live.insert("title".into(), "fresh list title".into());
+    store
+        .enqueue_job_with_metadata(object(), "r2".into(), None, true, true, 202, live.clone())
+        .await
+        .unwrap();
+    let promoted = store.claim_job(203).await.unwrap().unwrap();
+    assert!(promoted.install_head);
+    assert_eq!(promoted.source_metadata, live);
+    assert_eq!(
+        store.defer_budget_claim(&old_manual_job, 1000).await,
+        Err(DatabaseError::Conflict)
+    );
+    store.fail_claim(&promoted, false).await.unwrap();
+    store
+        .enqueue_job(object(), "budget-sample".into(), None, true, true, 100)
+        .await
+        .unwrap();
+    let first = store.claim_job(101).await.unwrap().unwrap();
+    store.defer_budget_claim(&first, 1000).await.unwrap();
+    assert!(store.claim_job(999).await.unwrap().is_none());
+    let resumed = store.claim_job(1000).await.unwrap().unwrap();
+    assert_eq!(resumed.attempts, 1);
+    store.fail_claim(&resumed, false).await.unwrap();
+    base.close().await.unwrap();
 }
 fn object() -> ObjectId {
     ObjectId {

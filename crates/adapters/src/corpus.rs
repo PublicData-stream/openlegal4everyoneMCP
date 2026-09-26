@@ -65,6 +65,86 @@ fn check(cancel: &CancellationToken) -> Result<(), DatabaseError> {
     }
 }
 impl PgCorpusStore {
+    /// Metadata-only checkpoint for an observed current-list revision. This
+    /// never reads blob bodies and never asserts provider inventory completeness.
+    pub async fn head_revision_ready(
+        &self,
+        object: &ObjectId,
+        revision_id: &str,
+        now: u64,
+    ) -> Result<bool, DatabaseError> {
+        self.gate().await?;
+        let identity = key(object)?;
+        let ready: Option<bool> = sqlx::query_scalar("SELECT NOT o.withdrawn AND NOT o.pending AND o.desired_head_revision=$2 AND c.revision_id=$2 AND o.validated_at IS NOT NULL AND o.validated_at<=$3::text::numeric AND o.validated_at>$3::text::numeric-3600 FROM openlegal.corpus_object o JOIN openlegal.corpus_capture c ON c.id=o.head_capture WHERE o.object_key=$1")
+            .bind(identity).bind(revision_id).bind(now.to_string())
+            .fetch_optional(&self.pool).await.map_err(db)?;
+        Ok(ready.unwrap_or(false))
+    }
+    /// Internal ingestion lookup for a recently validated retained capture. Public revision
+    /// selectors remain unsupported for datasets without provider history.
+    pub async fn revision_capture_recent(
+        &self,
+        object: &ObjectId,
+        revision_id: &str,
+        now: u64,
+    ) -> Result<bool, DatabaseError> {
+        self.gate().await?;
+        let identity = key(object)?;
+        let ready: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_revision r JOIN openlegal.corpus_capture c ON c.id=r.latest_capture JOIN openlegal.corpus_object o ON o.object_key=r.object_key WHERE r.object_key=$1 AND r.revision_id=$2 AND r.last_validated_at<=$3::text::numeric AND r.last_validated_at>$3::text::numeric-3600 AND (o.head_capture=c.id OR c.captured_at>$3::text::numeric-2592000) AND (c.expires_at IS NULL OR c.expires_at>$3::text::numeric))")
+            .bind(identity).bind(revision_id).bind(now.to_string())
+            .fetch_one(&self.pool).await.map_err(db)?;
+        Ok(ready)
+    }
+    pub async fn inventory_cursor(
+        &self,
+        dataset: Dataset,
+        historical: bool,
+    ) -> Result<u32, DatabaseError> {
+        self.gate().await?;
+        let name = format!(
+            "{}:{historical}",
+            serde_json::to_string(&dataset).map_err(corrupt)?
+        );
+        sqlx::query("INSERT INTO openlegal.provider_inventory_cursor(dataset) VALUES($1) ON CONFLICT DO NOTHING")
+            .bind(&name).execute(&self.pool).await.map_err(db)?;
+        let page: i32 = sqlx::query_scalar(
+            "SELECT next_page FROM openlegal.provider_inventory_cursor WHERE dataset=$1",
+        )
+        .bind(&name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)?;
+        u32::try_from(page).map_err(corrupt)
+    }
+    pub async fn advance_inventory_cursor(
+        &self,
+        dataset: Dataset,
+        historical: bool,
+        observed_page: u32,
+        done: bool,
+    ) -> Result<(), DatabaseError> {
+        self.gate().await?;
+        let name = format!(
+            "{}:{historical}",
+            serde_json::to_string(&dataset).map_err(corrupt)?
+        );
+        let next = if done {
+            1
+        } else {
+            observed_page
+                .checked_add(1)
+                .ok_or(DatabaseError::Capacity)?
+        };
+        let rows = sqlx::query("UPDATE openlegal.provider_inventory_cursor SET next_page=$1 WHERE dataset=$2 AND next_page=$3")
+            .bind(i32::try_from(next).map_err(corrupt)?)
+            .bind(&name)
+            .bind(i32::try_from(observed_page).map_err(corrupt)?)
+            .execute(&self.pool).await.map_err(db)?.rows_affected();
+        if rows != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        Ok(())
+    }
     pub fn new(pool: PgPool, blobs: Arc<dyn BlobStore>) -> Self {
         Self::with_publication_clock(
             pool,
@@ -274,6 +354,10 @@ impl PgCorpusStore {
         }
         let k = key(&object)?;
         let head = matches!(selector, RevisionSelector::Head);
+        let selected_revision = match &selector {
+            RevisionSelector::Revision { id } => Some(id.clone()),
+            _ => None,
+        };
         let expected_date = match &selector {
             RevisionSelector::PublicationDate { date } => Some((false, date.clone())),
             RevisionSelector::EffectiveDate { date } => Some((true, date.clone())),
@@ -283,7 +367,7 @@ impl PgCorpusStore {
             selector,
             RevisionSelector::PublicationDate { .. } | RevisionSelector::EffectiveDate { .. }
         );
-        if object.dataset == Dataset::Precedent
+        if !object.dataset.has_provider_revisions()
             && matches!(selector, RevisionSelector::Revision { .. })
         {
             return Err(DatabaseError::UnsupportedHistory);
@@ -305,7 +389,7 @@ impl PgCorpusStore {
             }
             date @ (RevisionSelector::PublicationDate { .. }
             | RevisionSelector::EffectiveDate { .. }) => {
-                if object.dataset == Dataset::Precedent {
+                if !object.dataset.has_provider_revisions() {
                     return Err(DatabaseError::UnsupportedHistory);
                 }
                 if !state.inventory_complete {
@@ -381,6 +465,15 @@ impl PgCorpusStore {
                 return Err(DatabaseError::Conflict);
             }
         }
+        if let Some(revision_id) = selected_revision {
+            let validation: Option<Option<String>> = sqlx::query_scalar("SELECT last_validated_at::text FROM openlegal.corpus_revision WHERE object_key=$1 AND revision_id=$2 AND latest_capture=$3")
+                .bind(&k).bind(&revision_id).bind(&id).fetch_optional(&self.pool).await.map_err(db)?;
+            match validation.flatten() {
+                Some(value) => result.validated_at = value.parse().map_err(corrupt)?,
+                None if !metadata_only => return Err(DatabaseError::Conflict),
+                None => {}
+            }
+        }
         if head {
             let row=sqlx::query("SELECT head_capture,validated_at::text,pending,withdrawn FROM openlegal.corpus_object WHERE object_key=$1").bind(k).fetch_one(&self.pool).await.map_err(db)?;
             if row.try_get::<bool, _>("withdrawn").map_err(db)? {
@@ -432,15 +525,21 @@ impl PgCorpusStore {
         {
             return Err(DatabaseError::InvalidInput);
         }
-        let previous = if p.install_head {
-            match self.state(&p.record.object).await?.head_capture {
-                Some(id) => Some(self.capture(&id, p.now, cancel.clone()).await?),
-                None => None,
-            }
-        } else {
-            None
-        };
         let k = key(&p.record.object)?;
+        let previous_id = if p.install_head {
+            self.state(&p.record.object).await?.head_capture
+        } else {
+            sqlx::query_scalar::<_, Option<String>>("SELECT latest_capture FROM openlegal.corpus_revision WHERE object_key=$1 AND revision_id=$2")
+                .bind(&k).bind(&p.record.revision_id).fetch_optional(&self.pool).await.map_err(db)?.flatten()
+        };
+        let previous = match previous_id {
+            Some(id) => match self.capture(&id, p.now, cancel.clone()).await {
+                Ok(capture) => Some(capture),
+                Err(DatabaseError::RevisionUnavailable) if !p.install_head => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
         let digest = bytes_hash(&p.raw);
         let size = p.raw.len() as i64;
         let generation: Uuid = sqlx::query_scalar("SELECT pg_catalog.uuidv7()")
@@ -475,7 +574,7 @@ impl PgCorpusStore {
         if counts.try_get::<i64, _>("raw_bytes").map_err(db)?
             + counts.try_get::<i64, _>("staged_bytes").map_err(db)?
             + total_size as i64
-            > 1024_i64 * 1024 * 1024 * 1024
+            > 480_i64 * 1024 * 1024 * 1024
             || counts.try_get::<i64, _>("staged_bytes").map_err(db)? + total_size as i64
                 > 16_i64 * 1024 * 1024 * 1024
             || counts.try_get::<i64, _>("stages").map_err(db)? + staged_blobs.len() as i64
@@ -580,18 +679,33 @@ impl PgCorpusStore {
         } else {
             false
         };
+        let previous_still_current = if let Some(old) = &previous {
+            if p.install_head {
+                object
+                    .try_get::<Option<String>, _>("head_capture")
+                    .map_err(db)?
+                    .as_deref()
+                    == Some(old.capture_id.as_str())
+            } else {
+                let latest: Option<String> = sqlx::query_scalar("SELECT latest_capture FROM openlegal.corpus_revision WHERE object_key=$1 AND revision_id=$2")
+                    .bind(&k).bind(&p.record.revision_id).fetch_optional(&mut *tx).await.map_err(db)?.flatten();
+                latest.as_deref() == Some(old.capture_id.as_str())
+            }
+        } else {
+            false
+        };
         if let Some(mut old) = previous
             && previous_evidence_matches
             && old.record == p.record
             && old.processor_version == p.processor_version
             && old.raw_sha256 == hex(&digest)
-            && object
-                .try_get::<Option<String>, _>("head_capture")
-                .map_err(db)?
-                .as_deref()
-                == Some(old.capture_id.as_str())
+            && previous_still_current
         {
-            sqlx::query("UPDATE openlegal.corpus_object SET validated_at=$2::text::numeric,pending=false,version=version+1 WHERE object_key=$1").bind(&k).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
+            if p.install_head {
+                sqlx::query("UPDATE openlegal.corpus_object SET validated_at=$2::text::numeric,pending=false,version=version+1 WHERE object_key=$1").bind(&k).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
+            }
+            sqlx::query("UPDATE openlegal.corpus_revision SET last_validated_at=$3::text::numeric WHERE object_key=$1 AND revision_id=$2 AND latest_capture=$4")
+                .bind(&k).bind(&p.record.revision_id).bind(p.now.to_string()).bind(&old.capture_id).execute(&mut *tx).await.map_err(db)?;
             for (location, d, n) in &staged_blobs {
                 sqlx::query("INSERT INTO openlegal.corpus_blob_deletion VALUES($1,$2,$3)")
                     .bind(location)
@@ -676,7 +790,7 @@ impl PgCorpusStore {
                 .await
                 .map_err(db)?;
         }
-        sqlx::query("INSERT INTO openlegal.corpus_revision VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric) ON CONFLICT(object_key,revision_id) DO UPDATE SET latest_capture=EXCLUDED.latest_capture,publication_date=EXCLUDED.publication_date,effective_date=EXCLUDED.effective_date,last_sequence=EXCLUDED.last_sequence,captured_at=EXCLUDED.captured_at").bind(&k).bind(&capture.record.revision_id).bind(&capture_id).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(sequence).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,publication_date,effective_date,last_sequence,captured_at,last_validated_at) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$7::text::numeric) ON CONFLICT(object_key,revision_id) DO UPDATE SET latest_capture=EXCLUDED.latest_capture,publication_date=EXCLUDED.publication_date,effective_date=EXCLUDED.effective_date,last_sequence=EXCLUDED.last_sequence,captured_at=EXCLUDED.captured_at,last_validated_at=EXCLUDED.last_validated_at").bind(&k).bind(&capture.record.revision_id).bind(&capture_id).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(sequence).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_object SET version=version+1,next_capture=next_capture+1,head_capture=CASE WHEN $2 THEN $3 ELSE head_capture END,validated_at=CASE WHEN $2 THEN $4::text::numeric ELSE validated_at END,pending=CASE WHEN $2 THEN false ELSE pending END WHERE object_key=$1").bind(&k).bind(p.install_head).bind(&capture_id).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("INSERT INTO openlegal.corpus_outbox SELECT next_event,$1,$2,$3,false,$4,false FROM openlegal.corpus_control").bind(&k).bind(version+1).bind(&capture_id).bind(p.install_head).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_control SET next_event=next_event+1,raw_bytes=raw_bytes+$1,staged_bytes=staged_bytes-$1").bind(total_size as i64).execute(&mut *tx).await.map_err(db)?;

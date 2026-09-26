@@ -66,6 +66,7 @@ name = "mcp-http"
 origin = "http://replace-with-private-node.invalid:30080"
 max_http_version = "h1"
 preserve_host = false
+pool_max_idle_per_host = 0
 connect_timeout_ms = 3000
 request_timeout_ms = 40000
 

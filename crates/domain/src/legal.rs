@@ -7,8 +7,21 @@ use std::{collections::BTreeMap, fmt};
 #[serde(rename_all = "snake_case")]
 pub enum Dataset {
     NationalStatute,
+    AdministrativeRule,
     Ordinance,
+    Treaty,
     Precedent,
+    ConstitutionalDecision,
+    LegalInterpretation,
+    AdministrativeAppeal,
+}
+impl Dataset {
+    pub fn has_provider_revisions(self) -> bool {
+        matches!(
+            self,
+            Self::NationalStatute | Self::AdministrativeRule | Self::Ordinance
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema)]
@@ -317,6 +330,7 @@ pub enum DatabaseError {
     StorageUnavailable,
     StorageCorrupt,
     Capacity,
+    BudgetExhausted,
     Conflict,
     Cancelled,
     SessionExpired,

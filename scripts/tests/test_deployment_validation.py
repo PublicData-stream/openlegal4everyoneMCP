@@ -762,7 +762,7 @@ class NetworkValidationTests(unittest.TestCase):
             ("NetworkPolicy", ("spec", "egress"), [{}]),
             ("NetworkPolicy", ("spec", "ingress"), [{}]),
             ("ResourceQuota", ("spec", "hard", "pods"), "3"),
-            ("RuntimeClass", ("handler",), "runc"),
+            ("RuntimeClass", ("handler",), "runsc-document"),
             ("RuntimeClass", ("scheduling",), {}),
             ("Namespace", ("metadata", "labels", "pod-security.kubernetes.io/enforce"), "privileged"),
         ):

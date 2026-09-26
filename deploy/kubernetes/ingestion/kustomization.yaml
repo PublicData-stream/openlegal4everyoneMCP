@@ -9,6 +9,7 @@ configMapGenerator:
     behavior: replace
     files:
       - server.toml
+      - pilot-candidates.json
   - name: openlegal-document-controller-config
     files:
       - kubeconfig

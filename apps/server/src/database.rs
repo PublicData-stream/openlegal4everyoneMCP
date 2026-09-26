@@ -210,7 +210,7 @@ impl ToolModule for DatabaseTools {
         let service = self.database.clone();
         registry.register_typed::<HistoryInput, HistoryPage, _, _>(
             "database.history",
-            "List provider revision checkpoints or separate capture observations of one object, newest first. A retained catalog entry does not promise retained body content. Precedent provider revision history is unsupported; capture history remains available.",
+            "List provider revision checkpoints or separate capture observations of one object, newest first. A retained catalog entry does not promise retained body content. Treaty and decision/precedent provider revision history is unsupported; capture history remains available.",
             ToolOptions::default(),
             move |input, ctx| {
                 let service = service.clone();
@@ -347,7 +347,7 @@ pub(crate) fn map_error(e: DatabaseError) -> ToolError {
         DatabaseError::NotFound => ToolError::NotFound,
         DatabaseError::StorageUnavailable => ToolError::StorageUnavailable,
         DatabaseError::StorageCorrupt => ToolError::StorageCorrupt,
-        DatabaseError::Capacity => ToolError::ResourceLimit,
+        DatabaseError::Capacity | DatabaseError::BudgetExhausted => ToolError::ResourceLimit,
         DatabaseError::AmbiguousRevision => ToolError::Ambiguous,
         DatabaseError::FreshnessUnavailable => ToolError::FreshnessUnavailable,
         DatabaseError::RevisionUnavailable => ToolError::SnapshotUnavailable,

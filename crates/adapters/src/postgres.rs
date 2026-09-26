@@ -165,6 +165,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0002_legal_corpus.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            3,
+            "provider request budget".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0003_provider_request_budget.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator
