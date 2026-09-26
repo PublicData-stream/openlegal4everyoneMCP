@@ -87,7 +87,7 @@ mode = "disabled"
 
 [[routes]]
 name = "mcp-http"
-hosts = ["openlegal4everyone.stream"]
+hosts = ["openlegal4everyone.mcp.publicdata.stream", "openlegal4everyone.api.publicdata.stream"]
 upstream = "mcp-http"
 compression = "off"
 [routes.limits]
@@ -98,7 +98,7 @@ exact = "/mcp"
 
 [[routes]]
 name = "mcp-webtransport"
-hosts = ["openlegal4everyone.stream"]
+hosts = ["openlegal4everyone.mcp.publicdata.stream", "openlegal4everyone.api.publicdata.stream"]
 upstream = "mcp-webtransport"
 [routes.match]
 methods = ["CONNECT"]

@@ -474,8 +474,8 @@ retention maintenance. The former text-only configuration is now a
 - Replace both backend authority placeholders with the authorities sent by
   OxiBelt: `NODE_DNS:30080` for HTTP and `NODE_DNS:30433` for WebTransport,
   where `NODE_DNS` is the selected private node hostname. The intended browser
-  Origin is
-  `https://openlegal4everyone.stream`; retain explicit Origin validation. Follow
+  Origins are `https://openlegal4everyone.mcp.publicdata.stream` and
+  `https://openlegal4everyone.api.publicdata.stream`; retain explicit Origin validation. Follow
   the [OxiBelt hosting contract](oxibelt.md#adapt-the-configuration-for-hosting).
 - Establish and verify the [NodePort firewall restrictions](#service-and-private-network-handoff)
   before applying the serving Kustomization, which creates the Service. Apply the
@@ -1345,9 +1345,9 @@ Build the native client explicitly before running smoke:
 ```sh
 cargo build --locked -p openlegal-server --example wt_client
 scripts/smoke-kubernetes-serving.sh \
-  --http-url https://openlegal4everyone.stream/mcp \
-  --webtransport-url https://openlegal4everyone.stream/mcp-wt/v1 \
-  --origin https://openlegal4everyone.stream \
+  --http-url https://openlegal4everyone.mcp.publicdata.stream/mcp \
+  --webtransport-url https://openlegal4everyone.mcp.publicdata.stream/mcp-wt/v1 \
+  --origin https://openlegal4everyone.mcp.publicdata.stream \
   --ca-file /absolute/operator/edge-ca-bundle.pem \
   --wt-client "$PWD/target/debug/examples/wt_client" \
   --report /absolute/operator/new-smoke-report.json

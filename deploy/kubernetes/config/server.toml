@@ -6,14 +6,14 @@ url = "https://github.com/PublicData-stream/openlegal4everyoneMCP/tree/REPLACE_W
 [http]
 bind = "0.0.0.0:8080"
 allowed_hosts = ["REPLACE_WITH_OXIBELT_BACKEND_AUTHORITY"]
-allowed_origins = ["https://openlegal4everyone.stream"]
+allowed_origins = ["https://openlegal4everyone.mcp.publicdata.stream", "https://openlegal4everyone.api.publicdata.stream"]
 
 [webtransport]
 bind = "0.0.0.0:4433"
 certificate = "/run/secrets/backend-tls/tls.crt"
 private_key = "/run/secrets/backend-tls/tls.key"
 allowed_hosts = ["REPLACE_WITH_OXIBELT_WEBTRANSPORT_AUTHORITY"]
-allowed_origins = ["https://openlegal4everyone.stream"]
+allowed_origins = ["https://openlegal4everyone.mcp.publicdata.stream", "https://openlegal4everyone.api.publicdata.stream"]
 
 [health]
 bind = "0.0.0.0:9090"

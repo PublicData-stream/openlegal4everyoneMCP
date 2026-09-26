@@ -142,7 +142,7 @@ root = pathlib.Path(sys.argv[1])
 source = pathlib.Path("deploy/oxibelt/kubernetes-upstream.example.toml").read_text()
 for before, after in (
     ("replace-with-private-node.invalid", "backend"),
-    ("openlegal4everyone.stream", "edge"),
+    ("openlegal4everyone.mcp.publicdata.stream", "edge"),
     ('["backend-ca.pem"]', '["ca.pem"]'),
 ):
     assert before in source, f"missing handoff substitution: {before}"

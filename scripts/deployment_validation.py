@@ -220,7 +220,8 @@ def validate_config(raw, profile="retained"):
             authority = ("REPLACE_WITH_OXIBELT_BACKEND_AUTHORITY" if transport == "http"
                          else "REPLACE_WITH_OXIBELT_WEBTRANSPORT_AUTHORITY")
             expected.update(allowed_hosts=[authority],
-                            allowed_origins=["https://openlegal4everyone.stream"])
+                            allowed_origins=["https://openlegal4everyone.mcp.publicdata.stream",
+                                             "https://openlegal4everyone.api.publicdata.stream"])
         if transport == "webtransport":
             expected.update(certificate="/run/secrets/backend-tls/tls.crt",
                             private_key="/run/secrets/backend-tls/tls.key")
@@ -644,11 +645,13 @@ def validate_oxibelt(raw, service):
         upstreams.append(upstream)
     equal(config["upstreams"], upstreams, "NodePort upstreams")
     equal(config["routes"], [
-        {"name": "mcp-http", "hosts": ["openlegal4everyone.stream"],
+        {"name": "mcp-http", "hosts": ["openlegal4everyone.mcp.publicdata.stream",
+                                      "openlegal4everyone.api.publicdata.stream"],
          "upstream": "mcp-http", "compression": "off",
          "limits": {"max_request_body_bytes": 16 * 1024 * 1024},
          "match": {"path": {"exact": "/mcp"}}},
-        {"name": "mcp-webtransport", "hosts": ["openlegal4everyone.stream"],
+        {"name": "mcp-webtransport", "hosts": ["openlegal4everyone.mcp.publicdata.stream",
+                                              "openlegal4everyone.api.publicdata.stream"],
          "upstream": "mcp-webtransport",
          "match": {"methods": ["CONNECT"], "protocols": ["webtransport"],
                    "path": {"exact": "/mcp-wt/v1"}}},

@@ -121,7 +121,7 @@ class ServingValidationTests(unittest.TestCase):
             ('[cache]\nenabled = false', '[cache]\nenabled = true'),
             ('[compression]\nenabled = false', '[compression]\nenabled = true'),
             ('max_request_body_bytes = 16777216', 'max_request_body_bytes = 10485760'),
-            ('hosts = ["openlegal4everyone.stream"]', 'hosts = ["*"]'),
+            ('hosts = ["openlegal4everyone.mcp.publicdata.stream", "openlegal4everyone.api.publicdata.stream"]', 'hosts = ["*"]'),
             ('exact = "/mcp"', 'prefix = "/"'),
             ('exact = "/mcp-wt/v1"', 'exact = "/ready"'),
             ('methods = ["CONNECT"]', 'methods = ["GET"]'),
@@ -201,7 +201,7 @@ class ServingValidationTests(unittest.TestCase):
             with self.subTest(section=section):
                 data["server.toml"] = original + f'\n[{section}]\nenabled = true\n'
                 self.rejected()
-        data["server.toml"] = original.replace('https://openlegal4everyone.stream', 'https://unreviewed.test')
+        data["server.toml"] = original.replace('https://openlegal4everyone.mcp.publicdata.stream', 'https://unreviewed.test')
         self.rejected()
 
     def test_secret_environment_is_runtime_only(self):

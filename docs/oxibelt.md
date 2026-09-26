@@ -137,9 +137,13 @@ backend-only upgrades remain unaccepted.
 
 Start with the complete
 [`kubernetes-upstream.example.toml`](../deploy/oxibelt/kubernetes-upstream.example.toml)
-for the pinned revision above. It routes the public host `openlegal4everyone.stream`
-on exact `/mcp` and CONNECT `/mcp-wt/v1` paths. The container listens on 8443;
+for the pinned revision above. It routes the public hosts
+`openlegal4everyone.mcp.publicdata.stream` and
+`openlegal4everyone.api.publicdata.stream` on exact `/mcp` and CONNECT
+`/mcp-wt/v1` paths. The container listens on 8443;
 the operator's host Compose must publish `443:8443/tcp` and `443:8443/udp`.
+The API hostname currently carries the same MCP paths; this configuration does
+not create a separate REST API.
 Remove the existing `openlegal4everyone` nginx service from that operator-owned
 Compose configuration and retain OxiBelt and lego. No host Compose file is shipped
 in this repository, and no additional proxy is needed between OxiBelt and the
@@ -157,7 +161,7 @@ identities together:
 | OxiBelt WebTransport origin | `https://NODE_DNS:30433` |
 | Backend `[webtransport].allowed_hosts` | `["NODE_DNS:30433"]` |
 | Backend certificate DNS SAN | `NODE_DNS` without a port |
-| Both backend `allowed_origins` | `["https://openlegal4everyone.stream"]`, extended only for intended callers |
+| Both backend `allowed_origins` | `["https://openlegal4everyone.mcp.publicdata.stream", "https://openlegal4everyone.api.publicdata.stream"]`, extended only for intended callers |
 
 The backend still listens on 8080/TCP and 4433/UDP. Kubernetes translates the
 NodePorts; it does not rewrite HTTP Host or WebTransport authority. Because
