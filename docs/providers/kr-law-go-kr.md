@@ -124,6 +124,15 @@ These are application choices, not claimed upstream service guarantees:
   is intentionally not reset on restart.
   Manual candidates contribute identity hints only; descriptive metadata for
   a public HEAD must come from a fresh live current-list observation.
+  A structurally invalid list page marks that family incomplete and the pilot
+  may inspect the next family. A `source_rejected` list or detail result also
+  covers HTTP client or authentication rejection, so it durably suspends
+  further provider requests until operator review.
+  The pilot logs each rejected family and a summary when the scan finishes;
+  queued candidates and prior valid pages do not establish publication or
+  inventory completeness.
+  Unclassified scan, job worker, index, lease and storage errors remain fatal
+  to serving. A rejected list page is handled at its provider boundary.
 - `mode = "continuous"` uses durable per-dataset page cursors and queues every
   record on one current page per dataset and one historical page for datasets
   with provider revisions each hour. The 128-job queue applies backpressure,
@@ -147,8 +156,10 @@ These are application choices, not claimed upstream service guarantees:
   verifies the provider state, clears the suspension and restarts ingestion;
   the recorded `next_allowed_at` still prevents an early retry.
   Each reserved request remains marked `unresolved_response` until its response
-  is handled. A crash or failed pause write leaves ingestion stopped after
-  restart; the operator must inspect the provider state before clearing it.
+  is handled. Cancellation before response handling leaves that marker set,
+  even if the request may not have been sent. A crash or failed pause or source
+  suspension write leaves ingestion stopped after restart; the operator must
+  inspect the provider state before clearing it.
   Deferred claims do not spend another job attempt while
   the pause holds. Permanent HTTP client rejection and deterministic parser/format failure
   return `source_rejected`; cancellation remains cancellation. Transient sandbox

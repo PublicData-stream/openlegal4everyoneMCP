@@ -604,6 +604,9 @@ impl CorpusRuntime {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1800);
         self.inventory_verified
             .store(false, std::sync::atomic::Ordering::Release);
+        let mut list_failures = 0usize;
+        let mut selected_total = 0usize;
+        let mut scanned_families = 0usize;
         for (dataset, class) in [
             (Dataset::NationalStatute, None),
             (Dataset::AdministrativeRule, None),
@@ -643,7 +646,12 @@ impl CorpusRuntime {
                         cancel.cancel();
                         return Ok(());
                     }
-                    Ok(Err(error)) => return Err(error),
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "law provider pilot: manual candidate for {dataset:?} class {class:?} failed: {error:?}"
+                        );
+                        return Err(error);
+                    }
                 }
             }
             let mut selected = 0;
@@ -666,12 +674,44 @@ impl CorpusRuntime {
                         cancel.cancel();
                         return Ok(());
                     }
+                    Ok(Err(DatabaseError::Capacity | DatabaseError::ProcessingPending)) => {
+                        eprintln!(
+                            "law provider pilot: {dataset:?} class {class:?} inventory page {page} could not be processed within admission limits; stopping pilot"
+                        );
+                        cancel.cancel();
+                        return Ok(());
+                    }
+                    // A rejected provider list is not evidence that retained
+                    // storage is corrupt. Record the incomplete family and
+                    // continue the bounded pilot without taking serving down.
+                    Ok(Err(DatabaseError::StorageCorrupt)) => {
+                        eprintln!(
+                            "law provider pilot: rejected {dataset:?} class {class:?} inventory page {page}; family incomplete"
+                        );
+                        list_failures += 1;
+                        break;
+                    }
+                    // SourceRejected also covers HTTP authentication/client
+                    // rejection. Durably stop the pilot so a restart cannot
+                    // repeat requests with a bad credential.
+                    Ok(Err(DatabaseError::SourceRejected)) => {
+                        eprintln!(
+                            "law provider pilot: source rejected {dataset:?} class {class:?} inventory page {page}; suspending provider requests; preceding families may be partial"
+                        );
+                        cancel.cancel();
+                        return Ok(());
+                    }
                     Ok(Err(DatabaseError::Cancelled)) if cancel.is_cancelled() => return Ok(()),
                     Err(_) => {
                         cancel.cancel();
                         return Ok(());
                     }
-                    Ok(Err(error)) => return Err(error),
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "law provider pilot: {dataset:?} class {class:?} inventory page {page} failed: {error:?}"
+                        );
+                        return Err(error);
+                    }
                 };
                 for item in items {
                     if dataset == Dataset::Treaty {
@@ -692,9 +732,15 @@ impl CorpusRuntime {
                             cancel.cancel();
                             return Ok(());
                         }
-                        Ok(Err(error)) => return Err(error),
+                        Ok(Err(error)) => {
+                            eprintln!(
+                                "law provider pilot: {dataset:?} class {class:?} observed candidate failed: {error:?}"
+                            );
+                            return Err(error);
+                        }
                     }
                     selected += 1;
+                    selected_total += 1;
                     if selected >= 2 {
                         break;
                     }
@@ -706,7 +752,11 @@ impl CorpusRuntime {
             if selected == 0 {
                 eprintln!("law provider pilot: no usable current-list candidate for {dataset:?}");
             }
+            scanned_families += 1;
         }
+        eprintln!(
+            "law provider pilot: scan finished; families_visited={scanned_families}, list_failures={list_failures}, head_candidates_queued={selected_total}; publication and inventory completeness not established"
+        );
         tokio::select! {
             _ = cancel.cancelled() => {},
             _ = tokio::time::sleep_until(deadline) => cancel.cancel(),
@@ -903,6 +953,17 @@ impl CorpusRuntime {
                         return Ok(());
                     }
                     tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(60))=>{}}
+                }
+                Err(DatabaseError::SourceRejected)
+                    if self.ingestion_mode == Some(IngestionMode::Pilot) =>
+                {
+                    self.store.fail_claim(&job, false).await?;
+                    eprintln!(
+                        "law provider pilot: detail source rejected for {:?}; suspending provider requests; queued HEAD may remain pending",
+                        job.object.dataset
+                    );
+                    cancel.cancel();
+                    return Ok(());
                 }
                 Err(
                     DatabaseError::SourceRejected

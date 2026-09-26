@@ -8,11 +8,23 @@ use openlegal_adapters::{
 };
 use openlegal_application::{
     database::{DatabaseStore, Publication},
+    document::{DocumentError, DocumentInput, DocumentOutput, DocumentProcessor},
     persistence::PersistentStore,
 };
 use openlegal_domain::legal::*;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
+
+struct UnusedDocumentProcessor;
+impl DocumentProcessor for UnusedDocumentProcessor {
+    fn process(
+        &self,
+        _input: DocumentInput,
+        _cancellation: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, Result<DocumentOutput, DocumentError>> {
+        Box::pin(async { Err(DocumentError::InvalidInput) })
+    }
+}
 
 struct FixtureClock;
 impl openlegal_application::Clock for FixtureClock {
@@ -276,6 +288,37 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
     let resumed = store.claim_job(1000).await.unwrap().unwrap();
     assert_eq!(resumed.attempts, 1);
     store.fail_claim(&resumed, false).await.unwrap();
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn source_rejection_suspends_restart_admission_and_clears_resolved_attempt() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let pool = base.pool();
+    let client = LawClient::new(
+        "fixture-credential".into(),
+        Arc::new(UnusedDocumentProcessor),
+    )
+    .unwrap()
+    .with_request_budget(pool.clone(), RequestBudgetMode::Pilot);
+    LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::Pilot, &token())
+        .await
+        .unwrap();
+    client.suspend_after_source_rejection().await.unwrap();
+    let flags: (bool, bool) = sqlx::query_as(
+        "SELECT operator_suspended,unresolved_response FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(flags, (true, false));
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::Pilot, &token())
+            .await,
+        Err(DatabaseError::BudgetExhausted)
+    );
     base.close().await.unwrap();
 }
 fn object() -> ObjectId {

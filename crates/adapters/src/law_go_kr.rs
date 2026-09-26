@@ -145,6 +145,23 @@ impl LawClient {
         self.operator_suspended.store(suspended, Ordering::Release);
         Ok(())
     }
+    /// A deterministic rejection may also be an invalid or revoked credential.
+    /// A pilot must not repeat it after a process restart without operator review.
+    pub async fn suspend_after_source_rejection(&self) -> Result<(), DatabaseError> {
+        self.operator_suspended.store(true, Ordering::Release);
+        if let Some((pool, _)) = &self.budget {
+            let updated = sqlx::query(
+                "UPDATE openlegal.provider_request_budget SET operator_suspended=true,unresolved_response=false WHERE singleton",
+            )
+            .execute(pool)
+            .await
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+            if updated.rows_affected() != 1 {
+                return Err(DatabaseError::StorageUnavailable);
+            }
+        }
+        Ok(())
+    }
     async fn complete_request(&self) -> Result<(), DatabaseError> {
         if let Some((pool, _)) = &self.budget
             && sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false WHERE singleton")
@@ -528,8 +545,8 @@ impl LawClient {
                 .extend_pairs(pairs)
                 .append_pair("type", "HTML");
         }
-        let (output, raw, retrieved_at) = self
-            .fetch_parse_timed(
+        let (mut record, links, raw, retrieved_at, processor_version) = self
+            .fetch_parse_timed_checked(
                 url,
                 if html {
                     DocumentFormat::Html
@@ -538,62 +555,77 @@ impl LawClient {
                 },
                 false,
                 cancel.clone(),
+                |output, raw, retrieved_at| {
+                    let record = project(item, &output)?;
+                    record.validate()?;
+                    let links = attachment_links(
+                        output.tree.as_ref().ok_or(DatabaseError::StorageCorrupt)?,
+                    )?;
+                    Ok((record, links, raw, retrieved_at, output.processor_version))
+                },
             )
             .await?;
-        let mut record = project(item, &output)?;
-        let links = attachment_links(output.tree.as_ref().ok_or(DatabaseError::StorageCorrupt)?)?;
         let mut additional_evidence = Vec::new();
         let mut total = raw.len();
         let mut extracted = 0usize;
         for (ordinal, link) in links.into_iter().enumerate() {
-            let (attachment, bytes) = self
-                .fetch_parse(link.url, link.format, true, cancel.clone())
+            let bytes = self
+                .fetch_parse_timed_checked(
+                    link.url,
+                    link.format,
+                    true,
+                    cancel.clone(),
+                    |attachment, bytes, _| {
+                        total = total
+                            .checked_add(bytes.len())
+                            .ok_or(DatabaseError::SourceRejected)?;
+                        if total > 100 * 1024 * 1024 {
+                            return Err(DatabaseError::SourceRejected);
+                        }
+                        let digest = attachment.source_sha256.clone();
+                        let pages = if attachment.pages.is_empty() {
+                            vec![openlegal_application::document::DocumentPage {
+                                page: 1,
+                                text: attachment.text,
+                            }]
+                        } else {
+                            attachment.pages
+                        };
+                        for (kind, pages) in [
+                            (SectionKind::Extracted, pages),
+                            (SectionKind::Ocr, attachment.ocr_pages),
+                        ] {
+                            for page in pages {
+                                extracted = extracted
+                                    .checked_add(page.text.len())
+                                    .ok_or(DatabaseError::SourceRejected)?;
+                                if extracted > 16 * 1024 * 1024 {
+                                    return Err(DatabaseError::SourceRejected);
+                                }
+                                let label = if kind == SectionKind::Ocr {
+                                    "ocr"
+                                } else {
+                                    "extracted"
+                                };
+                                record.sections.push(LegalSection {
+                                    id: format!("attachment:{}:{label}:{}", ordinal + 1, page.page),
+                                    title: link.title.clone(),
+                                    text: page.text,
+                                    kind: kind.clone(),
+                                    source_document_sha256: Some(digest.clone()),
+                                    page: Some(
+                                        page.page
+                                            .try_into()
+                                            .map_err(|_| DatabaseError::SourceRejected)?,
+                                    ),
+                                });
+                            }
+                        }
+                        record.validate()?;
+                        Ok(bytes)
+                    },
+                )
                 .await?;
-            total = total
-                .checked_add(bytes.len())
-                .ok_or(DatabaseError::SourceRejected)?;
-            if total > 100 * 1024 * 1024 {
-                return Err(DatabaseError::SourceRejected);
-            }
-            let digest = attachment.source_sha256.clone();
-            let pages = if attachment.pages.is_empty() {
-                vec![openlegal_application::document::DocumentPage {
-                    page: 1,
-                    text: attachment.text,
-                }]
-            } else {
-                attachment.pages
-            };
-            for (kind, pages) in [
-                (SectionKind::Extracted, pages),
-                (SectionKind::Ocr, attachment.ocr_pages),
-            ] {
-                for page in pages {
-                    extracted = extracted
-                        .checked_add(page.text.len())
-                        .ok_or(DatabaseError::SourceRejected)?;
-                    if extracted > 16 * 1024 * 1024 {
-                        return Err(DatabaseError::SourceRejected);
-                    }
-                    let label = if kind == SectionKind::Ocr {
-                        "ocr"
-                    } else {
-                        "extracted"
-                    };
-                    record.sections.push(LegalSection {
-                        id: format!("attachment:{}:{label}:{}", ordinal + 1, page.page),
-                        title: link.title.clone(),
-                        text: page.text,
-                        kind: kind.clone(),
-                        source_document_sha256: Some(digest.clone()),
-                        page: Some(
-                            page.page
-                                .try_into()
-                                .map_err(|_| DatabaseError::SourceRejected)?,
-                        ),
-                    });
-                }
-            }
             additional_evidence.push(bytes);
         }
         record.validate()?;
@@ -602,7 +634,7 @@ impl LawClient {
             record,
             raw,
             additional_evidence,
-            processor_version: output.processor_version,
+            processor_version,
         })
     }
     fn api(&self, path: &str, target: &str) -> Result<Url, DatabaseError> {
@@ -632,6 +664,24 @@ impl LawClient {
         ocr: bool,
         cancel: CancellationToken,
     ) -> Result<(DocumentOutput, Vec<u8>, u64), DatabaseError> {
+        self.fetch_parse_timed_checked(url, format, ocr, cancel, |output, raw, retrieved_at| {
+            Ok((output, raw, retrieved_at))
+        })
+        .await
+    }
+    /// Run source-dependent checks before releasing the one-request admission
+    /// permit and finalizing the durable response state.
+    async fn fetch_parse_timed_checked<T, F>(
+        &self,
+        url: Url,
+        format: DocumentFormat,
+        ocr: bool,
+        cancel: CancellationToken,
+        check: F,
+    ) -> Result<T, DatabaseError>
+    where
+        F: FnOnce(DocumentOutput, Vec<u8>, u64) -> Result<T, DatabaseError>,
+    {
         if url.scheme() != "https"
             || url.port_or_known_default() != Some(443)
             || !matches!(url.host_str(), Some("www.law.go.kr" | "law.go.kr"))
@@ -754,12 +804,34 @@ impl LawClient {
         };
         tokio::select! {_ = cancel.cancelled()=>Err(DatabaseError::Cancelled),result=fetch=>result}
         }.await;
-        if !self.operator_suspended.load(Ordering::Acquire) {
-            self.complete_request().await?;
-        }
-        let raw = fetched?;
+        let pilot = self
+            .budget
+            .as_ref()
+            .is_some_and(|(_, mode)| *mode == RequestBudgetMode::Pilot);
+        let raw = match fetched {
+            Ok(raw) => raw,
+            Err(DatabaseError::SourceRejected) if pilot => {
+                // Keep the admission permit until this failure is fenced in
+                // both the process and durable request ledger.
+                self.suspend_after_source_rejection().await?;
+                return Err(DatabaseError::SourceRejected);
+            }
+            Err(error @ (DatabaseError::Cancelled | DatabaseError::StorageUnavailable))
+                if pilot =>
+            {
+                // A reserved request may have been sent; preserve the
+                // unresolved marker for operator review after a restart.
+                return Err(error);
+            }
+            Err(DatabaseError::Cancelled) => return Err(DatabaseError::Cancelled),
+            Err(error) => {
+                if !self.operator_suspended.load(Ordering::Acquire) {
+                    self.complete_request().await?;
+                }
+                return Err(error);
+            }
+        };
         let retrieved_at = self.clock.now();
-        drop(permit);
         let digest = Sha256::digest(&raw)
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -776,8 +848,21 @@ impl LawClient {
                 cancel,
             )
             .await
-            .map_err(document_error)?;
-        Ok((output, raw, retrieved_at))
+            .map_err(document_error)
+            .and_then(|output| check(output, raw, retrieved_at));
+        match output {
+            Err(DatabaseError::SourceRejected) if pilot => {
+                self.suspend_after_source_rejection().await?;
+                return Err(DatabaseError::SourceRejected);
+            }
+            Err(DatabaseError::Cancelled) => return Err(DatabaseError::Cancelled),
+            _ => {}
+        }
+        if !self.operator_suspended.load(Ordering::Acquire) {
+            self.complete_request().await?;
+        }
+        drop(permit);
+        output
     }
 }
 fn http_status_error(status: reqwest::StatusCode) -> Option<DatabaseError> {
