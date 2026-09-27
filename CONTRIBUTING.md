@@ -140,6 +140,12 @@ cargo audit
 cargo deny check
 ```
 
+Host Rust CI and release-image jobs install the pinned toolchain into a fresh
+job-local `RUSTUP_HOME` under the runner temporary directory. This avoids
+partially installed toolchains supplied by runner images while retaining the
+normal Cargo cache. Allow disk space for the additional toolchain copy during
+image builds.
+
 The repository's `.cargo/config.toml` applies `target-cpu=x86-64-v3` to x86_64
 Rust builds and rustdoc/doctests without changing native artifact paths. Check
 the build and execution host's CPU support before running x86_64 binaries; on

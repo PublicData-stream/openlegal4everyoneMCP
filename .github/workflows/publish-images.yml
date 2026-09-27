@@ -144,6 +144,8 @@ jobs:
         env:
           RELEASE_REVISION: ${{ needs.contract.outputs.revision }}
         run: test "$(git rev-parse HEAD)" = "$RELEASE_REVISION"
+      - name: Isolate pinned Rust toolchain
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/openlegal-rustup" >> "$GITHUB_ENV"
       - name: Provision pinned Rust toolchain
         run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - name: Stamp validated tag into Rust release definitions
