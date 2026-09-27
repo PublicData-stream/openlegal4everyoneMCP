@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from deployment_validation import (NETWORK_VARIANTS, ValidationError, load_documents, validate,
                                    validate_admin, validate_document_boundary, validate_network,
                                    validate_oxibelt, validate_storage, validate_ingestion, validate_ingestion_rbac,
-                                   validate_document_controller_role)
+                                   validate_document_controller_role, document_worker_settings,
+                                   normalize_quantity)
 
 
 class ServingValidationTests(unittest.TestCase):
@@ -454,6 +455,27 @@ class IngestionValidationTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 validate_admin(admin, self.docs, operation)
 
+    def test_document_worker_options_are_optional_and_bounded(self):
+        raw = self.config["data"]["server.toml"]
+        default_block = ('[database.ingestion.document_worker]\n'
+                         'cpu = "2"\nmemory = "4Gi"\nscratch = "2Gi"\npool_limit = 2\n')
+        self.assertIn(default_block, raw)
+        self.config["data"]["server.toml"] = raw.replace(default_block, "")
+        validate_ingestion(self.docs, self.retained)
+        self.config["data"]["server.toml"] = raw.replace(default_block,
+            '[database.ingestion.document_worker]\ncpu = "1500m"\npool_limit = 3\n')
+        validate_ingestion(self.docs, self.retained)
+        for setting in ('cpu = "0"', 'memory = "-1Gi"', 'scratch = "x"',
+                        'pool_limit = 0', 'pool_limit = true', 'unknown = 1',
+                        'cpu = "9223372036854775808"'):
+            with self.subTest(setting=setting):
+                self.config["data"]["server.toml"] = raw.replace(default_block,
+                    '[database.ingestion.document_worker]\n' + setting + '\n')
+                self.rejected()
+        self.config["data"]["server.toml"] = raw.replace(default_block,
+            '[database.ingestion.document_worker]\ncpu = "9223372036854775807"\npool_limit = 2\n')
+        self.rejected()
+
     def test_projected_identity_and_bounded_writable_volume(self):
         account = next(obj for obj in self.docs if obj["kind"] == "ServiceAccount")
         projection = self.volumes["controller-identity"]["projected"]
@@ -776,6 +798,38 @@ class NetworkValidationTests(unittest.TestCase):
         for changed in (self.sandbox[:-1], self.sandbox + self.examples["edge"]):
             with self.assertRaises(ValidationError):
                 validate_document_boundary(changed)
+
+    def test_document_quota_matches_custom_pool_and_normalized_quantities(self):
+        custom = {"cpu": "1500m", "memory": "5120Mi", "scratch": "3Gi", "pool_limit": 3}
+        changed = copy.deepcopy(self.sandbox)
+        quota = next(obj for obj in changed if obj["kind"] == "ResourceQuota")
+        quota["spec"]["hard"] = {
+            "pods": "3", "requests.cpu": "4500m", "limits.cpu": "4.5",
+            "requests.memory": "15Gi", "limits.memory": "16106127360",
+            "requests.ephemeral-storage": "9Gi", "limits.ephemeral-storage": "9216Mi"}
+        validate_document_boundary(changed, custom)
+        for key, value in (("pods", "2"), ("limits.cpu", "4"),
+                           ("requests.memory", "14Gi"), ("limits.ephemeral-storage", "8Gi")):
+            altered = copy.deepcopy(changed)
+            next(obj for obj in altered if obj["kind"] == "ResourceQuota")["spec"]["hard"][key] = value
+            with self.subTest(key=key), self.assertRaises(ValidationError):
+                validate_document_boundary(altered, custom)
+        for scope in ({"scopes": ["BestEffort"]}, {"scopeSelector": {}}):
+            altered = copy.deepcopy(changed)
+            next(obj for obj in altered if obj["kind"] == "ResourceQuota")["spec"].update(scope)
+            with self.assertRaises(ValidationError):
+                validate_document_boundary(altered, custom)
+
+    def test_quantity_normalization_and_rounding(self):
+        self.assertEqual(normalize_quantity("2", "cpu"), normalize_quantity("2000m", "cpu"))
+        self.assertEqual(normalize_quantity("4Gi", "memory"), normalize_quantity("4096Mi", "memory"))
+        self.assertEqual(normalize_quantity("0.1m", "cpu"), 1)
+        self.assertEqual(normalize_quantity("1Ei", "scratch"), 2**60 * 1000)
+        self.assertEqual(normalize_quantity("1e3", "cpu"), 1000 * 1000)
+        self.assertEqual(normalize_quantity("0." + "0" * 99 + "1e100", "memory"), 1000)
+        self.assertEqual(normalize_quantity("1e-9999", "memory"), 1)
+        self.assertEqual(normalize_quantity("9223372036854775807", "memory"), (2**63 - 1) * 1000)
+        self.assertEqual(document_worker_settings({"document_worker": {"pool_limit": 3}})["cpu"], "2")
 
 
 if __name__ == "__main__":

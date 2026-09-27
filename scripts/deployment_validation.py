@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+from fractions import Fraction
 import json
 import re
 import sys
@@ -75,6 +76,62 @@ ADMIN = {
 
 NETWORK_VARIANTS = ("base", "edge", "postgres-in-cluster", "postgres-external",
                     "dns-cluster", "dns-fixed", "monitoring", "ingestion-api", "ingestion-provider")
+
+DOCUMENT_WORKER_DEFAULTS = {"cpu": "2", "memory": "4Gi", "scratch": "2Gi", "pool_limit": 2}
+QUANTITY_SCALE = {
+    "": 1, "n": Fraction(1, 10**9), "u": Fraction(1, 10**6),
+    "m": Fraction(1, 1000), "k": 10**3, "M": 10**6, "G": 10**9,
+    "T": 10**12, "P": 10**15, "E": 10**18,
+    "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40,
+    "Pi": 2**50, "Ei": 2**60,
+}
+
+
+def normalize_quantity(value, resource):
+    """Convert a positive Kubernetes Quantity to rounded milli base units."""
+    require(isinstance(value, str) and len(value) <= 128,
+            f"{resource}: expected bounded Quantity text")
+    match = re.fullmatch(r"([+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))"
+                         r"(Ki|Mi|Gi|Ti|Pi|Ei|[numkMGTPE]|[eE][+-]?[0-9]+)?", value)
+    require(match is not None, f"{resource}: invalid Quantity")
+    number, suffix = match.groups()
+    digits = number.lstrip("+")
+    numerator = Fraction(digits)
+    if (suffix or "") in QUANTITY_SCALE:
+        scale = QUANTITY_SCALE[suffix or ""]
+    else:
+        exponent = int(suffix[1:])
+        require(-(2**31) <= exponent <= 2**31 - 1,
+                f"{resource}: Quantity exponent out of range")
+        if exponent < -200:
+            require(numerator > 0, f"{resource}: Quantity must be positive")
+            return 1
+        require(exponent <= 200, f"{resource}: Quantity exceeds supported range")
+        scale = Fraction(10) ** exponent
+    amount = numerator * scale * 1000
+    require(amount > 0, f"{resource}: Quantity must be positive")
+    rounded = -(-amount.numerator // amount.denominator)
+    require(rounded <= (2**63 - 1) * 1000,
+            f"{resource}: Quantity exceeds supported range")
+    return rounded
+
+
+def document_worker_settings(ingestion):
+    """Validate optional operator settings without loosening other ingestion fields."""
+    supplied = ingestion.get("document_worker", {})
+    require(isinstance(supplied, dict), "document_worker must be a table")
+    require(set(supplied) <= set(DOCUMENT_WORKER_DEFAULTS),
+            "document_worker has unknown fields")
+    settings = DOCUMENT_WORKER_DEFAULTS | supplied
+    for resource in ("cpu", "memory", "scratch"):
+        normalize_quantity(settings[resource], resource)
+    pool = settings["pool_limit"]
+    require(type(pool) is int and 0 < pool <= 2**32 - 1,
+            "document_worker.pool_limit must be a positive integer")
+    for resource in ("cpu", "memory", "scratch"):
+        require(normalize_quantity(settings[resource], resource) * pool <= (2**63 - 1) * 1000,
+                f"document_worker aggregate {resource} exceeds quota range")
+    return settings
 
 
 def resource_index(documents):
@@ -159,8 +216,9 @@ def validate_network(documents, variants):
         equal(actual[identity], policy, f"NetworkPolicy {identity[-1]}")
 
 
-def validate_document_boundary(documents):
-    """Guard the existing document trust domain without altering its resources."""
+def validate_document_boundary(documents, worker_settings=None):
+    """Guard the document trust domain and the selected exact pool budget."""
+    settings = document_worker_settings({"document_worker": worker_settings or {}})
     objects = resource_index(documents)
     expected = {
         ("v1", "Namespace", "", "openlegal-documents"),
@@ -178,13 +236,37 @@ def validate_document_boundary(documents):
             value = value[key]
         return value
 
-    equal(field("NetworkPolicy", "spec"), network_example("base")["spec"], "document denial")
-    equal(field("ResourceQuota", "spec", "hard", "pods"), "2", "document Pod quota")
-    equal(field("Namespace", "metadata", "labels", "pod-security.kubernetes.io/enforce"),
-          "restricted", "document Pod Security")
-    equal(field("RuntimeClass", "handler"), "runc", "document runtime handler")
-    equal(field("RuntimeClass", "scheduling"), {"nodeSelector": {"openlegal.document-sandbox/ready": "true"}},
-          "document prepared-node scheduling")
+    quota = {"pods": settings["pool_limit"] * 1000}
+    for resource, quota_resource in (("cpu", "cpu"), ("memory", "memory"),
+                                     ("scratch", "ephemeral-storage")):
+        total = normalize_quantity(settings[resource], resource) * settings["pool_limit"]
+        for direction in ("requests", "limits"):
+            quota[f"{direction}.{quota_resource}"] = total
+    equal(by_kind["Namespace"], {"apiVersion": "v1", "kind": "Namespace", "metadata": {
+        "name": "openlegal-documents", "labels": {
+            "pod-security.kubernetes.io/enforce": "restricted",
+            "pod-security.kubernetes.io/enforce-version": "latest"}}}, "document Namespace")
+    equal(by_kind["NetworkPolicy"], network_example("base") | {"metadata": {
+        "name": "deny-all", "namespace": "openlegal-documents"}}, "document denial")
+    equal(by_kind["RuntimeClass"], {"apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
+        "metadata": {"name": "openlegal-document"}, "handler": "runc", "scheduling": {
+            "nodeSelector": {"openlegal.document-sandbox/ready": "true"}}},
+          "document runtime")
+    hard = field("ResourceQuota", "spec", "hard")
+    keys(hard, quota, "document quota hard resources")
+    for key, expected in quota.items():
+        if key == "pods":
+            require(normalize_quantity(hard[key], "pods") == expected,
+                    "document Pod quota differs from selected pool limit")
+        else:
+            resource = key.rsplit(".", 1)[1]
+            kind = "scratch" if resource == "ephemeral-storage" else resource
+            require(normalize_quantity(hard[key], kind) == expected,
+                    f"document quota {key} differs from selected worker budget")
+    equal({key: value for key, value in by_kind["ResourceQuota"].items() if key != "spec"},
+          {"apiVersion": "v1", "kind": "ResourceQuota", "metadata": {
+              "name": "document-budget", "namespace": "openlegal-documents"}}, "document quota identity")
+    equal(by_kind["ResourceQuota"]["spec"], {"hard": hard}, "document unscoped quota")
 
 
 def claim_name(volume):
@@ -403,6 +485,8 @@ def validate_ingestion(documents, retained_documents):
     ingestion = config["database"].pop("ingestion", None)
     require(isinstance(ingestion, dict), "ingestion configuration required")
     equal(config, tomllib.loads(retained_raw), "ingestion retained configuration parity")
+    document_worker_settings(ingestion)
+    ingestion.pop("document_worker", None)
     worker = ingestion.get("worker_image")
     digest_image(worker, "openlegal-document-worker")
     equal(ingestion, {
@@ -678,7 +762,10 @@ def main():
         raw = validate(documents, args.profile)
         if args.ingestion_manifest:
             require(args.profile == "retained", "ingestion requires retained baseline")
-            validate_ingestion(load_documents(args.ingestion_manifest.read_text()), documents)
+            ingestion_raw = validate_ingestion(load_documents(args.ingestion_manifest.read_text()), documents)
+            ingestion_settings = document_worker_settings(tomllib.loads(ingestion_raw)["database"]["ingestion"])
+        else:
+            ingestion_settings = None
         if args.document_controller_role:
             validate_document_controller_role(load_documents(args.document_controller_role.read_text()))
         if args.ingestion_rbac:
@@ -688,7 +775,7 @@ def main():
                 validate_network(load_documents((args.network_dir / f"{variant}.yaml").read_text()),
                                  [variant])
         if args.document_boundary:
-            validate_document_boundary(load_documents(args.document_boundary.read_text()))
+            validate_document_boundary(load_documents(args.document_boundary.read_text()), ingestion_settings)
         seen = set()
         for admin in args.admin_manifest:
             require(args.profile == "retained", "administration requires retained serving profile")

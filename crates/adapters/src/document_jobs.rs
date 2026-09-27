@@ -8,12 +8,7 @@ use openlegal_application::document::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    path::PathBuf,
-    process::Stdio,
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -21,7 +16,212 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-static DOCUMENT_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
+/// Resource quantities for one disposable Pod and the maximum number of Pods.
+/// The original spelling is retained for the Pod manifest; admission compares
+/// exact, Kubernetes-rounded milli-units rather than textual spellings.
+#[derive(Clone, Debug)]
+pub struct DocumentWorkerLimits {
+    pool_limit: u32,
+    cpu: String,
+    memory: String,
+    scratch: String,
+    cpu_milli: i128,
+    memory_milli: i128,
+    scratch_milli: i128,
+}
+
+impl Default for DocumentWorkerLimits {
+    fn default() -> Self {
+        Self::new(2, "2", "4Gi", "2Gi").expect("valid built-in document worker limits")
+    }
+}
+
+impl DocumentWorkerLimits {
+    pub fn new(
+        pool_limit: u32,
+        cpu: &str,
+        memory: &str,
+        scratch: &str,
+    ) -> Result<Self, DocumentError> {
+        if pool_limit == 0 || (pool_limit as usize) > Semaphore::MAX_PERMITS {
+            return Err(DocumentError::InvalidInput);
+        }
+        let cpu_milli = parse_quantity_milli(cpu).ok_or(DocumentError::InvalidInput)?;
+        let memory_milli = parse_quantity_milli(memory).ok_or(DocumentError::InvalidInput)?;
+        let scratch_milli = parse_quantity_milli(scratch).ok_or(DocumentError::InvalidInput)?;
+        for amount in [cpu_milli, memory_milli, scratch_milli] {
+            let total = amount
+                .checked_mul(i128::from(pool_limit))
+                .ok_or(DocumentError::InvalidInput)?;
+            if total > i128::from(i64::MAX) * 1000 {
+                return Err(DocumentError::InvalidInput);
+            }
+        }
+        Ok(Self {
+            pool_limit,
+            cpu: cpu.into(),
+            memory: memory.into(),
+            scratch: scratch.into(),
+            cpu_milli,
+            memory_milli,
+            scratch_milli,
+        })
+    }
+
+    pub fn pool_limit(&self) -> u32 {
+        self.pool_limit
+    }
+    pub fn cpu(&self) -> &str {
+        &self.cpu
+    }
+    pub fn memory(&self) -> &str {
+        &self.memory
+    }
+    pub fn scratch(&self) -> &str {
+        &self.scratch
+    }
+
+    fn threads(&self) -> i128 {
+        ((self.cpu_milli + 999) / 1000).clamp(1, 64)
+    }
+
+    fn matches_quota(&self, quota: &Value) -> bool {
+        let Some(spec) = quota.pointer("/spec").and_then(Value::as_object) else {
+            return false;
+        };
+        let Some(hard) = spec.get("hard").and_then(Value::as_object) else {
+            return false;
+        };
+        if spec.len() != 1 || hard.len() != 7 {
+            return false;
+        }
+        let expected = [
+            ("requests.cpu", self.cpu_milli),
+            ("limits.cpu", self.cpu_milli),
+            ("requests.memory", self.memory_milli),
+            ("limits.memory", self.memory_milli),
+            ("requests.ephemeral-storage", self.scratch_milli),
+            ("limits.ephemeral-storage", self.scratch_milli),
+        ];
+        hard.get("pods")
+            .and_then(Value::as_str)
+            .and_then(parse_quantity_milli)
+            == Some(i128::from(self.pool_limit) * 1000)
+            && expected.iter().all(|(key, per_pod)| {
+                hard.get(*key)
+                    .and_then(Value::as_str)
+                    .and_then(parse_quantity_milli)
+                    == per_pod.checked_mul(i128::from(self.pool_limit))
+            })
+    }
+}
+
+// Multiply decimal digits by a bounded binary-SI factor without first forcing
+// the unscaled coefficient into a machine integer.
+fn multiply_decimal(digits: &str, factor: u128) -> Option<String> {
+    let mut carry = 0u128;
+    let mut output = Vec::with_capacity(digits.len() + 20);
+    for digit in digits.bytes().rev() {
+        let value = u128::from(digit - b'0')
+            .checked_mul(factor)?
+            .checked_add(carry)?;
+        output.push(b'0' + (value % 10) as u8);
+        carry = value / 10;
+    }
+    while carry != 0 {
+        output.push(b'0' + (carry % 10) as u8);
+        carry /= 10;
+    }
+    output.reverse();
+    String::from_utf8(output).ok()
+}
+
+/// Kubernetes Quantity grammar and its documented round-up to milli-units.
+/// This same normalization is used for configured values and API quota values.
+fn parse_quantity_milli(raw: &str) -> Option<i128> {
+    if raw.is_empty() || raw.len() > 128 {
+        return None;
+    }
+    let raw = raw.strip_prefix('+').unwrap_or(raw);
+    let split = raw
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(raw.len());
+    let (number, suffix) = raw.split_at(split);
+    let (integer, fraction) = match number.split_once('.') {
+        Some((integer, fraction)) if !integer.is_empty() || !fraction.is_empty() => {
+            (integer, fraction)
+        }
+        None if !number.is_empty() => (number, ""),
+        _ => return None,
+    };
+    if !integer.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{integer}{fraction}");
+    if !digits.bytes().any(|b| b != b'0') {
+        return None;
+    }
+    let (scale, binary) = match suffix {
+        "n" => (-9, 0),
+        "u" => (-6, 0),
+        "m" => (-3, 0),
+        "" => (0, 0),
+        "k" => (3, 0),
+        "M" => (6, 0),
+        "G" => (9, 0),
+        "T" => (12, 0),
+        "P" => (15, 0),
+        "E" => (18, 0),
+        "Ki" => (0, 1),
+        "Mi" => (0, 2),
+        "Gi" => (0, 3),
+        "Ti" => (0, 4),
+        "Pi" => (0, 5),
+        "Ei" => (0, 6),
+        _ if suffix.starts_with('e') || suffix.starts_with('E') => {
+            let exponent = &suffix[1..];
+            if exponent.is_empty() || exponent == "+" || exponent == "-" {
+                return None;
+            }
+            let power: i32 = exponent.parse().ok()?;
+            (power, 0)
+        }
+        _ => return None,
+    };
+    let digits = if binary == 0 {
+        digits
+    } else {
+        multiply_decimal(&digits, 1024u128.checked_pow(binary)?)?
+    };
+    let shift = i64::from(scale) + 3 - i64::try_from(fraction.len()).ok()?;
+    let normalized = if shift >= 0 {
+        let zeros = usize::try_from(shift).ok()?;
+        if zeros > 40 {
+            return None;
+        }
+        format!("{digits}{}", "0".repeat(zeros))
+    } else {
+        let divisor_digits = usize::try_from(-shift).ok()?;
+        let cut = digits.len().saturating_sub(divisor_digits);
+        let quotient = &digits[..cut];
+        let remainder = &digits[cut..];
+        let quotient = quotient.trim_start_matches('0');
+        let whole = if quotient.is_empty() {
+            0
+        } else {
+            quotient.parse::<i128>().ok()?
+        };
+        return whole
+            .checked_add(i128::from(remainder.bytes().any(|b| b != b'0')))
+            .filter(|v| *v > 0 && *v <= i128::from(i64::MAX) * 1000);
+    };
+    normalized
+        .trim_start_matches('0')
+        .parse::<i128>()
+        .ok()
+        .filter(|v| *v > 0 && *v <= i128::from(i64::MAX) * 1000)
+}
 
 #[derive(Clone)]
 pub struct KubernetesDocumentProcessor {
@@ -30,6 +230,8 @@ pub struct KubernetesDocumentProcessor {
     context: String,
     namespace: String,
     image: String,
+    limits: DocumentWorkerLimits,
+    slots: Arc<Semaphore>,
 }
 
 impl KubernetesDocumentProcessor {
@@ -40,6 +242,7 @@ impl KubernetesDocumentProcessor {
         context: String,
         namespace: String,
         image: String,
+        limits: DocumentWorkerLimits,
     ) -> Result<Self, DocumentError> {
         let safe_name = |v: &str| {
             !v.is_empty()
@@ -72,6 +275,8 @@ impl KubernetesDocumentProcessor {
             context,
             namespace,
             image,
+            slots: Arc::new(Semaphore::new(limits.pool_limit as usize)),
+            limits,
         })
     }
 
@@ -171,21 +376,19 @@ impl KubernetesDocumentProcessor {
         }
         let quota: Value =
             serde_json::from_slice(&bytes).map_err(|_| DocumentError::SandboxUnavailable)?;
-        if quota.pointer("/spec/hard/pods").and_then(Value::as_str) != Some("2")
-            || quota
-                .pointer("/spec/scopes")
-                .is_some_and(|scopes| scopes.as_array().is_none_or(|items| !items.is_empty()))
-            || quota
-                .pointer("/spec/scopeSelector")
-                .is_some_and(|selector| !selector.is_null())
-        {
+        if !self.limits.matches_quota(&quota) {
             return Err(DocumentError::SandboxUnavailable);
         }
         self.control(
             &["create", "-f", "-"],
             Some(
-                serde_json::to_vec(&pod_manifest(pod, &self.namespace, &self.image))
-                    .map_err(|_| DocumentError::SandboxUnavailable)?,
+                serde_json::to_vec(&pod_manifest(
+                    pod,
+                    &self.namespace,
+                    &self.image,
+                    &self.limits,
+                ))
+                .map_err(|_| DocumentError::SandboxUnavailable)?,
             ),
         )
         .await?;
@@ -291,7 +494,8 @@ impl KubernetesDocumentProcessor {
         input: DocumentInput,
         cancellation: CancellationToken,
     ) -> Result<DocumentOutput, DocumentError> {
-        let _permit = DOCUMENT_SLOTS
+        let _permit = self
+            .slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| DocumentError::ResourceLimit)?;
@@ -362,7 +566,8 @@ impl DocumentProcessor for KubernetesDocumentProcessor {
     }
 }
 
-fn pod_manifest(name: &str, namespace: &str, image: &str) -> Value {
+fn pod_manifest(name: &str, namespace: &str, image: &str, limits: &DocumentWorkerLimits) -> Value {
+    let threads = limits.threads().to_string();
     json!({
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": name, "namespace": namespace, "labels": {"app.kubernetes.io/name": "openlegal-document-worker"}},
@@ -378,14 +583,14 @@ fn pod_manifest(name: &str, namespace: &str, image: &str) -> Value {
             "containers": [{"name": "worker", "image": image, "imagePullPolicy": "IfNotPresent",
                 "command": ["/usr/local/bin/openlegal-document-worker", "--idle"],
                 "env": [{"name": "TMPDIR", "value": "/scratch"}, {"name": "TESSDATA_PREFIX", "value": "/opt/tessdata"},
-                    {"name": "OMP_THREAD_LIMIT", "value": "2"}, {"name": "RAYON_NUM_THREADS", "value": "2"}],
+                    {"name": "OMP_THREAD_LIMIT", "value": threads}, {"name": "RAYON_NUM_THREADS", "value": threads}],
                 "securityContext": {"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true,
                     "capabilities": {"drop": ["ALL"]},
                     "appArmorProfile": {"type": "Localhost", "localhostProfile": "openlegal-document"}},
-                "resources": {"requests": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "2Gi"},
-                    "limits": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "2Gi"}},
+                "resources": {"requests": {"cpu": limits.cpu, "memory": limits.memory, "ephemeral-storage": limits.scratch},
+                    "limits": {"cpu": limits.cpu, "memory": limits.memory, "ephemeral-storage": limits.scratch}},
                 "volumeMounts": [{"name": "scratch", "mountPath": "/scratch"}]}],
-            "volumes": [{"name": "scratch", "emptyDir": {"sizeLimit": "2Gi"}}]
+            "volumes": [{"name": "scratch", "emptyDir": {"sizeLimit": limits.scratch}}]
         }
     })
 }
@@ -403,7 +608,8 @@ mod tests {
                 "/config".into(),
                 "test".into(),
                 "workers".into(),
-                "worker:latest".into()
+                "worker:latest".into(),
+                DocumentWorkerLimits::default(),
             )
             .is_err()
         );
@@ -413,7 +619,8 @@ mod tests {
                 "/config".into(),
                 "test".into(),
                 "workers".into(),
-                format!("worker@sha256:{}", "a".repeat(64))
+                format!("worker@sha256:{}", "a".repeat(64)),
+                DocumentWorkerLimits::default(),
             )
             .is_ok()
         );
@@ -421,6 +628,15 @@ mod tests {
 
     #[cfg(unix)]
     fn fixture_controller(directory: &std::path::Path, mode: &str) -> KubernetesDocumentProcessor {
+        fixture_controller_with_limits(directory, mode, DocumentWorkerLimits::default())
+    }
+
+    #[cfg(unix)]
+    fn fixture_controller_with_limits(
+        directory: &std::path::Path,
+        mode: &str,
+        limits: DocumentWorkerLimits,
+    ) -> KubernetesDocumentProcessor {
         use std::os::unix::fs::PermissionsExt;
         let executable = directory.join("kubectl");
         let script = r#"#!/usr/bin/python3
@@ -439,21 +655,29 @@ for key in ['OPENLEGAL_LAW_PROVIDER_CREDENTIAL','OPENLEGAL_DATABASE_URL',
 with (root/'commands').open('a') as log:
     log.write(json.dumps(args[8:])+'\n')
 if 'get' in args:
-    spec={'hard':{'pods':'2'}}
+    spec={'hard':{'pods':@PODS@,'requests.cpu':@CPU@,'limits.cpu':@CPU@,
+                  'requests.memory':@MEMORY@,'limits.memory':@MEMORY@,
+                  'requests.ephemeral-storage':@SCRATCH@,'limits.ephemeral-storage':@SCRATCH@}}
     if @MODE@ == 'scoped': spec['scopes']=['BestEffort']
     if @MODE@ == 'selector': spec['scopeSelector']={'matchExpressions':[]}
     if @MODE@ == 'unbounded': spec['hard']['pods']='3'
+    if @MODE@ == 'missing-resource': del spec['hard']['requests.cpu']
+    if @MODE@ == 'wrong-resource': spec['hard']['limits.memory']='1Gi'
+    if @MODE@ == 'extra-resource': spec['hard']['configmaps']='1'
     print(json.dumps({'spec':spec}))
 elif 'create' in args:
     (root/'created').write_text('yes')
     pod=json.load(sys.stdin)
     assert pod['spec']['hostUsers'] is False
     assert pod['spec']['automountServiceAccountToken'] is False
-    assert pod['spec']['volumes'] == [{'name':'scratch','emptyDir':{'sizeLimit':'2Gi'}}]
+    assert pod['spec']['volumes'] == [{'name':'scratch','emptyDir':{'sizeLimit':@POD_SCRATCH@}}]
     assert pod['spec']['containers'][0]['volumeMounts'] == [{'name':'scratch','mountPath':'/scratch'}]
     assert pod['spec']['containers'][0]['env'] == [
         {'name':'TMPDIR','value':'/scratch'}, {'name':'TESSDATA_PREFIX','value':'/opt/tessdata'},
-        {'name':'OMP_THREAD_LIMIT','value':'2'}, {'name':'RAYON_NUM_THREADS','value':'2'}]
+        {'name':'OMP_THREAD_LIMIT','value':@THREADS@}, {'name':'RAYON_NUM_THREADS','value':@THREADS@}]
+    for scope in ['requests','limits']:
+        assert pod['spec']['containers'][0]['resources'][scope] == {
+            'cpu':@POD_CPU@,'memory':@POD_MEMORY@,'ephemeral-storage':@POD_SCRATCH@}
     assert pod['spec']['containers'][0]['securityContext']['readOnlyRootFilesystem']
 elif 'exec' in args:
     data=sys.stdin.buffer.read()
@@ -468,9 +692,18 @@ elif 'exec' in args:
     sys.stdout.buffer.write(struct.pack('>I',len(encoded))+encoded)
 elif 'delete' in args:
     (root/'deleted').write_text('yes')
+    if @MODE@ == 'delete-fails': sys.exit(1)
 "#
             .replace("@ROOT@", &serde_json::to_string(directory.to_str().unwrap()).unwrap())
-            .replace("@MODE@", &serde_json::to_string(mode).unwrap());
+            .replace("@MODE@", &serde_json::to_string(mode).unwrap())
+            .replace("@PODS@", &serde_json::to_string(&limits.pool_limit.to_string()).unwrap())
+            .replace("@CPU@", &serde_json::to_string(&format!("{}m", limits.cpu_milli * i128::from(limits.pool_limit))).unwrap())
+            .replace("@MEMORY@", &serde_json::to_string(&format!("{}m", limits.memory_milli * i128::from(limits.pool_limit))).unwrap())
+            .replace("@SCRATCH@", &serde_json::to_string(&format!("{}m", limits.scratch_milli * i128::from(limits.pool_limit))).unwrap())
+            .replace("@POD_CPU@", &serde_json::to_string(&limits.cpu).unwrap())
+            .replace("@POD_MEMORY@", &serde_json::to_string(&limits.memory).unwrap())
+            .replace("@POD_SCRATCH@", &serde_json::to_string(&limits.scratch).unwrap())
+            .replace("@THREADS@", &serde_json::to_string(&limits.threads().to_string()).unwrap());
         std::fs::write(&executable, script).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         KubernetesDocumentProcessor::new(
@@ -479,6 +712,7 @@ elif 'delete' in args:
             "fixture".into(),
             "documents".into(),
             format!("worker@sha256:{}", "a".repeat(64)),
+            limits,
         )
         .unwrap()
     }
@@ -494,6 +728,138 @@ elif 'delete' in args:
             format: openlegal_application::document::DocumentFormat::Xml,
             ocr: false,
         }
+    }
+
+    #[test]
+    fn parses_kubernetes_quantities_and_rejects_unrepresentable_limits() {
+        for (raw, expected) in [
+            ("1", 1000),
+            ("1000m", 1000),
+            ("0.1m", 1),
+            ("1e-9", 1),
+            ("1.25", 1250),
+            ("+1.25E+3", 1_250_000),
+            ("1Ki", 1_024_000),
+            ("1.5Mi", 1_572_864_000),
+            ("1G", 1_000_000_000_000),
+            ("1k", 1_000_000),
+            ("1u", 1),
+            ("1n", 1),
+            (".5", 500),
+            ("1.", 1000),
+            ("1E", 1_000_000_000_000_000_000_000),
+        ] {
+            assert_eq!(parse_quantity_milli(raw), Some(expected), "{raw}");
+        }
+        assert_eq!(parse_quantity_milli("1e-9999"), Some(1));
+        for raw in [
+            "",
+            "0",
+            "-1",
+            "1x",
+            "1K",
+            "1e",
+            "1e+",
+            ".",
+            "1.2.3",
+            "NaN",
+            "1 Ei",
+            "9223372036854775808",
+            "1e9999",
+        ] {
+            assert_eq!(parse_quantity_milli(raw), None, "{raw}");
+        }
+        assert_eq!(parse_quantity_milli(&"0".repeat(128)), None);
+        assert_eq!(parse_quantity_milli(&"0".repeat(129)), None);
+        assert!(DocumentWorkerLimits::new(0, "1", "1Gi", "1Gi").is_err());
+        assert!(DocumentWorkerLimits::new(2, "9223372036854775807", "1", "1").is_err());
+    }
+
+    #[test]
+    fn quota_matches_normalized_aggregate_values_only() {
+        let limits = DocumentWorkerLimits::new(3, "1250m", "1.5Gi", "512Mi").unwrap();
+        let mut quota = json!({"spec":{"hard":{
+            "pods":"3", "requests.cpu":"3.75", "limits.cpu":"3750m",
+            "requests.memory":"4.5Gi", "limits.memory":"4608Mi",
+            "requests.ephemeral-storage":"1.5Gi", "limits.ephemeral-storage":"1536Mi"
+        }}});
+        assert!(limits.matches_quota(&quota));
+        quota["spec"]["hard"]["limits.memory"] = json!("4Gi");
+        assert!(!limits.matches_quota(&quota));
+        quota["spec"]["hard"]
+            .as_object_mut()
+            .unwrap()
+            .remove("limits.memory");
+        assert!(!limits.matches_quota(&quota));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nondefault_limits_reach_pod_and_quota_gate() {
+        let _guard = SERIAL.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let limits = DocumentWorkerLimits::new(3, "1250m", "1.5Gi", "512Mi").unwrap();
+        let processor = fixture_controller_with_limits(directory.path(), "valid", limits);
+        assert_eq!(
+            processor
+                .process(fixture_input(), CancellationToken::new())
+                .await
+                .unwrap()
+                .text,
+            "fixture"
+        );
+        assert!(directory.path().join("created").is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cloned_controllers_share_pool_and_failed_delete_consumes_slot() {
+        let _guard = SERIAL.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let limits = DocumentWorkerLimits::new(1, "500m", "1Gi", "1Gi").unwrap();
+        let processor = fixture_controller_with_limits(directory.path(), "delete-fails", limits);
+        assert!(matches!(
+            processor
+                .process(fixture_input(), CancellationToken::new())
+                .await,
+            Err(DocumentError::SandboxUnavailable)
+        ));
+        assert!(directory.path().join("deleted").is_file());
+        assert!(matches!(
+            processor
+                .clone()
+                .process(fixture_input(), CancellationToken::new())
+                .await,
+            Err(DocumentError::ResourceLimit)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cloned_controllers_reject_work_while_pool_is_full() {
+        let _guard = SERIAL.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let limits = DocumentWorkerLimits::new(1, "500m", "1Gi", "1Gi").unwrap();
+        let processor = fixture_controller_with_limits(directory.path(), "wait", limits);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(processor.process(fixture_input(), cancellation.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !directory.path().join("running").is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            processor
+                .clone()
+                .process(fixture_input(), CancellationToken::new())
+                .await,
+            Err(DocumentError::ResourceLimit)
+        ));
+        cancellation.cancel();
+        assert!(matches!(task.await.unwrap(), Err(DocumentError::Cancelled)));
+        assert!(directory.path().join("deleted").is_file());
     }
 
     #[cfg(unix)]
@@ -569,7 +935,14 @@ elif 'delete' in args:
     #[tokio::test]
     async fn rejects_quotas_that_do_not_bound_every_worker_pod() {
         let _guard = SERIAL.lock().await;
-        for mode in ["scoped", "selector", "unbounded"] {
+        for mode in [
+            "scoped",
+            "selector",
+            "unbounded",
+            "missing-resource",
+            "wrong-resource",
+            "extra-resource",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let processor = fixture_controller(directory.path(), mode);
             assert!(matches!(

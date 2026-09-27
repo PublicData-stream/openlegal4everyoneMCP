@@ -850,7 +850,7 @@ alone does not prove network denial. Use fresh connections after policy converge
   Record CNI/firewall evidence for any node-address exemptions.
 
 The [document namespace](document-sandbox.md) remains a separate trust boundary:
-its deny-all ingress/egress, two-Pod quota and qualified `runc` RuntimeClass
+its deny-all ingress/egress, configured Pod/resource quota and qualified `runc` RuntimeClass
 remain required. No serving policy grants parser access or a fetch role. Its existing
 real-cluster sandbox acceptance remains independently pending. Offline manifests,
 Docker OxiBelt tests and synthetic controls do not establish completed production,
@@ -1199,6 +1199,21 @@ support does not imply ARM64 document-worker support.
 The overlay replaces the generated server ConfigMap with retained configuration
 plus `[database.ingestion]`. Its fixed context is `openlegal-document-controller`,
 its namespace is `openlegal-documents`, and history-body ingestion remains disabled.
+The optional `[database.ingestion.document_worker]` table selects per-Pod `cpu`,
+`memory`, `scratch` and `pool_limit`. The committed values and omitted-field defaults
+are `2`, `4Gi`, `2Gi` and `2`. Edit the operator copy of
+`ResourceQuota/document-budget` to set `pods` to `pool_limit` and both
+`requests` and `limits` for CPU, memory and ephemeral storage to exactly
+`pool_limit × cpu`, `pool_limit × memory` and `pool_limit × scratch`.
+Kubernetes Quantity spellings may differ if they normalize to the same value;
+the offline validator and controller compare normalized values. Leave the
+quota unscoped. Requests remain equal to limits, and each worker Pod's
+`emptyDir` size follows `scratch`.
+After rendering the tailored overlay, validate the selected TOML and quota
+together with `scripts/deployment_validation.py RETAINED_RENDERED.yaml
+--ingestion-manifest INGESTION_RENDERED.yaml --document-boundary
+DOCUMENT_BOUNDARY.yaml`; the committed offline gate still checks the default
+examples. This validation checks source/rendered invariants, not cluster admission.
 The same ConfigMap mounts `pilot-candidates.json` at the explicit
 `manual_candidates_path`. Its committed default is empty. To use operator-held
 list exports, run:
@@ -1290,6 +1305,9 @@ Operator sequence (commands refer to an explicitly tailored copy):
 
 1. Complete retained-serving acceptance and stop the sole backend during the
    activation window. Do not run an additional ingestion process against its index.
+   For a resource/pool change, stop ingestion first and reconcile all old worker
+   Pods before applying the matching edited quota. Then start only with the matching
+   ingestion TOML and qualify that selected profile.
 2. Prepare compatible document nodes and complete the separately configured
    [sandbox acceptance gate](document-sandbox.md#cluster-preparation-and-acceptance).
 3. Provision immutable images, provider Secret, controller identity/RoleBinding and

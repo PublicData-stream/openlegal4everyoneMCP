@@ -675,6 +675,8 @@ pub struct IngestionConfig {
     pub context: String,
     pub namespace: String,
     pub worker_image: String,
+    #[serde(default)]
+    pub document_worker: DocumentWorkerConfig,
     /// Explicit operator authorization for managed background upstream traffic.
     pub enabled: bool,
     /// A pilot is a single bounded sample pass; continuous mode revisits full inventories.
@@ -683,6 +685,41 @@ pub struct IngestionConfig {
     pub manual_candidates_path: Option<PathBuf>,
     #[serde(default)]
     pub retain_history_bodies: bool,
+}
+
+/// Operator-selected capacity for disposable document Pods.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DocumentWorkerConfig {
+    pub cpu: String,
+    pub memory: String,
+    pub scratch: String,
+    pub pool_limit: u32,
+}
+
+impl Default for DocumentWorkerConfig {
+    fn default() -> Self {
+        Self {
+            cpu: "2".into(),
+            memory: "4Gi".into(),
+            scratch: "2Gi".into(),
+            pool_limit: 2,
+        }
+    }
+}
+
+impl DocumentWorkerConfig {
+    pub fn limits(
+        &self,
+    ) -> Result<openlegal_adapters::document_jobs::DocumentWorkerLimits, ServerError> {
+        openlegal_adapters::document_jobs::DocumentWorkerLimits::new(
+            self.pool_limit,
+            &self.cpu,
+            &self.memory,
+            &self.scratch,
+        )
+        .map_err(|_| "invalid document worker resource limits".into())
+    }
 }
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -719,13 +756,16 @@ impl DatabaseConfig {
         {
             return Err("ingestion requires explicit executable, kubeconfig and credential environment name".into());
         }
+        if let Some(i) = &self.ingestion {
+            i.document_worker.limits()?;
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod database_config_tests {
-    use super::DatabaseConfig;
+    use super::{DatabaseConfig, DocumentWorkerConfig};
 
     #[test]
     fn corpus_requires_an_explicit_dictionary_without_loading_it() {
@@ -740,5 +780,31 @@ mod database_config_tests {
         ))
         .unwrap();
         configured.validate().unwrap();
+    }
+
+    #[test]
+    fn document_worker_defaults_and_partial_operator_settings() {
+        let defaults: DocumentWorkerConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.pool_limit, 2);
+        assert_eq!(defaults.cpu, "2");
+        assert_eq!(defaults.memory, "4Gi");
+        assert_eq!(defaults.scratch, "2Gi");
+        defaults.limits().unwrap();
+
+        let custom: DocumentWorkerConfig = toml::from_str("cpu = '750m'\npool_limit = 3").unwrap();
+        assert_eq!(custom.memory, "4Gi");
+        assert_eq!(custom.scratch, "2Gi");
+        custom.limits().unwrap();
+
+        for raw in [
+            "pool_limit = 0",
+            "cpu = '0'",
+            "memory = '-1Gi'",
+            "scratch = 'oops'",
+        ] {
+            let invalid: DocumentWorkerConfig = toml::from_str(raw).unwrap();
+            assert!(invalid.limits().is_err(), "{raw}");
+        }
+        assert!(toml::from_str::<DocumentWorkerConfig>("unknown = 1").is_err());
     }
 }

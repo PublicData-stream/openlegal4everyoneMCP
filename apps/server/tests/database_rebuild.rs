@@ -128,6 +128,7 @@ async fn offline_rebuild_preserves_ack_retirement_withdrawal_and_previous_index(
         context: "fixture".into(),
         namespace: "fixture".into(),
         worker_image: "fixture@sha256:unused".into(),
+        document_worker: Default::default(),
         enabled: true,
         mode: openlegal_server::config::IngestionMode::Pilot,
         manual_candidates_path: None,

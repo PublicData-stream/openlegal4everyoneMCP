@@ -138,6 +138,7 @@ fn ingestion_template_preserves_retained_config_and_explicit_controller_contract
         ingestion.context,
         ingestion.namespace,
         ingestion.worker_image,
+        ingestion.document_worker.limits().unwrap(),
     )
     .unwrap();
 }

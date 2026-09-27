@@ -18,7 +18,8 @@ identity, authoritative legal applicability, or complete text.
 The trusted controller requires explicit absolute `kubectl` and kubeconfig paths,
 an explicit context and namespace, and an image pinned by SHA-256 digest. There is
 no ambient-context or mutable-image fallback. Configure one controller process;
-the namespace quota additionally limits live Pods to two across controller crashes.
+the namespace quota additionally limits live Pods to the configured pool limit
+across controller crashes. The default is two.
 
 Each `kubectl` subprocess starts with a cleared environment and only fixed
 `PATH=/usr/local/bin:/usr/bin:/bin`, `HOME=/tmp` and `TMPDIR=/tmp`. This includes
@@ -84,8 +85,9 @@ legal evidence. Raw provider bytes, derived results and processing versions must
 remain separately associated in corpus persistence. OCR is excluded from default
 search/comparison; the application chooses it only through the explicit option.
 
-The controller verifies the named namespace quota has a two-Pod limit before
-creating work, and owns a process-wide two-job semaphore, 300-second deadline and
+The controller verifies the named unscoped namespace quota matches the pool limit
+and all six aggregate request/limit values before creating work. Its clones share
+a semaphore at that limit, a 300-second deadline and
 cleanup after success, cancellation, failure, timeout or uncertain Pod creation.
 Caller-future disposal does not dispose the cleanup task. API-server failures
 during deletion return `sandbox_unavailable` and keep that process admission slot
@@ -231,8 +233,14 @@ acceptance gate below before live documents are processed:
   property together, leave the node unqualified; do not weaken the manifest.
 
 Each Pod has a read-only root, non-root UID/GID 65532, no capabilities, no privilege
-escalation, explicit seccomp/AppArmor, two CPUs, 4 GiB memory, 2 GiB ephemeral
-storage and a 2 GiB `emptyDir`. PID limits come from kubelet configuration, never
+escalation, explicit seccomp/AppArmor, and configurable CPU, memory and scratch
+limits. The defaults are two CPUs, 4 GiB memory and 2 GiB ephemeral storage with
+a 2 GiB `emptyDir`. Requests equal limits. Set `cpu`, `memory`, `scratch` and
+`pool_limit` under `[database.ingestion.document_worker]` in the ingestion TOML;
+the table and individual fields are optional. Resources use positive Kubernetes
+Quantity strings, and the pool limit is a positive integer. The worker's OMP and
+Rayon thread limits use the CPU limit rounded up to whole cores, clamped to 1–64.
+PID limits come from kubelet configuration, never
 an invented Pod resource field. Kubernetes ephemeral-storage enforcement is
 eviction-based unless the underlying node filesystem supplies stronger quotas;
 the configured `emptyDir` size is not a synchronous per-write disk quota.
@@ -244,13 +252,20 @@ RUN_DOCUMENT_SANDBOX_TESTS=1 \
 DOCUMENT_KUBECONFIG=/absolute/path/to/test-kubeconfig \
 DOCUMENT_CONTEXT=isolated-test \
 DOCUMENT_IMAGE=registry.example/openlegal-document-worker@sha256:<64-hex-digest> \
+DOCUMENT_SERVER_CONFIG=/absolute/path/to/selected-ingestion-server.toml \
 scripts/test-document-sandbox.sh
 ```
+
+`DOCUMENT_IMAGE` must equal `worker_image` in the selected ingestion TOML. Omit
+`DOCUMENT_SERVER_CONFIG` only when testing the default resource profile.
 
 The gate creates/deletes synthetic worker Pods and checks user mapping,
 privilege/capability restrictions, AppArmor/seccomp, network EPERM/EACCES (not mere unreachability),
 read-only root (EROFS at an image-owned writable probe path), absent tokens, actual CPU/memory/PID cgroups, XML exec framing,
-absence of document logs, PID/memory exhaustion and deadline enforcement. On
+absence of document logs, PID denial and deadline enforcement. The fixed 5 GiB
+probe checks memory exhaustion only when the selected limit is below 5 GiB;
+for larger limits the gate reports that exhaustion was not tested while still
+checking `memory.max`. On
 the selected user-namespaced `runc` Pod, the container-local `pids.max` can
 report a wider ancestor; the gate verifies effective PID denial with the
 exhaustion probe, and the operator separately verifies kubelet `podPidsLimit=128`.

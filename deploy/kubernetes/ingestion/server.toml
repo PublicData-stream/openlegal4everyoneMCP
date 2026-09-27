@@ -58,3 +58,11 @@ enabled = true
 mode = "pilot"
 manual_candidates_path = "/etc/openlegal/pilot-candidates.json"
 retain_history_bodies = false
+
+# Match deploy/document-sandbox/namespace.yaml ResourceQuota/document-budget.
+# Omitting this table retains these defaults.
+[database.ingestion.document_worker]
+cpu = "2"
+memory = "4Gi"
+scratch = "2Gi"
+pool_limit = 2

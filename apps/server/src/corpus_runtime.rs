@@ -229,6 +229,7 @@ impl CorpusRuntime {
                 c.context.clone(),
                 c.namespace.clone(),
                 c.worker_image.clone(),
+                c.document_worker.limits()?,
             )
             .map_err(|_| "invalid document sandbox configuration")?;
             let secret = std::env::var(&c.credential_env)
@@ -1010,6 +1011,7 @@ mod manual_pilot_tests {
                 context: "test".into(),
                 namespace: "test".into(),
                 worker_image: "example.invalid/worker@sha256:placeholder".into(),
+                document_worker: Default::default(),
                 enabled: true,
                 mode: IngestionMode::Pilot,
                 manual_candidates_path: Some(path.clone()),
