@@ -239,40 +239,12 @@ impl ServerHandler for McpHandler {
             result = tokio::time::timeout_at(deadline, (tool.invoke)(arguments, execution)) => {
                 match result {
                     Ok(Ok(value)) => Ok(value),
-                    Ok(Err(ToolError::InvalidInput)) => Err(ErrorData::invalid_params("invalid tool arguments", None)),
-                    Ok(Err(error)) => {
-                        self.counters.failures.fetch_add(1, Ordering::Relaxed);
-                        if let ToolError::InvalidUtf8Boundary { offset } = error {
-                            return Ok(CallToolResult::structured_error(serde_json::json!({
-                                "code": "invalid_utf8_boundary",
-                                "message": "The byte offset is not on a UTF-8 character boundary.",
-                                "offset": offset
-                            })).into());
+                    Ok(Err(error)) => match map_tool_error(error) {
+                        Ok(result) => {
+                            self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                            return Ok(result.into());
                         }
-                        let (code, message) = match error {
-                            ToolError::ProcessingPending => ("processing_pending", "An observed source replacement is awaiting processing."),
-                            ToolError::UnsupportedHistory => ("unsupported_history", "Provider revision history is not supported for this dataset."),
-                            ToolError::HistoryIncomplete => ("history_incomplete", "The revision inventory is insufficient for this selector."),
-                            ToolError::SessionExpired => ("session_expired", "The retained query session has expired."),
-                            ToolError::SnapshotInvalidated => ("snapshot_invalidated", "The retained query was invalidated by a source withdrawal."),
-                            ToolError::Withdrawn => ("withdrawn", "The source object was withdrawn."),
-                            ToolError::StorageUnavailable => ("storage_unavailable", "Persistent storage is temporarily unavailable."),
-                            ToolError::StorageCorrupt => ("storage_corrupt", "Retained data failed integrity checks."),
-                            ToolError::StorageCapacity => ("storage_capacity", "Persistent storage capacity is exhausted."),
-                            ToolError::SnapshotUnavailable => ("snapshot_unavailable", "The exact snapshot is not retained."),
-                            ToolError::NotFound => ("not_found", "Requested data was not found."),
-                            ToolError::InvalidRegex => ("invalid_regex", "The regular expression is invalid."),
-                            ToolError::PatchConflict => ("patch_conflict", "Patch context did not match the target."),
-                            ToolError::AttachmentKindMismatch => ("attachment_kind_mismatch", "Attachment kind is incompatible with this operation."),
-                            ToolError::Unavailable => ("unavailable", "Service is temporarily unavailable."),
-                            ToolError::RateLimited => ("rate_limited", "Request rate limit exceeded."),
-                            ToolError::Ambiguous => ("ambiguous", "The requested data is ambiguous."),
-                            ToolError::FreshnessUnavailable => ("freshness_unavailable", "Data meeting the freshness requirement is unavailable."),
-                            ToolError::NormalizationFailed => ("normalization_failed", "Source data could not be processed."),
-                            ToolError::ResourceLimit => ("resource_limit", "The operation exceeds its resource limit."),
-                            _ => ("internal", "Tool execution failed."),
-                        };
-                        return Ok(CallToolResult::structured_error(serde_json::json!({"code":code,"message":message})).into());
+                        Err(error) => Err(error),
                     },
                     Err(_) => { context.ct.cancel(); Err(ErrorData::internal_error("tool deadline exceeded", None)) }
                 }
@@ -312,6 +284,79 @@ impl ServerHandler for McpHandler {
             }
         }
     }
+}
+
+fn map_tool_error(error: ToolError) -> Result<CallToolResult, ErrorData> {
+    let (code, message) = match error {
+        ToolError::InvalidInput => {
+            return Err(ErrorData::invalid_params("invalid tool arguments", None));
+        }
+        ToolError::InvalidUtf8Boundary { offset } => {
+            return Ok(CallToolResult::structured_error(serde_json::json!({
+                "code": "invalid_utf8_boundary",
+                "message": "The byte offset is not on a UTF-8 character boundary.",
+                "offset": offset
+            })));
+        }
+        ToolError::ProcessingPending => (
+            "processing_pending",
+            "An observed source replacement is awaiting processing.",
+        ),
+        ToolError::UnsupportedHistory => (
+            "unsupported_history",
+            "Provider revision history is not supported for this dataset.",
+        ),
+        ToolError::HistoryIncomplete => (
+            "history_incomplete",
+            "The revision inventory is insufficient for this selector.",
+        ),
+        ToolError::SessionExpired => ("session_expired", "The retained query session has expired."),
+        ToolError::SnapshotInvalidated => (
+            "snapshot_invalidated",
+            "The retained query was invalidated by a source withdrawal.",
+        ),
+        ToolError::Withdrawn => ("withdrawn", "The source object was withdrawn."),
+        ToolError::StorageUnavailable => (
+            "storage_unavailable",
+            "Persistent storage is temporarily unavailable.",
+        ),
+        ToolError::StorageCorrupt => ("storage_corrupt", "Retained data failed integrity checks."),
+        ToolError::StorageCapacity => (
+            "storage_capacity",
+            "Persistent storage capacity is exhausted.",
+        ),
+        ToolError::SnapshotUnavailable => (
+            "snapshot_unavailable",
+            "The exact snapshot is not retained.",
+        ),
+        ToolError::NotFound => ("not_found", "Requested data was not found."),
+        ToolError::InvalidRegex => ("invalid_regex", "The regular expression is invalid."),
+        ToolError::PatchConflict => ("patch_conflict", "Patch context did not match the target."),
+        ToolError::AttachmentKindMismatch => (
+            "attachment_kind_mismatch",
+            "Attachment kind is incompatible with this operation.",
+        ),
+        ToolError::Unavailable => ("unavailable", "Service is temporarily unavailable."),
+        ToolError::RateLimited => ("rate_limited", "Request rate limit exceeded."),
+        ToolError::Ambiguous => ("ambiguous", "The requested data is ambiguous."),
+        ToolError::FreshnessUnavailable => (
+            "freshness_unavailable",
+            "Data meeting the freshness requirement is unavailable.",
+        ),
+        ToolError::NormalizationFailed => (
+            "normalization_failed",
+            "Source data could not be processed.",
+        ),
+        ToolError::ResourceLimit => (
+            "resource_limit",
+            "The operation exceeds its resource limit.",
+        ),
+        ToolError::Internal => ("internal", "Tool execution failed."),
+    };
+    Ok(CallToolResult::structured_error(serde_json::json!({
+        "code": code,
+        "message": message
+    })))
 }
 
 #[cfg(test)]

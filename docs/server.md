@@ -132,9 +132,18 @@ not a sandbox or authorization mechanism.
 Registration validates object input schemas, names, descriptions, duplicate names,
 and registry size. Remote/file schema resolution is disabled. Each invocation
 validates its arguments against the registered schema before deserializing or
-calling a handler. Input errors remain protocol errors; not-found, unavailable,
-rate-limited, and internal execution failures are bounded structured tool errors
-with distinct codes. Raw implementation diagnostics never become tool errors.
+calling a handler. Malformed tool arguments and generic invalid input return a
+JSON-RPC `-32602` protocol error. Recognized application failures return an MCP
+tool result with `isError: true` and `structuredContent` containing a stable
+`code` and sanitized `message`. For example, patch context mismatch returns
+`{"code":"patch_conflict","message":"Patch context did not match the target."}`;
+invalid regex returns `invalid_regex`, and an offset inside a UTF-8 character
+returns `invalid_utf8_boundary` with the supplied byte `offset`. Attachment kind
+mismatch, not-found, freshness and resource-limit failures use the same envelope.
+Both Streamable HTTP and WebTransport expose these MCP error categories. HTTP
+status for a JSON-RPC protocol error depends on the negotiated revision, so
+clients should inspect the JSON-RPC `error` or `result.isError` field. Raw
+implementation diagnostics never become tool errors.
 
 Use `ServerBuilder::register_endpoint` with an implementation of `Endpoint` to
 add a transport. Its binding declaration is checked before startup; `bind` returns

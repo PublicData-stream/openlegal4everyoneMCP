@@ -76,6 +76,18 @@ impl Server {
         for (name, error) in [
             ("invalid", ToolError::InvalidInput),
             ("invalid_regex", ToolError::InvalidRegex),
+            ("patch_conflict", ToolError::PatchConflict),
+            (
+                "invalid_utf8_boundary",
+                ToolError::InvalidUtf8Boundary { offset: 8 },
+            ),
+            (
+                "attachment_kind_mismatch",
+                ToolError::AttachmentKindMismatch,
+            ),
+            ("not_found", ToolError::NotFound),
+            ("freshness_unavailable", ToolError::FreshnessUnavailable),
+            ("resource_limit", ToolError::ResourceLimit),
             ("unavailable", ToolError::Unavailable),
             ("internal", ToolError::Internal),
         ] {
@@ -308,25 +320,85 @@ async fn long_tool_can_finish_after_io_interval_and_errors_stay_typed() {
     )
     .await;
     assert_eq!(response["result"]["structuredContent"]["completed"], true);
-    for name in ["invalid", "invalid_regex", "unavailable", "internal"] {
-        let response = decode(
-            server
-                .request(
-                    "2026-07-28",
-                    "tools/call",
-                    json!({"name":name,"arguments":{}}),
-                )
-                .send()
-                .await
-                .unwrap(),
-            if name == "invalid" { 400 } else { 200 },
-        )
-        .await;
-        if name == "invalid" {
-            assert_eq!(response["error"]["code"], -32602);
-        } else {
-            assert_eq!(response["result"]["isError"], true);
-            assert_eq!(response["result"]["structuredContent"]["code"], name);
+    for version in ["2026-07-28", "2025-11-25"] {
+        for (name, expected) in [
+            ("invalid", None),
+            (
+                "invalid_regex",
+                Some(
+                    json!({"code":"invalid_regex","message":"The regular expression is invalid."}),
+                ),
+            ),
+            (
+                "patch_conflict",
+                Some(
+                    json!({"code":"patch_conflict","message":"Patch context did not match the target."}),
+                ),
+            ),
+            (
+                "invalid_utf8_boundary",
+                Some(
+                    json!({"code":"invalid_utf8_boundary","message":"The byte offset is not on a UTF-8 character boundary.","offset":8}),
+                ),
+            ),
+            (
+                "attachment_kind_mismatch",
+                Some(
+                    json!({"code":"attachment_kind_mismatch","message":"Attachment kind is incompatible with this operation."}),
+                ),
+            ),
+            (
+                "not_found",
+                Some(json!({"code":"not_found","message":"Requested data was not found."})),
+            ),
+            (
+                "freshness_unavailable",
+                Some(
+                    json!({"code":"freshness_unavailable","message":"Data meeting the freshness requirement is unavailable."}),
+                ),
+            ),
+            (
+                "resource_limit",
+                Some(
+                    json!({"code":"resource_limit","message":"The operation exceeds its resource limit."}),
+                ),
+            ),
+            (
+                "unavailable",
+                Some(json!({"code":"unavailable","message":"Service is temporarily unavailable."})),
+            ),
+            (
+                "internal",
+                Some(json!({"code":"internal","message":"Tool execution failed."})),
+            ),
+        ] {
+            let response = decode(
+                server
+                    .request(version, "tools/call", json!({"name":name,"arguments":{}}))
+                    .send()
+                    .await
+                    .unwrap(),
+                if expected.is_none() && version == "2026-07-28" {
+                    400
+                } else {
+                    200
+                },
+            )
+            .await;
+            if let Some(expected) = expected {
+                assert!(
+                    response.get("error").is_none(),
+                    "{version} {name}: {response}"
+                );
+                assert_eq!(response["result"]["isError"], true, "{version} {name}");
+                assert_eq!(
+                    response["result"]["structuredContent"], expected,
+                    "{version} {name}"
+                );
+            } else {
+                assert_eq!(response["error"]["code"], -32602, "{version} {name}");
+                assert!(response.get("result").is_none(), "{version} {name}");
+            }
         }
     }
 }

@@ -150,6 +150,12 @@ impl Server {
                     Err(match input.kind.as_str() {
                         "invalid" => ToolError::InvalidInput,
                         "invalid_regex" => ToolError::InvalidRegex,
+                        "patch_conflict" => ToolError::PatchConflict,
+                        "invalid_utf8_boundary" => ToolError::InvalidUtf8Boundary { offset: 8 },
+                        "attachment_kind_mismatch" => ToolError::AttachmentKindMismatch,
+                        "not_found" => ToolError::NotFound,
+                        "freshness_unavailable" => ToolError::FreshnessUnavailable,
+                        "resource_limit" => ToolError::ResourceLimit,
                         "unavailable" => ToolError::Unavailable,
                         _ => ToolError::Internal,
                     })
@@ -450,40 +456,120 @@ async fn validates_access_before_loading_certificates_or_binding() {
 #[tokio::test]
 async fn typed_tool_errors_preserve_input_and_operational_categories() {
     let server = Server::start().await;
-    let client = server.client(true);
-    let connection = timeout(Duration::from_secs(3), client.connect(server.url(PATH)))
-        .await
-        .unwrap()
-        .unwrap();
-    let (mut tx, rx) = connection.open_bi().await.unwrap().await.unwrap();
-    let mut rx = reader(rx);
-    for (id, kind) in [
-        (1, "invalid"),
-        (2, "invalid_regex"),
-        (3, "unavailable"),
-        (4, "internal"),
-    ] {
-        send(
-            &mut tx,
-            &modern(
-                id,
-                "tools/call",
-                json!({"name":"failure","arguments":{"kind":kind}}),
-            ),
-        )
-        .await;
-        let result = response(&mut rx).await;
-        assert_eq!(result["id"], id);
-        if kind == "invalid" {
-            assert_eq!(result["error"]["code"], -32602);
-            assert!(result.get("result").is_none());
-        } else {
-            assert!(result.get("error").is_none());
-            assert_eq!(result["result"]["isError"], true);
-            assert_eq!(result["result"]["structuredContent"]["code"], kind);
+    for legacy in [false, true] {
+        let client = server.client(true);
+        let connection = timeout(Duration::from_secs(3), client.connect(server.url(PATH)))
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut tx, rx) = connection.open_bi().await.unwrap().await.unwrap();
+        let mut rx = reader(rx);
+        if legacy {
+            send(&mut tx, &json!({"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}})).await;
+            assert_eq!(
+                response(&mut rx).await["result"]["protocolVersion"],
+                "2025-11-25"
+            );
+            send(
+                &mut tx,
+                &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            )
+            .await;
         }
+        for (id, kind, expected) in [
+            (1, "invalid", None),
+            (
+                2,
+                "invalid_regex",
+                Some(
+                    json!({"code":"invalid_regex","message":"The regular expression is invalid."}),
+                ),
+            ),
+            (
+                3,
+                "patch_conflict",
+                Some(
+                    json!({"code":"patch_conflict","message":"Patch context did not match the target."}),
+                ),
+            ),
+            (
+                4,
+                "invalid_utf8_boundary",
+                Some(
+                    json!({"code":"invalid_utf8_boundary","message":"The byte offset is not on a UTF-8 character boundary.","offset":8}),
+                ),
+            ),
+            (
+                5,
+                "attachment_kind_mismatch",
+                Some(
+                    json!({"code":"attachment_kind_mismatch","message":"Attachment kind is incompatible with this operation."}),
+                ),
+            ),
+            (
+                6,
+                "not_found",
+                Some(json!({"code":"not_found","message":"Requested data was not found."})),
+            ),
+            (
+                7,
+                "freshness_unavailable",
+                Some(
+                    json!({"code":"freshness_unavailable","message":"Data meeting the freshness requirement is unavailable."}),
+                ),
+            ),
+            (
+                8,
+                "resource_limit",
+                Some(
+                    json!({"code":"resource_limit","message":"The operation exceeds its resource limit."}),
+                ),
+            ),
+            (
+                9,
+                "unavailable",
+                Some(json!({"code":"unavailable","message":"Service is temporarily unavailable."})),
+            ),
+            (
+                10,
+                "internal",
+                Some(json!({"code":"internal","message":"Tool execution failed."})),
+            ),
+        ] {
+            let params = json!({"name":"failure","arguments":{"kind":kind}});
+            let request = if legacy {
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":params})
+            } else {
+                modern(id, "tools/call", params)
+            };
+            send(&mut tx, &request).await;
+            let result = response(&mut rx).await;
+            assert_eq!(result["id"], id, "{legacy} {kind}");
+            if let Some(expected) = expected {
+                assert!(result.get("error").is_none(), "{legacy} {kind}: {result}");
+                assert_eq!(result["result"]["isError"], true, "{legacy} {kind}");
+                assert_eq!(
+                    result["result"]["structuredContent"], expected,
+                    "{legacy} {kind}"
+                );
+            } else {
+                assert_eq!(result["error"]["code"], -32602, "{legacy} {kind}");
+                assert!(result.get("result").is_none(), "{legacy} {kind}");
+            }
+        }
+        let params = json!({"name":"failure","arguments":{"kind":123}});
+        let request = if legacy {
+            json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":params})
+        } else {
+            modern(11, "tools/call", params)
+        };
+        send(&mut tx, &request).await;
+        let malformed = response(&mut rx).await;
+        assert_eq!(malformed["id"], 11, "{legacy}");
+        assert_eq!(malformed["error"]["code"], -32602, "{legacy}");
+        assert!(malformed.get("result").is_none(), "{legacy}");
+        connection.close(0_u32.into(), b"done");
     }
-    connection.close(0_u32.into(), b"done");
 }
 
 #[tokio::test]
