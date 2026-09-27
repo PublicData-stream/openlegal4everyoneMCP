@@ -29,6 +29,7 @@ pub enum ToolError {
     StorageCapacity,
     SnapshotUnavailable,
     InvalidInput,
+    InvalidUtf8Boundary { offset: usize },
     InvalidRegex,
     PatchConflict,
     AttachmentKindMismatch,

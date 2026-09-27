@@ -388,6 +388,7 @@ pub struct PageResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextDiffError {
     InvalidInput,
+    InvalidUtf8Boundary { offset: usize },
     PatchConflict,
     AttachmentKindMismatch,
     NotFound,

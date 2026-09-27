@@ -251,6 +251,10 @@ not client-supplied byte counts, expiry or sealed status, governs access. Bare
 strings in text inputs are inline text, not attachment IDs.
 
 Chunks contain at most 32 KiB of UTF-8 and offsets must be scalar boundaries.
+Offsets count UTF-8 bytes, not characters. A read or upload retry whose offset
+falls inside already stored UTF-8 text returns structured `invalid_utf8_boundary`
+with the supplied `offset` and message
+`The byte offset is not on a UTF-8 character boundary.`
 Upload sequentially. Exact replays of committed bytes succeed; gaps and conflicting
 replays fail. `final: true` seals only when the declared length has been reached;
 sealed bytes cannot change. Empty attachments are an empty final first upload.

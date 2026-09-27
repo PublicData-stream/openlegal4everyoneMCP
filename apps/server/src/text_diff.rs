@@ -178,7 +178,7 @@ fn register_canonical(
     )?;
     let upload = service.clone();
     registry.register_attachment_builtin::<AttachmentUploadInput, AttachmentSummary, _, _>(
-        "text.attachment.upload", "Create or append a temporary UTF-8 text/patch attachment in chunks of at most 32 KiB. Initial upload supplies kind and total_bytes; continuations supply attachment_id and byte offset, or a complete returned summary plus resume:true, byte offset and chunk. Exact retries succeed. Final seals immutable bytes; ten-minute expiry never extends. Bearer handles authorize read and deletion.",
+        "text.attachment.upload", "Create or append a temporary UTF-8 text/patch attachment in chunks of at most 32 KiB. Initial upload supplies kind and total_bytes; continuations supply attachment_id and byte offset, or a complete returned summary plus resume:true, byte offset and chunk. Offsets inside stored UTF-8 characters return invalid_utf8_boundary. Exact retries succeed. Final seals immutable bytes; ten-minute expiry never extends. Bearer handles authorize read and deletion.",
         ToolOptions { annotations: rmcp::model::ToolAnnotations::from_raw(None, Some(false), Some(false), Some(false), Some(false)), meta: None },
         move |input, context| { let service = upload.clone(); async move {
             if context.request.cancellation.is_cancelled() { return Err(ToolError::Unavailable); }
@@ -194,7 +194,7 @@ fn register_canonical(
     )?;
     let reading = service.clone();
     registry.register_typed::<AttachmentReadInput, AttachmentPage, _, _>(
-        "text.attachment.read", "Read a sealed attachment by ID handle or complete returned summary at a UTF-8 byte boundary. Returns up to 32 KiB with next_offset, total bytes and fixed expiry. Missing and expired handles are indistinguishable.",
+        "text.attachment.read", "Read a sealed attachment by ID handle or complete returned summary at a UTF-8 byte boundary. An offset inside a character returns invalid_utf8_boundary. Returns up to 32 KiB with next_offset, total bytes and fixed expiry. Missing and expired handles are indistinguishable.",
         ToolOptions::default(), move |input, _| { let service = reading.clone(); async move {
             let (request, kind) = input.into_request();
             let page = service.read_attachment_with_kind(request, kind).map_err(map_error)?;
@@ -239,6 +239,7 @@ fn register_canonical(
 pub(crate) fn map_error(error: TextDiffError) -> ToolError {
     match error {
         TextDiffError::InvalidInput => ToolError::InvalidInput,
+        TextDiffError::InvalidUtf8Boundary { offset } => ToolError::InvalidUtf8Boundary { offset },
         TextDiffError::PatchConflict => ToolError::PatchConflict,
         TextDiffError::AttachmentKindMismatch => ToolError::AttachmentKindMismatch,
         TextDiffError::NotFound => ToolError::NotFound,

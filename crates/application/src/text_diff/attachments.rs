@@ -167,6 +167,13 @@ impl TextDiffService {
                 .get_mut(&id)
                 .ok_or(TextDiffError::NotFound)?;
             check_declared_kind(declared_kind, entry.summary.kind)?;
+            if request.offset < entry.data.text.len()
+                && !entry.data.text.is_char_boundary(request.offset)
+            {
+                return Err(TextDiffError::InvalidUtf8Boundary {
+                    offset: request.offset,
+                });
+            }
             let end = request
                 .offset
                 .checked_add(request.chunk.len())
@@ -278,8 +285,13 @@ impl TextDiffService {
             .get(&request.attachment_id)
             .ok_or(TextDiffError::NotFound)?;
         check_declared_kind(declared_kind, entry.summary.kind)?;
-        if !entry.summary.sealed || !entry.data.text.is_char_boundary(request.offset) {
+        if !entry.summary.sealed || request.offset > entry.data.text.len() {
             return Err(TextDiffError::InvalidInput);
+        }
+        if !entry.data.text.is_char_boundary(request.offset) {
+            return Err(TextDiffError::InvalidUtf8Boundary {
+                offset: request.offset,
+            });
         }
         let mut end = request
             .offset
@@ -625,6 +637,86 @@ mod tests {
                 offset: 0
             })
             .is_err()
+        );
+    }
+    #[test]
+    fn attachment_offsets_distinguish_utf8_boundaries_from_other_invalid_input() {
+        let s = service();
+        let pending = s.upload_attachment(upload("안", 6, false)).unwrap();
+        assert!(matches!(
+            s.read_attachment(AttachmentRead {
+                attachment_id: pending.attachment_id.clone(),
+                offset: 1,
+            }),
+            Err(TextDiffError::InvalidInput)
+        ));
+        let sealed = s
+            .upload_attachment(AttachmentUpload {
+                attachment_id: Some(pending.attachment_id.clone()),
+                kind: None,
+                total_bytes: None,
+                offset: 3,
+                chunk: "녕".into(),
+                complete: true,
+            })
+            .unwrap();
+        for offset in [1, 2, 4, 5] {
+            assert!(matches!(
+                s.read_attachment(AttachmentRead {
+                    attachment_id: sealed.attachment_id.clone(),
+                    offset,
+                }),
+                Err(TextDiffError::InvalidUtf8Boundary { offset: reported }) if reported == offset
+            ));
+        }
+        assert!(matches!(
+            s.read_attachment(AttachmentRead {
+                attachment_id: sealed.attachment_id.clone(),
+                offset: 7,
+            }),
+            Err(TextDiffError::InvalidInput)
+        ));
+        assert_eq!(
+            s.read_attachment(AttachmentRead {
+                attachment_id: sealed.attachment_id.clone(),
+                offset: 3,
+            })
+            .unwrap()
+            .text,
+            "녕"
+        );
+        assert_eq!(
+            s.read_attachment(AttachmentRead {
+                attachment_id: sealed.attachment_id.clone(),
+                offset: 6,
+            })
+            .unwrap()
+            .text,
+            ""
+        );
+        let retry = |offset, chunk: &str, complete| AttachmentUpload {
+            attachment_id: Some(sealed.attachment_id.clone()),
+            kind: None,
+            total_bytes: None,
+            offset,
+            chunk: chunk.into(),
+            complete,
+        };
+        assert!(matches!(
+            s.upload_attachment(retry(1, "녕", false)),
+            Err(TextDiffError::InvalidUtf8Boundary { offset: 1 })
+        ));
+        assert_eq!(
+            s.upload_attachment(retry(3, "녕", true))
+                .unwrap()
+                .committed_bytes,
+            sealed.committed_bytes
+        );
+        assert_eq!(
+            s.upload_attachment(retry(6, "", true))
+                .unwrap()
+                .attachment_id,
+            sealed.attachment_id
         );
     }
     #[test]

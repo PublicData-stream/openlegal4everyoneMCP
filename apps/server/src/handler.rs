@@ -242,6 +242,13 @@ impl ServerHandler for McpHandler {
                     Ok(Err(ToolError::InvalidInput)) => Err(ErrorData::invalid_params("invalid tool arguments", None)),
                     Ok(Err(error)) => {
                         self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                        if let ToolError::InvalidUtf8Boundary { offset } = error {
+                            return Ok(CallToolResult::structured_error(serde_json::json!({
+                                "code": "invalid_utf8_boundary",
+                                "message": "The byte offset is not on a UTF-8 character boundary.",
+                                "offset": offset
+                            })).into());
+                        }
                         let (code, message) = match error {
                             ToolError::ProcessingPending => ("processing_pending", "An observed source replacement is awaiting processing."),
                             ToolError::UnsupportedHistory => ("unsupported_history", "Provider revision history is not supported for this dataset."),

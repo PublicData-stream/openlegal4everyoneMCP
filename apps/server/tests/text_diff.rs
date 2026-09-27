@@ -809,6 +809,93 @@ async fn patch_context_conflict_is_a_structured_mcp_error() {
 }
 
 #[tokio::test]
+async fn attachment_utf8_byte_offsets_have_structured_mcp_errors() {
+    let server = Server::start(false).await;
+    for version in ["2025-11-25", "2026-07-28"] {
+        let uploaded = server
+            .successful_call(
+                version,
+                "text.attachment.upload",
+                json!({"kind":"text","total_bytes":12,"chunk":"안녕 world","final":true}),
+            )
+            .await;
+        for offset in [1, 4] {
+            let mut full_read = uploaded.clone();
+            full_read["offset"] = json!(offset);
+            let minimal_read = json!({"attachment_id":uploaded["attachment_id"],"offset":offset});
+            for arguments in [minimal_read, full_read] {
+                let response = server
+                    .call(version, "text.attachment.read", arguments)
+                    .await;
+                assert!(response.get("error").is_none(), "{response}");
+                assert_eq!(response["result"]["isError"], true, "{response}");
+                assert_eq!(
+                    response["result"]["structuredContent"],
+                    json!({"code":"invalid_utf8_boundary",
+                        "message":"The byte offset is not on a UTF-8 character boundary.",
+                        "offset":offset})
+                );
+            }
+        }
+        for arguments in [
+            json!({"attachment_id":uploaded["attachment_id"],"offset":1,
+                "chunk":"녕","final":false}),
+            json!({"schema_version":uploaded["schema_version"],
+                "attachment_id":uploaded["attachment_id"],"kind":uploaded["kind"],
+                "total_bytes":uploaded["total_bytes"],
+                "committed_bytes":uploaded["committed_bytes"],
+                "sealed":uploaded["sealed"],"expires_at":uploaded["expires_at"],
+                "resume":true,"offset":4,"chunk":"x","final":false}),
+        ] {
+            let offset = arguments["offset"].clone();
+            let response = server
+                .call(version, "text.attachment.upload", arguments)
+                .await;
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            assert_eq!(
+                response["result"]["structuredContent"],
+                json!({"code":"invalid_utf8_boundary",
+                    "message":"The byte offset is not on a UTF-8 character boundary.",
+                    "offset":offset})
+            );
+        }
+        for (offset, expected) in [(0, "안녕 world"), (3, "녕 world"), (6, " world"), (12, "")] {
+            let page = server
+                .successful_call(
+                    version,
+                    "text.attachment.read",
+                    json!({"attachment_id":uploaded["attachment_id"],"offset":offset}),
+                )
+                .await;
+            assert_eq!(page["text"], expected);
+            assert_eq!(page["offset"], offset);
+        }
+        let replay = server
+            .successful_call(
+                version,
+                "text.attachment.upload",
+                json!({"attachment_id":uploaded["attachment_id"],"offset":6,
+                    "chunk":" world","final":true}),
+            )
+            .await;
+        assert_eq!(replay, uploaded);
+        let out_of_range = server
+            .call(
+                version,
+                "text.attachment.read",
+                json!({"attachment_id":uploaded["attachment_id"],"offset":13}),
+            )
+            .await;
+        assert_eq!(out_of_range["error"]["code"], -32602, "{out_of_range}");
+        server
+            .successful_call(version, "text.attachment.delete", uploaded)
+            .await;
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn attachment_input_schemas_match_composable_forms_and_kind_errors() {
     let server = Server::start(false).await;
     for version in ["2025-11-25", "2026-07-28"] {
