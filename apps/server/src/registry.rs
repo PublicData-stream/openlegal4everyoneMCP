@@ -29,6 +29,7 @@ pub enum ToolError {
     StorageCapacity,
     SnapshotUnavailable,
     InvalidInput,
+    PatchConflict,
     AttachmentKindMismatch,
     NotFound,
     Unavailable,

@@ -228,8 +228,10 @@ newline markers. Header names are ignored as paths. Every context/deletion line
 must match the target at exactly the declared location, including CR and LF bytes.
 There is no fuzz, offset search, whitespace repair, reverse mode or partial success.
 Mode changes, rename metadata, binary/combined/multi-file patches and malformed
-counts are rejected. Empty patches preserve the target. Invalid syntax and target
-mismatches return invalid-input errors; size/work limits remain resource errors.
+counts are rejected. Empty patches preserve the target. Invalid syntax remains an
+invalid-input error. A well-formed patch whose declared position or context does
+not match the target returns a structured `patch_conflict` error with message
+`Patch context did not match the target.`; size/work limits remain resource errors.
 The target and result retain the existing 1 MiB/line-count/line-size text limits;
 patch inputs permit up to 8 MiB. This parser is a pure transformation in normalization;
 the same killable two-worker pool enforces the ten-second/caller deadline.

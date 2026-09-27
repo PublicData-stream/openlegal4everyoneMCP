@@ -388,6 +388,7 @@ pub struct PageResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextDiffError {
     InvalidInput,
+    PatchConflict,
     AttachmentKindMismatch,
     NotFound,
     Busy,

@@ -121,6 +121,7 @@ fn write_response(
         Ok((patch, metadata)) => (0u32, patch, metadata),
         Err(TextDiffError::InvalidInput) => (1, String::new(), Vec::new()),
         Err(TextDiffError::ResourceLimit) => (2, String::new(), Vec::new()),
+        Err(TextDiffError::PatchConflict) => (4, String::new(), Vec::new()),
         Err(_) => (3, String::new(), Vec::new()),
     };
     writer
@@ -163,7 +164,7 @@ pub(super) async fn read_response(
     if patch_len > MAX_PATCH_BYTES || metadata_len > MAX_METADATA_BYTES {
         return Err(TextDiffError::ResourceLimit);
     }
-    if status > 3 || (status != 0 && (patch_len != 0 || metadata_len != 0)) {
+    if status > 4 || (status != 0 && (patch_len != 0 || metadata_len != 0)) {
         return Err(TextDiffError::Unavailable);
     }
     let mut patch = vec![0; patch_len];
@@ -192,6 +193,7 @@ pub(super) async fn read_response(
         }),
         1 => Err(TextDiffError::InvalidInput),
         2 => Err(TextDiffError::ResourceLimit),
+        4 => Err(TextDiffError::PatchConflict),
         _ => Err(TextDiffError::Internal),
     }
 }
@@ -248,6 +250,29 @@ mod tests {
         assert!(matches!(
             read_response(exchange("\0", "").as_slice()).await,
             Err(TextDiffError::InvalidInput)
+        ));
+    }
+    #[tokio::test]
+    async fn patch_conflict_has_distinct_worker_status() {
+        let target = "wrong\n";
+        let patch = "--- a\n+++ b\n@@ -1 +1 @@\n-a\n+x\n";
+        let mut request = patch_request_header(target.len(), patch.len())
+            .unwrap()
+            .to_vec();
+        request.extend_from_slice(target.as_bytes());
+        request.extend_from_slice(patch.as_bytes());
+        let mut response = Vec::new();
+        run(request.as_slice(), &mut response).unwrap();
+        assert_eq!(&response[8..12], &4u32.to_be_bytes());
+        assert_eq!(response.len(), 20);
+        assert!(matches!(
+            read_response(response.as_slice()).await,
+            Err(TextDiffError::PatchConflict)
+        ));
+        response[8..12].copy_from_slice(&5u32.to_be_bytes());
+        assert!(matches!(
+            read_response(response.as_slice()).await,
+            Err(TextDiffError::Unavailable)
         ));
     }
     #[test]

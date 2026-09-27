@@ -254,6 +254,7 @@ impl ServerHandler for McpHandler {
                             ToolError::StorageCapacity => ("storage_capacity", "Persistent storage capacity is exhausted."),
                             ToolError::SnapshotUnavailable => ("snapshot_unavailable", "The exact snapshot is not retained."),
                             ToolError::NotFound => ("not_found", "Requested data was not found."),
+                            ToolError::PatchConflict => ("patch_conflict", "Patch context did not match the target."),
                             ToolError::AttachmentKindMismatch => ("attachment_kind_mismatch", "Attachment kind is incompatible with this operation."),
                             ToolError::Unavailable => ("unavailable", "Service is temporarily unavailable."),
                             ToolError::RateLimited => ("rate_limited", "Request rate limit exceeded."),

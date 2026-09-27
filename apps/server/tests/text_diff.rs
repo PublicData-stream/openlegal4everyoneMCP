@@ -764,6 +764,51 @@ async fn canonical_diff_patch_export_and_attachment_application_roundtrip() {
 }
 
 #[tokio::test]
+async fn patch_context_conflict_is_a_structured_mcp_error() {
+    let server = Server::start(false).await;
+    for version in ["2025-11-25", "2026-07-28"] {
+        let before = "alpha\n법률 제1조\nomega\n";
+        let after = "alpha\n법률 제2조\n새 줄\nomega\n";
+        let diff = server
+            .successful_call(version, "text.diff", json!({"before":before,"after":after}))
+            .await;
+        let conflict = server
+            .call(
+                version,
+                "text.apply_patch",
+                json!({"target":"alpha\n법률 제999조\nomega\n","patch":diff["patch"]}),
+            )
+            .await;
+        assert!(conflict.get("error").is_none(), "{conflict}");
+        assert_eq!(conflict["result"]["isError"], true);
+        assert_eq!(
+            conflict["result"]["structuredContent"],
+            json!({"code":"patch_conflict","message":"Patch context did not match the target."})
+        );
+        let malformed = server
+            .call(
+                version,
+                "text.apply_patch",
+                json!({"target":"wrong\n","patch":"--- a\n+++ b\n@@ -1 +1 @@\n-a\n+x\n@@ -2 +2 @@\n-b\n"}),
+            )
+            .await;
+        assert_eq!(malformed["error"]["code"], -32602, "{malformed}");
+        let missing = server
+            .call(
+                version,
+                "text.apply_patch",
+                json!({"target":before,"patch":{"attachment_id":"a".repeat(64)}}),
+            )
+            .await;
+        assert_eq!(missing["result"]["structuredContent"]["code"], "not_found");
+        server
+            .successful_call(version, "text.attachment.delete", diff["patch"].clone())
+            .await;
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn attachment_input_schemas_match_composable_forms_and_kind_errors() {
     let server = Server::start(false).await;
     for version in ["2025-11-25", "2026-07-28"] {

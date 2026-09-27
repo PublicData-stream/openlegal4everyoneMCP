@@ -239,6 +239,7 @@ fn register_canonical(
 pub(crate) fn map_error(error: TextDiffError) -> ToolError {
     match error {
         TextDiffError::InvalidInput => ToolError::InvalidInput,
+        TextDiffError::PatchConflict => ToolError::PatchConflict,
         TextDiffError::AttachmentKindMismatch => ToolError::AttachmentKindMismatch,
         TextDiffError::NotFound => ToolError::NotFound,
         TextDiffError::Busy => ToolError::RateLimited,
