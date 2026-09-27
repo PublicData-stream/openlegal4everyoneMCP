@@ -35,7 +35,16 @@ export function metadata(value: unknown, expected: ObjectId, selector: Selector)
   const freshness = m.freshness === null ? null : object(m.freshness);
   if ((selector.kind === 'head') !== (freshness !== null)) throw new Error('The server returned inconsistent HEAD freshness.');
   if (freshness) { if (!['fresh', 'stale'].includes(String(freshness.state))) throw new Error('The freshness status is invalid.'); for (const key of ['served_at', 'cached_at', 'age_seconds', 'fresh_ttl_seconds', 'fresh_remaining_seconds']) number(freshness[key]); }
-  return { capture_id: hash(m.capture_id), revision_id: text(m.revision_id, 256), title: text(m.title), source_url: text(m.source_url, 2048), retrieved_at: number(m.retrieved_at), captured_at: number(m.captured_at), validated_at: number(m.validated_at), raw_sha256: hash(m.raw_sha256), processor_version: text(m.processor_version, 256), metadata: object(m.metadata), freshness };
+  const fields = object(m.metadata);
+  let missingAttachments: { expected: number; available: number } | null = null;
+  if (fields.attachment_status !== undefined) {
+    if (fields.attachment_status !== 'incomplete') throw new Error('The attachment status is invalid.');
+    const expected = Number(text(fields.attachment_expected_count, 2));
+    const available = Number(text(fields.attachment_available_count, 2));
+    if (!Number.isSafeInteger(expected) || expected < 1 || expected > 64 || !Number.isSafeInteger(available) || available < 0 || available >= expected) throw new Error('The attachment counts are invalid.');
+    missingAttachments = { expected, available };
+  }
+  return { capture_id: hash(m.capture_id), revision_id: text(m.revision_id, 256), title: text(m.title), source_url: text(m.source_url, 2048), retrieved_at: number(m.retrieved_at), captured_at: number(m.captured_at), validated_at: number(m.validated_at), raw_sha256: hash(m.raw_sha256), processor_version: text(m.processor_version, 256), metadata: fields, freshness, missingAttachments };
 }
 export function getResult(result: unknown, expected: ObjectId, selector: Selector, section: string, offset: number, session?: string, sectionsOffset = 0) {
   const value = data(result);

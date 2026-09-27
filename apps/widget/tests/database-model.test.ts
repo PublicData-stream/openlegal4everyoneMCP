@@ -10,6 +10,12 @@ test('database object and selector validation prevents checkpoint substitution',
   assert.throws(() => metadata(meta, id, { kind: 'revision', id: 'r2' }));
   assert.throws(() => metadata(meta, id, { kind: 'head' }));
 });
+test('incomplete attachment counts are exposed and bounded', () => {
+  const partial = { ...meta, metadata: { attachment_status: 'incomplete', attachment_expected_count: '3', attachment_available_count: '2', attachment_failures: '[]' } };
+  assert.deepEqual(metadata(partial, id, { kind: 'capture', id: meta.capture_id }).missingAttachments, { expected: 3, available: 2 });
+  assert.equal(metadata(meta, id, { kind: 'capture', id: meta.capture_id }).missingAttachments, null);
+  assert.throws(() => metadata({ ...partial, metadata: { ...partial.metadata, attachment_available_count: '3' } }, id, { kind: 'capture', id: meta.capture_id }));
+});
 test('database content continuation uses exact bytes and search pages are bounded', () => {
   const page = { structuredContent: { session: 'e'.repeat(64), schema_version: 1, metadata: meta, section: 'body', text: '한', offset: 0, next_offset: 3, section_count: 0, next_sections_offset: null, sections: [] } };
   assert.equal(getResult(page, id, { kind: 'capture', id: meta.capture_id }, 'body', 0).next_offset, 3);

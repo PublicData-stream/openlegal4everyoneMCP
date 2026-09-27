@@ -99,6 +99,24 @@ inventing a download URL. Primary and attachment bytes are immutable evidence;
 extracted sections carry their source digest and physical page. XML, HTML, PDF,
 HWP5, HWPX and OCR parsing use the configured no-network document sandbox.
 
+An attachment endpoint can return HTTP success with bytes in the wrong document
+format. An HTML response gets at most two additional requests through the same
+durable admission ledger and spacing policy. If the response still is not the
+advertised PDF/HWP format, an identified primary body may be published with
+`attachment_status=incomplete`, expected/available counts, and a bounded list of
+failed link ordinals, expected formats and response digests. The final unexpected
+response is retained as private evidence, not exposed as legal text. Successful
+attachments retain their source sections. A valid PDF containing only `삭제` is
+preserved as PDF evidence and text without inferring a legal withdrawal.
+
+An incomplete result never replaces an existing complete HEAD or advances that
+HEAD's validation time. An incomplete HEAD does not establish corpus coverage or
+suppress later collection. Budget exhaustion, cancellation, HTTP rejection,
+destination violations, document-worker failure, and format-correct but invalid
+documents do not qualify for partial publication. The previously observed 200
+HTML attachment page reported service congestion; its underlying cause and
+subsequent availability remain unverified outside that diagnostic response.
+
 Source references preserve dataset, selected identifier, `efYd`, character view
 and the actual `type=XML` or `type=HTML`. The real `OC` value never appears in
 references, fixtures, logs or returned errors. Requests use HTTPS with certificate
@@ -161,8 +179,10 @@ These are application choices, not claimed upstream service guarantees:
   suspension write leaves ingestion stopped after restart; the operator must
   inspect the provider state before clearing it.
   Deferred claims do not spend another job attempt while
-  the pause holds. Permanent HTTP client rejection and deterministic parser/format failure
-  return `source_rejected`; cancellation remains cancellation. Transient sandbox
+  the pause holds. Permanent HTTP client rejection and deterministic parser failure
+  return `source_rejected`; a successful HTTP attachment response with the wrong
+  document format follows the incomplete-attachment policy above. Cancellation
+  remains cancellation. Transient sandbox
   unavailability and timeouts remain retryable processing states.
 - The queue holds at most 128 active jobs, with at most three attempts and fenced
   claims. A publication accepts at most 100 MiB combined source bytes and 64

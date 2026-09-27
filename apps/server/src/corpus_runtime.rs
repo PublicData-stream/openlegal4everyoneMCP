@@ -806,10 +806,15 @@ impl CorpusRuntime {
                 ) => true,
                 Err(e) => return Err(*e),
             };
-            if old
-                .as_ref()
-                .is_ok_and(|c| !replacement && now().saturating_sub(c.validated_at) < 3600)
-            {
+            if old.as_ref().is_ok_and(|c| {
+                !replacement
+                    && c.record
+                        .metadata
+                        .get("attachment_status")
+                        .map(String::as_str)
+                        != Some("incomplete")
+                    && now().saturating_sub(c.validated_at) < 3600
+            }) {
                 return Ok(());
             }
             replacement

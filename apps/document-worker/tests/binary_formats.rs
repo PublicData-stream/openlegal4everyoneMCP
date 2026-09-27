@@ -2,10 +2,30 @@
 //! Documents are generated from a blank template and explicitly fictional text.
 #![cfg(feature = "documents")]
 
-use openlegal_application::document::{DocumentFormat, DocumentInput};
+use openlegal_application::document::{DocumentError, DocumentFormat, DocumentInput};
 use sha2::{Digest, Sha256};
 
 const TEXT: &str = "FICTIONAL OPENLEGAL TEST 12345. 가상 문서 검증.";
+
+#[tokio::test]
+async fn html_error_page_is_not_a_pdf() {
+    let raw = b"<!doctype html><html><body>Fictional service busy</body></html>".to_vec();
+    let source_sha256 = Sha256::digest(&raw)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert!(matches!(
+        openlegal_document_worker::process(DocumentInput {
+            format: DocumentFormat::Pdf,
+            raw,
+            source_sha256,
+            ocr: false,
+        })
+        .await
+        .err(),
+        Some(DocumentError::InvalidDocument)
+    ));
+}
 
 async fn check(format: DocumentFormat, ocr: bool, outlined_pdf: bool) {
     let mut document = rhwp::DocumentCore::new_empty();

@@ -75,7 +75,7 @@ impl PgCorpusStore {
     ) -> Result<bool, DatabaseError> {
         self.gate().await?;
         let identity = key(object)?;
-        let ready: Option<bool> = sqlx::query_scalar("SELECT NOT o.withdrawn AND NOT o.pending AND o.desired_head_revision=$2 AND c.revision_id=$2 AND o.validated_at IS NOT NULL AND o.validated_at<=$3::text::numeric AND o.validated_at>$3::text::numeric-3600 FROM openlegal.corpus_object o JOIN openlegal.corpus_capture c ON c.id=o.head_capture WHERE o.object_key=$1")
+        let ready: Option<bool> = sqlx::query_scalar("SELECT NOT o.withdrawn AND NOT o.pending AND o.desired_head_revision=$2 AND c.revision_id=$2 AND COALESCE(c.payload->'record'->'metadata'->>'attachment_status','complete') <> 'incomplete' AND o.validated_at IS NOT NULL AND o.validated_at<=$3::text::numeric AND o.validated_at>$3::text::numeric-3600 FROM openlegal.corpus_object o JOIN openlegal.corpus_capture c ON c.id=o.head_capture WHERE o.object_key=$1")
             .bind(identity).bind(revision_id).bind(now.to_string())
             .fetch_optional(&self.pool).await.map_err(db)?;
         Ok(ready.unwrap_or(false))
@@ -90,7 +90,7 @@ impl PgCorpusStore {
     ) -> Result<bool, DatabaseError> {
         self.gate().await?;
         let identity = key(object)?;
-        let ready: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_revision r JOIN openlegal.corpus_capture c ON c.id=r.latest_capture JOIN openlegal.corpus_object o ON o.object_key=r.object_key WHERE r.object_key=$1 AND r.revision_id=$2 AND r.last_validated_at<=$3::text::numeric AND r.last_validated_at>$3::text::numeric-3600 AND (o.head_capture=c.id OR c.captured_at>$3::text::numeric-2592000) AND (c.expires_at IS NULL OR c.expires_at>$3::text::numeric))")
+        let ready: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_revision r JOIN openlegal.corpus_capture c ON c.id=r.latest_capture JOIN openlegal.corpus_object o ON o.object_key=r.object_key WHERE r.object_key=$1 AND r.revision_id=$2 AND COALESCE(c.payload->'record'->'metadata'->>'attachment_status','complete') <> 'incomplete' AND r.last_validated_at<=$3::text::numeric AND r.last_validated_at>$3::text::numeric-3600 AND (o.head_capture=c.id OR c.captured_at>$3::text::numeric-2592000) AND (c.expires_at IS NULL OR c.expires_at>$3::text::numeric))")
             .bind(identity).bind(revision_id).bind(now.to_string())
             .fetch_one(&self.pool).await.map_err(db)?;
         Ok(ready)
@@ -382,7 +382,7 @@ impl PgCorpusStore {
             RevisionSelector::Capture { id } => id,
             RevisionSelector::Revision { id } => {
                 if metadata_only {
-                    sqlx::query_scalar::<_,String>("SELECT id FROM openlegal.corpus_capture_catalog WHERE object_key=$1 AND revision_id=$2 ORDER BY sequence DESC LIMIT 1").bind(&k).bind(id).fetch_optional(&self.pool).await.map_err(db)?.ok_or(DatabaseError::RevisionUnavailable)?
+                    sqlx::query_scalar::<_,Option<String>>("SELECT COALESCE(r.latest_capture,(SELECT id FROM openlegal.corpus_capture_catalog c WHERE c.object_key=r.object_key AND c.revision_id=r.revision_id ORDER BY sequence DESC LIMIT 1)) FROM openlegal.corpus_revision r WHERE r.object_key=$1 AND r.revision_id=$2").bind(&k).bind(id).fetch_optional(&self.pool).await.map_err(db)?.flatten().ok_or(DatabaseError::RevisionUnavailable)?
                 } else {
                     sqlx::query_scalar::<_,Option<String>>("SELECT latest_capture FROM openlegal.corpus_revision WHERE object_key=$1 AND revision_id=$2").bind(&k).bind(id).fetch_optional(&self.pool).await.map_err(db)?.flatten().ok_or(DatabaseError::RevisionUnavailable)?
                 }
@@ -397,11 +397,11 @@ impl PgCorpusStore {
                 }
                 let (query, date) = match date {
                     RevisionSelector::PublicationDate { date } => (
-                        "SELECT CASE WHEN $3 THEN (SELECT id FROM openlegal.corpus_capture_catalog c WHERE c.object_key=r.object_key AND c.revision_id=r.revision_id ORDER BY sequence DESC LIMIT 1) ELSE latest_capture END FROM openlegal.corpus_revision r WHERE object_key=$1 AND publication_date=$2 LIMIT 2",
+                        "SELECT CASE WHEN $3 THEN COALESCE(r.latest_capture,(SELECT id FROM openlegal.corpus_capture_catalog c WHERE c.object_key=r.object_key AND c.revision_id=r.revision_id ORDER BY sequence DESC LIMIT 1)) ELSE latest_capture END FROM openlegal.corpus_revision r WHERE object_key=$1 AND publication_date=$2 LIMIT 2",
                         date,
                     ),
                     RevisionSelector::EffectiveDate { date } => (
-                        "SELECT CASE WHEN $3 THEN (SELECT id FROM openlegal.corpus_capture_catalog c WHERE c.object_key=r.object_key AND c.revision_id=r.revision_id ORDER BY sequence DESC LIMIT 1) ELSE latest_capture END FROM openlegal.corpus_revision r WHERE object_key=$1 AND effective_date=$2 LIMIT 2",
+                        "SELECT CASE WHEN $3 THEN COALESCE(r.latest_capture,(SELECT id FROM openlegal.corpus_capture_catalog c WHERE c.object_key=r.object_key AND c.revision_id=r.revision_id ORDER BY sequence DESC LIMIT 1)) ELSE latest_capture END FROM openlegal.corpus_revision r WHERE object_key=$1 AND effective_date=$2 LIMIT 2",
                         date,
                     ),
                     _ => return Err(DatabaseError::InvalidInput),
@@ -659,6 +659,27 @@ impl PgCorpusStore {
         if u64::try_from(version).map_err(corrupt)? != p.expected_version {
             return Err(DatabaseError::Conflict);
         }
+        // Preserve the complete HEAD and its validation time while recording
+        // this partial observation. The version fence above proves `previous`
+        // still describes the current HEAD.
+        let preserve_head = p.install_head
+            && p.record
+                .metadata
+                .get("attachment_status")
+                .map(String::as_str)
+                == Some("incomplete")
+            && previous.as_ref().is_some_and(|old| {
+                old.record
+                    .metadata
+                    .get("attachment_status")
+                    .map(String::as_str)
+                    != Some("incomplete")
+            });
+        let publish_head = p.install_head && !preserve_head;
+        let preserve_revision = preserve_head
+            && previous
+                .as_ref()
+                .is_some_and(|old| old.record.revision_id == p.record.revision_id);
         for (location, _, _) in &staged_blobs {
             let staged: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM openlegal.corpus_staging WHERE storage_key=$1)",
@@ -733,7 +754,7 @@ impl PgCorpusStore {
             old.validated_at = p.now;
             return Ok(old);
         }
-        let historical_add = if p.install_head {
+        let historical_add = if publish_head {
             if let Some(old_id) = object
                 .try_get::<Option<String>, _>("head_capture")
                 .map_err(db)?
@@ -790,9 +811,14 @@ impl PgCorpusStore {
                 .await
                 .map_err(db)?;
         }
-        sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,publication_date,effective_date,last_sequence,captured_at,last_validated_at) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$7::text::numeric) ON CONFLICT(object_key,revision_id) DO UPDATE SET latest_capture=EXCLUDED.latest_capture,publication_date=EXCLUDED.publication_date,effective_date=EXCLUDED.effective_date,last_sequence=EXCLUDED.last_sequence,captured_at=EXCLUDED.captured_at,last_validated_at=EXCLUDED.last_validated_at").bind(&k).bind(&capture.record.revision_id).bind(&capture_id).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(sequence).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
-        sqlx::query("UPDATE openlegal.corpus_object SET version=version+1,next_capture=next_capture+1,head_capture=CASE WHEN $2 THEN $3 ELSE head_capture END,validated_at=CASE WHEN $2 THEN $4::text::numeric ELSE validated_at END,pending=CASE WHEN $2 THEN false ELSE pending END WHERE object_key=$1").bind(&k).bind(p.install_head).bind(&capture_id).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
-        sqlx::query("INSERT INTO openlegal.corpus_outbox SELECT next_event,$1,$2,$3,false,$4,false FROM openlegal.corpus_control").bind(&k).bind(version+1).bind(&capture_id).bind(p.install_head).execute(&mut *tx).await.map_err(db)?;
+        if !preserve_revision {
+            sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,publication_date,effective_date,last_sequence,captured_at,last_validated_at) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$7::text::numeric) ON CONFLICT(object_key,revision_id) DO UPDATE SET latest_capture=EXCLUDED.latest_capture,publication_date=EXCLUDED.publication_date,effective_date=EXCLUDED.effective_date,last_sequence=EXCLUDED.last_sequence,captured_at=EXCLUDED.captured_at,last_validated_at=EXCLUDED.last_validated_at").bind(&k).bind(&capture.record.revision_id).bind(&capture_id).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(sequence).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
+        }
+        // A different desired revision keeps HEAD pending, so the old capture
+        // cannot be served with a fresh claim after its replacement was seen.
+        let clear_pending = publish_head || preserve_revision;
+        sqlx::query("UPDATE openlegal.corpus_object SET version=version+1,next_capture=next_capture+1,head_capture=CASE WHEN $2 THEN $3 ELSE head_capture END,validated_at=CASE WHEN $2 THEN $4::text::numeric ELSE validated_at END,pending=CASE WHEN $5 THEN false ELSE pending END WHERE object_key=$1").bind(&k).bind(publish_head).bind(&capture_id).bind(p.now.to_string()).bind(clear_pending).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("INSERT INTO openlegal.corpus_outbox SELECT next_event,$1,$2,$3,false,$4,false FROM openlegal.corpus_control").bind(&k).bind(version+1).bind(&capture_id).bind(publish_head).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_control SET next_event=next_event+1,raw_bytes=raw_bytes+$1,staged_bytes=staged_bytes-$1").bind(total_size as i64).execute(&mut *tx).await.map_err(db)?;
         for (location, _, _) in &staged_blobs {
             sqlx::query("DELETE FROM openlegal.corpus_staging WHERE storage_key=$1")

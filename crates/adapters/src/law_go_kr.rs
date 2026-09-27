@@ -62,6 +62,19 @@ pub struct ProviderDetail {
     pub additional_evidence: Vec<Vec<u8>>,
     pub processor_version: String,
 }
+
+enum FetchedDocument<T> {
+    Processed(T),
+    UnexpectedAttachment { raw: Vec<u8>, html: bool },
+}
+
+#[derive(Serialize)]
+struct MissingAttachment {
+    ordinal: usize,
+    expected_format: DocumentFormat,
+    response_sha256: String,
+    reason: &'static str,
+}
 #[derive(Clone)]
 pub struct LawClient {
     credential: Arc<String>,
@@ -568,65 +581,118 @@ impl LawClient {
         let mut additional_evidence = Vec::new();
         let mut total = raw.len();
         let mut extracted = 0usize;
+        let expected_count = links.len();
+        let mut missing = Vec::new();
         for (ordinal, link) in links.into_iter().enumerate() {
-            let bytes = self
-                .fetch_parse_timed_checked(
-                    link.url,
-                    link.format,
-                    true,
-                    cancel.clone(),
-                    |attachment, bytes, _| {
+            let mut retries = 0;
+            let bytes = loop {
+                let result = self
+                    .fetch_attachment_timed_checked(
+                        link.url.clone(),
+                        link.format,
+                        (100usize * 1024 * 1024).saturating_sub(total),
+                        cancel.clone(),
+                        |attachment, bytes, _| {
+                            total = total
+                                .checked_add(bytes.len())
+                                .ok_or(DatabaseError::SourceRejected)?;
+                            if total > 100 * 1024 * 1024 {
+                                return Err(DatabaseError::SourceRejected);
+                            }
+                            let digest = attachment.source_sha256.clone();
+                            let pages = if attachment.pages.is_empty() {
+                                vec![openlegal_application::document::DocumentPage {
+                                    page: 1,
+                                    text: attachment.text,
+                                }]
+                            } else {
+                                attachment.pages
+                            };
+                            for (kind, pages) in [
+                                (SectionKind::Extracted, pages),
+                                (SectionKind::Ocr, attachment.ocr_pages),
+                            ] {
+                                for page in pages {
+                                    extracted = extracted
+                                        .checked_add(page.text.len())
+                                        .ok_or(DatabaseError::SourceRejected)?;
+                                    if extracted > 16 * 1024 * 1024 {
+                                        return Err(DatabaseError::SourceRejected);
+                                    }
+                                    let label = if kind == SectionKind::Ocr {
+                                        "ocr"
+                                    } else {
+                                        "extracted"
+                                    };
+                                    record.sections.push(LegalSection {
+                                        id: format!(
+                                            "attachment:{}:{label}:{}",
+                                            ordinal + 1,
+                                            page.page
+                                        ),
+                                        title: link.title.clone(),
+                                        text: page.text,
+                                        kind: kind.clone(),
+                                        source_document_sha256: Some(digest.clone()),
+                                        page: Some(
+                                            page.page
+                                                .try_into()
+                                                .map_err(|_| DatabaseError::SourceRejected)?,
+                                        ),
+                                    });
+                                }
+                            }
+                            record.validate()?;
+                            Ok(bytes)
+                        },
+                    )
+                    .await?;
+                match result {
+                    FetchedDocument::Processed(bytes) => break bytes,
+                    FetchedDocument::UnexpectedAttachment { raw, html } if html && retries < 2 => {
+                        retries += 1;
+                        // Each attempt passes through the same durable request
+                        // admission and spacing policy as the first download.
+                        drop(raw);
+                    }
+                    FetchedDocument::UnexpectedAttachment { raw, .. } => {
                         total = total
-                            .checked_add(bytes.len())
+                            .checked_add(raw.len())
                             .ok_or(DatabaseError::SourceRejected)?;
                         if total > 100 * 1024 * 1024 {
                             return Err(DatabaseError::SourceRejected);
                         }
-                        let digest = attachment.source_sha256.clone();
-                        let pages = if attachment.pages.is_empty() {
-                            vec![openlegal_application::document::DocumentPage {
-                                page: 1,
-                                text: attachment.text,
-                            }]
-                        } else {
-                            attachment.pages
-                        };
-                        for (kind, pages) in [
-                            (SectionKind::Extracted, pages),
-                            (SectionKind::Ocr, attachment.ocr_pages),
-                        ] {
-                            for page in pages {
-                                extracted = extracted
-                                    .checked_add(page.text.len())
-                                    .ok_or(DatabaseError::SourceRejected)?;
-                                if extracted > 16 * 1024 * 1024 {
-                                    return Err(DatabaseError::SourceRejected);
-                                }
-                                let label = if kind == SectionKind::Ocr {
-                                    "ocr"
-                                } else {
-                                    "extracted"
-                                };
-                                record.sections.push(LegalSection {
-                                    id: format!("attachment:{}:{label}:{}", ordinal + 1, page.page),
-                                    title: link.title.clone(),
-                                    text: page.text,
-                                    kind: kind.clone(),
-                                    source_document_sha256: Some(digest.clone()),
-                                    page: Some(
-                                        page.page
-                                            .try_into()
-                                            .map_err(|_| DatabaseError::SourceRejected)?,
-                                    ),
-                                });
-                            }
-                        }
-                        record.validate()?;
-                        Ok(bytes)
-                    },
-                )
-                .await?;
+                        missing.push(MissingAttachment {
+                            ordinal: ordinal + 1,
+                            expected_format: link.format,
+                            response_sha256: Sha256::digest(&raw)
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect(),
+                            reason: "unexpected_attachment_format",
+                        });
+                        break raw;
+                    }
+                }
+            };
             additional_evidence.push(bytes);
+        }
+        if !missing.is_empty() {
+            record
+                .metadata
+                .insert("attachment_status".into(), "incomplete".into());
+            record.metadata.insert(
+                "attachment_expected_count".into(),
+                expected_count.to_string(),
+            );
+            record.metadata.insert(
+                "attachment_available_count".into(),
+                (expected_count - missing.len()).to_string(),
+            );
+            record.metadata.insert(
+                "attachment_failures".into(),
+                serde_json::to_string(&missing).map_err(|_| DatabaseError::StorageCorrupt)?,
+            );
         }
         record.validate()?;
         Ok(ProviderDetail {
@@ -679,6 +745,47 @@ impl LawClient {
         cancel: CancellationToken,
         check: F,
     ) -> Result<T, DatabaseError>
+    where
+        F: FnOnce(DocumentOutput, Vec<u8>, u64) -> Result<T, DatabaseError>,
+    {
+        match self
+            .fetch_parse_timed_checked_inner(url, format, ocr, cancel, None, check)
+            .await?
+        {
+            FetchedDocument::Processed(value) => Ok(value),
+            FetchedDocument::UnexpectedAttachment { .. } => Err(DatabaseError::StorageCorrupt),
+        }
+    }
+    async fn fetch_attachment_timed_checked<T, F>(
+        &self,
+        url: Url,
+        format: DocumentFormat,
+        remaining_bytes: usize,
+        cancel: CancellationToken,
+        check: F,
+    ) -> Result<FetchedDocument<T>, DatabaseError>
+    where
+        F: FnOnce(DocumentOutput, Vec<u8>, u64) -> Result<T, DatabaseError>,
+    {
+        self.fetch_parse_timed_checked_inner(
+            url,
+            format,
+            true,
+            cancel,
+            Some(remaining_bytes),
+            check,
+        )
+        .await
+    }
+    async fn fetch_parse_timed_checked_inner<T, F>(
+        &self,
+        url: Url,
+        format: DocumentFormat,
+        ocr: bool,
+        cancel: CancellationToken,
+        attachment_remaining_bytes: Option<usize>,
+        check: F,
+    ) -> Result<FetchedDocument<T>, DatabaseError>
     where
         F: FnOnce(DocumentOutput, Vec<u8>, u64) -> Result<T, DatabaseError>,
     {
@@ -781,11 +888,19 @@ impl LawClient {
             {
                 return Err(DatabaseError::SourceRejected);
             }
-            let max = if matches!(format, DocumentFormat::Xml | DocumentFormat::Html) {
+            let html_content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/html"));
+            let max = if matches!(format, DocumentFormat::Xml | DocumentFormat::Html)
+                || (attachment_remaining_bytes.is_some() && html_content_type)
+            {
                 16 * 1024 * 1024
             } else {
                 100 * 1024 * 1024
             };
+            let max = max.min(attachment_remaining_bytes.unwrap_or(usize::MAX));
             if response.content_length().is_some_and(|n| n > max as u64) {
                 return Err(DatabaseError::SourceRejected);
             }
@@ -800,7 +915,7 @@ impl LawClient {
                 }
                 raw.extend_from_slice(&chunk);
             }
-            Ok(raw)
+            Ok((raw, html_content_type))
         };
         tokio::select! {_ = cancel.cancelled()=>Err(DatabaseError::Cancelled),result=fetch=>result}
         }.await;
@@ -808,8 +923,8 @@ impl LawClient {
             .budget
             .as_ref()
             .is_some_and(|(_, mode)| *mode == RequestBudgetMode::Pilot);
-        let raw = match fetched {
-            Ok(raw) => raw,
+        let (raw, html_content_type) = match fetched {
+            Ok(value) => value,
             Err(DatabaseError::SourceRejected) if pilot => {
                 // Keep the admission permit until this failure is fenced in
                 // both the process and durable request ledger.
@@ -832,6 +947,16 @@ impl LawClient {
             }
         };
         let retrieved_at = self.clock.now();
+        if attachment_remaining_bytes.is_some() && !expected_document_magic(&raw, format) {
+            if !self.operator_suspended.load(Ordering::Acquire) {
+                self.complete_request().await?;
+            }
+            drop(permit);
+            return Ok(FetchedDocument::UnexpectedAttachment {
+                html: html_content_type || looks_like_html(&raw),
+                raw,
+            });
+        }
         let digest = Sha256::digest(&raw)
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -849,7 +974,8 @@ impl LawClient {
             )
             .await
             .map_err(document_error)
-            .and_then(|output| check(output, raw, retrieved_at));
+            .and_then(|output| check(output, raw, retrieved_at))
+            .map(FetchedDocument::Processed);
         match output {
             Err(DatabaseError::SourceRejected) if pilot => {
                 self.suspend_after_source_rejection().await?;
@@ -886,6 +1012,26 @@ fn document_error(error: DocumentError) -> DatabaseError {
         | DocumentError::ProcessingFailed
         | DocumentError::ResourceLimit => DatabaseError::SourceRejected,
     }
+}
+fn expected_document_magic(raw: &[u8], format: DocumentFormat) -> bool {
+    match format {
+        DocumentFormat::Pdf => raw.starts_with(b"%PDF-"),
+        DocumentFormat::Hwp5 => raw.starts_with(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+        DocumentFormat::Hwpx => raw.starts_with(b"PK\x03\x04"),
+        DocumentFormat::Xml | DocumentFormat::Html => false,
+    }
+}
+fn looks_like_html(raw: &[u8]) -> bool {
+    let prefix = raw
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(raw)
+        .iter()
+        .copied()
+        .skip_while(u8::is_ascii_whitespace)
+        .take(16)
+        .collect::<Vec<_>>();
+    let lower = prefix.to_ascii_lowercase();
+    lower.starts_with(b"<!doctype html") || lower.starts_with(b"<html")
 }
 struct AttachmentLink {
     url: Url,
@@ -1689,6 +1835,25 @@ mod tests {
             ))
             .is_err()
         );
+    }
+    #[test]
+    fn attachment_signatures_distinguish_html_error_from_document_bytes() {
+        let busy = b"\xef\xbb\xbf  <!DOCTYPE html><html>fictional busy page</html>";
+        assert!(looks_like_html(busy));
+        for format in [
+            DocumentFormat::Pdf,
+            DocumentFormat::Hwp5,
+            DocumentFormat::Hwpx,
+        ] {
+            assert!(!expected_document_magic(busy, format));
+        }
+        assert!(expected_document_magic(b"%PDF-1.7", DocumentFormat::Pdf));
+        assert!(expected_document_magic(
+            &[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1],
+            DocumentFormat::Hwp5
+        ));
+        assert!(expected_document_magic(b"PK\x03\x04", DocumentFormat::Hwpx));
+        assert!(!looks_like_html(b"%PDF-1.7"));
     }
     #[test]
     fn terminal_provider_failures_and_typed_judgment_dates() {

@@ -12,6 +12,7 @@ use openlegal_application::{
     persistence::PersistentStore,
 };
 use openlegal_domain::legal::*;
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
@@ -366,6 +367,278 @@ async fn publish(store: &PgCorpusStore, revision: &str, body: &str, now: u64) ->
 
 #[tokio::test]
 #[ignore = "requires scripts/test-postgres.sh"]
+async fn incomplete_attachment_evidence_never_replaces_a_complete_head() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("partial-head"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(base.pool(), blobs, Arc::new(FixtureClock));
+    let complete = publish(&store, "r1", "complete body", 100).await;
+    store
+        .enqueue_job(object(), "r2".into(), None, true, true, 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .resolve(object(), RevisionSelector::Head, 200, token())
+            .await
+            .err(),
+        Some(DatabaseError::ProcessingPending)
+    );
+    let job = store.claim_job(201).await.unwrap().unwrap();
+    let mut partial = record("r2", "new body");
+    partial.publication_date = Some("20260301".into());
+    partial.effective_date = Some("20260401".into());
+    partial
+        .metadata
+        .insert("attachment_status".into(), "incomplete".into());
+    let rejected = b"<html>fictional busy page</html>".to_vec();
+    let expected_digest = Sha256::digest(&rejected).to_vec();
+    let observed = store
+        .publish(
+            Publication {
+                record: partial,
+                raw: b"new body".to_vec(),
+                additional_evidence: vec![rejected],
+                processor_version: "fixture_v1".into(),
+                retrieved_at: 200,
+                now: 202,
+                expected_version: job.expected_version,
+                install_head: true,
+                job_id: Some(job.id),
+            },
+            token(),
+        )
+        .await
+        .unwrap();
+    let state = store.state(&object()).await.unwrap();
+    assert_eq!(state.head_capture, Some(complete.capture_id.clone()));
+    assert!(state.pending);
+    assert_eq!(
+        store
+            .resolve(object(), RevisionSelector::Head, 202, token())
+            .await
+            .err(),
+        Some(DatabaseError::ProcessingPending)
+    );
+    let retained = store
+        .resolve(
+            object(),
+            RevisionSelector::Capture {
+                id: complete.capture_id.clone(),
+            },
+            202,
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retained.capture_id, complete.capture_id);
+    assert_eq!(retained.validated_at, 100);
+    let head_validated_at: String = sqlx::query_scalar(
+        "SELECT validated_at::text FROM openlegal.corpus_object WHERE head_capture=$1",
+    )
+    .bind(&complete.capture_id)
+    .fetch_one(&base.pool())
+    .await
+    .unwrap();
+    assert_eq!(head_validated_at, "100");
+    let partial = store
+        .resolve(
+            object(),
+            RevisionSelector::Capture {
+                id: observed.capture_id.clone(),
+            },
+            202,
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(partial.record.body, "new body");
+    assert_eq!(partial.record.metadata["attachment_status"], "incomplete");
+    let stored_digest: Vec<u8> = sqlx::query_scalar(
+        "SELECT raw_sha256 FROM openlegal.corpus_capture_blob WHERE capture_id=$1 AND ordinal=1",
+    )
+    .bind(&observed.capture_id)
+    .fetch_one(&base.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_digest, expected_digest);
+    assert_eq!(
+        store
+            .resolve(
+                object(),
+                RevisionSelector::Revision { id: "r2".into() },
+                202,
+                token(),
+            )
+            .await
+            .unwrap()
+            .capture_id,
+        observed.capture_id
+    );
+    assert!(
+        !store
+            .head_revision_ready(&object(), "r2", 202)
+            .await
+            .unwrap()
+    );
+    store
+        .enqueue_job(object(), "r1".into(), None, true, true, 203)
+        .await
+        .unwrap();
+    let same_revision_job = store.claim_job(204).await.unwrap().unwrap();
+    let mut same_revision = record("r1", "incomplete body");
+    same_revision
+        .metadata
+        .insert("attachment_status".into(), "incomplete".into());
+    let same_revision_capture = store
+        .publish(
+            Publication {
+                record: same_revision,
+                raw: b"incomplete body".to_vec(),
+                additional_evidence: vec![b"<html>second fictional busy page</html>".to_vec()],
+                processor_version: "fixture_v1".into(),
+                retrieved_at: 205,
+                now: 205,
+                expected_version: same_revision_job.expected_version,
+                install_head: true,
+                job_id: Some(same_revision_job.id),
+            },
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(same_revision_capture.capture_id, complete.capture_id);
+    assert_eq!(
+        store.state(&object()).await.unwrap().head_capture,
+        Some(complete.capture_id.clone())
+    );
+    assert_eq!(
+        store
+            .resolve(object(), RevisionSelector::Head, 205, token())
+            .await
+            .unwrap()
+            .validated_at,
+        100
+    );
+    assert_eq!(
+        store
+            .resolve(
+                object(),
+                RevisionSelector::Revision { id: "r1".into() },
+                205,
+                token()
+            )
+            .await
+            .unwrap()
+            .capture_id,
+        complete.capture_id
+    );
+    store
+        .mark_inventory_complete(&object(), true)
+        .await
+        .unwrap();
+    for selector in [
+        RevisionSelector::Revision { id: "r1".into() },
+        RevisionSelector::PublicationDate {
+            date: "20260101".into(),
+        },
+        RevisionSelector::EffectiveDate {
+            date: "20260201".into(),
+        },
+    ] {
+        assert_eq!(
+            store
+                .resolve(object(), selector.clone(), 205, token())
+                .await
+                .unwrap()
+                .capture_id,
+            complete.capture_id
+        );
+        assert_eq!(
+            store
+                .resolve_metadata(object(), selector, 205, token())
+                .await
+                .unwrap()
+                .capture_id,
+            complete.capture_id
+        );
+    }
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn incomplete_attachment_capture_retains_private_response_without_claiming_coverage() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("partial-evidence"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(base.pool(), blobs, Arc::new(FixtureClock));
+    let mut partial = record("r1", "identified provider body");
+    partial.object.provider = "law_go_kr".into();
+    partial
+        .metadata
+        .insert("attachment_status".into(), "incomplete".into());
+    partial
+        .metadata
+        .insert("attachment_expected_count".into(), "1".into());
+    partial
+        .metadata
+        .insert("attachment_available_count".into(), "0".into());
+    let object = partial.object.clone();
+    let rejected = b"<html>fictional busy page</html>".to_vec();
+    let expected_digest = Sha256::digest(&rejected).to_vec();
+    let capture = store
+        .publish(
+            Publication {
+                record: partial,
+                raw: b"identified provider body".to_vec(),
+                additional_evidence: vec![rejected],
+                processor_version: "fixture_v1".into(),
+                retrieved_at: 100,
+                now: 100,
+                expected_version: store.state(&object).await.unwrap().version,
+                install_head: true,
+                job_id: None,
+            },
+            token(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openlegal.corpus_object SET desired_head_revision='r1' WHERE identity->>'provider'='law_go_kr'")
+        .execute(&base.pool()).await.unwrap();
+    let stored_digest: Vec<u8> = sqlx::query_scalar(
+        "SELECT raw_sha256 FROM openlegal.corpus_capture_blob WHERE capture_id=$1 AND ordinal=1",
+    )
+    .bind(&capture.capture_id)
+    .fetch_one(&base.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_digest, expected_digest);
+    assert!(!store.head_revision_ready(&object, "r1", 100).await.unwrap());
+    assert!(
+        !store
+            .revision_capture_recent(&object, "r1", 100)
+            .await
+            .unwrap()
+    );
+    assert!(!store.current_coverage_ready(100).await.unwrap());
+    assert_eq!(
+        store
+            .resolve(object, RevisionSelector::Head, 100, token())
+            .await
+            .unwrap()
+            .capture_id,
+        capture.capture_id
+    );
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
 async fn corpus_capture_identity_unchanged_validation_and_conflict() {
     let fixture = support::TestDatabase::new().await;
     let base = fixture.open(100).await;
@@ -651,7 +924,6 @@ async fn corpus_index_ack_and_session_pins_precede_physical_retention() {
 #[tokio::test]
 #[ignore = "requires scripts/test-postgres.sh"]
 async fn corpus_attachment_evidence_catalog_and_index_replay() {
-    use sha2::{Digest, Sha256};
     let fixture = support::TestDatabase::new().await;
     let base = fixture.open(100).await;
     let blobs = FsBlobStore::open(&fixture.directory.path().join("corpus"))

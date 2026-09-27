@@ -61,6 +61,19 @@ cannot make the previous HEAD fresh. Historical results do not carry current TTL
 Provider text, extracted attachment text, and OCR are distinct sections. OCR has
 source digest/page provenance and is excluded from search/comparison by default.
 The page excerpts do not alter stored evidence.
+When a Korean provider attachment returns HTTP success with the wrong document
+format after bounded retry, an incomplete capture exposes the identified provider
+body with `metadata.attachment_status="incomplete"`.
+`attachment_expected_count` and `attachment_available_count` are decimal strings;
+`attachment_failures` is a JSON string listing one-based `ordinal`,
+`expected_format`, `response_sha256` and `reason` for each missing attachment.
+The failure response is retained privately as exact evidence but has no content
+section. If a complete HEAD exists, its capture and original validation time
+are preserved while the incomplete observation is retained as a capture. A
+newly observed replacement revision keeps HEAD pending under the existing
+freshness contract; a failed attachment on the same revision leaves the prior
+complete HEAD readable. A partial capture never asserts complete corpus coverage or suppresses a later
+collection; the browser shows a visible warning when reading it.
 
 `database.diff` resolves both selectors for one object and returns the exact capture
 metadata with a text-comparison handle. Its line and character comparison is the

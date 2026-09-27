@@ -56,6 +56,11 @@ Validate source identity, expected format, completeness, and provenance before
 publishing a successful entry. Publish payload/record metadata consistently; a
 partial or failed refresh must not overwrite good data as a successful result.
 Prevent an older concurrent refresh from replacing a newer accepted result.
+An identified primary body may be published with missing linked attachment
+evidence only when its provider profile defines an explicit incomplete status,
+retains the failed response privately, and prevents that capture from replacing
+a complete HEAD or satisfying full-coverage checks. Other validation failures
+remain failures.
 
 Raw evidence retention follows the
 [legal-data policy](legal-data-policy.md#retained-evidence-and-fixtures).
