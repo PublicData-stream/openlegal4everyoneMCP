@@ -87,6 +87,15 @@ fn validate(kind: AttachmentKind, text: &str) -> Result<(), TextDiffError> {
     }
     Ok(())
 }
+fn check_declared_kind(
+    declared: Option<AttachmentKind>,
+    actual: AttachmentKind,
+) -> Result<(), TextDiffError> {
+    if declared.is_some_and(|kind| kind != actual) {
+        return Err(TextDiffError::AttachmentKindMismatch);
+    }
+    Ok(())
+}
 impl TextDiffService {
     fn fresh_attachment_id(&self, state: &State) -> Result<String, TextDiffError> {
         for _ in 0..4 {
@@ -106,14 +115,18 @@ impl TextDiffService {
         let result = match input {
             TextSource::Inline(text) => ResolvedText::Inline(text),
             TextSource::Attachment(handle) => {
-                valid_handle(&handle.attachment_id)?;
+                valid_handle(handle.attachment_id())?;
                 let mut state = self.state.lock().map_err(|_| TextDiffError::Internal)?;
                 expire(&mut state);
                 let entry = state
                     .attachments
-                    .get(&handle.attachment_id)
+                    .get(handle.attachment_id())
                     .ok_or(TextDiffError::NotFound)?;
-                if !entry.summary.sealed || entry.summary.kind != kind {
+                check_declared_kind(handle.declared_kind(), entry.summary.kind)?;
+                if entry.summary.kind != kind {
+                    return Err(TextDiffError::AttachmentKindMismatch);
+                }
+                if !entry.summary.sealed {
                     return Err(TextDiffError::InvalidInput);
                 }
                 ResolvedText::Attachment(entry.data.clone())
@@ -126,6 +139,15 @@ impl TextDiffService {
     pub fn upload_attachment(
         &self,
         request: AttachmentUpload,
+    ) -> Result<AttachmentSummary, TextDiffError> {
+        self.upload_attachment_with_kind(request, None)
+    }
+
+    /// The declared kind comes only from an optional complete response object.
+    pub fn upload_attachment_with_kind(
+        &self,
+        request: AttachmentUpload,
+        declared_kind: Option<AttachmentKind>,
     ) -> Result<AttachmentSummary, TextDiffError> {
         if request.chunk.len() > MAX_ATTACHMENT_CHUNK_BYTES || request.chunk.contains('\0') {
             return Err(TextDiffError::InvalidInput);
@@ -144,6 +166,7 @@ impl TextDiffService {
                 .attachments
                 .get_mut(&id)
                 .ok_or(TextDiffError::NotFound)?;
+            check_declared_kind(declared_kind, entry.summary.kind)?;
             let end = request
                 .offset
                 .checked_add(request.chunk.len())
@@ -178,6 +201,9 @@ impl TextDiffService {
             entry.summary.committed_bytes = end;
             entry.summary.sealed = request.complete;
             return Ok(entry.summary.clone());
+        }
+        if declared_kind.is_some() {
+            return Err(TextDiffError::InvalidInput);
         }
         let kind = request.kind.ok_or(TextDiffError::InvalidInput)?;
         let total = request.total_bytes.ok_or(TextDiffError::InvalidInput)?;
@@ -235,6 +261,15 @@ impl TextDiffService {
         &self,
         request: AttachmentRead,
     ) -> Result<AttachmentPage, TextDiffError> {
+        self.read_attachment_with_kind(request, None)
+    }
+
+    /// A supplied summary kind is checked against storage before reading bytes.
+    pub fn read_attachment_with_kind(
+        &self,
+        request: AttachmentRead,
+        declared_kind: Option<AttachmentKind>,
+    ) -> Result<AttachmentPage, TextDiffError> {
         valid_handle(&request.attachment_id)?;
         let mut state = self.state.lock().map_err(|_| TextDiffError::Internal)?;
         expire(&mut state);
@@ -242,6 +277,7 @@ impl TextDiffService {
             .attachments
             .get(&request.attachment_id)
             .ok_or(TextDiffError::NotFound)?;
+        check_declared_kind(declared_kind, entry.summary.kind)?;
         if !entry.summary.sealed || !entry.data.text.is_char_boundary(request.offset) {
             return Err(TextDiffError::InvalidInput);
         }
@@ -262,12 +298,22 @@ impl TextDiffService {
         })
     }
     pub fn delete_attachment(&self, id: &str) -> Result<(), TextDiffError> {
+        self.delete_attachment_with_kind(id, None)
+    }
+
+    /// Missing handles remain idempotent; a present handle checks supplied kind.
+    pub fn delete_attachment_with_kind(
+        &self,
+        id: &str,
+        declared_kind: Option<AttachmentKind>,
+    ) -> Result<(), TextDiffError> {
         valid_handle(id)?;
-        self.state
-            .lock()
-            .map_err(|_| TextDiffError::Internal)?
-            .attachments
-            .remove(id);
+        let mut state = self.state.lock().map_err(|_| TextDiffError::Internal)?;
+        expire(&mut state);
+        if let Some(entry) = state.attachments.get(id) {
+            check_declared_kind(declared_kind, entry.summary.kind)?;
+        }
+        state.attachments.remove(id);
         Ok(())
     }
     fn publish_attachment(
@@ -582,14 +628,38 @@ mod tests {
         );
     }
     #[test]
+    fn full_summary_delete_of_expired_attachment_is_idempotent() {
+        let s = service();
+        let summary = s.upload_attachment(upload("x", 1, true)).unwrap();
+        s.state
+            .lock()
+            .unwrap()
+            .attachments
+            .get_mut(&summary.attachment_id)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_secs(1);
+        s.delete_attachment_with_kind(&summary.attachment_id, Some(AttachmentKind::Patch))
+            .unwrap();
+        assert!(matches!(
+            s.read_attachment(AttachmentRead {
+                attachment_id: summary.attachment_id,
+                offset: 0,
+            }),
+            Err(TextDiffError::NotFound)
+        ));
+    }
+    #[test]
     fn leases_remain_charged_after_delete_and_expiry_is_fixed() {
         let s = service();
         let a = s.upload_attachment(upload("x", 1, true)).unwrap();
         let lease = s
             .resolve(
-                TextSource::Attachment(AttachmentHandle {
-                    attachment_id: a.attachment_id.clone(),
-                }),
+                TextSource::Attachment(
+                    AttachmentHandle {
+                        attachment_id: a.attachment_id.clone(),
+                    }
+                    .into(),
+                ),
                 AttachmentKind::Text,
             )
             .unwrap();

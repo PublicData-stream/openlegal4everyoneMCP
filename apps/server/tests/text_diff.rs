@@ -653,15 +653,21 @@ async fn canonical_diff_patch_export_and_attachment_application_roundtrip() {
             .successful_call(
                 version,
                 "text.apply_patch",
-                json!({"target":before,"patch":{"attachment_id":diff["patch"]["attachment_id"]}}),
+                json!({"target":before,"patch":diff["patch"]}),
             )
             .await;
-        let page = server
+        let verification = server
             .successful_call(
                 version,
-                "text.attachment.read",
-                json!({"attachment_id":applied["result"]["attachment_id"]}),
+                "text.diff",
+                json!({"before":applied["result"],"after":after}),
             )
+            .await;
+        assert_eq!(verification["comparison"]["equal"], true);
+        assert_eq!(verification["comparison"]["additions"], 0);
+        assert_eq!(verification["comparison"]["deletions"], 0);
+        let page = server
+            .successful_call(version, "text.attachment.read", applied["result"].clone())
             .await;
         assert_eq!(page["text"], after);
         assert_eq!(page["complete"], true);
@@ -677,7 +683,11 @@ async fn canonical_diff_patch_export_and_attachment_application_roundtrip() {
             .successful_call(
                 version,
                 "text.attachment.upload",
-                json!({"attachment_id":id,"offset":3,"chunk":"\r\n","final":true}),
+                json!({"schema_version":first["schema_version"],"attachment_id":id,
+                    "kind":first["kind"],"total_bytes":first["total_bytes"],
+                    "committed_bytes":first["committed_bytes"],"sealed":first["sealed"],
+                    "expires_at":first["expires_at"],"resume":true,
+                    "offset":3,"chunk":"\r\n","final":true}),
             )
             .await;
         assert_eq!(sealed["sealed"], true);
@@ -689,10 +699,31 @@ async fn canonical_diff_patch_export_and_attachment_application_roundtrip() {
             )
             .await;
         assert_eq!(replay, sealed);
+        let sealed_retry = server
+            .successful_call(
+                version,
+                "text.attachment.upload",
+                json!({"schema_version":sealed["schema_version"],"attachment_id":id,
+                    "kind":sealed["kind"],"total_bytes":sealed["total_bytes"],
+                    "committed_bytes":sealed["committed_bytes"],"sealed":sealed["sealed"],
+                    "expires_at":sealed["expires_at"],"resume":true,
+                    "offset":3,"chunk":"\r\n","final":true}),
+            )
+            .await;
+        assert_eq!(sealed_retry, sealed);
+        let uploaded_diff = server
+            .successful_call(
+                version,
+                "text.diff",
+                json!({"before":sealed,"after":"한\r\n"}),
+            )
+            .await;
+        assert_eq!(uploaded_diff["comparison"]["equal"], true);
         for attachment in [
-            id,
             &diff["patch"]["attachment_id"],
             &applied["result"]["attachment_id"],
+            &verification["patch"]["attachment_id"],
+            &uploaded_diff["patch"]["attachment_id"],
         ] {
             server
                 .successful_call(
@@ -703,11 +734,159 @@ async fn canonical_diff_patch_export_and_attachment_application_roundtrip() {
                 .await;
         }
         server
+            .successful_call(version, "text.attachment.delete", sealed.clone())
+            .await;
+        server
+            .successful_call(
+                version,
+                "text.attachment.delete",
+                json!({"attachment_id":id}),
+            )
+            .await;
+        for comparison in [&verification, &uploaded_diff] {
+            server
+                .successful_call(
+                    version,
+                    "text.diff.delete",
+                    json!({"comparison_id":comparison["comparison"]["comparison_id"]}),
+                )
+                .await;
+        }
+        server
             .successful_call(
                 version,
                 "text.diff.delete",
                 json!({"comparison_id":diff["comparison"]["comparison_id"]}),
             )
+            .await;
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn attachment_input_schemas_match_composable_forms_and_kind_errors() {
+    let server = Server::start(false).await;
+    for version in ["2025-11-25", "2026-07-28"] {
+        let listed = server.rpc(version, "tools/list", json!({})).await;
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        let id = "a".repeat(64);
+        let text = json!({"schema_version":1,"attachment_id":id,"kind":"text",
+            "total_bytes":3,"committed_bytes":3,"sealed":true,"expires_at":123});
+        let mut patch = text.clone();
+        patch["kind"] = json!("patch");
+        let handle = json!({"attachment_id":id});
+        let partial = json!({"attachment_id":id,"kind":"text"});
+        let unknown = json!({"attachment_id":id,"extra":true});
+        for (name, accepted, rejected) in [
+            (
+                "text.diff",
+                vec![
+                    json!({"before":text,"after":"x"}),
+                    json!({"before":handle,"after":"x"}),
+                ],
+                vec![
+                    json!({"before":partial,"after":"x"}),
+                    json!({"before":unknown,"after":"x"}),
+                ],
+            ),
+            (
+                "text.apply_patch",
+                vec![
+                    json!({"target":"x","patch":patch}),
+                    json!({"target":"x","patch":handle}),
+                ],
+                vec![json!({"target":"x","patch":partial})],
+            ),
+            (
+                "text.attachment.read",
+                vec![text.clone(), json!({"attachment_id":id,"offset":0})],
+                vec![partial.clone(), unknown.clone()],
+            ),
+            (
+                "text.attachment.delete",
+                vec![text.clone(), handle.clone()],
+                vec![partial.clone(), unknown.clone()],
+            ),
+            (
+                "text.attachment.upload",
+                vec![
+                    json!({"kind":"text","total_bytes":3,"chunk":"abc","final":true}),
+                    json!({"attachment_id":id,"offset":0,"chunk":"abc","final":true}),
+                    json!({"schema_version":1,"attachment_id":id,"kind":"text",
+                        "total_bytes":3,"committed_bytes":0,"sealed":false,
+                        "expires_at":123,"resume":true,"offset":0,"chunk":"abc","final":true}),
+                ],
+                vec![
+                    json!({"schema_version":1,"attachment_id":id,"kind":"text",
+                    "total_bytes":3,"committed_bytes":0,"sealed":false,
+                    "expires_at":123,"resume":false,"offset":0,"chunk":"abc","final":true}),
+                    json!({"attachment_id":id,"kind":"text","resume":true,
+                        "offset":0,"chunk":"abc","final":true}),
+                ],
+            ),
+        ] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            let validator = jsonschema::validator_for(&tool["inputSchema"]).unwrap();
+            for value in accepted {
+                assert!(validator.is_valid(&value), "{name} rejected {value}");
+            }
+            for value in rejected {
+                assert!(!validator.is_valid(&value), "{name} accepted {value}");
+            }
+        }
+
+        let uploaded = server
+            .successful_call(
+                version,
+                "text.attachment.upload",
+                json!({
+                    "kind":"text","total_bytes":1,"chunk":"x","final":true
+                }),
+            )
+            .await;
+        let mut falsely_labeled = uploaded.clone();
+        falsely_labeled["kind"] = json!("patch");
+        let invalid_resume = json!({"schema_version":uploaded["schema_version"],
+            "attachment_id":uploaded["attachment_id"],"kind":"patch",
+            "total_bytes":uploaded["total_bytes"],
+            "committed_bytes":uploaded["committed_bytes"],
+            "sealed":uploaded["sealed"],"expires_at":uploaded["expires_at"],
+            "resume":true,"offset":0,"chunk":"x","final":true});
+        for (name, arguments) in [
+            (
+                "text.apply_patch",
+                json!({"target":"x","patch":uploaded.clone()}),
+            ),
+            (
+                "text.diff",
+                json!({"before":falsely_labeled.clone(),"after":"x"}),
+            ),
+            ("text.attachment.read", falsely_labeled.clone()),
+            ("text.attachment.delete", falsely_labeled.clone()),
+            ("text.attachment.upload", invalid_resume),
+        ] {
+            let response = server.call(version, name, arguments).await;
+            assert_eq!(
+                response["result"]["structuredContent"]["code"], "attachment_kind_mismatch",
+                "{name}: {response}"
+            );
+        }
+        for (name, arguments) in [
+            ("text.diff", json!({"before":partial,"after":"x"})),
+            ("text.attachment.delete", unknown),
+            (
+                "text.attachment.upload",
+                json!({"schema_version":1,
+                "attachment_id":uploaded["attachment_id"],"kind":"text",
+                "total_bytes":1,"committed_bytes":1,"sealed":true,
+                "expires_at":123,"resume":false,"offset":0,"chunk":"x","final":true}),
+            ),
+        ] {
+            let response = server.call(version, name, arguments).await;
+            assert!(response.get("error").is_some(), "{name}: {response}");
+        }
+        server
+            .successful_call(version, "text.attachment.delete", uploaded)
             .await;
     }
     server.stop().await;

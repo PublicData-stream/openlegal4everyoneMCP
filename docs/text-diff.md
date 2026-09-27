@@ -204,16 +204,20 @@ The canonical API adds `text.diff`, `text.apply_patch`, `text.diff.show`,
 `text.diff.page`, and `text.diff.delete`. The four original tool names remain
 available with their original input/output shapes; the namespaced show/page/delete
 helpers have the same contracts. `text.diff` accepts `before` and `after` as UTF-8
-strings or `{ "attachment_id": "<handle>" }`, plus optional display labels. Its
+strings, `{ "attachment_id": "<handle>" }`, or a complete returned text attachment
+object, plus optional display labels. Its
 result contains `comparison`, a sealed `patch` attachment, and a deterministic
 `explanation` of the line/scalar algorithm described above. The patch attachment
 contains one complete unified patch; concatenating display fragments is not a
 substitute. Equal texts export an empty no-op patch. Comparison and patch handles
 are independently deletable and expire ten minutes after their publication.
 
-`text.apply_patch` accepts `target` and `patch`, each either inline or an attachment
-reference of the corresponding kind. It returns `result` (a sealed text attachment)
-and `info` (text byte/line information). Read the result through attachment pages;
+`text.apply_patch` accepts `target` and `patch`, each either inline, an ID-only
+attachment handle, or a complete returned attachment object of the corresponding
+kind. For example, pass `text.diff`'s `patch` directly as `patch`, then pass the
+returned `result` directly to `text.diff` as `before` or `after`. It returns
+`result` (a sealed text attachment) and `info` (text byte/line information).
+Read the result through attachment pages;
 its maximum escaped representation need not fit in one tool response. Applying a
 patch never writes a file, changes a database object, or modifies an input
 attachment. A separate comparison can visualize the target/result difference.
@@ -234,9 +238,15 @@ Three built-in tools manage memory-only attachments:
 
 | Tool | Contract |
 | --- | --- |
-| `text.attachment.upload` | First call: `kind` (`text` or `patch`), `total_bytes`, `chunk`, `final`, and optional zero `offset`. Later calls: `attachment_id`, byte `offset`, `chunk`, `final`; omit kind/total. |
-| `text.attachment.read` | `attachment_id`, optional zero `offset`; returns `attachment` metadata, `text`, `next_offset` and `complete`. Only sealed attachments are readable. |
-| `text.attachment.delete` | `attachment_id`; repeated deletion of a well-formed absent handle succeeds. |
+| `text.attachment.upload` | First call: `kind` (`text` or `patch`), `total_bytes`, `chunk`, `final`, and optional zero `offset`. Later calls: `attachment_id`, byte `offset`, `chunk`, `final`; omit kind/total. Alternatively, send the complete returned attachment object plus `resume: true`, `offset`, `chunk`, and `final`. |
+| `text.attachment.read` | `attachment_id` or a complete returned attachment object, plus optional zero `offset`; returns `attachment` metadata, `text`, `next_offset` and `complete`. Only sealed attachments are readable. |
+| `text.attachment.delete` | `attachment_id` or a complete returned attachment object; repeated deletion of a well-formed absent handle succeeds. |
+
+A complete object includes all seven returned metadata fields; partial or unknown
+metadata fields are rejected. The server checks its `kind` against stored state and
+returns structured `attachment_kind_mismatch` for a known mismatch. Stored state,
+not client-supplied byte counts, expiry or sealed status, governs access. Bare
+strings in text inputs are inline text, not attachment IDs.
 
 Chunks contain at most 32 KiB of UTF-8 and offsets must be scalar boundaries.
 Upload sequentially. Exact replays of committed bytes succeed; gaps and conflicting
