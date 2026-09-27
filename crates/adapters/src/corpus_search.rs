@@ -6,7 +6,7 @@ use crate::{
 };
 use futures::future::BoxFuture;
 use grep_matcher::Matcher;
-use grep_regex::RegexMatcherBuilder;
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use openlegal_application::{
     database::DatabaseStore,
     search::{SearchBackend, SearchBudget, SearchMode},
@@ -34,6 +34,7 @@ struct Session {
     expires: u64,
     corpus_complete: bool,
     query: Option<Arc<CompiledQuery>>,
+    regex: Option<Arc<RegexMatcher>>,
 }
 #[derive(Clone)]
 struct Cursor {
@@ -125,18 +126,34 @@ impl CorpusSearch {
                     } else {
                         None
                     };
-                    Ok::<_, E>((snapshot_index.snapshot()?, query))
+                    let regex = if matches!(mode, SearchMode::Ripgrep) {
+                        Some(Arc::new(
+                            RegexMatcherBuilder::new()
+                                .multi_line(true)
+                                .line_terminator(Some(b'\n'))
+                                .case_insensitive(request.ignore_case)
+                                .fixed_strings(request.literal)
+                                .size_limit(1024 * 1024)
+                                .dfa_size_limit(1024 * 1024)
+                                .build(&query_text)
+                                .map_err(|_| E::InvalidRegex)?,
+                        ))
+                    } else {
+                        None
+                    };
+                    Ok::<_, E>((snapshot_index.snapshot()?, query, regex))
                 })();
                 (prepared, budget)
             })
             .await
             .map_err(|_| E::Capacity)?;
             budget = returned_budget;
-            let (snapshot, query) = prepared?;
+            let (snapshot, query, regex) = prepared?;
             let id = random()?;
             let session = Session {
                 snapshot: snapshot.clone(),
                 query,
+                regex,
                 fingerprint,
                 expires: now() + 600,
                 corpus_complete: !request.include_history
@@ -181,7 +198,6 @@ impl CorpusSearch {
             let result = scan(
                 &index,
                 &worker_session,
-                mode,
                 &request,
                 position,
                 &budget,
@@ -258,7 +274,6 @@ type ScanResult = (Vec<SearchHit>, Option<Position>, usize);
 fn scan(
     index: &CorpusIndex,
     session: &Session,
-    mode: SearchMode,
     request: &SearchRequest,
     mut position: Position,
     budget: &SearchBudget,
@@ -266,21 +281,7 @@ fn scan(
 ) -> Result<ScanResult, E> {
     let snapshot = &session.snapshot;
     let expression = session.query.as_deref();
-    let regex = if matches!(mode, SearchMode::Ripgrep) {
-        Some(
-            RegexMatcherBuilder::new()
-                .multi_line(true)
-                .line_terminator(Some(b'\n'))
-                .case_insensitive(request.ignore_case)
-                .fixed_strings(request.literal)
-                .size_limit(1024 * 1024)
-                .dfa_size_limit(1024 * 1024)
-                .build(&request.query)
-                .map_err(|_| E::InvalidInput)?,
-        )
-    } else {
-        None
-    };
+    let regex = session.regex.as_deref();
     let mut hits = Vec::new();
     let mut scanned = 0usize;
     loop {

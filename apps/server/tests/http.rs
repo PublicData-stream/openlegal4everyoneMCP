@@ -75,6 +75,7 @@ impl Server {
             .unwrap();
         for (name, error) in [
             ("invalid", ToolError::InvalidInput),
+            ("invalid_regex", ToolError::InvalidRegex),
             ("unavailable", ToolError::Unavailable),
             ("internal", ToolError::Internal),
         ] {
@@ -307,7 +308,7 @@ async fn long_tool_can_finish_after_io_interval_and_errors_stay_typed() {
     )
     .await;
     assert_eq!(response["result"]["structuredContent"]["completed"], true);
-    for name in ["invalid", "unavailable", "internal"] {
+    for name in ["invalid", "invalid_regex", "unavailable", "internal"] {
         let response = decode(
             server
                 .request(

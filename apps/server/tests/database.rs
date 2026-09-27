@@ -322,6 +322,28 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
             assert_eq!(hit["text"], "after\n");
             assert_eq!(hit["byte_start"], 0);
             assert_eq!(hit["byte_end"], 5);
+            // Rejected patterns must not consume the 32 retained search-session slots.
+            for _ in 0..33 {
+                let invalid = call(&url, protocol, "database.rg", json!({"query":"(["})).await?;
+                assert!(invalid.get("error").is_none(), "{invalid}");
+                assert_eq!(invalid["result"]["isError"], true, "{invalid}");
+                assert_eq!(
+                    invalid["result"]["structuredContent"],
+                    json!({"code":"invalid_regex","message":"The regular expression is invalid."}),
+                    "{invalid}"
+                );
+            }
+            let literal = call(
+                &url,
+                protocol,
+                "database.rg",
+                json!({"query":"([","literal":true}),
+            )
+            .await?;
+            assert_ne!(literal["result"]["isError"], true, "{literal}");
+            let still_usable =
+                call(&url, protocol, "database.rg", json!({"query":"^after$"})).await?;
+            assert_ne!(still_usable["result"]["isError"], true, "{still_usable}");
         }
         Ok::<(), String>(())
     };

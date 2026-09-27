@@ -112,6 +112,12 @@ appropriate evidence before making that claim.
 sensitive unless explicitly changed with typed `literal`, `ignore_case`, or
 `context_lines` options. There are no CLI flags, PCRE2 execution, or filesystem
 inputs. Match offsets are UTF-8 byte offsets in the identified original section.
+Patterns the engine cannot compile return an MCP tool error with
+`isError: true` and structured content
+`{"code":"invalid_regex","message":"The regular expression is invalid."}`.
+Setting `literal` treats the query as plain text, subject to the same input
+and engine limits. The error does not expose engine diagnostics, which may
+change across dependency versions.
 
 Managed publication preflights indexability: at most 262144 analyzed tokens combined across both
 engines per text field and a 48 MiB serialized index envelope, with 8 KiB reserved for capture

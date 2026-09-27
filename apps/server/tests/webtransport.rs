@@ -149,6 +149,7 @@ impl Server {
                 |input, _| async move {
                     Err(match input.kind.as_str() {
                         "invalid" => ToolError::InvalidInput,
+                        "invalid_regex" => ToolError::InvalidRegex,
                         "unavailable" => ToolError::Unavailable,
                         _ => ToolError::Internal,
                     })
@@ -456,7 +457,12 @@ async fn typed_tool_errors_preserve_input_and_operational_categories() {
         .unwrap();
     let (mut tx, rx) = connection.open_bi().await.unwrap().await.unwrap();
     let mut rx = reader(rx);
-    for (id, kind) in [(1, "invalid"), (2, "unavailable"), (3, "internal")] {
+    for (id, kind) in [
+        (1, "invalid"),
+        (2, "invalid_regex"),
+        (3, "unavailable"),
+        (4, "internal"),
+    ] {
         send(
             &mut tx,
             &modern(

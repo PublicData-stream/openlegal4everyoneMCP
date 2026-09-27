@@ -319,6 +319,7 @@ pub struct HistoryPage {
 pub enum DatabaseError {
     SourceRejected,
     InvalidInput,
+    InvalidRegex,
     NotFound,
     RevisionUnavailable,
     AmbiguousRevision,

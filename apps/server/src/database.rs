@@ -344,6 +344,7 @@ fn diff_text(result: &GetResult, ocr: bool) -> Result<String, ToolError> {
 pub(crate) fn map_error(e: DatabaseError) -> ToolError {
     match e {
         DatabaseError::InvalidInput => ToolError::InvalidInput,
+        DatabaseError::InvalidRegex => ToolError::InvalidRegex,
         DatabaseError::NotFound => ToolError::NotFound,
         DatabaseError::StorageUnavailable => ToolError::StorageUnavailable,
         DatabaseError::StorageCorrupt => ToolError::StorageCorrupt,
