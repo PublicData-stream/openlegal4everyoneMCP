@@ -108,6 +108,11 @@ coalesced request for a dedicated collection Job Pod; `database.collection_statu
 only reads its state. The scheduler and request Jobs share provider spacing and
 single-call admission. Continuous and explicit collection each have an operator
 cap of 1,000 reserved attempts per UTC day, for at most 2,000 in total.
+The scheduler marks an explicit request failed when its Kubernetes Job reports a
+terminal failure, including failure before the request Pod can open storage.
+Transient storage admission contention is retried only during collection Pod
+startup, before any provider request is made. An uncertain Job creation outcome
+remains fenced until it can be reconciled or its lease expires.
 
 Negative-cache confirmed absence or valid empty searches only when the provider's
 meaning is understood and a bounded lifetime is defined. Never turn authentication

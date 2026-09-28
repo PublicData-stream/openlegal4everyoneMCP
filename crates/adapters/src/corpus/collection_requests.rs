@@ -2,6 +2,35 @@ use super::*;
 use openlegal_domain::collection::{CollectionReceipt, CollectionRequest};
 
 impl PgCorpusStore {
+    /// Return unsettled request Jobs. A launched Job can remain `launching`
+    /// when the scheduler loses its database acknowledgement.
+    pub async fn unsettled_collection_jobs(
+        &self,
+    ) -> Result<Vec<(String, Option<String>)>, DatabaseError> {
+        self.gate().await?;
+        let rows = sqlx::query("SELECT id,job_name FROM openlegal.collection_request WHERE status IN ('launching','running') ORDER BY created_at,id LIMIT 16")
+            .fetch_all(&self.pool).await.map_err(db)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<Uuid, _>("id").map_err(db)?.to_string(),
+                    row.try_get("job_name").map_err(db)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// A terminal failed Job can race with the request Pod's own settlement.
+    pub async fn fail_finished_collection_job(
+        &self,
+        id: &str,
+        job_name: &str,
+    ) -> Result<(), DatabaseError> {
+        let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
+        sqlx::query("UPDATE openlegal.collection_request SET status='failed',payload='{}'::jsonb,lease_until=NULL WHERE id=$1 AND ((status='running' AND job_name=$2) OR (status='launching' AND job_name IS NULL))")
+            .bind(id).bind(job_name).execute(&self.pool).await.map_err(db)?;
+        Ok(())
+    }
     pub async fn heartbeat_collection_scheduler(&self) -> Result<(), DatabaseError> {
         self.gate().await?;
         sqlx::query("UPDATE openlegal.corpus_control SET collection_scheduler_seen_at=floor(extract(epoch from clock_timestamp()))::bigint WHERE singleton")

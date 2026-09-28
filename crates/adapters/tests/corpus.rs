@@ -75,6 +75,18 @@ async fn explicit_collection_requests_coalesce_and_clear_completed_payloads() {
         .await
         .unwrap();
     assert!(store.load_collection_request(&id).await.is_ok());
+    assert_eq!(
+        store.unsettled_collection_jobs().await.unwrap(),
+        vec![(id.clone(), Some("openlegal-request-test".into()))]
+    );
+    store
+        .fail_finished_collection_job(&id, "openlegal-request-other")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.collection_status(&id).await.unwrap().status,
+        "running"
+    );
     store
         .settle_collection_request(&id, "deferred")
         .await
@@ -94,6 +106,68 @@ async fn explicit_collection_requests_coalesce_and_clear_completed_payloads() {
     store.settle_collection_request(&id, "done").await.unwrap();
     assert_eq!(store.collection_status(&id).await.unwrap().status, "done");
     assert!(store.load_collection_request(&id).await.is_err());
+    assert!(store.unsettled_collection_jobs().await.unwrap().is_empty());
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn terminal_failed_job_clears_request_without_touching_provider_budget() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("failed-request"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::new(base.pool(), blobs);
+    store.heartbeat_collection_scheduler().await.unwrap();
+    let mut requested = object();
+    requested.provider = "law_go_kr".into();
+    let receipt = store
+        .request_collection(CollectionRequest {
+            target: CollectionTarget::Object { object: requested },
+        })
+        .await
+        .unwrap();
+    let (id, _) = store.claim_collection_request().await.unwrap().unwrap();
+    assert_eq!(id, receipt.request_id);
+    store
+        .mark_collection_running(&id, "openlegal-request-failed")
+        .await
+        .unwrap();
+    store
+        .fail_finished_collection_job(&id, "openlegal-request-failed")
+        .await
+        .unwrap();
+    assert_eq!(store.collection_status(&id).await.unwrap().status, "failed");
+    assert!(store.unsettled_collection_jobs().await.unwrap().is_empty());
+    assert!(store.load_collection_request(&id).await.is_err());
+    store
+        .fail_finished_collection_job(&id, "openlegal-request-failed")
+        .await
+        .unwrap();
+    let mut another = object();
+    another.provider = "law_go_kr".into();
+    another.id = "002".into();
+    let launch = store
+        .request_collection(CollectionRequest {
+            target: CollectionTarget::Object { object: another },
+        })
+        .await
+        .unwrap();
+    let (launch_id, _) = store.claim_collection_request().await.unwrap().unwrap();
+    assert_eq!(launch_id, launch.request_id);
+    assert_eq!(
+        store.unsettled_collection_jobs().await.unwrap(),
+        vec![(launch_id.clone(), None)]
+    );
+    store
+        .fail_finished_collection_job(&launch_id, "openlegal-request-any")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.collection_status(&launch_id).await.unwrap().status,
+        "failed"
+    );
     base.close().await.unwrap();
 }
 #[tokio::test]

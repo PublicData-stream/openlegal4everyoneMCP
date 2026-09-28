@@ -108,6 +108,35 @@ async fn open_storage(
     }
 }
 
+/// Collection Pods may overlap briefly with other storage users during startup.
+/// Retry only admission contention, before a provider client can make a request.
+async fn open_collection_storage(
+    cache: &CacheConfig,
+) -> Result<std::sync::Arc<openlegal_adapters::postgres::PostgresStore>, ServerError> {
+    use openlegal_adapters::postgres::{StartupError, StartupMode};
+    use openlegal_domain::RetrievalError;
+
+    for attempt in 0..5 {
+        match open_storage(cache, StartupMode::Serve).await {
+            Ok(store) => return Ok(store),
+            Err(error) => {
+                let busy = matches!(
+                    error.downcast_ref::<StartupError>(),
+                    Some(StartupError::Storage(RetrievalError::Busy))
+                ) || matches!(
+                    error.downcast_ref::<RetrievalError>(),
+                    Some(RetrievalError::Busy)
+                );
+                if !busy {
+                    return Err(error);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200 << attempt)).await;
+            }
+        }
+    }
+    open_storage(cache, StartupMode::Serve).await
+}
+
 #[tokio::main]
 async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), ServerError> {
     // SDK/driver diagnostics can contain secrets or payloads; filtering below is mandatory.
@@ -132,8 +161,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
             .cache
             .as_ref()
             .ok_or("collection requires persistent storage")?;
-        let persistent =
-            open_storage(cache, openlegal_adapters::postgres::StartupMode::Serve).await?;
+        let persistent = open_collection_storage(cache).await?;
         let runtime =
             openlegal_server::corpus_runtime::CorpusRuntime::open_background(database, &persistent)
                 .await?;
@@ -465,6 +493,7 @@ async fn run_collection_scheduler(
                 return Ok(());
             }
             store.reap_stale_collection_requests().await?;
+            reconcile_failed_collection_jobs(&store, ingestion).await?;
             let Some((id, _request)) = store.claim_collection_request().await? else {
                 tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
                 continue;
@@ -523,6 +552,75 @@ async fn run_collection_scheduler(
     tokio::select! { result = heartbeat => result, result = dispatch => result }
 }
 
+fn collection_job_failed(job: &serde_json::Value, name: &str) -> bool {
+    job.pointer("/metadata/name")
+        .and_then(serde_json::Value::as_str)
+        == Some(name)
+        && job
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|conditions| {
+                conditions.iter().any(|condition| {
+                    condition.get("type").and_then(serde_json::Value::as_str) == Some("Failed")
+                        && condition.get("status").and_then(serde_json::Value::as_str)
+                            == Some("True")
+                })
+            })
+}
+
+async fn reconcile_failed_collection_jobs(
+    store: &openlegal_adapters::corpus::PgCorpusStore,
+    ingestion: &openlegal_server::config::IngestionConfig,
+) -> Result<(), ServerError> {
+    for (id, stored_name) in store.unsettled_collection_jobs().await? {
+        let name = format!("openlegal-request-{}", id.replace('-', ""));
+        if stored_name.as_deref().is_some_and(|stored| stored != name) {
+            return Err("collection request Job name is inconsistent".into());
+        }
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::process::Command::new(&ingestion.kubectl)
+                .args([
+                    "--kubeconfig",
+                    ingestion
+                        .kubeconfig
+                        .to_str()
+                        .ok_or("invalid kubeconfig path")?,
+                    "--context",
+                    &ingestion.context,
+                    "-n",
+                    &ingestion.collection_namespace,
+                    "get",
+                    "job",
+                    &name,
+                    "-o=json",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("HOME", "/tmp")
+                .env("TMPDIR", "/tmp")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let Ok(Ok(output)) = output else {
+            // API timeouts are not proof that a Job failed. The DB lease remains
+            // fenced until a terminal condition can be observed.
+            continue;
+        };
+        if !output.status.success() || output.stdout.len() > 128 * 1024 {
+            continue;
+        }
+        let Ok(job) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            continue;
+        };
+        if collection_job_failed(&job, &name) {
+            store.fail_finished_collection_job(&id, &name).await?;
+        }
+    }
+    Ok(())
+}
+
 fn logging_subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subscriber + Send + Sync
 where
     W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
@@ -544,6 +642,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_a_matching_terminal_job_failure_can_settle_a_request() {
+        let job = serde_json::json!({"metadata":{"name":"openlegal-request-test"},"status":{"conditions":[{"type":"Failed","status":"True"}]}});
+        assert!(collection_job_failed(&job, "openlegal-request-test"));
+        assert!(!collection_job_failed(&job, "openlegal-request-other"));
+        let mut pending = job.clone();
+        pending["status"]["conditions"][0]["status"] = "False".into();
+        assert!(!collection_job_failed(&pending, "openlegal-request-test"));
+        pending["status"]["conditions"][0]["type"] = "Complete".into();
+        pending["status"]["conditions"][0]["status"] = "True".into();
+        assert!(!collection_job_failed(&pending, "openlegal-request-test"));
+    }
     #[derive(Clone)]
     struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
     impl std::io::Write for Capture {
