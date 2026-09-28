@@ -172,6 +172,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0003_provider_request_budget.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            4,
+            "provider collection gaps".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0004_provider_collection_gap.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator
@@ -276,7 +283,7 @@ async fn verify_version(pool: &PgPool) -> Result<(), Error> {
 async fn verify_schema(pool: &PgPool) -> Result<(), Error> {
     verify_version(pool).await?;
     let rows = sqlx::query(
-        "SELECT version, checksum, success FROM public._sqlx_migrations ORDER BY version LIMIT 3",
+        "SELECT version, checksum, success FROM public._sqlx_migrations ORDER BY version",
     )
     .fetch_all(pool)
     .await

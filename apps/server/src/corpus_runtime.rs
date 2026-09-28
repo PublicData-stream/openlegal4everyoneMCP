@@ -5,10 +5,10 @@ use crate::{
 };
 use openlegal_adapters::{
     blob::FsBlobStore,
-    corpus::{CorpusRuntimeLease, PgCorpusStore},
+    corpus::{CorpusRuntimeLease, PageGapObservation, PgCorpusStore},
     corpus_search::CorpusSearch,
     korean_analysis::KoreanAnalyzer,
-    law_go_kr::{InventoryItem, LawClient, RequestBudgetMode},
+    law_go_kr::{InventoryItem, InventoryPage, LawClient, RequestBudgetMode},
     search_index::CorpusIndex,
 };
 use openlegal_application::{
@@ -216,6 +216,65 @@ async fn apply_index_event(
     Ok(())
 }
 impl CorpusRuntime {
+    async fn observed_page(
+        &self,
+        provider: &LawClient,
+        dataset: Dataset,
+        page: u32,
+        historical: bool,
+        class: Option<u8>,
+        cancel: CancellationToken,
+    ) -> Result<Option<InventoryPage>, DatabaseError> {
+        match provider
+            .inventory_page_class(dataset, page, historical, None, class, cancel)
+            .await
+        {
+            Ok(result) => {
+                if result.incomplete {
+                    self.store
+                        .record_page_gap(
+                            dataset,
+                            historical,
+                            class,
+                            page,
+                            PageGapObservation {
+                                reason: "source_data_invalid",
+                                rows: result.rejected_rows,
+                                now: now(),
+                            },
+                        )
+                        .await?;
+                } else {
+                    self.store
+                        .resolve_page_gap(dataset, historical, class, page, now())
+                        .await?;
+                }
+                Ok(Some(result))
+            }
+            Err(error @ (DatabaseError::SourceUnavailable | DatabaseError::SourceDataInvalid)) => {
+                let reason = if error == DatabaseError::SourceUnavailable {
+                    "source_unavailable"
+                } else {
+                    "source_data_invalid"
+                };
+                self.store
+                    .record_page_gap(
+                        dataset,
+                        historical,
+                        class,
+                        page,
+                        PageGapObservation {
+                            reason,
+                            rows: 1,
+                            now: now(),
+                        },
+                    )
+                    .await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub async fn open(
         config: &DatabaseConfig,
         persistent: &Arc<openlegal_adapters::postgres::PostgresStore>,
@@ -432,6 +491,7 @@ impl CorpusRuntime {
         cancel: CancellationToken,
     ) -> Result<(), DatabaseError> {
         loop {
+            self.store.requeue_due_details(now()).await?;
             self.inventory_verified
                 .store(false, std::sync::atomic::Ordering::Release);
             for dataset in [
@@ -448,6 +508,47 @@ impl CorpusRuntime {
                     return Ok(());
                 }
                 let page = self.store.inventory_cursor(dataset, false).await?;
+                if dataset == Dataset::Treaty {
+                    for class in [1u8, 2] {
+                        if let Some(due) = self
+                            .store
+                            .due_gap_page(dataset, false, Some(class), now())
+                            .await?
+                        {
+                            match self
+                                .observed_page(
+                                    provider,
+                                    dataset,
+                                    due,
+                                    false,
+                                    Some(class),
+                                    cancel.clone(),
+                                )
+                                .await
+                            {
+                                Ok(Some(revisited)) => {
+                                    for item in revisited.items {
+                                        let expected = if class == 1 { "440101" } else { "440102" };
+                                        if item.treaty_class_code.as_deref() == Some(expected) {
+                                            self.refresh_with_backpressure(
+                                                provider,
+                                                item,
+                                                true,
+                                                cancel.clone(),
+                                            )
+                                            .await?;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => {
+                                    break;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
+                }
                 if page > 1 {
                     // Moving offset pages can shift records behind the cursor.
                     // Alternate a front-page refresh with one-page overlap;
@@ -457,12 +558,12 @@ impl CorpusRuntime {
                     } else {
                         page - 1
                     };
-                    match provider
-                        .inventory_page(dataset, revisit, false, None, cancel.clone())
+                    match self
+                        .observed_page(provider, dataset, revisit, false, None, cancel.clone())
                         .await
                     {
-                        Ok((overlap, _, _)) => {
-                            for item in overlap {
+                        Ok(Some(overlap)) => {
+                            for item in overlap.items {
                                 self.refresh_with_backpressure(
                                     provider,
                                     item,
@@ -472,18 +573,50 @@ impl CorpusRuntime {
                                 .await?;
                             }
                         }
+                        Ok(None) => {}
                         Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => break,
                         Err(error) => return Err(error),
                     }
                 }
-                let (items, done, _) = match provider
-                    .inventory_page(dataset, page, false, None, cancel.clone())
+                if let Some(due) = self.store.due_gap_page(dataset, false, None, now()).await?
+                    && due != page
+                {
+                    match self
+                        .observed_page(provider, dataset, due, false, None, cancel.clone())
+                        .await
+                    {
+                        Ok(Some(revisited)) => {
+                            for item in revisited.items {
+                                self.refresh_with_backpressure(
+                                    provider,
+                                    item,
+                                    true,
+                                    cancel.clone(),
+                                )
+                                .await?;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => break,
+                        Err(error) => return Err(error),
+                    }
+                }
+                let page_data = match self
+                    .observed_page(provider, dataset, page, false, None, cancel.clone())
                     .await
                 {
-                    Ok(result) => result,
+                    Ok(Some(result)) => result,
+                    Ok(None) => {
+                        self.store
+                            .advance_inventory_cursor(dataset, false, page, false)
+                            .await?;
+                        continue;
+                    }
                     Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => break,
                     Err(error) => return Err(error),
                 };
+                let items = page_data.items;
+                let done = page_data.done;
                 for item in &items {
                     self.refresh_with_backpressure(provider, item.clone(), true, cancel.clone())
                         .await?;
@@ -504,14 +637,56 @@ impl CorpusRuntime {
                     return Ok(());
                 }
                 let page = self.store.inventory_cursor(dataset, true).await?;
-                let (items, done, _) = match provider
-                    .inventory_page(dataset, page, true, None, cancel.clone())
+                if let Some(due) = self.store.due_gap_page(dataset, true, None, now()).await?
+                    && due != page
+                {
+                    match self
+                        .observed_page(provider, dataset, due, true, None, cancel.clone())
+                        .await
+                    {
+                        Ok(Some(revisited)) => {
+                            for item in revisited.items {
+                                self.store
+                                    .record_revision_catalog(
+                                        &item.object,
+                                        &item.revision_id,
+                                        item.publication_date.as_deref(),
+                                        item.effective_date.as_deref(),
+                                        now(),
+                                    )
+                                    .await?;
+                                if self.retain_history_bodies {
+                                    self.refresh_with_backpressure(
+                                        provider,
+                                        item,
+                                        false,
+                                        cancel.clone(),
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => break,
+                        Err(error) => return Err(error),
+                    }
+                }
+                let page_data = match self
+                    .observed_page(provider, dataset, page, true, None, cancel.clone())
                     .await
                 {
-                    Ok(result) => result,
+                    Ok(Some(result)) => result,
+                    Ok(None) => {
+                        self.store
+                            .advance_inventory_cursor(dataset, true, page, false)
+                            .await?;
+                        continue;
+                    }
                     Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => break,
                     Err(error) => return Err(error),
                 };
+                let items = page_data.items;
+                let done = page_data.done;
                 for item in &items {
                     self.store
                         .record_revision_catalog(
@@ -562,6 +737,13 @@ impl CorpusRuntime {
             }
             let mut ready = true;
             for item in items {
+                if self
+                    .store
+                    .detail_gap_active(&item.object, &item.revision_id)
+                    .await?
+                {
+                    continue;
+                }
                 if head {
                     if !self
                         .store
@@ -659,18 +841,15 @@ impl CorpusRuntime {
             for page in 1..=5 {
                 let page_result = tokio::time::timeout_at(
                     deadline,
-                    provider.inventory_page_class(
-                        dataset,
-                        page,
-                        false,
-                        None,
-                        class,
-                        cancel.clone(),
-                    ),
+                    self.observed_page(provider, dataset, page, false, class, cancel.clone()),
                 )
                 .await;
-                let (items, done, _) = match page_result {
-                    Ok(Ok(page)) => page,
+                let page_data = match page_result {
+                    Ok(Ok(Some(page_data))) => page_data,
+                    Ok(Ok(None)) => {
+                        list_failures += 1;
+                        continue;
+                    }
                     Ok(Err(DatabaseError::BudgetExhausted)) => {
                         cancel.cancel();
                         return Ok(());
@@ -682,20 +861,7 @@ impl CorpusRuntime {
                         cancel.cancel();
                         return Ok(());
                     }
-                    // A rejected provider list is not evidence that retained
-                    // storage is corrupt. Record the incomplete family and
-                    // continue the bounded pilot without taking serving down.
-                    Ok(Err(DatabaseError::StorageCorrupt)) => {
-                        eprintln!(
-                            "law provider pilot: rejected {dataset:?} class {class:?} inventory page {page}; family incomplete"
-                        );
-                        list_failures += 1;
-                        break;
-                    }
-                    // SourceRejected also covers HTTP authentication/client
-                    // rejection. Durably stop the pilot so a restart cannot
-                    // repeat requests with a bad credential.
-                    Ok(Err(DatabaseError::SourceRejected)) => {
+                    Ok(Err(DatabaseError::SourceRejected | DatabaseError::SourceUnauthorized)) => {
                         eprintln!(
                             "law provider pilot: source rejected {dataset:?} class {class:?} inventory page {page}; suspending provider requests; preceding families may be partial"
                         );
@@ -714,7 +880,11 @@ impl CorpusRuntime {
                         return Err(error);
                     }
                 };
-                for item in items {
+                if page_data.incomplete {
+                    list_failures += 1;
+                }
+                let done = page_data.done;
+                for item in page_data.items {
                     if dataset == Dataset::Treaty {
                         let expected = if class == Some(1) { "440101" } else { "440102" };
                         if item.treaty_class_code.as_deref() != Some(expected) {
@@ -960,20 +1130,27 @@ impl CorpusRuntime {
                     }
                     tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(60))=>{}}
                 }
-                Err(DatabaseError::SourceRejected)
-                    if self.ingestion_mode == Some(IngestionMode::Pilot) =>
-                {
+                Err(
+                    error @ (DatabaseError::SourceUnavailable | DatabaseError::SourceDataInvalid),
+                ) => {
+                    let reason = if error == DatabaseError::SourceUnavailable {
+                        "source_unavailable"
+                    } else {
+                        "source_data_invalid"
+                    };
+                    self.store.skip_claim(&job, reason, now()).await?;
+                }
+                Err(DatabaseError::SourceRejected | DatabaseError::SourceUnauthorized) => {
                     self.store.fail_claim(&job, false).await?;
                     eprintln!(
-                        "law provider pilot: detail source rejected for {:?}; suspending provider requests; queued HEAD may remain pending",
+                        "law provider: detail source rejected for {:?}; suspending provider requests; queued HEAD may remain pending",
                         job.object.dataset
                     );
                     cancel.cancel();
                     return Ok(());
                 }
                 Err(
-                    DatabaseError::SourceRejected
-                    | DatabaseError::InvalidInput
+                    DatabaseError::InvalidInput
                     | DatabaseError::StorageCorrupt
                     | DatabaseError::NotFound
                     | DatabaseError::UnsupportedHistory

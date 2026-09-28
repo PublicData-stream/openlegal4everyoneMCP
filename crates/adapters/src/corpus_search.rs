@@ -194,6 +194,20 @@ impl CorpusSearch {
         let index = self.index.clone();
         let worker_session = session.clone();
         let worker_cancel = cancel.clone();
+        let notice_datasets = if request.filters.datasets.is_empty() {
+            vec![
+                openlegal_domain::legal::Dataset::NationalStatute,
+                openlegal_domain::legal::Dataset::AdministrativeRule,
+                openlegal_domain::legal::Dataset::Ordinance,
+                openlegal_domain::legal::Dataset::Treaty,
+                openlegal_domain::legal::Dataset::Precedent,
+                openlegal_domain::legal::Dataset::ConstitutionalDecision,
+                openlegal_domain::legal::Dataset::LegalInterpretation,
+                openlegal_domain::legal::Dataset::AdministrativeAppeal,
+            ]
+        } else {
+            request.filters.datasets.clone()
+        };
         let (result, _lease) = tokio::task::spawn_blocking(move || {
             let result = scan(
                 &index,
@@ -242,12 +256,16 @@ impl CorpusSearch {
         } else {
             None
         };
+        let collection_notices = self
+            .store
+            .collection_notices(&notice_datasets, None)
+            .await?;
         Ok(SearchPage {
             schema_version: 1,
             hits: result.0,
             next_cursor,
             generation: session.snapshot.generation,
-            corpus_complete: session.corpus_complete,
+            corpus_complete: session.corpus_complete && collection_notices.is_empty(),
             scanned_bytes: result.2 as u64,
             analyzer_version: session.snapshot.analyzer_version.clone(),
             index_lag: self
@@ -255,6 +273,7 @@ impl CorpusSearch {
                 .watermark()
                 .await?
                 .saturating_sub(session.snapshot.generation),
+            collection_notices,
         })
     }
 }

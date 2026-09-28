@@ -498,7 +498,7 @@ impl KubernetesDocumentProcessor {
             .slots
             .clone()
             .try_acquire_owned()
-            .map_err(|_| DocumentError::ResourceLimit)?;
+            .map_err(|_| DocumentError::SandboxUnavailable)?;
         if cancellation.is_cancelled() {
             return Err(DocumentError::Cancelled);
         }
@@ -830,7 +830,7 @@ elif 'delete' in args:
                 .clone()
                 .process(fixture_input(), CancellationToken::new())
                 .await,
-            Err(DocumentError::ResourceLimit)
+            Err(DocumentError::SandboxUnavailable)
         ));
     }
 
@@ -855,7 +855,7 @@ elif 'delete' in args:
                 .clone()
                 .process(fixture_input(), CancellationToken::new())
                 .await,
-            Err(DocumentError::ResourceLimit)
+            Err(DocumentError::SandboxUnavailable)
         ));
         cancellation.cancel();
         assert!(matches!(task.await.unwrap(), Err(DocumentError::Cancelled)));

@@ -1,8 +1,10 @@
 /** Bounded wire validation for the legal database browser. Fixture data is explicitly synthetic. */
-export type ObjectId = { jurisdiction: string; provider: string; dataset: 'national_statute' | 'ordinance' | 'precedent'; id: string };
+export type Dataset = 'national_statute' | 'administrative_rule' | 'ordinance' | 'treaty' | 'precedent' | 'constitutional_decision' | 'legal_interpretation' | 'administrative_appeal';
+export type ObjectId = { jurisdiction: string; provider: string; dataset: Dataset; id: string };
+export type CollectionNotice = { dataset: Dataset; scope: 'page' | 'detail'; code: 'source_unavailable' | 'source_data_invalid' | 'attachment_incomplete'; affected_count: number; last_seen_at: number; retry_at: number };
 export type Selector = { kind: 'head' } | { kind: 'revision' | 'capture'; id: string };
 export type Hit = { object: ObjectId; revision_id: string; capture_id: string; title: string; section: string; line: number; text: string; derived_ocr: boolean; match_scope: 'line' | 'object'; excerpt_section: string; includes_ocr: boolean };
-export type SearchPage = { hits: Hit[]; next_cursor: string | null; generation: number; corpus_complete: boolean; index_lag: number };
+export type SearchPage = { hits: Hit[]; next_cursor: string | null; generation: number; corpus_complete: boolean; index_lag: number; collection_notices: CollectionNotice[] };
 export type HistoryEntry = { revision_id: string; capture_id: string | null; captured_at: number | null; sequence: number; publication_date: string | null; effective_date: string | null };
 const bytes = (value: string) => new TextEncoder().encode(value).length;
 export function object(value: unknown): Record<string, unknown> { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('The server returned an invalid database response.'); return value as Record<string, unknown>; }
@@ -14,16 +16,21 @@ function hash(value: unknown): string { const result = text(value, 64); if (!/^[
 export function data(result: unknown): Record<string, unknown> { const response = object(result); if (response.isError) throw new Error('The database operation failed. Data may be unavailable, incomplete or expired.'); const value = object(response.structuredContent); if (bytes(JSON.stringify(value)) > 2 * 1024 * 1024) throw new Error('The response exceeds the browser display budget.'); return value; }
 export function identity(value: unknown): ObjectId {
   const id = object(value); const dataset = text(id.dataset, 32);
-  if (!['national_statute', 'ordinance', 'precedent'].includes(dataset)) throw new Error('Unsupported dataset.');
+  if (!['national_statute', 'administrative_rule', 'ordinance', 'treaty', 'precedent', 'constitutional_decision', 'legal_interpretation', 'administrative_appeal'].includes(dataset)) throw new Error('Unsupported dataset.');
   const result = { jurisdiction: text(id.jurisdiction, 32), provider: text(id.provider, 64), dataset: dataset as ObjectId['dataset'], id: text(id.id, 128) };
   if (![result.jurisdiction, result.provider, result.id].every(s => /^[A-Za-z0-9_-]+$/.test(s))) throw new Error('The server returned an invalid object identity.');
   return result;
 }
 export function sameObject(a: ObjectId, b: ObjectId): boolean { return a.jurisdiction === b.jurisdiction && a.provider === b.provider && a.dataset === b.dataset && a.id === b.id; }
+export function collectionNotices(value: unknown): CollectionNotice[] {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.length > 64) throw new Error('The collection notices are invalid.');
+  return value.map(raw => { const n = object(raw); const dataset = text(n.dataset, 32); const scope = text(n.scope, 16); const code = text(n.code, 40); if (!['national_statute','administrative_rule','ordinance','treaty','precedent','constitutional_decision','legal_interpretation','administrative_appeal'].includes(dataset) || !['page','detail'].includes(scope) || !['source_unavailable','source_data_invalid','attachment_incomplete'].includes(code)) throw new Error('The collection notice is unsupported.'); return { dataset: dataset as Dataset, scope: scope as CollectionNotice['scope'], code: code as CollectionNotice['code'], affected_count: number(n.affected_count), last_seen_at: number(n.last_seen_at), retry_at: number(n.retry_at) }; });
+}
 export function searchPage(result: unknown): SearchPage {
   const value = data(result);
   if (value.schema_version !== 1 || !Array.isArray(value.hits) || value.hits.length > 20) throw new Error('The search page is unsupported.');
-  return { hits: value.hits.map(raw => { const h = object(raw); const match_scope = text(h.match_scope, 8); const section = text(h.section, 256); const line = number(h.line); const excerpt_section = text(h.excerpt_section, 256); if (match_scope !== 'line' && match_scope !== 'object' || match_scope === 'object' && (section !== 'object' || line !== 0) || match_scope === 'line' && (line === 0 || section !== excerpt_section)) throw new Error('The search evidence scope is invalid.'); return { match_scope, excerpt_section, includes_ocr: boolean(h.includes_ocr), object: identity(h.object), revision_id: text(h.revision_id, 256), capture_id: hash(h.capture_id), title: text(h.title), section: text(h.section, 256), line: number(h.line), text: text(h.text, 65536), derived_ocr: boolean(h.derived_ocr) }; }), next_cursor: optionalText(value.next_cursor, 2048), generation: number(value.generation), corpus_complete: boolean(value.corpus_complete), index_lag: number(value.index_lag) };
+  return { hits: value.hits.map(raw => { const h = object(raw); const match_scope = text(h.match_scope, 8); const section = text(h.section, 256); const line = number(h.line); const excerpt_section = text(h.excerpt_section, 256); if (match_scope !== 'line' && match_scope !== 'object' || match_scope === 'object' && (section !== 'object' || line !== 0) || match_scope === 'line' && (line === 0 || section !== excerpt_section)) throw new Error('The search evidence scope is invalid.'); return { match_scope, excerpt_section, includes_ocr: boolean(h.includes_ocr), object: identity(h.object), revision_id: text(h.revision_id, 256), capture_id: hash(h.capture_id), title: text(h.title), section: text(h.section, 256), line: number(h.line), text: text(h.text, 65536), derived_ocr: boolean(h.derived_ocr) }; }), next_cursor: optionalText(value.next_cursor, 2048), generation: number(value.generation), corpus_complete: boolean(value.corpus_complete), index_lag: number(value.index_lag), collection_notices: collectionNotices(value.collection_notices) };
 }
 export function historyPage(result: unknown): { entries: HistoryEntry[]; next_cursor: string | null; inventory_complete: boolean } {
   const value = data(result); if (!Array.isArray(value.entries) || value.entries.length > 20) throw new Error('The history page is unsupported.');
@@ -44,7 +51,7 @@ export function metadata(value: unknown, expected: ObjectId, selector: Selector)
     if (!Number.isSafeInteger(expected) || expected < 1 || expected > 64 || !Number.isSafeInteger(available) || available < 0 || available >= expected) throw new Error('The attachment counts are invalid.');
     missingAttachments = { expected, available };
   }
-  return { capture_id: hash(m.capture_id), revision_id: text(m.revision_id, 256), title: text(m.title), source_url: text(m.source_url, 2048), retrieved_at: number(m.retrieved_at), captured_at: number(m.captured_at), validated_at: number(m.validated_at), raw_sha256: hash(m.raw_sha256), processor_version: text(m.processor_version, 256), metadata: fields, freshness, missingAttachments };
+  return { capture_id: hash(m.capture_id), revision_id: text(m.revision_id, 256), title: text(m.title), source_url: text(m.source_url, 2048), retrieved_at: number(m.retrieved_at), captured_at: number(m.captured_at), validated_at: number(m.validated_at), raw_sha256: hash(m.raw_sha256), processor_version: text(m.processor_version, 256), metadata: fields, freshness, missingAttachments, collection_notices: collectionNotices(m.collection_notices) };
 }
 export function getResult(result: unknown, expected: ObjectId, selector: Selector, section: string, offset: number, session?: string, sectionsOffset = 0) {
   const value = data(result);

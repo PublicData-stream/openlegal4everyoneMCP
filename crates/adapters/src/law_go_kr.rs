@@ -62,17 +62,29 @@ pub struct ProviderDetail {
     pub additional_evidence: Vec<Vec<u8>>,
     pub processor_version: String,
 }
+#[derive(Clone, Debug)]
+pub struct InventoryPage {
+    pub items: Vec<InventoryItem>,
+    pub done: bool,
+    pub total: Option<u64>,
+    pub rejected_rows: usize,
+    pub incomplete: bool,
+}
 
 enum FetchedDocument<T> {
     Processed(T),
-    UnexpectedAttachment { raw: Vec<u8>, html: bool },
+    UnexpectedAttachment {
+        raw: Vec<u8>,
+        html: bool,
+        reason: &'static str,
+    },
 }
 
 #[derive(Serialize)]
 struct MissingAttachment {
     ordinal: usize,
     expected_format: DocumentFormat,
-    response_sha256: String,
+    response_sha256: Option<String>,
     reason: &'static str,
 }
 #[derive(Clone)]
@@ -303,7 +315,7 @@ impl LawClient {
     ) -> Result<(Vec<InventoryItem>, bool), DatabaseError> {
         self.inventory_page(dataset, page, false, None, cancel)
             .await
-            .map(|(items, done, _)| (items, done))
+            .map(|page| (page.items, page.done))
     }
     pub async fn historical_inventory(
         &self,
@@ -314,7 +326,7 @@ impl LawClient {
     ) -> Result<(Vec<InventoryItem>, bool), DatabaseError> {
         self.inventory_page(dataset, page, true, object_id, cancel)
             .await
-            .map(|(items, done, _)| (items, done))
+            .map(|page| (page.items, page.done))
     }
     pub async fn inventory_page(
         &self,
@@ -323,7 +335,7 @@ impl LawClient {
         historical: bool,
         object_id: Option<&str>,
         cancel: CancellationToken,
-    ) -> Result<(Vec<InventoryItem>, bool, u64), DatabaseError> {
+    ) -> Result<InventoryPage, DatabaseError> {
         self.inventory_page_class(dataset, page, historical, object_id, None, cancel)
             .await
     }
@@ -337,7 +349,7 @@ impl LawClient {
         object_id: Option<&str>,
         treaty_class: Option<u8>,
         cancel: CancellationToken,
-    ) -> Result<(Vec<InventoryItem>, bool, u64), DatabaseError> {
+    ) -> Result<InventoryPage, DatabaseError> {
         if treaty_class.is_some_and(|c| dataset != Dataset::Treaty || !matches!(c, 1 | 2)) {
             return Err(DatabaseError::InvalidInput);
         }
@@ -392,125 +404,11 @@ impl LawClient {
         let (parsed, _) = self
             .fetch_parse(url, DocumentFormat::Xml, false, cancel)
             .await?;
-        let tree = parsed.tree.as_ref().ok_or(DatabaseError::StorageCorrupt)?;
-        let item_name = match dataset {
-            Dataset::NationalStatute => "law",
-            Dataset::AdministrativeRule => "admrul",
-            Dataset::Ordinance => "law",
-            Dataset::Treaty => "trty",
-            Dataset::Precedent => "prec",
-            Dataset::ConstitutionalDecision => "detc",
-            Dataset::LegalInterpretation => "expc",
-            Dataset::AdministrativeAppeal => "decc",
-        };
-        let mut nodes = Vec::new();
-        elements(tree, item_name, &mut nodes);
-        // Ordinance feeds use either `law` or `ordin` record elements; exact ID fields remain mandatory.
-        if nodes.is_empty() && dataset == Dataset::Ordinance {
-            elements(tree, "ordin", &mut nodes);
-        }
-        let mut items = Vec::new();
-        for node in nodes {
-            let idfield = match dataset {
-                Dataset::NationalStatute => "법령ID",
-                Dataset::AdministrativeRule => "행정규칙ID",
-                Dataset::Ordinance => "자치법규ID",
-                Dataset::Treaty => "조약일련번호",
-                Dataset::Precedent => "판례일련번호",
-                Dataset::ConstitutionalDecision => "헌재결정례일련번호",
-                Dataset::LegalInterpretation => "법령해석례일련번호",
-                Dataset::AdministrativeAppeal => "행정심판재결례일련번호",
-            };
-            let revfield = match dataset {
-                Dataset::NationalStatute => "법령일련번호",
-                Dataset::AdministrativeRule => "행정규칙일련번호",
-                Dataset::Ordinance => "자치법규일련번호",
-                Dataset::Treaty => "조약일련번호",
-                Dataset::Precedent => "판례일련번호",
-                Dataset::ConstitutionalDecision => "헌재결정례일련번호",
-                Dataset::LegalInterpretation => "법령해석례일련번호",
-                Dataset::AdministrativeAppeal => "행정심판재결례일련번호",
-            };
-            let id = first(node, idfield).ok_or(DatabaseError::StorageCorrupt)?;
-            let master = first(node, revfield).ok_or(DatabaseError::StorageCorrupt)?;
-            if dataset == Dataset::AdministrativeAppeal && (master == "0" || id == "0") {
-                // This list includes placeholder rows without a usable detail ID.
-                continue;
-            }
-            if !numeric_id(&master) || !numeric_id(&id) || master == "0" || id == "0" {
-                return Err(DatabaseError::StorageCorrupt);
-            }
-            let title = first(
-                node,
-                match dataset {
-                    Dataset::NationalStatute => "법령명한글",
-                    Dataset::AdministrativeRule => "행정규칙명",
-                    Dataset::Ordinance => "자치법규명",
-                    Dataset::Treaty => "조약명",
-                    Dataset::Precedent => "사건명",
-                    Dataset::ConstitutionalDecision => "사건명",
-                    Dataset::LegalInterpretation => "안건명",
-                    Dataset::AdministrativeAppeal => "사건명",
-                },
-            )
-            .unwrap_or_default();
-            let object = ObjectId {
-                jurisdiction: "kr".into(),
-                provider: "law_go_kr".into(),
-                dataset,
-                id,
-            };
-            object.validate()?;
-            let effective_date = match dataset {
-                Dataset::NationalStatute | Dataset::AdministrativeRule | Dataset::Ordinance => {
-                    date(first(node, "시행일자"))?
-                }
-                Dataset::Treaty => date(first(node, "발효일자"))?,
-                _ => None,
-            };
-            let revision_id = if dataset == Dataset::NationalStatute {
-                format!(
-                    "{master}:{}",
-                    effective_date
-                        .as_deref()
-                        .ok_or(DatabaseError::StorageCorrupt)?
-                )
-            } else {
-                master
-            };
-            items.push(InventoryItem {
-                publication_date: if matches!(
-                    dataset,
-                    Dataset::NationalStatute | Dataset::Ordinance
-                ) {
-                    date(first(node, "공포일자"))?
-                } else {
-                    None
-                },
-                object,
-                revision_id,
-                effective_date,
-                title,
-                data_source: first(node, "데이터출처명"),
-                case_number: first(node, "사건번호"),
-                treaty_class_code: if dataset == Dataset::Treaty {
-                    first(node, "조약구분코드")
-                } else {
-                    None
-                },
-            });
-        }
-        let total = first(tree, "totalCnt")
-            .and_then(|v| v.parse::<u64>().ok())
-            .ok_or(DatabaseError::StorageCorrupt)?;
-        if items.len() > 100
-            || (dataset != Dataset::AdministrativeAppeal
-                && items.is_empty()
-                && (page as u64 - 1) * 100 < total)
-        {
-            return Err(DatabaseError::StorageCorrupt);
-        }
-        Ok((items, (page as u64) * 100 >= total, total))
+        let tree = parsed
+            .tree
+            .as_ref()
+            .ok_or(DatabaseError::SourceDataInvalid)?;
+        parse_inventory_tree(tree, dataset, page)
     }
     pub async fn detail(
         &self,
@@ -570,7 +468,9 @@ impl LawClient {
                 cancel.clone(),
                 |output, raw, retrieved_at| {
                     let record = project(item, &output)?;
-                    record.validate()?;
+                    record
+                        .validate()
+                        .map_err(|_| DatabaseError::StorageCorrupt)?;
                     let links = attachment_links(
                         output.tree.as_ref().ok_or(DatabaseError::StorageCorrupt)?,
                     )?;
@@ -579,11 +479,15 @@ impl LawClient {
             )
             .await?;
         let mut additional_evidence = Vec::new();
+        let mut evidence_ordinals = Vec::new();
         let mut total = raw.len();
         let mut extracted = 0usize;
         let expected_count = links.len();
         let mut missing = Vec::new();
         for (ordinal, link) in links.into_iter().enumerate() {
+            let section_checkpoint = record.sections.len();
+            let total_checkpoint = total;
+            let extracted_checkpoint = extracted;
             let mut retries = 0;
             let bytes = loop {
                 let result = self
@@ -595,9 +499,9 @@ impl LawClient {
                         |attachment, bytes, _| {
                             total = total
                                 .checked_add(bytes.len())
-                                .ok_or(DatabaseError::SourceRejected)?;
+                                .ok_or(DatabaseError::SourceDataInvalid)?;
                             if total > 100 * 1024 * 1024 {
-                                return Err(DatabaseError::SourceRejected);
+                                return Err(DatabaseError::SourceDataInvalid);
                             }
                             let digest = attachment.source_sha256.clone();
                             let pages = if attachment.pages.is_empty() {
@@ -615,9 +519,9 @@ impl LawClient {
                                 for page in pages {
                                     extracted = extracted
                                         .checked_add(page.text.len())
-                                        .ok_or(DatabaseError::SourceRejected)?;
+                                        .ok_or(DatabaseError::SourceDataInvalid)?;
                                     if extracted > 16 * 1024 * 1024 {
-                                        return Err(DatabaseError::SourceRejected);
+                                        return Err(DatabaseError::SourceDataInvalid);
                                     }
                                     let label = if kind == SectionKind::Ocr {
                                         "ocr"
@@ -637,45 +541,82 @@ impl LawClient {
                                         page: Some(
                                             page.page
                                                 .try_into()
-                                                .map_err(|_| DatabaseError::SourceRejected)?,
+                                                .map_err(|_| DatabaseError::SourceDataInvalid)?,
                                         ),
                                     });
                                 }
                             }
-                            record.validate()?;
+                            record
+                                .validate()
+                                .map_err(|_| DatabaseError::SourceDataInvalid)?;
                             Ok(bytes)
                         },
                     )
-                    .await?;
+                    .await;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(DatabaseError::SourceUnavailable) => {
+                        missing.push(MissingAttachment {
+                            ordinal: ordinal + 1,
+                            expected_format: link.format,
+                            response_sha256: None,
+                            reason: "source_unavailable",
+                        });
+                        break Vec::new();
+                    }
+                    Err(DatabaseError::SourceDataInvalid) => {
+                        record.sections.truncate(section_checkpoint);
+                        total = total_checkpoint;
+                        extracted = extracted_checkpoint;
+                        missing.push(MissingAttachment {
+                            ordinal: ordinal + 1,
+                            expected_format: link.format,
+                            response_sha256: None,
+                            reason: "download_invalid",
+                        });
+                        break Vec::new();
+                    }
+                    Err(error) => return Err(error),
+                };
                 match result {
                     FetchedDocument::Processed(bytes) => break bytes,
-                    FetchedDocument::UnexpectedAttachment { raw, html } if html && retries < 2 => {
+                    FetchedDocument::UnexpectedAttachment {
+                        raw, html: true, ..
+                    } if retries < 2 => {
                         retries += 1;
                         // Each attempt passes through the same durable request
                         // admission and spacing policy as the first download.
                         drop(raw);
                     }
-                    FetchedDocument::UnexpectedAttachment { raw, .. } => {
+                    FetchedDocument::UnexpectedAttachment { raw, reason, .. } => {
+                        record.sections.truncate(section_checkpoint);
+                        total = total_checkpoint;
+                        extracted = extracted_checkpoint;
                         total = total
                             .checked_add(raw.len())
-                            .ok_or(DatabaseError::SourceRejected)?;
+                            .ok_or(DatabaseError::SourceDataInvalid)?;
                         if total > 100 * 1024 * 1024 {
-                            return Err(DatabaseError::SourceRejected);
+                            return Err(DatabaseError::SourceDataInvalid);
                         }
                         missing.push(MissingAttachment {
                             ordinal: ordinal + 1,
                             expected_format: link.format,
-                            response_sha256: Sha256::digest(&raw)
-                                .iter()
-                                .map(|b| format!("{b:02x}"))
-                                .collect(),
-                            reason: "unexpected_attachment_format",
+                            response_sha256: Some(
+                                Sha256::digest(&raw)
+                                    .iter()
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect(),
+                            ),
+                            reason,
                         });
                         break raw;
                     }
                 }
             };
-            additional_evidence.push(bytes);
+            if !bytes.is_empty() {
+                additional_evidence.push(bytes);
+                evidence_ordinals.push(ordinal + 1);
+            }
         }
         if !missing.is_empty() {
             record
@@ -693,8 +634,15 @@ impl LawClient {
                 "attachment_failures".into(),
                 serde_json::to_string(&missing).map_err(|_| DatabaseError::StorageCorrupt)?,
             );
+            record.metadata.insert(
+                "attachment_evidence_ordinals".into(),
+                serde_json::to_string(&evidence_ordinals)
+                    .map_err(|_| DatabaseError::StorageCorrupt)?,
+            );
         }
-        record.validate()?;
+        record
+            .validate()
+            .map_err(|_| DatabaseError::SourceDataInvalid)?;
         Ok(ProviderDetail {
             retrieved_at,
             record,
@@ -886,7 +834,7 @@ impl LawClient {
                 .get("content-encoding")
                 .is_some_and(|v| v != "identity")
             {
-                return Err(DatabaseError::SourceRejected);
+                return Err(DatabaseError::SourceDataInvalid);
             }
             let html_content_type = response
                 .headers()
@@ -902,7 +850,7 @@ impl LawClient {
             };
             let max = max.min(attachment_remaining_bytes.unwrap_or(usize::MAX));
             if response.content_length().is_some_and(|n| n > max as u64) {
-                return Err(DatabaseError::SourceRejected);
+                return Err(DatabaseError::SourceDataInvalid);
             }
             let mut raw = Vec::new();
             while let Some(chunk) = response
@@ -911,7 +859,7 @@ impl LawClient {
                 .map_err(|_| DatabaseError::StorageUnavailable)?
             {
                 if raw.len().saturating_add(chunk.len()) > max {
-                    return Err(DatabaseError::SourceRejected);
+                    return Err(DatabaseError::SourceDataInvalid);
                 }
                 raw.extend_from_slice(&chunk);
             }
@@ -919,26 +867,19 @@ impl LawClient {
         };
         tokio::select! {_ = cancel.cancelled()=>Err(DatabaseError::Cancelled),result=fetch=>result}
         }.await;
-        let pilot = self
-            .budget
-            .as_ref()
-            .is_some_and(|(_, mode)| *mode == RequestBudgetMode::Pilot);
         let (raw, html_content_type) = match fetched {
             Ok(value) => value,
-            Err(DatabaseError::SourceRejected) if pilot => {
+            Err(error @ (DatabaseError::SourceRejected | DatabaseError::SourceUnauthorized)) => {
                 // Keep the admission permit until this failure is fenced in
                 // both the process and durable request ledger.
                 self.suspend_after_source_rejection().await?;
-                return Err(DatabaseError::SourceRejected);
+                return Err(error);
             }
-            Err(error @ (DatabaseError::Cancelled | DatabaseError::StorageUnavailable))
-                if pilot =>
-            {
+            Err(error @ (DatabaseError::Cancelled | DatabaseError::StorageUnavailable)) => {
                 // A reserved request may have been sent; preserve the
                 // unresolved marker for operator review after a restart.
                 return Err(error);
             }
-            Err(DatabaseError::Cancelled) => return Err(DatabaseError::Cancelled),
             Err(error) => {
                 if !self.operator_suspended.load(Ordering::Acquire) {
                     self.complete_request().await?;
@@ -955,13 +896,14 @@ impl LawClient {
             return Ok(FetchedDocument::UnexpectedAttachment {
                 html: html_content_type || looks_like_html(&raw),
                 raw,
+                reason: "unexpected_attachment_format",
             });
         }
         let digest = Sha256::digest(&raw)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        let output = self
+        let processed = self
             .processor
             .process(
                 DocumentInput {
@@ -973,13 +915,30 @@ impl LawClient {
                 cancel,
             )
             .await
-            .map_err(document_error)
-            .and_then(|output| check(output, raw, retrieved_at))
+            .map_err(document_error);
+        let output = processed
+            .and_then(|output| {
+                check(output, raw.clone(), retrieved_at).map_err(|error| {
+                    if error == DatabaseError::StorageCorrupt {
+                        DatabaseError::SourceDataInvalid
+                    } else {
+                        error
+                    }
+                })
+            })
             .map(FetchedDocument::Processed);
-        match output {
-            Err(DatabaseError::SourceRejected) if pilot => {
+        match &output {
+            Err(DatabaseError::SourceDataInvalid) if attachment_remaining_bytes.is_some() => {
+                self.complete_request().await?;
+                return Ok(FetchedDocument::UnexpectedAttachment {
+                    raw,
+                    html: false,
+                    reason: "document_invalid",
+                });
+            }
+            Err(DatabaseError::SourceRejected | DatabaseError::SourceUnauthorized) => {
                 self.suspend_after_source_rejection().await?;
-                return Err(DatabaseError::SourceRejected);
+                return output;
             }
             Err(DatabaseError::Cancelled) => return Err(DatabaseError::Cancelled),
             _ => {}
@@ -991,11 +950,165 @@ impl LawClient {
         output
     }
 }
+fn parse_inventory_tree(
+    tree: &DocumentNode,
+    dataset: Dataset,
+    page: u32,
+) -> Result<InventoryPage, DatabaseError> {
+    let item_name = match dataset {
+        Dataset::NationalStatute => "law",
+        Dataset::AdministrativeRule => "admrul",
+        Dataset::Ordinance => "law",
+        Dataset::Treaty => "trty",
+        Dataset::Precedent => "prec",
+        Dataset::ConstitutionalDecision => "detc",
+        Dataset::LegalInterpretation => "expc",
+        Dataset::AdministrativeAppeal => "decc",
+    };
+    let mut nodes = Vec::new();
+    elements(tree, item_name, &mut nodes);
+    // Ordinance feeds use either `law` or `ordin` record elements; exact ID fields remain mandatory.
+    if nodes.is_empty() && dataset == Dataset::Ordinance {
+        elements(tree, "ordin", &mut nodes);
+    }
+    let observed_rows = nodes.len();
+    let mut items = Vec::new();
+    let mut rejected_rows = 0usize;
+    for node in nodes {
+        let parsed = (|| -> Result<Option<InventoryItem>, DatabaseError> {
+            let idfield = match dataset {
+                Dataset::NationalStatute => "법령ID",
+                Dataset::AdministrativeRule => "행정규칙ID",
+                Dataset::Ordinance => "자치법규ID",
+                Dataset::Treaty => "조약일련번호",
+                Dataset::Precedent => "판례일련번호",
+                Dataset::ConstitutionalDecision => "헌재결정례일련번호",
+                Dataset::LegalInterpretation => "법령해석례일련번호",
+                Dataset::AdministrativeAppeal => "행정심판재결례일련번호",
+            };
+            let revfield = match dataset {
+                Dataset::NationalStatute => "법령일련번호",
+                Dataset::AdministrativeRule => "행정규칙일련번호",
+                Dataset::Ordinance => "자치법규일련번호",
+                Dataset::Treaty => "조약일련번호",
+                Dataset::Precedent => "판례일련번호",
+                Dataset::ConstitutionalDecision => "헌재결정례일련번호",
+                Dataset::LegalInterpretation => "법령해석례일련번호",
+                Dataset::AdministrativeAppeal => "행정심판재결례일련번호",
+            };
+            let id = first(node, idfield).ok_or(DatabaseError::StorageCorrupt)?;
+            let master = first(node, revfield).ok_or(DatabaseError::StorageCorrupt)?;
+            if dataset == Dataset::AdministrativeAppeal && (master == "0" || id == "0") {
+                // This list includes placeholder rows without a usable detail ID.
+                return Ok(None);
+            }
+            if !numeric_id(&master) || !numeric_id(&id) || master == "0" || id == "0" {
+                return Err(DatabaseError::StorageCorrupt);
+            }
+            let title = first(
+                node,
+                match dataset {
+                    Dataset::NationalStatute => "법령명한글",
+                    Dataset::AdministrativeRule => "행정규칙명",
+                    Dataset::Ordinance => "자치법규명",
+                    Dataset::Treaty => "조약명",
+                    Dataset::Precedent => "사건명",
+                    Dataset::ConstitutionalDecision => "사건명",
+                    Dataset::LegalInterpretation => "안건명",
+                    Dataset::AdministrativeAppeal => "사건명",
+                },
+            )
+            .unwrap_or_default();
+            let object = ObjectId {
+                jurisdiction: "kr".into(),
+                provider: "law_go_kr".into(),
+                dataset,
+                id,
+            };
+            object.validate()?;
+            let effective_date = match dataset {
+                Dataset::NationalStatute | Dataset::AdministrativeRule | Dataset::Ordinance => {
+                    date(first(node, "시행일자"))?
+                }
+                Dataset::Treaty => date(first(node, "발효일자"))?,
+                _ => None,
+            };
+            let revision_id = if dataset == Dataset::NationalStatute {
+                format!(
+                    "{master}:{}",
+                    effective_date
+                        .as_deref()
+                        .ok_or(DatabaseError::StorageCorrupt)?
+                )
+            } else {
+                master
+            };
+            Ok(Some(InventoryItem {
+                publication_date: if matches!(
+                    dataset,
+                    Dataset::NationalStatute | Dataset::Ordinance
+                ) {
+                    date(first(node, "공포일자"))?
+                } else {
+                    None
+                },
+                object,
+                revision_id,
+                effective_date,
+                title,
+                data_source: first(node, "데이터출처명"),
+                case_number: first(node, "사건번호"),
+                treaty_class_code: if dataset == Dataset::Treaty {
+                    first(node, "조약구분코드")
+                } else {
+                    None
+                },
+            }))
+        })();
+        match parsed {
+            Ok(Some(item)) => items.push(item),
+            Ok(None) => {}
+            Err(_) => rejected_rows += 1,
+        }
+    }
+    let total = first(tree, "totalCnt").and_then(|v| v.parse::<u64>().ok());
+    let incomplete = rejected_rows > 0
+        || total.is_none()
+        || observed_rows > 100
+        || total.is_some_and(|total| {
+            total < u64::from(page.saturating_sub(1)) * 100 + observed_rows as u64
+        })
+        || total.is_some_and(|total| {
+            dataset != Dataset::AdministrativeAppeal
+                && items.is_empty()
+                && u64::from(page.saturating_sub(1)) * 100 < total
+        });
+    if items.len() > 100 {
+        items.truncate(100);
+    }
+    Ok(InventoryPage {
+        items,
+        done: total.is_some_and(|total| (page as u64) * 100 >= total),
+        total,
+        rejected_rows,
+        incomplete,
+    })
+}
 fn http_status_error(status: reqwest::StatusCode) -> Option<DatabaseError> {
     if status.is_success() {
         None
-    } else if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        Some(DatabaseError::StorageUnavailable)
+    } else if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        Some(DatabaseError::SourceUnauthorized)
+    } else if matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+    ) {
+        Some(DatabaseError::SourceUnavailable)
+    } else if status.is_server_error() {
+        Some(DatabaseError::SourceTransient)
     } else {
         Some(DatabaseError::SourceRejected)
     }
@@ -1006,11 +1119,12 @@ fn document_error(error: DocumentError) -> DatabaseError {
         DocumentError::SandboxUnavailable | DocumentError::TimedOut => {
             DatabaseError::ProcessingPending
         }
-        DocumentError::InvalidInput
-        | DocumentError::InvalidDocument
+        DocumentError::InvalidDocument
         | DocumentError::UnsupportedFormat
-        | DocumentError::ProcessingFailed
-        | DocumentError::ResourceLimit => DatabaseError::SourceRejected,
+        | DocumentError::ResourceLimit => DatabaseError::SourceDataInvalid,
+        DocumentError::InvalidInput | DocumentError::ProcessingFailed => {
+            DatabaseError::SourceRejected
+        }
     }
 }
 fn expected_document_magic(raw: &[u8], format: DocumentFormat) -> bool {
@@ -1087,7 +1201,7 @@ fn attachment_links(tree: &DocumentNode) -> Result<Vec<AttachmentLink>, Database
                     title: field.into(),
                 });
                 if found.len() > 64 {
-                    return Err(DatabaseError::SourceRejected);
+                    return Err(DatabaseError::SourceDataInvalid);
                 }
             }
         }
@@ -1471,7 +1585,9 @@ pub fn project(
         }
         .into(),
     };
-    record.validate()?;
+    record
+        .validate()
+        .map_err(|_| DatabaseError::StorageCorrupt)?;
     Ok(record)
 }
 
@@ -1603,13 +1719,96 @@ fn project_additional(
         source_url: source.into(),
         representation: "provider_record".into(),
     };
-    record.validate()?;
+    record
+        .validate()
+        .map_err(|_| DatabaseError::StorageCorrupt)?;
     Ok(record)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mixed_inventory_keeps_valid_rows_and_marks_page_incomplete() {
+        let tree = branch(
+            "root",
+            vec![
+                field("totalCnt", "2"),
+                branch(
+                    "prec",
+                    vec![
+                        field("판례일련번호", "100"),
+                        field("사건명", "Fictional case"),
+                    ],
+                ),
+                branch(
+                    "prec",
+                    vec![
+                        field("판례일련번호", "invalid"),
+                        field("사건명", "Broken case"),
+                    ],
+                ),
+            ],
+        );
+        let page = parse_inventory_tree(&tree, Dataset::Precedent, 1).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].object.id, "100");
+        assert_eq!(page.rejected_rows, 1);
+        assert!(page.incomplete);
+        let unknown_total = branch(
+            "root",
+            vec![
+                field("totalCnt", "broken"),
+                branch("prec", vec![field("판례일련번호", "100")]),
+            ],
+        );
+        let page = parse_inventory_tree(&unknown_total, Dataset::Precedent, 1).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.incomplete);
+        assert!(!page.done);
+        let contradictory_total = branch(
+            "root",
+            vec![
+                field("totalCnt", "0"),
+                branch("prec", vec![field("판례일련번호", "100")]),
+            ],
+        );
+        let page = parse_inventory_tree(&contradictory_total, Dataset::Precedent, 1).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.incomplete);
+    }
+    #[test]
+    fn provider_response_classification_preserves_auth_and_pause_boundaries() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            http_status_error(StatusCode::NOT_FOUND),
+            Some(DatabaseError::SourceUnavailable)
+        );
+        assert_eq!(
+            http_status_error(StatusCode::GONE),
+            Some(DatabaseError::SourceUnavailable)
+        );
+        assert_eq!(
+            http_status_error(StatusCode::UNAUTHORIZED),
+            Some(DatabaseError::SourceUnauthorized)
+        );
+        assert_eq!(
+            http_status_error(StatusCode::FORBIDDEN),
+            Some(DatabaseError::SourceUnauthorized)
+        );
+        assert_eq!(
+            http_status_error(StatusCode::INTERNAL_SERVER_ERROR),
+            Some(DatabaseError::SourceTransient)
+        );
+        assert_eq!(
+            document_error(DocumentError::InvalidDocument),
+            DatabaseError::SourceDataInvalid
+        );
+        assert_eq!(
+            document_error(DocumentError::SandboxUnavailable),
+            DatabaseError::ProcessingPending
+        );
+    }
     fn field(name: &str, value: &str) -> DocumentNode {
         DocumentNode::Element {
             name: name.into(),
@@ -1857,15 +2056,20 @@ mod tests {
     }
     #[test]
     fn terminal_provider_failures_and_typed_judgment_dates() {
-        for status in [401, 403, 404, 302] {
+        for (status, expected) in [
+            (401, DatabaseError::SourceUnauthorized),
+            (403, DatabaseError::SourceUnauthorized),
+            (404, DatabaseError::SourceUnavailable),
+            (302, DatabaseError::SourceRejected),
+        ] {
             assert_eq!(
                 http_status_error(reqwest::StatusCode::from_u16(status).unwrap()),
-                Some(DatabaseError::SourceRejected)
+                Some(expected)
             );
         }
         assert_eq!(
             http_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
-            Some(DatabaseError::StorageUnavailable)
+            Some(DatabaseError::SourceTransient)
         );
         assert_eq!(
             document_error(DocumentError::Cancelled),
@@ -1877,7 +2081,7 @@ mod tests {
         );
         assert_eq!(
             document_error(DocumentError::UnsupportedFormat),
-            DatabaseError::SourceRejected
+            DatabaseError::SourceDataInvalid
         );
         let mut i = item();
         i.object.dataset = Dataset::Precedent;

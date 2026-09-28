@@ -73,4 +73,6 @@ pub struct SearchPage {
     pub scanned_bytes: u64,
     pub analyzer_version: String,
     pub index_lag: u64,
+    #[serde(default)]
+    pub collection_notices: Vec<crate::legal::CollectionNotice>,
 }

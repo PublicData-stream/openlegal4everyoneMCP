@@ -139,6 +139,7 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
             reader: runtime.reader.clone(),
             search: runtime.search.clone(),
             comparison: comparison.clone(),
+            store: runtime.store.clone(),
         })
         .unwrap();
     registry

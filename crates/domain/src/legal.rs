@@ -269,6 +269,17 @@ pub struct MetadataResult {
     pub processor_version: String,
     pub raw_sha256: String,
     pub freshness: Option<HeadFreshness>,
+    #[serde(default)]
+    pub collection_notices: Vec<CollectionNotice>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct CollectionNotice {
+    pub dataset: Dataset,
+    pub scope: String,
+    pub code: String,
+    pub affected_count: u64,
+    pub last_seen_at: u64,
+    pub retry_at: u64,
 }
 impl From<GetResult> for MetadataResult {
     fn from(v: GetResult) -> Self {
@@ -289,6 +300,7 @@ impl From<GetResult> for MetadataResult {
             processor_version: c.processor_version,
             raw_sha256: c.raw_sha256,
             freshness: v.freshness,
+            collection_notices: Vec::new(),
         }
     }
 }
@@ -318,6 +330,14 @@ pub struct HistoryPage {
 #[serde(rename_all = "snake_case")]
 pub enum DatabaseError {
     SourceRejected,
+    /// A known provider response for one item/page is unavailable (404/410).
+    SourceUnavailable,
+    /// Downloaded provider bytes failed bounded format or content validation.
+    SourceDataInvalid,
+    /// A provider authentication/authorization response requires operator review.
+    SourceUnauthorized,
+    /// A completed provider response indicates a temporary server failure.
+    SourceTransient,
     InvalidInput,
     InvalidRegex,
     NotFound,

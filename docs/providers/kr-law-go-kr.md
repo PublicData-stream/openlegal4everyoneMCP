@@ -102,18 +102,22 @@ HWP5, HWPX and OCR parsing use the configured no-network document sandbox.
 An attachment endpoint can return HTTP success with bytes in the wrong document
 format. An HTML response gets at most two additional requests through the same
 durable admission ledger and spacing policy. If the response still is not the
-advertised PDF/HWP format, an identified primary body may be published with
+advertised PDF/HWP format, the file is corrupt, or that attachment alone returns
+404/410, an identified primary body may be published with
 `attachment_status=incomplete`, expected/available counts, and a bounded list of
-failed link ordinals, expected formats and response digests. The final unexpected
-response is retained as private evidence, not exposed as legal text. Successful
+failed link ordinals, expected formats and optional response digests. A digest is
+absent when no response bytes were received. Actual unexpected bytes are retained
+as private evidence for the terminal failed attempt, not exposed as legal text; earlier HTML retry responses are discarded. `attachment_evidence_ordinals`
+maps stored attachment evidence to advertised link ordinals. Successful
 attachments retain their source sections. A valid PDF containing only `삭제` is
 preserved as PDF evidence and text without inferring a legal withdrawal.
 
 An incomplete result never replaces an existing complete HEAD or advances that
 HEAD's validation time. An incomplete HEAD does not establish corpus coverage or
-suppress later collection. Budget exhaustion, cancellation, HTTP rejection,
-destination violations, document-worker failure, and format-correct but invalid
-documents do not qualify for partial publication. The previously observed 200
+suppress later collection. Budget exhaustion, cancellation, authentication or
+rate-limit rejection, destination violations, and document-worker infrastructure
+failure do not qualify for partial publication. A corrupt primary body is never
+published. The previously observed 200
 HTML attachment page reported service congestion; its underlying cause and
 subsequent availability remain unverified outside that diagnostic response.
 
@@ -142,10 +146,11 @@ These are application choices, not claimed upstream service guarantees:
   is intentionally not reset on restart.
   Manual candidates contribute identity hints only; descriptive metadata for
   a public HEAD must come from a fresh live current-list observation.
-  A structurally invalid list page marks that family incomplete and the pilot
-  may inspect the next family. A `source_rejected` list or detail result also
-  covers HTTP client or authentication rejection, so it durably suspends
-  further provider requests until operator review.
+  A structurally invalid list row is skipped while valid rows are used; a fully
+  invalid page is recorded as a gap and the bounded scan continues. An individual
+  404/410 or corrupt downloaded detail is recorded as a gap. Authentication and
+  other unsafe client rejection still suspend provider requests until operator
+  review. Network failures remain unresolved until response handling is known.
   The pilot logs each rejected family and a summary when the scan finishes;
   queued candidates and prior valid pages do not establish publication or
   inventory completeness.
@@ -154,8 +159,10 @@ These are application choices, not claimed upstream service guarantees:
 - `mode = "continuous"` uses durable per-dataset page cursors and queues every
   record on one current page per dataset and one historical page for datasets
   with provider revisions each hour. The 128-job queue applies backpressure,
-  and a current-page cursor advances only after all listed HEAD revisions have
-  published. It alternates a front-page refresh with one-page overlap to reduce
+  and a current-page cursor advances only after each listed HEAD revision has
+  published or has a durable, explicitly incomplete gap. Due page and detail gaps
+  are retried once in a later hourly cycle under the same request budget. It
+  alternates a front-page refresh with one-page overlap to reduce
   moving-offset omissions. This is incremental
   collection, not a stabilized full inventory. It never marks date-selector
   catalogs or corpus-wide coverage complete. Historical details are revalidated
@@ -179,9 +186,9 @@ These are application choices, not claimed upstream service guarantees:
   suspension write leaves ingestion stopped after restart; the operator must
   inspect the provider state before clearing it.
   Deferred claims do not spend another job attempt while
-  the pause holds. Permanent HTTP client rejection and deterministic parser failure
-  return `source_rejected`; a successful HTTP attachment response with the wrong
-  document format follows the incomplete-attachment policy above. Cancellation
+  the pause holds. Individual 404/410 and corrupt downloaded bytes are classified
+  separately from authentication and unsafe client rejection. The former can be
+  skipped and reported; the latter suspend provider requests. Cancellation
   remains cancellation. Transient sandbox
   unavailability and timeouts remain retryable processing states.
 - The queue holds at most 128 active jobs, with at most three attempts and fenced

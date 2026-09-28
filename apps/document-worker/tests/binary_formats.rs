@@ -27,6 +27,26 @@ async fn html_error_page_is_not_a_pdf() {
     ));
 }
 
+#[tokio::test]
+async fn pdf_header_with_broken_body_is_invalid_document() {
+    let raw = b"%PDF-1.7\nfictional damaged body\n".to_vec();
+    let source_sha256 = Sha256::digest(&raw)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        openlegal_document_worker::process(DocumentInput {
+            format: DocumentFormat::Pdf,
+            raw,
+            source_sha256,
+            ocr: false,
+        })
+        .await
+        .err(),
+        Some(DocumentError::InvalidDocument)
+    );
+}
+
 async fn check(format: DocumentFormat, ocr: bool, outlined_pdf: bool) {
     let mut document = rhwp::DocumentCore::new_empty();
     document.create_blank_document_native().unwrap();

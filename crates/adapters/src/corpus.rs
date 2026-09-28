@@ -15,6 +15,8 @@ use std::sync::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod collection_gaps;
+pub use collection_gaps::PageGapObservation;
 mod lifecycle;
 mod runtime_lease;
 pub use runtime_lease::CorpusRuntimeLease;
@@ -525,6 +527,21 @@ impl PgCorpusStore {
         {
             return Err(DatabaseError::InvalidInput);
         }
+        let update_job_gap = p.job_id.is_some();
+        let attachment_incomplete = p
+            .record
+            .metadata
+            .get("attachment_status")
+            .map(String::as_str)
+            == Some("incomplete");
+        if update_job_gap && attachment_incomplete {
+            let object_key = key(&p.record.object)?;
+            self.ensure_gap_capacity(&collection_gaps::detail_key(
+                &object_key,
+                &p.record.revision_id,
+            ))
+            .await?;
+        }
         let k = key(&p.record.object)?;
         let previous_id = if p.install_head {
             self.state(&p.record.object).await?.head_capture
@@ -749,6 +766,16 @@ impl PgCorpusStore {
             if let Some(job) = p.job_id {
                 sqlx::query("UPDATE openlegal.corpus_job SET status='done',lease_until=NULL WHERE id=$1 AND object_key=$2 AND expected_version=$3").bind(Uuid::parse_str(&job).map_err(|_|DatabaseError::InvalidInput)?).bind(&k).bind(version).execute(&mut *tx).await.map_err(db)?;
             }
+            if update_job_gap {
+                self.update_published_detail_gap(
+                    &mut tx,
+                    &p.record.object,
+                    &p.record.revision_id,
+                    attachment_incomplete,
+                    p.now,
+                )
+                .await?;
+            }
             check(&cancel)?;
             tx.commit().await.map_err(db)?;
             old.validated_at = p.now;
@@ -830,6 +857,16 @@ impl PgCorpusStore {
         if let Some(job) = p.job_id {
             let job = Uuid::parse_str(&job).map_err(|_| DatabaseError::InvalidInput)?;
             sqlx::query("UPDATE openlegal.corpus_job SET status='done',lease_until=NULL WHERE id=$1 AND object_key=$2 AND expected_version=$3").bind(job).bind(&k).bind(version).execute(&mut *tx).await.map_err(db)?;
+        }
+        if update_job_gap {
+            self.update_published_detail_gap(
+                &mut tx,
+                &capture.record.object,
+                &capture.record.revision_id,
+                attachment_incomplete,
+                p.now,
+            )
+            .await?;
         }
         check(&cancel)?;
         tx.commit().await.map_err(db)?;

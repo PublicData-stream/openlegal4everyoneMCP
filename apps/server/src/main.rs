@@ -182,6 +182,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                 reader: runtime.reader.clone(),
                 search: runtime.search.clone(),
                 comparison: diff_service.clone().ok_or("database comparison unavailable")?,
+                store: runtime.store.clone(),
             })?;
             corpus_runtime = Some(runtime);
         }

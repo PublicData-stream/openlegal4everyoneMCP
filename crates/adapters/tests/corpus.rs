@@ -3,7 +3,7 @@
 mod support;
 use openlegal_adapters::{
     blob::FsBlobStore,
-    corpus::PgCorpusStore,
+    corpus::{PageGapObservation, PgCorpusStore},
     law_go_kr::{LawClient, RequestBudgetMode},
 };
 use openlegal_application::{
@@ -35,6 +35,90 @@ impl openlegal_application::Clock for FixtureClock {
 }
 fn token() -> CancellationToken {
     CancellationToken::new()
+}
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn collection_gaps_are_durable_bounded_notices_and_retries() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("collection-gaps"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(base.pool(), blobs, Arc::new(FixtureClock));
+    store
+        .record_page_gap(
+            Dataset::Treaty,
+            false,
+            Some(1),
+            1,
+            PageGapObservation {
+                reason: "source_data_invalid",
+                rows: 2,
+                now: 100,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .due_gap_page(Dataset::Treaty, false, Some(1), 100)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .due_gap_page(Dataset::Treaty, false, Some(1), 3700)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    let notices = store
+        .collection_notices(&[Dataset::Treaty], None)
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].affected_count, 2);
+    store
+        .resolve_page_gap(Dataset::Treaty, false, Some(1), 1, 3701)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .collection_notices(&[Dataset::Treaty], None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .enqueue_job(object(), "r1".into(), None, true, true, 4000)
+        .await
+        .unwrap();
+    let job = store.claim_job(4001).await.unwrap().unwrap();
+    store
+        .skip_claim(&job, "source_unavailable", 4002)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .detail_gap_active(&job.object, &job.revision_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.requeue_due_details(7602).await.unwrap(), 1);
+    let retried = store.claim_job(7603).await.unwrap().unwrap();
+    assert_eq!(retried.revision_id, "r1");
+    store
+        .resolve_detail_gap(&job.object, &job.revision_id, 7604)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .detail_gap_active(&job.object, &job.revision_id)
+            .await
+            .unwrap()
+    );
+    base.close().await.unwrap();
 }
 #[tokio::test]
 #[ignore = "requires scripts/test-postgres.sh"]
@@ -415,6 +499,7 @@ async fn incomplete_attachment_evidence_never_replaces_a_complete_head() {
     let state = store.state(&object()).await.unwrap();
     assert_eq!(state.head_capture, Some(complete.capture_id.clone()));
     assert!(state.pending);
+    assert!(store.detail_gap_active(&object(), "r2").await.unwrap());
     assert_eq!(
         store
             .resolve(object(), RevisionSelector::Head, 202, token())

@@ -16,6 +16,13 @@ test('incomplete attachment counts are exposed and bounded', () => {
   assert.equal(metadata(meta, id, { kind: 'capture', id: meta.capture_id }).missingAttachments, null);
   assert.throws(() => metadata({ ...partial, metadata: { ...partial.metadata, attachment_available_count: '3' } }, id, { kind: 'capture', id: meta.capture_id }));
 });
+test('collection notices are bounded, validated and retained alongside content', () => {
+  const notice = { dataset: 'national_statute', scope: 'detail', code: 'source_data_invalid', affected_count: 1, last_seen_at: 100, retry_at: 3700 };
+  assert.deepEqual(metadata({ ...meta, collection_notices: [notice] }, id, { kind: 'capture', id: meta.capture_id }).collection_notices, [notice]);
+  assert.deepEqual(searchPage({ structuredContent: { schema_version: 1, hits: [], next_cursor: null, generation: 0, corpus_complete: false, index_lag: 0, collection_notices: [notice] } }).collection_notices, [notice]);
+  assert.throws(() => metadata({ ...meta, collection_notices: [{ ...notice, code: 'unknown' }] }, id, { kind: 'capture', id: meta.capture_id }));
+  assert.throws(() => searchPage({ structuredContent: { schema_version: 1, hits: [], collection_notices: Array(65).fill(notice) } }));
+});
 test('database content continuation uses exact bytes and search pages are bounded', () => {
   const page = { structuredContent: { session: 'e'.repeat(64), schema_version: 1, metadata: meta, section: 'body', text: '한', offset: 0, next_offset: 3, section_count: 0, next_sections_offset: null, sections: [] } };
   assert.equal(getResult(page, id, { kind: 'capture', id: meta.capture_id }, 'body', 0).next_offset, 3);

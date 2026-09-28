@@ -75,9 +75,20 @@ async fn run_xberg(
     });
     let mut result = xberg::extract(ExtractInput::from_bytes(bytes, mime, None), &config)
         .await
-        .map_err(|_| DocumentError::ProcessingFailed)?;
+        .map_err(|error| match error {
+            xberg::XbergError::Parsing { .. } | xberg::XbergError::UnsupportedFormat(_) if !ocr => {
+                DocumentError::InvalidDocument
+            }
+            _ => DocumentError::ProcessingFailed,
+        })?;
     if !result.errors.is_empty() || result.results.len() != 1 {
-        return Err(DocumentError::ProcessingFailed);
+        return Err(
+            if !ocr && result.errors.len() == 1 && matches!(result.errors[0].code, 1001 | 1010) {
+                DocumentError::InvalidDocument
+            } else {
+                DocumentError::ProcessingFailed
+            },
+        );
     }
     result.results.pop().ok_or(DocumentError::ProcessingFailed)
 }
@@ -139,7 +150,7 @@ async fn pdf(input: &DocumentInput, output: &mut DocumentOutput) -> Result<(), D
     if !native.processing_warnings.is_empty() {
         output.diagnostics.push("native_extraction_warning".into());
     }
-    let pages = native.pages.ok_or(DocumentError::ProcessingFailed)?;
+    let pages = native.pages.ok_or(DocumentError::InvalidDocument)?;
     if pages.len() != count {
         return Err(DocumentError::InvalidDocument);
     }
@@ -164,7 +175,7 @@ async fn pdf(input: &DocumentInput, output: &mut DocumentOutput) -> Result<(), D
                 (height as u32).min(MAX_RASTER_SIDE),
                 &options,
             )
-            .map_err(|_| DocumentError::ProcessingFailed)?;
+            .map_err(|_| DocumentError::InvalidDocument)?;
             if u64::from(rendered.width) * u64::from(rendered.height) > 16_000_000 {
                 return Err(DocumentError::ResourceLimit);
             }
@@ -233,7 +244,7 @@ async fn hwp(input: &DocumentInput, output: &mut DocumentOutput) -> Result<(), D
     for index in 0..count {
         let layout = doc
             .get_page_text_layout_native(index as u32)
-            .map_err(|_| DocumentError::ProcessingFailed)?;
+            .map_err(|_| DocumentError::InvalidDocument)?;
         if layout.len() > MAX_DOCUMENT_OUTPUT_BYTES {
             return Err(DocumentError::ResourceLimit);
         }
@@ -256,12 +267,12 @@ async fn hwp(input: &DocumentInput, output: &mut DocumentOutput) -> Result<(), D
         if input.ocr {
             let svg = doc
                 .render_page_svg_legacy_native(index as u32)
-                .map_err(|_| DocumentError::ProcessingFailed)?;
+                .map_err(|_| DocumentError::InvalidDocument)?;
             if svg.len() > MAX_DOCUMENT_BYTES {
                 return Err(DocumentError::ResourceLimit);
             }
             let tree = resvg::usvg::Tree::from_str(&svg, &options)
-                .map_err(|_| DocumentError::ProcessingFailed)?;
+                .map_err(|_| DocumentError::InvalidDocument)?;
             let size = tree.size();
             let scale = (150.0 / 96.0_f32)
                 .min(MAX_RASTER_SIDE as f32 / size.width())
@@ -271,8 +282,8 @@ async fn hwp(input: &DocumentInput, output: &mut DocumentOutput) -> Result<(), D
             if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 16_000_000 {
                 return Err(DocumentError::ResourceLimit);
             }
-            let mut pixmap =
-                resvg::tiny_skia::Pixmap::new(width, height).ok_or(DocumentError::ResourceLimit)?;
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+                .ok_or(DocumentError::SandboxUnavailable)?;
             pixmap.fill(resvg::tiny_skia::Color::WHITE);
             resvg::render(
                 &tree,

@@ -22,6 +22,7 @@ pub struct DatabaseTools {
     pub reader: Arc<openlegal_application::database_read::DatabaseReader>,
     pub search: Arc<SearchService>,
     pub comparison: Arc<TextDiffService>,
+    pub store: Arc<openlegal_adapters::corpus::PgCorpusStore>,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -107,12 +108,14 @@ fn output<T>(structured: T) -> ToolOutput<T> {
 impl ToolModule for DatabaseTools {
     fn register(self, registry: &mut ToolRegistry) -> Result<(), ServerError> {
         let service = self.reader.clone();
+        let notices = self.store.clone();
         registry.register_typed::<ReadInput, ContentPage, _, _>(
             "database.get",
             "Read one legal object at HEAD or an exact retained revision/capture. HEAD includes TTL and fetch/cache times. Content pages contain up to 32 KiB. Continue using selector kind=capture and the returned metadata.capture_id with next_offset and the same section; historical content never falls back to HEAD.",
             ToolOptions::default(),
             move |input, ctx| {
                 let service = service.clone();
+                let notices = notices.clone();
                 async move {
                     if input.section.as_ref().is_some_and(|s| s.len() > 256)
                         || input.offset > 64 * 1024 * 1024
@@ -176,10 +179,12 @@ impl ToolModule for DatabaseTools {
                     let section_end = input.sections_offset + sections.len();
                     let next_sections_offset =
                         (section_end < section_count).then_some(section_end);
+                    let mut metadata: MetadataResult = result.into();
+                    metadata.collection_notices = notices.collection_notices(&[metadata.object.dataset], Some(&metadata.object)).await.map_err(map_error)?;
                     Ok(output(ContentPage {
                         session,
                         schema_version: 1,
-                        metadata: result.into(),
+                        metadata,
                         section,
                         text: page,
                         offset: input.offset,
@@ -192,18 +197,19 @@ impl ToolModule for DatabaseTools {
             },
         )?;
         let service = self.database.clone();
+        let notices = self.store.clone();
         registry.register_typed::<GetRequest, MetadataResult, _, _>(
             "database.get_metadata",
             "Retrieve metadata and provenance for HEAD or an exact checkpoint, with HEAD freshness and upstream retrieval/validation/cache times. No legal body content is returned.",
             ToolOptions::default(),
             move |input, ctx| {
                 let service = service.clone();
+                let notices = notices.clone();
                 async move {
-                    service
-                        .get_metadata(input, ctx.request.cancellation)
-                        .await
-                        .map(output)
-                        .map_err(map_error)
+                    let object = input.object.clone();
+                    let mut result = service.get_metadata(input, ctx.request.cancellation).await.map_err(map_error)?;
+                    result.collection_notices = notices.collection_notices(&[object.dataset], Some(&object)).await.map_err(map_error)?;
+                    Ok(output(result))
                 }
             },
         )?;
@@ -343,6 +349,10 @@ fn diff_text(result: &GetResult, ocr: bool) -> Result<String, ToolError> {
 }
 pub(crate) fn map_error(e: DatabaseError) -> ToolError {
     match e {
+        DatabaseError::SourceUnavailable
+        | DatabaseError::SourceDataInvalid
+        | DatabaseError::SourceUnauthorized => ToolError::Unavailable,
+        DatabaseError::SourceTransient => ToolError::StorageUnavailable,
         DatabaseError::InvalidInput => ToolError::InvalidInput,
         DatabaseError::InvalidRegex => ToolError::InvalidRegex,
         DatabaseError::NotFound => ToolError::NotFound,

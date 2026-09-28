@@ -221,9 +221,13 @@ values, raw workload dumps and private host details out of shared evidence.
    sandbox acceptance and independent review, prepare identity/RBAC/networking,
    then use `mode = "pilot"` for the bounded first live pass. Enabling the overlay
    immediately initiates provider traffic. The durable pilot ledger allows 100
-   attempts over 30 minutes and never resets automatically. Verify an actual
-   provider detail, source and search result for every public category before
-   selecting `mode = "continuous"`; continuous collection remains incomplete.
+   attempts over 30 minutes and never resets automatically. After operator review,
+   a new pilot may reset only its pilot counter while preserving the daily cap and
+   next-request timestamp. Before selecting `mode = "continuous"`, verify an actual
+   provider detail, source and search result in each category without a recorded
+   gap; publish bounded warnings for skipped categories and records. If no category
+   qualifies or authentication/request-budget safeguards fail, remain in retained
+   serving. Continuous collection remains incomplete.
 
 ## Upgrade and Secret rotation
 

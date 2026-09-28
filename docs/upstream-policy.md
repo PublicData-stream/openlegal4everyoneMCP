@@ -58,7 +58,7 @@ partial or failed refresh must not overwrite good data as a successful result.
 Prevent an older concurrent refresh from replacing a newer accepted result.
 An identified primary body may be published with missing linked attachment
 evidence only when its provider profile defines an explicit incomplete status,
-retains the failed response privately, and prevents that capture from replacing
+retains the terminal failed response bytes privately when available, and prevents that capture from replacing
 a complete HEAD or satisfying full-coverage checks. Other validation failures
 remain failures.
 
