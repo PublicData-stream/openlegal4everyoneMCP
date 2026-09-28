@@ -400,9 +400,10 @@ async fn bind_health(
                 let metrics = metrics.clone();
                 async move {
                     let mut output = format!(
-                        "openlegal_tool_calls_total {}\nopenlegal_tool_failures_total {}\n",
+                        "openlegal_tool_calls_total {}\nopenlegal_tool_failures_total {}\nopenlegal_tool_rate_limited_total {}\n",
                         context.handler.counters.calls.load(Ordering::Relaxed),
-                        context.handler.counters.failures.load(Ordering::Relaxed)
+                        context.handler.counters.failures.load(Ordering::Relaxed),
+                        context.handler.counters.rate_limited.load(Ordering::Relaxed)
                     );
                     let extra = metrics();
                     if extra.len() <= 16 * 1024 {

@@ -4,6 +4,7 @@ use crate::{
     ServerError,
     config::{Limits, SourceOffer},
     progress::{ProgressReporter, validate_progress_token},
+    rate_limit::RateLimiter,
     registry::{
         ToolContext, ToolError, ToolExecutionContext, ToolRegistry, ensure_serialized_limit,
     },
@@ -24,6 +25,7 @@ use tokio::sync::Semaphore;
 pub struct Counters {
     pub calls: AtomicU64,
     pub failures: AtomicU64,
+    pub rate_limited: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -33,6 +35,7 @@ pub struct McpHandler {
     resources: Arc<ResourceRegistry>,
     limits: Arc<Limits>,
     calls: Arc<Semaphore>,
+    rate: Arc<RateLimiter>,
     pub counters: Arc<Counters>,
 }
 
@@ -55,7 +58,7 @@ impl McpHandler {
         limits.validate()?;
         ensure_serialized_limit(
             &crate::registry::server_info(&source),
-            limits.max_message_bytes / 8,
+            limits.tool_result_limit(),
         )
         .map_err(|_| "source offer exceeds configured tool result budget")?;
         resources.validate_limits(limits.max_message_bytes)?;
@@ -88,6 +91,7 @@ impl McpHandler {
             source,
             resources: Arc::new(resources),
             calls: Arc::new(Semaphore::new(limits.max_in_flight)),
+            rate: Arc::new(RateLimiter::new(limits.rate_limit.clone())),
             limits,
             counters: Arc::new(Counters::default()),
         })
@@ -215,6 +219,11 @@ impl ServerHandler for McpHandler {
             .try_acquire_owned()
             .map_err(|_| ErrorData::internal_error("server busy", None))?;
         self.counters.calls.fetch_add(1, Ordering::Relaxed);
+        if !self.rate.try_admit().await {
+            self.counters.failures.fetch_add(1, Ordering::Relaxed);
+            self.counters.rate_limited.fetch_add(1, Ordering::Relaxed);
+            return Ok(map_tool_error(ToolError::RateLimited)?.into());
+        }
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.limits.call_timeout_secs);
         let progress = ProgressReporter::new(
@@ -231,7 +240,7 @@ impl ServerHandler for McpHandler {
             },
             deadline,
             progress,
-            result_limit: self.limits.max_message_bytes / 8,
+            result_limit: self.limits.tool_result_limit(),
         };
         let result = tokio::select! {
             biased;
@@ -263,8 +272,12 @@ impl ServerHandler for McpHandler {
                     )
                     .into());
                 }
-                ensure_serialized_limit(&value.structured, self.limits.max_message_bytes / 8)
-                    .map_err(|_| ErrorData::internal_error("tool result exceeds limit", None))?;
+                if ensure_serialized_limit(&value.structured, self.limits.tool_result_limit())
+                    .is_err()
+                {
+                    self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                    return Ok(map_tool_error(ToolError::ResourceLimit)?.into());
+                }
                 let mut result = if let Some(text) = value.text {
                     let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
                     result.structured_content = Some(value.structured);

@@ -8,6 +8,8 @@ use std::{net::SocketAddr, path::PathBuf};
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_message_bytes: usize,
+    /// Omitted values retain the message-relative tool output budget.
+    pub max_tool_result_bytes: Option<usize>,
     pub max_buffer_bytes: usize,
     pub max_in_flight: usize,
     pub max_connections: usize,
@@ -16,12 +18,32 @@ pub struct Limits {
     pub call_timeout_secs: u64,
     pub idle_timeout_secs: u64,
     pub shutdown_timeout_secs: u64,
+    pub rate_limit: RateLimitConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitConfig {
+    pub enabled: bool,
+    pub calls_per_second: u32,
+    pub burst: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            calls_per_second: 100,
+            burst: 100,
+        }
+    }
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
             max_message_bytes: 1024 * 1024,
+            max_tool_result_bytes: None,
             max_buffer_bytes: 64 * 1024 * 1024,
             max_in_flight: 64,
             max_connections: 128,
@@ -30,13 +52,22 @@ impl Default for Limits {
             call_timeout_secs: 30,
             idle_timeout_secs: 60,
             shutdown_timeout_secs: 15,
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
 
 impl Limits {
+    pub fn tool_result_limit(&self) -> usize {
+        self.max_tool_result_bytes
+            .unwrap_or(self.max_message_bytes / 8)
+    }
+
     pub fn validate(&self) -> Result<(), ServerError> {
         if !(4096..=16 * 1024 * 1024).contains(&self.max_message_bytes)
+            || self
+                .max_tool_result_bytes
+                .is_some_and(|value| value == 0 || value > self.max_message_bytes / 8)
             || self.max_buffer_bytes < self.max_message_bytes * 4
             || self.max_buffer_bytes > u32::MAX as usize
             || self.max_in_flight == 0
@@ -45,6 +76,8 @@ impl Limits {
             || self.max_connections > 65536
             || self.max_calls_per_connection == 0
             || self.max_calls_per_connection > self.max_in_flight
+            || !(1..=10_000).contains(&self.rate_limit.calls_per_second)
+            || !(1..=10_000).contains(&self.rate_limit.burst)
             || [
                 self.io_timeout_secs,
                 self.call_timeout_secs,
@@ -57,6 +90,54 @@ impl Limits {
             return Err("invalid resource limits".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod limits_tests {
+    use super::*;
+
+    #[test]
+    fn result_budget_tracks_message_size_unless_explicitly_set() {
+        let mut limits = Limits::default();
+        assert_eq!(limits.tool_result_limit(), 128 * 1024);
+        limits.max_message_bytes = 16 * 1024 * 1024;
+        assert_eq!(limits.tool_result_limit(), 2 * 1024 * 1024);
+        limits.max_buffer_bytes = 256 * 1024 * 1024;
+        limits.max_tool_result_bytes = Some(4096);
+        assert_eq!(limits.tool_result_limit(), 4096);
+        assert!(limits.validate().is_ok());
+        limits.max_tool_result_bytes = Some(0);
+        assert!(limits.validate().is_err());
+        limits.max_tool_result_bytes = Some(2 * 1024 * 1024 + 1);
+        assert!(limits.validate().is_err());
+    }
+
+    #[test]
+    fn rate_limit_defaults_and_overrides_are_validated() {
+        let defaults = Limits::default();
+        assert!(defaults.rate_limit.enabled);
+        assert_eq!(defaults.rate_limit.calls_per_second, 100);
+        assert_eq!(defaults.rate_limit.burst, 100);
+        let config: Limits =
+            toml::from_str("[rate_limit]\nenabled = false\ncalls_per_second = 4\nburst = 8\n")
+                .unwrap();
+        assert!(!config.rate_limit.enabled);
+        assert_eq!(config.rate_limit.calls_per_second, 4);
+        assert_eq!(config.rate_limit.burst, 8);
+        assert!(config.validate().is_ok());
+        for invalid in [
+            "[rate_limit]\ncalls_per_second = 0",
+            "[rate_limit]\nburst = 0",
+            "[rate_limit]\ncalls_per_second = 10001",
+            "[rate_limit]\nburst = 10001",
+            "[rate_limit]\nunknown = 1",
+        ] {
+            assert!(
+                toml::from_str::<Limits>(invalid).map_or(true, |limits| limits.validate().is_err()),
+                "{invalid}"
+            );
+        }
     }
 }
 

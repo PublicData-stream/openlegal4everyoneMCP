@@ -60,7 +60,7 @@ see the operator runbook for builds and image acceptance, the ordered
 HTTP `/mcp` is private plaintext behind the TLS edge. WebTransport `/mcp-wt/v1`
 always uses TLS/QUIC. Both must bind successfully before readiness becomes true.
 Keep health `/live`, `/ready`, and `/metrics` private; they have no authentication.
-`/metrics` exposes aggregate tool call/failure counts and, when configured, bounded
+`/metrics` exposes aggregate tool call/failure and rate-rejection counts and, when configured, bounded
 application retrieval metrics, not request payloads.
 SIGINT/SIGTERM stop admission and drain the server. An unexpected required endpoint
 failure also stops the server. Shutdown deadline exhaustion is an error.
@@ -238,6 +238,7 @@ lists tools and calls `server_info`; never disable certificate verification.
 | Configuration under `[limits]` | Default |
 | --- | ---: |
 | `max_message_bytes` | 1,048,576 |
+| `max_tool_result_bytes` | `max_message_bytes / 8` when omitted |
 | `max_buffer_bytes` | 67,108,864 |
 | `max_in_flight` | 64 |
 | `max_connections` | 128 |
@@ -246,6 +247,24 @@ lists tools and calls `server_info`; never disable certificate verification.
 | `call_timeout_secs` | 30 |
 | `idle_timeout_secs` | 60 |
 | `shutdown_timeout_secs` | 15 |
+
+`[limits.rate_limit]` controls valid `tools/call` requests across both transports:
+
+| Setting | Default |
+| --- | ---: |
+| `enabled` | `true` |
+| `calls_per_second` | 100 |
+| `burst` | 100 |
+
+The rate and burst must each be between 1 and 10,000, including when disabled.
+The bucket starts full and refills continuously. An exhausted call fails immediately
+with the structured `rate_limited` tool error. Known tool calls with valid arguments
+spend one token after concurrency admission, including calls that later fail in the
+application. Unknown tool names and schema-invalid arguments retain their protocol
+errors without spending tokens. A later deserialization failure retains its
+protocol error but may spend a token. Initialization, discovery, resource reads,
+and health requests do not use this bucket. Operators can set `enabled = false`
+explicitly.
 
 Budgets are process-local and shared by both data transports. The buffering budget
 is distinct from QUIC flow control: stream receive credit is at most 256 KiB and
@@ -256,8 +275,12 @@ The buffering budget accounts for admitted application frames/bodies, with
 conservative HTTP copy reservations; it is not a bound on process RSS or arbitrary plugin allocations.
 TLS/QUIC, HTTP/2 and kernel buffers have separate finite limits. Registry discovery
 must fit in half a message. Tool output is preflighted before SDK serialization;
-structured values must fit one-eighth of a message, leaving room for its text copy,
-escaping and protocol metadata. Final serialized responses remain bounded.
+tool output must fit `max_tool_result_bytes`, which cannot exceed one-eighth of a
+message, leaving room for its text copy, escaping and protocol metadata. Oversized
+typed and untyped tool output returns the structured `resource_limit` error. An
+explicitly small result budget that cannot hold `server_info` fails startup.
+Final serialized responses remain bounded. The rate bucket is process-local, so
+additional serving replicas would require a separate shared admission design.
 
 HTTP limits header parsing and socket write progress separately from tool work.
 An independent response watchdog closes the TCP connection after call plus I/O

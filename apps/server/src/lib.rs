@@ -13,6 +13,7 @@ pub mod framing;
 pub mod handler;
 pub mod http;
 pub mod progress;
+mod rate_limit;
 pub mod registry;
 pub mod resources;
 pub mod text_diff;
