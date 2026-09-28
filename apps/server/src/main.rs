@@ -147,7 +147,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         }
         return Ok(());
     }
-    config.limits.validate()?;
+    config.validate_transport_security()?;
     config.validate_storage()?;
     if let Some(diff) = &config.text_diff {
         diff.validate(&config.limits)?;
@@ -243,6 +243,8 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         }
         builder.register_endpoint(HttpEndpoint {
             bind: config.http.bind,
+            tls: config.http.tls,
+            edge_mtls: config.edge_mtls.clone(),
             access: AccessPolicy {
                 allowed_hosts: config.http.allowed_hosts,
                 allowed_origins: config.http.allowed_origins,
@@ -250,6 +252,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         })?;
         builder.register_endpoint(WebTransportEndpoint {
             bind: config.webtransport.bind,
+            edge_mtls: config.edge_mtls,
             certificate: config.webtransport.certificate,
             private_key: config.webtransport.private_key,
             access: AccessPolicy {

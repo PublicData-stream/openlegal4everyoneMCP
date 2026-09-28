@@ -32,6 +32,7 @@ async fn assert_tls_identity_rejected(certificate_pem: &str, private_key_pem: &s
     std::fs::write(&certificate, certificate_pem).unwrap();
     std::fs::write(&private_key, private_key_pem).unwrap();
     let result = WebTransportEndpoint {
+        edge_mtls: None,
         bind: "127.0.0.1:0".parse().unwrap(),
         certificate,
         private_key,
@@ -230,6 +231,7 @@ impl Server {
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let bound = WebTransportEndpoint {
+            edge_mtls: None,
             bind,
             certificate,
             private_key,
@@ -439,6 +441,7 @@ async fn validates_access_before_loading_certificates_or_binding() {
         ),
     ] {
         let result = WebTransportEndpoint {
+            edge_mtls: None,
             bind: server.address,
             certificate: server._directory.path().join("missing-cert.pem"),
             private_key: server._directory.path().join("missing-key.pem"),

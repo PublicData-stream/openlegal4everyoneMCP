@@ -8,6 +8,7 @@ pub mod config;
 pub mod corpus_runtime;
 pub mod database;
 pub mod demo;
+mod edge_mtls;
 pub mod endpoint;
 pub mod framing;
 pub mod handler;

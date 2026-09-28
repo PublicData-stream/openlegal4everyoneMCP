@@ -119,6 +119,8 @@ impl Server {
             connections: Arc::new(Semaphore::new(limits.max_connections)),
         };
         let bound = HttpEndpoint {
+            tls: None,
+            edge_mtls: None,
             bind: "127.0.0.1:0".parse().unwrap(),
             access: AccessPolicy {
                 allowed_hosts: vec!["backend.test".into()],

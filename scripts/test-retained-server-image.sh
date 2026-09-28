@@ -66,7 +66,8 @@ fi
 docker build --platform "$native_platform" --file test-support/retained-image/Dockerfile --tag "$helper_image" .
 docker pull --platform "$native_platform" "$node_image" >/dev/null
 docker pull --platform "$native_platform" "$postgres_image" >/dev/null
-mkdir -p "$scratch/fixture/config" "$scratch/fixture/tls" "$scratch/fixture/postgres-ca" "$scratch/fixture/bad-ca" "$scratch/postgres-tls"
+mkdir -p "$scratch/fixture/config" "$scratch/fixture/tls" "$scratch/fixture/edge-client-ca" \
+    "$scratch/fixture/edge-client" "$scratch/fixture/postgres-ca" "$scratch/fixture/bad-ca" "$scratch/postgres-tls"
 scripts/test-kubernetes-serving.sh --profile retained --config-output "$scratch/fixture/config/server.toml" \
     --admin-output-dir "$scratch/admin"
 deploy_tools=${OPENLEGAL_DEPLOY_TOOLS:-$repo/target/deployment-tools}
@@ -92,8 +93,25 @@ c = tomllib.loads((root / 'config/server.toml').read_text())
 (root / 'client.json').write_text(json.dumps({'source': c['source']['url'], 'authority': c['http']['allowed_hosts'][0], 'retained': True}))
 PY
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
-    -subj /CN=localhost -addext subjectAltName=DNS:localhost \
+    -subj /CN=server -addext subjectAltName=DNS:server,DNS:localhost \
     -keyout "$scratch/fixture/tls/tls.key" -out "$scratch/fixture/tls/tls.crt" >/dev/null 2>&1
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+    -subj /CN=retained-image-edge-client-ca -addext basicConstraints=critical,CA:TRUE \
+    -addext keyUsage=critical,keyCertSign,cRLSign \
+    -keyout "$scratch/edge-client-ca.key" -out "$scratch/fixture/edge-client-ca/ca.crt" >/dev/null 2>&1
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -subj /CN=oxibelt.openlegal.internal -keyout "$scratch/fixture/edge-client/tls.key" \
+    -out "$scratch/edge-client.csr" >/dev/null 2>&1
+printf '%s\n' 'subjectAltName=DNS:oxibelt.openlegal.internal' \
+    'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' \
+    'extendedKeyUsage=clientAuth' > "$scratch/edge-client.ext"
+openssl x509 -req -days 2 -in "$scratch/edge-client.csr" \
+    -CA "$scratch/fixture/edge-client-ca/ca.crt" -CAkey "$scratch/edge-client-ca.key" \
+    -set_serial 1 -extfile "$scratch/edge-client.ext" \
+    -out "$scratch/fixture/edge-client/tls.crt" >/dev/null 2>&1
+openssl verify -purpose sslclient -verify_hostname oxibelt.openlegal.internal \
+    -CAfile "$scratch/fixture/edge-client-ca/ca.crt" \
+    "$scratch/fixture/edge-client/tls.crt" >/dev/null
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
     -subj /CN=retained-image-fixture-ca -addext basicConstraints=critical,CA:TRUE \
     -addext keyUsage=critical,keyCertSign,cRLSign \
@@ -149,9 +167,9 @@ docker run --rm --name "$initializer" --platform "$native_platform" --network no
         # mode. Five digits explicitly clear it, matching operator install -m.
         mkdir "$root/data"; chown 10004:10004 "$root/data"; chmod 00700 "$root/data"
     done
-    chown -R 0:10004 /fixture/tls /fixture/postgres-ca /fixture/bad-ca
-    chmod 750 /fixture/tls /fixture/postgres-ca /fixture/bad-ca
-    chmod 440 /fixture/tls/* /fixture/postgres-ca/* /fixture/bad-ca/*
+    chown -R 0:10004 /fixture/tls /fixture/edge-client-ca /fixture/edge-client /fixture/postgres-ca /fixture/bad-ca
+    chmod 750 /fixture/tls /fixture/edge-client-ca /fixture/edge-client /fixture/postgres-ca /fixture/bad-ca
+    chmod 440 /fixture/tls/* /fixture/edge-client-ca/* /fixture/edge-client/* /fixture/postgres-ca/* /fixture/bad-ca/*
     '
 # Fresh rebuild destinations retain the same volume-root/private-data contract.
 for volume in "$run_id-interrupted-index" "$run_id-rebuilt-index"; do
@@ -198,6 +216,7 @@ docker exec "$postgres" psql -U postgres -v ON_ERROR_STOP=1 -c 'SELECT pg_reload
 hardening=(--read-only --cap-drop ALL --security-opt no-new-privileges --memory 4g --cpus 2 --pids-limit 128)
 config=(--mount "type=volume,source=$fixture,target=/etc/openlegal,volume-subpath=config,readonly")
 tls=(--mount "type=volume,source=$fixture,target=/run/secrets/backend-tls,volume-subpath=tls,readonly")
+edge_client_ca=(--mount "type=volume,source=$fixture,target=/run/secrets/edge-client-ca,volume-subpath=edge-client-ca,readonly")
 ca=(--mount "type=volume,source=$fixture,target=/run/secrets/postgres-ca,volume-subpath=postgres-ca,readonly")
 # Diagnostics are mapped to a fixed allowlist, never echoed from driver output.
 report_failure_category() {
@@ -270,7 +289,8 @@ fi
 [[ $(fixture_sql 'SELECT count(*) FROM openlegal.corpus_capture') == 2 ]]
 start_server() {
     docker run -d --name "$server" --platform "$platform" --network "$network" --network-alias server \
-        "${hardening[@]}" "${config[@]}" "${tls[@]}" "${ca[@]}" "${storage[@]}" "${dictionary_ro[@]}" \
+        "${hardening[@]}" "${config[@]}" "${tls[@]}" "${edge_client_ca[@]}" \
+        "${ca[@]}" "${storage[@]}" "${dictionary_ro[@]}" \
         "$@" "$image" >/dev/null
 }
 stop_server() {
@@ -310,7 +330,7 @@ acceptance_cycle() {
         grep -Eq "^CapEff:[[:space:]]+0+$" /proc/1/status
         grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/1/status
         grep -Eq "^Seccomp:[[:space:]]+2$" /proc/1/status
-        for root in /tmp /etc/openlegal /run/secrets/backend-tls /run/secrets/postgres-ca /var/lib/openlegal/mecab-ko-dictionary /var/lib/openlegal/mecab-ko-dictionary/data; do
+        for root in /tmp /etc/openlegal /run/secrets/backend-tls /run/secrets/edge-client-ca /run/secrets/postgres-ca /var/lib/openlegal/mecab-ko-dictionary /var/lib/openlegal/mecab-ko-dictionary/data; do
             if touch "$root/forbidden-write" 2>/dev/null; then exit 1; fi
         done
         '

@@ -5,9 +5,10 @@ HTTP, and `/mcp-wt/v1` uses the project's custom WebTransport binding. ChatGPT
 connects to the public HTTPS `/mcp` URL. Browser WebTransport interoperability
 and a live ChatGPT connection require separate platform testing.
 
-The integration configuration targets OxiBelt source revision
-[`72564d165dfd05cb29a64aeebd19fccd7944ea6f`](https://github.com/OxiBelt/OxiBelt/tree/72564d165dfd05cb29a64aeebd19fccd7944ea6f).
-It follows that revision's [WebTransport forwarding implementation](https://github.com/OxiBelt/OxiBelt/blob/72564d165dfd05cb29a64aeebd19fccd7944ea6f/source/src/proxy/http/webtransport.rs).
+The integration configuration targets OxiBelt 0.10.0 at the immutable release
+commit [`e879ac7e263b0af9a86280cd8799de44cbffc05c`](https://github.com/OxiBelt/OxiBelt/tree/e879ac7e263b0af9a86280cd8799de44cbffc05c).
+Its [upstream client identity and rate-limit syntax](https://github.com/OxiBelt/OxiBelt/blob/e879ac7e263b0af9a86280cd8799de44cbffc05c/docs/Configuration.md)
+is used by both profiles.
 The reference repository is not modified by the harness.
 
 ## Run the isolated integration test
@@ -20,7 +21,7 @@ scripts/test-oxibelt.sh --profile fixture
 scripts/test-oxibelt.sh --profile kubernetes
 ```
 
-The default profile is `fixture`, using the original synthetic edge/backend
+The default profile is `fixture`, using the synthetic edge/backend
 configuration. The `kubernetes` profile reads the committed
 [NodePort handoff example](../deploy/oxibelt/kubernetes-upstream.example.toml),
 substitutes disposable hostnames/certificates, and uses a backend listening directly
@@ -65,7 +66,9 @@ the edge's inherited 10 MiB default cannot carry the largest escaped text pair.
 
 All service containers share an internal Docker network. No host port is
 published and no legal-data provider is contacted. The test generates a
-short-lived synthetic CA and TLS leaves with `edge` and `backend` DNS SANs.
+short-lived server CA and TLS leaves with `edge` and `backend` DNS SANs, plus a
+separate edge-client CA and client leaf with the exact
+`oxibelt.openlegal.internal` DNS SAN.
 Configuration and disposable leaf keys are streamed into a temporary Docker
 volume, mounted read-only by serving containers. Keys are excluded from the
 Docker build context and cache. The script removes its containers, network,
@@ -82,9 +85,15 @@ The test fails unless all of these checks pass:
 - Rejection of wrong routes, public `/live`, `/ready` and `/metrics`, HTTP
   authority, disallowed Origin, and untrusted downstream certificates.
 - Rejection when only OxiBelt's backend CA trust changes, followed by a successful
-  reconnect after restoring trust.
+  reconnect after restoring trust, on both upstream transports.
+- Rejection when OxiBelt omits its upstream client certificate, on both transports.
 - Rejection of a backend certificate signed by the trusted CA but issued for the
   wrong DNS name, followed by successful recovery with the matching certificate.
+- Edge HTTP 429 and refill recovery under a temporary one-request bucket, plus
+  WebTransport CONNECT rejection and refill recovery under its temporary
+  one-handshake bucket.
+  The normal fixture sets the ordinary backend tool-call bucket to one and
+  verifies that authenticated edge traffic uses the alternate 1,000-call bucket.
 
 A successful run reports that the OxiBelt HTTP and WebTransport integration checks
 passed for the selected profile.
@@ -102,7 +111,7 @@ OxiBelt expects certificate filenames relative to a `cert/` directory beside its
 
 | Traffic | Edge listener/path | Private destination |
 | --- | --- | --- |
-| ChatGPT and other MCP HTTP clients | TCP TLS, `/mcp` | `http://backend:8080` |
+| ChatGPT and other MCP HTTP clients | TCP TLS, `/mcp` | `https://backend:8080` |
 | Native WebTransport clients | UDP QUIC/HTTP/3, CONNECT `/mcp-wt/v1` | `https://backend:4433` |
 | Backend health | Private administration network | Port `9090` |
 
@@ -120,10 +129,23 @@ independent of the public server URL. Native callers may omit Origin. OxiBelt
 must preserve caller Origin so the backend can enforce this policy.
 
 Trust the backend's issuing CA in OxiBelt and issue its certificate with a SAN
-matching the backend DNS name. Never disable certificate verification to fix
-routing. The HTTP route disables response buffering, caching, and compression
-so MCP streaming can pass through. Treat proxy timeouts, connection budgets,
+matching the backend DNS name. Issue a separate client certificate from the
+dedicated edge-client CA with the exact DNS SAN configured by the backend; present
+it through `[upstreams.tls.client_identity]` on both HTTPS upstreams. Never disable
+certificate verification to fix routing. The HTTP route disables response buffering,
+caching, and compression so MCP streaming can pass through. Treat proxy timeouts, connection budgets,
 backend request deadlines, and shutdown grace as one deployment policy.
+
+The example uses a top-level route limit for 1,000 HTTP requests per second with
+burst 1,000 on `/mcp`, and a request-phase WAF rate-limit action for 100
+WebTransport CONNECT handshakes per second with burst 100 on `/mcp-wt/v1`.
+OxiBelt 0.10.0's WebTransport preparation path evaluates the WAF action but does
+not evaluate top-level route limits. Both configured buckets use
+`max_buckets = 1` and are process-local by default. WebTransport calls within a
+session do not consume the CONNECT bucket;
+the backend's verified-tunnel tool-call bucket covers calls from both transports.
+All public callers using one authenticated edge share these budgets. The client
+certificate authenticates OxiBelt to the backend, not each public caller.
 
 ## Kubernetes NodePort handoff
 
@@ -156,11 +178,12 @@ identities together:
 
 | Setting | Operator value, where `NODE_DNS` is the private node hostname |
 | --- | --- |
-| OxiBelt HTTP origin | `http://NODE_DNS:30080` |
+| OxiBelt HTTP origin | `https://NODE_DNS:30080` |
 | Backend `[http].allowed_hosts` | `["NODE_DNS:30080"]` |
 | OxiBelt WebTransport origin | `https://NODE_DNS:30433` |
 | Backend `[webtransport].allowed_hosts` | `["NODE_DNS:30433"]` |
 | Backend certificate DNS SAN | `NODE_DNS` without a port |
+| OxiBelt client certificate DNS SAN | `oxibelt.openlegal.internal`, matching backend `[edge_mtls].required_client_dns_san` |
 | Both backend `allowed_origins` | `["https://openlegal4everyone.mcp.publicdata.stream", "https://openlegal4everyone.api.publicdata.stream"]`, extended only for intended callers |
 
 The backend still listens on 8080/TCP and 4433/UDP. Kubernetes translates the
@@ -182,14 +205,21 @@ stability. Record immediate public and backend-restart smoke before cutover.
 Public edge TLS and private backend TLS have separate ownership. Mount the
 lego/ACME edge certificate and key as `cert/edge.pem` and `cert/edge-key.pem`
 beside OxiBelt's `config/` directory. Mount the backend issuing CA certificate as
-`cert/backend-ca.pem`, as selected by `proxy.trusted_ca_certs`. Put only the
-issued backend certificate and private key into Kubernetes Secret
-`openlegal-backend-tls` (`tls.crt` and `tls.key`). Keep the CA private key outside
-both OxiBelt and Kubernetes. Do not disable chain or hostname verification, and
-do not reuse the public edge certificate identity as the backend identity by
-assumption. The example disables hot reload; coordinate edge restart and backend
-rollout when replacing certificates, allowing for `Recreate` downtime and
-preserving current trust.
+`cert/backend-ca.pem`, as selected by `proxy.trusted_ca_certs`. Mount the separate
+client leaf and key as `cert/openlegal-client.pem` and
+`cert/openlegal-client-key.pem`; the client key must be owned by the OxiBelt UID
+and unreadable by group and world. Neither belongs in the backend Pod. Put the backend
+server leaf and key into Kubernetes Secret `openlegal-backend-tls` (`tls.crt` and
+`tls.key`), and mount the public certificate of the separate edge-client CA in
+the serving Pod at the configured `[edge_mtls].client_ca_file`. Keep both CA
+private keys outside OxiBelt and Kubernetes. Both backend listeners use the same
+server certificate and require the client leaf and exact DNS SAN before using
+`[limits.rate_limit.verified_tunnel]`. Do not disable chain or hostname
+verification. The example disables hot reload; coordinate trust overlap,
+OxiBelt restart and backend rollout when replacing certificates, allowing for
+`Recreate` downtime. To roll back, restore the prior matching edge and backend
+configuration together; an HTTP plaintext origin cannot connect to the
+client-authenticated backend listener.
 
 Private node DNS is the primary path. When OxiBelt and Kubernetes share a physical
 host, an operator may instead use a stable hostname explicitly mapped to a verified

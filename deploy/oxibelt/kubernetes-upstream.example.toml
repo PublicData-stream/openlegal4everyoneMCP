@@ -1,7 +1,7 @@
 # Kubernetes handoff example; read docs/oxibelt.md before use.
 # Replace the reserved node DNS name and provision certificates outside Git.
 # Container :8443 maps to host :443 on TCP and UDP.
-# Schema/source pin: 72564d165dfd05cb29a64aeebd19fccd7944ea6f.
+# Schema/source pin: OxiBelt 0.10.0 (e879ac7e263b0af9a86280cd8799de44cbffc05c).
 [config]
 strict_unknown_fields = true
 
@@ -56,19 +56,52 @@ enabled = false
 [cache]
 enabled = false
 
-# This transport example does not define a complete host WAF/security policy.
+# This is a transport-specific handshake rule, not a complete host WAF policy.
 [waf]
-enabled = false
+enabled = true
+mode = "enforcing"
+
+[[waf.rules]]
+name = "mcp-webtransport-handshake-budget"
+id = "ol-mcp-wt-handshake-rate"
+phase = "request"
+priority = 100
+when = "Request.Http.Path == '/mcp-wt/v1'"
+
+[[waf.rules.actions]]
+type = "rate_limit"
+name = "mcp-webtransport-handshakes"
+key = "route"
+rate = "100r/s"
+burst = 100
+max_buckets = 1
+status = 429
+
+[[rate_limits]]
+name = "mcp-http-edge-budget"
+key = "route"
+routes = ["mcp-http"]
+rate = "1000r/s"
+burst = 1000
+max_buckets = 1
+status = 429
 
 # Backend HTTP allowed_hosts must contain NODE_DNS:30080.
 [[upstreams]]
 name = "mcp-http"
-origin = "http://replace-with-private-node.invalid:30080"
+origin = "https://replace-with-private-node.invalid:30080"
 max_http_version = "h1"
 preserve_host = false
 pool_max_idle_per_host = 0
 connect_timeout_ms = 3000
 request_timeout_ms = 40000
+
+[upstreams.tls.client_identity]
+cert_chain = "openlegal-client.pem"
+private_key = "openlegal-client-key.pem"
+
+[upstreams.tls.ech]
+mode = "disabled"
 
 # Backend WebTransport allowed_hosts must contain NODE_DNS:30433.
 # Its certificate DNS SAN must match NODE_DNS; never disable verification.
@@ -81,6 +114,10 @@ webtransport = true
 connect_timeout_ms = 3000
 request_timeout_ms = 40000
 idle_timeout_ms = 65000
+
+[upstreams.tls.client_identity]
+cert_chain = "openlegal-client.pem"
+private_key = "openlegal-client-key.pem"
 
 [upstreams.tls.ech]
 mode = "disabled"

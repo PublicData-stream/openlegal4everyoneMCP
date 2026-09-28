@@ -170,6 +170,8 @@ async fn changes_reversions_exact_history_and_comparison_preserve_capture_origin
         .unwrap();
     builder
         .register_endpoint(HttpEndpoint {
+            tls: None,
+            edge_mtls: None,
             bind: "127.0.0.1:0".parse().unwrap(),
             access: AccessPolicy {
                 allowed_hosts: vec!["history.test".into()],

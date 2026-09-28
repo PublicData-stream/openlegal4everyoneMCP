@@ -279,7 +279,7 @@ def validate_config(raw, profile="retained"):
     config = tomllib.loads(raw)
     sections = ("source", "http", "webtransport", "health", "limits", "text_diff")
     if profile == "retained":
-        sections += ("cache", "database")
+        sections += ("edge_mtls", "cache", "database")
     keys(config, sections, f"{profile} server configuration")
     keys(config["source"], ("url",), "source")
     url = config["source"]["url"]
@@ -304,14 +304,26 @@ def validate_config(raw, profile="retained"):
             expected.update(allowed_hosts=[authority],
                             allowed_origins=["https://openlegal4everyone.mcp.publicdata.stream",
                                              "https://openlegal4everyone.api.publicdata.stream"])
+            if transport == "http":
+                expected["tls"] = {"certificate": "/run/secrets/backend-tls/tls.crt",
+                                   "private_key": "/run/secrets/backend-tls/tls.key"}
         if transport == "webtransport":
             expected.update(certificate="/run/secrets/backend-tls/tls.crt",
                             private_key="/run/secrets/backend-tls/tls.key")
         equal(config[transport], expected, transport)
+    if profile == "retained":
+        equal(config["edge_mtls"], {
+            "client_ca_file": "/run/secrets/edge-client-ca/ca.crt",
+            "required_client_dns_san": "oxibelt.openlegal.internal",
+        }, "edge mTLS")
     equal(config["health"], {"bind": "0.0.0.0:9090"}, "health")
-    equal(config["limits"], {"max_message_bytes": 16 * 1024 * 1024,
-                             "max_buffer_bytes": 256 * 1024 * 1024,
-                             "shutdown_timeout_secs": 15}, "limits")
+    expected_limits = {"max_message_bytes": 16 * 1024 * 1024,
+                       "max_buffer_bytes": 256 * 1024 * 1024,
+                       "shutdown_timeout_secs": 15}
+    if profile == "retained":
+        expected_limits["rate_limit"] = {"verified_tunnel": {
+            "calls_per_second": 1000, "burst": 1000}}
+    equal(config["limits"], expected_limits, "limits")
     equal(config["text_diff"], {"widget_html": "/opt/openlegal/widgets/text-diff.html"}, "text_diff")
     if profile == "retained":
         equal(config["cache"], {
@@ -426,6 +438,11 @@ def validate(documents, profile="retained"):
                {"name": "backend-tls", "secret": {"secretName": "openlegal-backend-tls", "defaultMode": 0o440,
                 "items": [{"key": "tls.crt", "path": "tls.crt"}, {"key": "tls.key", "path": "tls.key"}]}}]
     if profile == "retained":
+        mounts.append({"name": "edge-client-ca", "mountPath": "/run/secrets/edge-client-ca",
+                       "readOnly": True})
+        volumes.append({"name": "edge-client-ca", "secret": {
+            "secretName": "openlegal-edge-client-ca", "defaultMode": 0o440,
+            "items": [{"key": "ca.crt", "path": "ca.crt"}]}})
         mounts.append({"name": "postgres-ca", "mountPath": "/run/secrets/postgres-ca", "readOnly": True})
         volumes.append({"name": "postgres-ca", "secret": {"secretName": "openlegal-postgres-ca",
                         "defaultMode": 0o440, "items": [{"key": "ca.crt", "path": "ca.crt"}]}})
@@ -698,7 +715,7 @@ def validate_oxibelt(raw, service):
     validate_service(service)
     config = tomllib.loads(raw)
     keys(config, ("config", "logging", "runtime", "quic", "listeners", "tls", "proxy",
-                  "compression", "cache", "waf", "upstreams", "routes"), "OxiBelt example")
+                  "compression", "cache", "waf", "rate_limits", "upstreams", "routes"), "OxiBelt example")
     equal(config["config"], {"strict_unknown_fields": True}, "OxiBelt schema policy")
     equal(config["listeners"], {"https_bind": "0.0.0.0:8443", "http1": True,
                                 "http2": True, "http3": True}, "edge listeners")
@@ -711,21 +728,38 @@ def validate_oxibelt(raw, service):
     }, "backend trust and streaming")
     for section in ("compression", "cache"):
         equal(config[section], {"enabled": False}, section)
+    equal(config["waf"], {
+        "enabled": True, "mode": "enforcing", "rules": [{
+            "name": "mcp-webtransport-handshake-budget",
+            "id": "ol-mcp-wt-handshake-rate", "phase": "request", "priority": 100,
+            "when": "Request.Http.Path == '/mcp-wt/v1'",
+            "actions": [{"type": "rate_limit", "name": "mcp-webtransport-handshakes",
+                         "key": "route", "rate": "100r/s", "burst": 100,
+                         "max_buckets": 1, "status": 429}],
+        }],
+    }, "WebTransport handshake WAF rate limit")
+    equal(config["rate_limits"], [
+        {"name": "mcp-http-edge-budget", "key": "route", "routes": ["mcp-http"],
+         "rate": "1000r/s", "burst": 1000, "max_buckets": 1, "status": 429},
+    ], "HTTP edge route rate limit")
     upstreams = []
     for port in service["spec"]["ports"]:
         webtransport = port["protocol"] == "UDP"
-        scheme = "https" if webtransport else "http"
         upstream = {
             "name": port["name"],
-            "origin": f"{scheme}://replace-with-private-node.invalid:{port['nodePort']}",
+            "origin": f"https://replace-with-private-node.invalid:{port['nodePort']}",
             "max_http_version": "h3" if webtransport else "h1",
             "preserve_host": False, "connect_timeout_ms": 3000, "request_timeout_ms": 40000,
         }
+        client_identity = {"client_identity": {"cert_chain": "openlegal-client.pem",
+                                               "private_key": "openlegal-client-key.pem"},
+                           "ech": {"mode": "disabled"}}
         if webtransport:
             upstream.update(webtransport=True, idle_timeout_ms=65000,
-                            tls={"ech": {"mode": "disabled"}})
+                            tls=client_identity)
         else:
             upstream["pool_max_idle_per_host"] = 0
+            upstream["tls"] = client_identity
         upstreams.append(upstream)
     equal(config["upstreams"], upstreams, "NodePort upstreams")
     equal(config["routes"], [

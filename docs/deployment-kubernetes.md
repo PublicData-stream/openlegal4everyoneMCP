@@ -47,7 +47,7 @@ Internet -- TCP/443 + UDP/443 --> Host Docker Compose
                               Kubernetes NodePorts TCP :30080 / UDP :30433
                                     |                |
 Kubernetes                          v                v
-  openlegal-serving             HTTP :8080       QUIC/TLS :4433
+  openlegal-serving             HTTPS/mTLS :8080 QUIC/mTLS :4433
     openlegal-server Deployment: one replica, Recreate
       |-- private health :9090 (no NodePort or public edge route)
       |-- PostgreSQL 18 (operator-provisioned endpoint)
@@ -64,12 +64,28 @@ Kubernetes                          v                v
 OxiBelt and lego stay outside Kubernetes to retain host ownership of public
 routing and certificate lifecycle. OxiBelt already provides the required edge;
 this design adds no intermediary reverse proxy. The NodePort handoff carries
-private plaintext HTTP and separately verified WebTransport TLS. Follow the
+verified mTLS on both HTTP and WebTransport. Follow the
 [OxiBelt hosting contract](oxibelt.md#adapt-the-configuration-for-hosting): preserve
 caller Origin, retain `preserve_host = false`, allow the actual backend authorities,
-and issue a backend certificate matching the authority trusted by OxiBelt.
+and issue a backend certificate matching the authority trusted by OxiBelt. The
+backend validates OxiBelt's client certificate against a dedicated edge-client CA
+and exact DNS SAN `oxibelt.openlegal.internal` on both transports. The private
+health listener stays plaintext and has no NodePort or public route.
 NodePorts alone do not establish privacy; the operator must restrict access to
 the intended host/private path and validate the effective network controls.
+
+The serving templates allocate a separate process-wide bucket of 1,000 tool
+calls/second with burst 1,000 for the verified tunnel. HTTP and WebTransport
+share that bucket. All public callers behind OxiBelt share its allowance;
+the client certificate identifies the edge, not each public caller. The edge
+handoff separately limits `/mcp` to 1,000 requests/second and `/mcp-wt/v1`
+to 100 CONNECT handshakes/second, each with matching burst. Both backend and
+edge buckets are process-local; the handshake limit is not a per-tool-call
+limit inside a session. A request header cannot select this bucket.
+These rates are ceilings, not throughput guarantees; connection and in-flight
+limits still apply independently.
+Configurations without verified edge mTLS continue to use the existing default
+bucket.
 
 The serving Deployment has exactly one desired replica and uses `Recreate`.
 Application budgets and upstream coordination assume one backend, and concurrent
@@ -99,7 +115,7 @@ the operator supplies and qualifies each target deployment.
 | Fixed TCP 30080 / UDP 30433 NodePorts and OxiBelt handoff example | NodePort availability, private node DNS, backend authorities, allowed origins, firewall rules and host Compose/certificate configuration |
 | Namespace-wide default deny and independently selected allow templates | Enforcing CNI, exact edge/database/DNS/monitoring peers, firewall controls and network acceptance |
 | Separate storage mounts and generic Local PV/PVC examples | ZFS datasets, host paths, node affinity, capacity, ownership/permissions and provisioned dictionary |
-| Secret references and separate serving/migration commands | PostgreSQL endpoint, roles/grants, credentials, CA material and backend TLS certificate/key |
+| Secret references and separate serving/migration commands | PostgreSQL endpoint, roles/grants, credentials, backend TLS certificate/key, dedicated edge-client CA and OxiBelt client certificate/key |
 | Explicit opt-in ingestion overlay and namespace-scoped controller access | Provider credential, digest-pinned worker image and separately configured controller identity after sandbox acceptance |
 
 Commit no credentials, private keys, production kubeconfig, database URL, real
@@ -122,7 +138,7 @@ production configuration.
 | --- | --- |
 | Release | Clean source revision, truthful build version, published image digest for each selected platform/target, and matching public corresponding-source URL; follow [image preparation](#production-server-image) |
 | Cluster | Explicit kubeconfig/context, qualified node/CPU, admitted resource kinds, measured resource budget and enforcing CNI; schema tool versions are not a supported-cluster matrix |
-| Database and Secrets | PostgreSQL 18 endpoint, separate DBA-provisioned migration/runtime roles, verified CA, backend TLS identity, and the [Secret names and keys](#operator-prerequisites); keep values private |
+| Database and Secrets | PostgreSQL 18 endpoint, separate DBA-provisioned migration/runtime roles, verified CA, backend TLS and edge-client identities, and the [Secret names and keys](#operator-prerequisites); keep values private |
 | Storage | Prepared Local PV roots, capacities, node affinity, dictionary identity and recovery material; follow [storage preparation](#storage-and-permissions) |
 | Edge and network | Actual edge path, backend DNS/authorities, allowed Origin, firewall restrictions and selected database/DNS/monitoring policies; follow [NodePort handoff](oxibelt.md#kubernetes-nodeport-handoff) |
 | Maintenance and evidence | Named operator, maintenance window, prior compatible release artifacts, private recovery location, and per-gate acceptance outcomes |
@@ -171,7 +187,7 @@ values, raw workload dumps and private host details out of shared evidence.
 
    Check claim reservations, node affinity, capacity and private directory ownership.
    The dictionary must be complete and validated before serving starts. Migration
-   itself needs only its credential and PostgreSQL CA, not these volumes or backend TLS.
+   itself needs only its credential and PostgreSQL CA, not these volumes or serving TLS material.
 4. Follow [prepare, stop and execute](#prepare-stop-and-execute) to render and apply
    the migration Job suspended, inspect its image/configuration/credential set, and
    explicitly activate it. Require successful completion, exit and termination.
@@ -190,8 +206,10 @@ values, raw workload dumps and private host details out of shared evidence.
 
    This apply creates both the running Deployment and NodePort Service. Readiness
    failure is a stop condition; do not relax network or storage validation to bypass it.
-6. Verify private health, then TCP and native UDP transport from the actual OxiBelt
-   container through the trusted NodePorts. Configure the edge using the
+6. Verify private health, then HTTPS/TCP and native QUIC/UDP transport from the
+   actual OxiBelt container through the trusted NodePorts, including successful
+   client-certificate authentication and rejection of absent or wrong client
+   identity. Configure the edge using the
    [authority and TLS mapping](oxibelt.md#kubernetes-nodeport-handoff), then complete
    [public smoke and acceptance](#observability-and-acceptance), including rejection
    cases. Apply the public HTTP blocker above to the acceptance decision.
@@ -234,17 +252,19 @@ Use a maintenance window; `Recreate` entails downtime. Keep the
 
 Configuration hashes cause replacement, but mounted certificates and environment
 credentials do not hot-reload. For a Secret-only change that needs no schema or
-storage administration, coordinate database credential validity or backend CA/SAN
-trust first, update the operator-managed Secret, then explicitly restart:
+storage administration, coordinate database credential validity, backend CA/SAN
+trust, or edge-client CA/client-certificate overlap first. Update the operator-managed
+Secret and OxiBelt certificate/trust configuration in the agreed order, then explicitly restart:
 
 ```bash
 "${kube[@]}" -n openlegal-serving rollout restart deployment/openlegal-server
 "${kube[@]}" -n openlegal-serving rollout status deployment/openlegal-server --timeout=360s
 ```
 
-Recheck private health, retained data and both public transports. Backend certificate
-or CA changes also require the coordinated edge trust/restart procedure in the
-[OxiBelt contract](oxibelt.md#kubernetes-nodeport-handoff). Retain required old trust
+Recheck private health, retained data and both public transports. Backend and
+edge-client certificate or CA changes require the coordinated edge trust/restart
+procedure in the [OxiBelt contract](oxibelt.md#kubernetes-nodeport-handoff).
+Retain required old trust
 and credential recovery material until the transition is accepted. Do not print
 Secret values to verify rotation.
 
@@ -261,6 +281,12 @@ Retain failed administrative destinations for investigation. A retry needs a new
 Job attempt and, for rebuild, another fresh destination after actual termination
 of the old process. Resume one backend only when the intended release and storage
 are known compatible; repeat the same retained-data and public transport checks.
+
+For an edge mTLS configuration rollback, restore a compatible backend image,
+configuration and edge configuration together while serving is stopped. Keep the
+previous backend and client trust chains and certificates available until both
+transports pass from the actual OxiBelt container. A previous image that accepts
+plaintext HTTP is not a safe standalone rollback while TCP 30080 is reachable.
 
 When private/NodePort serving succeeds but public HTTP fails, preserve the failed
 result and consult the [observed edge recovery](#acceptance-checklist-and-evidence-boundaries).
@@ -472,11 +498,17 @@ retention maintenance. The former text-only configuration is now a
 - Replace `[source].url`'s release revision with free corresponding source for the
   exact running server and widgets, including modifications and build material.
 - Replace both backend authority placeholders with the authorities sent by
-  OxiBelt: `NODE_DNS:30080` for HTTP and `NODE_DNS:30433` for WebTransport,
+  OxiBelt: `NODE_DNS:30080` for HTTPS and `NODE_DNS:30433` for WebTransport,
   where `NODE_DNS` is the selected private node hostname. The intended browser
   Origins are `https://openlegal4everyone.mcp.publicdata.stream` and
   `https://openlegal4everyone.api.publicdata.stream`; retain explicit Origin validation. Follow
   the [OxiBelt hosting contract](oxibelt.md#adapt-the-configuration-for-hosting).
+- Issue the backend server certificate with `NODE_DNS` as a DNS SAN, trusted by
+  OxiBelt on both upstreams. Separately issue an OxiBelt client certificate
+  with exact DNS SAN `oxibelt.openlegal.internal` from the dedicated edge-client
+  CA mounted below. Do not reuse the public edge certificate or the backend
+  server CA as the client identity. Configure OxiBelt to present that client
+  certificate to both upstreams and verify the backend hostname and CA.
 - Establish and verify the [NodePort firewall restrictions](#service-and-private-network-handoff)
   before applying the serving Kustomization, which creates the Service. Apply the
   [network baseline and tailored allows](#network-and-namespace-boundaries) before
@@ -498,11 +530,15 @@ retention maintenance. The former text-only configuration is now a
 | `openlegal-runtime-db` | `OPENLEGAL_DATABASE_URL` | Individual `secretKeyRef` into the runtime environment |
 | `openlegal-migration-db` | `OPENLEGAL_MIGRATION_DATABASE_URL` | None; migration Job only |
 | `openlegal-backend-tls` | `tls.crt`, `tls.key` | Read-only `/run/secrets/backend-tls`, mode `0440` |
+| `openlegal-edge-client-ca` | `ca.crt` | Read-only `/run/secrets/edge-client-ca/ca.crt`, mode `0440` |
 | `openlegal-postgres-ca` | `ca.crt` | Read-only `/run/secrets/postgres-ca/ca.crt`, mode `0440` |
 
 TLS volumes expose only the listed keys. Group `10004` supplies read access;
-verify effective permissions on the target cluster. Issue the backend certificate
-for the actual verified WebTransport authority. Preserve PostgreSQL `verify-full`,
+verify effective permissions on the target cluster. The backend TLS Secret serves
+both HTTPS/TCP and QUIC/UDP. The edge-client CA Secret contains only the trust
+anchor, never the OxiBelt client private key. Issue the backend certificate for
+the actual verified `NODE_DNS` authority and keep OxiBelt's client certificate/key
+on the edge host. Preserve PostgreSQL `verify-full`,
 including hostname verification. Do not put connection URLs in TOML or weaken TLS
 to bypass certificate errors.
 
@@ -680,8 +716,9 @@ forward to the serving Pod even when it runs elsewhere. This does not add replic
 or storage failover. The cluster must admit these fixed NodePorts without a port
 collision. Use the selected private node DNS name in both upstream URLs in the
 [OxiBelt handoff example](../deploy/oxibelt/kubernetes-upstream.example.toml).
-The [hosting instructions](oxibelt.md#kubernetes-nodeport-handoff) cover the matching
-backend authorities, certificate identity and same-host gateway alternative.
+The [hosting instructions](oxibelt.md#kubernetes-nodeport-handoff) cover the
+matching backend authorities, server and client certificate identities, and
+same-host gateway alternative.
 
 **Before applying the Service**, restrict TCP 30080 and UDP 30433 to the intended
 OxiBelt host/private path on every node/interface where the Service is reachable.
@@ -693,11 +730,12 @@ the source address, so verify the effective firewall path and do not treat the
 backend-observed source IP as client authentication. See the
 [Kubernetes NodePort guidance](https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport).
 
-After applying, operator acceptance must demonstrate HTTP through TCP 30080 and
+After applying, operator acceptance must demonstrate HTTPS through TCP 30080 and
 WebTransport through UDP 30433 from the OxiBelt container, and denial from unintended
 networks across all exposed nodes/interfaces. Verify backend certificate trust and
-hostname validation, allowed Host/Origin behavior, and absence of public health
-routes. Run these checks again after service-proxy, CNI, Docker, firewall or node
+hostname validation, the required client CA/DNS SAN on both transports, allowed
+Host/Origin behavior, and absence of public health routes. Run these checks again
+after service-proxy, CNI, Docker, firewall or node
 changes. Offline rendering and Docker fixtures do not establish these properties
 on a real cluster. The [network policies](#network-and-namespace-boundaries)
 complement these host restrictions; no intermediary proxy is introduced.
@@ -824,8 +862,10 @@ appropriate permitted control, then correlate the rejected attempt with CNI/fire
 denial evidence. A timeout, authentication failure, TLS rejection or missing listener
 alone does not prove network denial. Use fresh connections after policy convergence.
 
-- From the actual OxiBelt container, verify HTTP and native WebTransport through
-  the two NodePorts, retaining certificate, Host and Origin checks. From unintended
+- From the actual OxiBelt container, verify HTTPS and native WebTransport through
+  the two NodePorts, retaining server/client certificate, Host and Origin checks.
+  Verify fresh connections without a client certificate and with a wrong client
+  CA or DNS SAN fail before tool admission on each transport. From unintended
   networks, verify rejection on every exposed node/interface and both protocols;
   include direct Pod paths when routable. Node-exempt paths require firewall evidence.
 - Verify PostgreSQL with hostname-validated TLS for serving and each of migration,
@@ -929,7 +969,8 @@ the project-specific invariants; it does not establish scheduling, authorization
 CNI enforcement, storage availability or correctness of operator substitutions.
 
 The image gate consumes rendered configurations with the same runtime paths,
-using disposable values for authorities, corresponding source and certificates.
+using disposable values for authorities, corresponding source, backend and
+edge-client certificates and CA.
 It exercises both HTTP MCP revisions, Host/Origin denial, packaged widgets and
 text workers, then retained search/restart and startup failures described above.
 Fixtures use named Docker volume subdirectories; no host ports are published.
@@ -1137,10 +1178,12 @@ The [command dispatcher](../apps/server/src/main.rs) implements these modes;
 
 The [configuration implementation](../apps/server/src/config.rs) makes listener
 addresses explicit; `8080/TCP`, `4433/UDP` and `9090/TCP` above are the selected
-deployment ports, not hard-coded server defaults. WebTransport requires explicit
-certificate/key paths. The corpus requires PostgreSQL persistence, text comparison,
-widget paths and a provisioned MeCab-Ko dictionary. Preserve the text-comparison
-profile of 16 MiB messages and at least 256 MiB transport buffering.
+deployment ports, not hard-coded server defaults. Both data transports require
+the backend certificate/key and verify the edge client against the configured CA
+and DNS SAN; private health remains plaintext. The corpus requires PostgreSQL
+persistence, text comparison, widget paths and a provisioned MeCab-Ko dictionary.
+Preserve the text-comparison profile of 16 MiB messages and at least 256 MiB
+transport buffering.
 
 Runtime and migration environment names are configurable and must differ. Keep
 the existing defaults, `OPENLEGAL_DATABASE_URL` and
@@ -1426,10 +1469,10 @@ database or enable ingestion for these checks.
 | Gate | Required observation | Evidence limit |
 | --- | --- | --- |
 | Pod and private health | Running, non-terminating Ready Pod; `/live` and `/ready` return 200 from permitted path | Not index catch-up or a fresh DB query |
-| TCP/UDP NodePorts | Actual edge container reaches HTTP and native WebTransport; unintended fixture clients are denied | Positive controls plus observed CNI/firewall counters; timeouts alone fail evidence requirements |
+| TCP/UDP NodePorts | Actual edge container reaches HTTPS and native WebTransport; unintended fixture clients are denied | Positive controls plus observed CNI/firewall counters; timeouts alone fail evidence requirements |
 | Public MCP | Both revisions, both transports, source metadata, tiny diff and HTTP SSE progress pass | Native clients, not browser or ChatGPT acceptance |
 | Host/Origin and health exclusion | Invalid HTTP Host 404, invalid Origin 403, public health paths 404; native invalid Origin is session-rejected | Keep known-good TLS/endpoint controls |
-| Backend trust and identity | Fresh WT connection fails under unrelated backend CA and under trusted wrong-SAN certificate; HTTP/private-health controls remain good; restoring trust/identity recovers WT | Change only disposable edge trust/backend certificate; client-side CA failure is a different boundary |
+| Backend trust and identity | Fresh HTTPS and WebTransport connections fail under unrelated backend CA or wrong server SAN; absent client certificate and wrong client CA/DNS SAN fail on both transports; restoring trust and identity recovers both | Change only disposable edge/backend trust and certificates; keep a private-health positive control |
 | PostgreSQL credentials | Migration Job completes before serving; runtime role receives insufficient-privilege SQLSTATE for disposable DDL; serving has no migration credential reference or mount | Never print environment values, Secret data, SQL credentials or full workload dumps |
 | Storage | Separate PV/mount paths, expected ownership, writable private data paths and read-only dictionary | Local directories inside kind are not production ZFS qualification or disk quotas |
 | Graceful lifecycle | Stop an already-ready Deployment, observe clean server termination within grace, then start it and verify retained capture/search identity | Do not force-delete Pods; early initialization has a different shutdown boundary |

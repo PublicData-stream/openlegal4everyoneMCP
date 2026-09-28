@@ -170,6 +170,8 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
     .with_resources(resources);
     builder
         .register_endpoint(HttpEndpoint {
+            tls: None,
+            edge_mtls: None,
             bind: "127.0.0.1:0".parse().unwrap(),
             access: AccessPolicy {
                 allowed_hosts: vec!["database.test".into()],

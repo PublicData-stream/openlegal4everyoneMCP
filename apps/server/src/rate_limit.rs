@@ -1,6 +1,6 @@
 //! Fixed-size process-local token bucket for valid MCP tool calls.
 
-use crate::config::RateLimitConfig;
+use crate::config::VerifiedTunnelRateLimitConfig;
 use tokio::{sync::Mutex, time::Instant};
 
 const TOKEN: u128 = 1_000_000_000;
@@ -11,23 +11,31 @@ struct Bucket {
 }
 
 pub(crate) struct RateLimiter {
-    config: RateLimitConfig,
+    enabled: bool,
+    calls_per_second: u32,
+    burst: u32,
     bucket: Mutex<Bucket>,
 }
 
 impl RateLimiter {
-    pub(crate) fn new(config: RateLimitConfig) -> Self {
+    pub(crate) fn new(enabled: bool, calls_per_second: u32, burst: u32) -> Self {
         Self {
             bucket: Mutex::new(Bucket {
-                tokens: u128::from(config.burst) * TOKEN,
+                tokens: u128::from(burst) * TOKEN,
                 at: Instant::now(),
             }),
-            config,
+            enabled,
+            calls_per_second,
+            burst,
         }
     }
 
+    pub(crate) fn verified_tunnel(config: &VerifiedTunnelRateLimitConfig) -> Self {
+        Self::new(true, config.calls_per_second, config.burst)
+    }
+
     pub(crate) async fn try_admit(&self) -> bool {
-        if !self.config.enabled {
+        if !self.enabled {
             return true;
         }
         let mut bucket = self.bucket.lock().await;
@@ -35,11 +43,11 @@ impl RateLimiter {
         let refill = now
             .saturating_duration_since(bucket.at)
             .as_nanos()
-            .saturating_mul(u128::from(self.config.calls_per_second));
+            .saturating_mul(u128::from(self.calls_per_second));
         bucket.tokens = bucket
             .tokens
             .saturating_add(refill)
-            .min(u128::from(self.config.burst) * TOKEN);
+            .min(u128::from(self.burst) * TOKEN);
         bucket.at = now;
         if bucket.tokens < TOKEN {
             return false;
@@ -56,11 +64,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn burst_and_fractional_refill_are_exact() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            enabled: true,
-            calls_per_second: 2,
-            burst: 3,
-        });
+        let limiter = RateLimiter::new(true, 2, 3);
         for _ in 0..3 {
             assert!(limiter.try_admit().await);
         }
@@ -79,11 +83,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_limiter_never_consumes_tokens() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            enabled: false,
-            calls_per_second: 1,
-            burst: 1,
-        });
+        let limiter = RateLimiter::new(false, 1, 1);
         for _ in 0..100 {
             assert!(limiter.try_admit().await);
         }

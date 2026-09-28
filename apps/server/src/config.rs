@@ -27,6 +27,14 @@ pub struct RateLimitConfig {
     pub enabled: bool,
     pub calls_per_second: u32,
     pub burst: u32,
+    pub verified_tunnel: Option<VerifiedTunnelRateLimitConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedTunnelRateLimitConfig {
+    pub calls_per_second: u32,
+    pub burst: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -35,6 +43,7 @@ impl Default for RateLimitConfig {
             enabled: true,
             calls_per_second: 100,
             burst: 100,
+            verified_tunnel: None,
         }
     }
 }
@@ -78,6 +87,14 @@ impl Limits {
             || self.max_calls_per_connection > self.max_in_flight
             || !(1..=10_000).contains(&self.rate_limit.calls_per_second)
             || !(1..=10_000).contains(&self.rate_limit.burst)
+            || self
+                .rate_limit
+                .verified_tunnel
+                .as_ref()
+                .is_some_and(|override_config| {
+                    !(1..=10_000).contains(&override_config.calls_per_second)
+                        || !(1..=10_000).contains(&override_config.burst)
+                })
             || [
                 self.io_timeout_secs,
                 self.call_timeout_secs,
@@ -132,12 +149,19 @@ mod limits_tests {
             "[rate_limit]\ncalls_per_second = 10001",
             "[rate_limit]\nburst = 10001",
             "[rate_limit]\nunknown = 1",
+            "[rate_limit.verified_tunnel]\ncalls_per_second = 0\nburst = 1",
+            "[rate_limit.verified_tunnel]\ncalls_per_second = 1\nburst = 10001",
+            "[rate_limit.verified_tunnel]\ncalls_per_second = 1",
         ] {
             assert!(
                 toml::from_str::<Limits>(invalid).map_or(true, |limits| limits.validate().is_err()),
                 "{invalid}"
             );
         }
+        let tunnel: Limits =
+            toml::from_str("[rate_limit.verified_tunnel]\ncalls_per_second = 1000\nburst = 1000")
+                .unwrap();
+        assert!(tunnel.validate().is_ok());
     }
 }
 
@@ -204,6 +228,46 @@ pub struct HttpConfig {
     pub bind: SocketAddr,
     pub allowed_hosts: Vec<String>,
     pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub tls: Option<HttpTlsConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpTlsConfig {
+    pub certificate: PathBuf,
+    pub private_key: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeMtlsConfig {
+    pub client_ca_file: PathBuf,
+    pub required_client_dns_san: String,
+}
+
+impl EdgeMtlsConfig {
+    pub fn validate(&self) -> Result<(), ServerError> {
+        let name = self.required_client_dns_san.as_str();
+        if name.is_empty()
+            || name.len() > 253
+            || name.starts_with('.')
+            || name.ends_with('.')
+            || name.parse::<std::net::IpAddr>().is_ok()
+            || name.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+        {
+            return Err("edge mTLS requires an exact DNS SAN".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -229,6 +293,8 @@ pub struct Config {
     pub http: HttpConfig,
     pub webtransport: WebTransportConfig,
     pub health: HealthConfig,
+    #[serde(default)]
+    pub edge_mtls: Option<EdgeMtlsConfig>,
     #[serde(default)]
     pub limits: Limits,
     /// Explicit, isolated synthetic workflow. Absent in ordinary server configurations.
@@ -421,6 +487,18 @@ impl PostgresConfig {
 }
 
 impl Config {
+    pub fn validate_transport_security(&self) -> Result<(), ServerError> {
+        if let Some(edge_mtls) = &self.edge_mtls {
+            edge_mtls.validate()?;
+            if self.http.tls.is_none() {
+                return Err("edge mTLS requires HTTP TLS".into());
+            }
+        } else if self.limits.rate_limit.verified_tunnel.is_some() {
+            return Err("verified tunnel rate limit requires edge mTLS".into());
+        }
+        self.limits.validate()
+    }
+
     pub fn validate_storage(&self) -> Result<(), ServerError> {
         if (self.demo.is_some() || self.database.is_some()) && self.cache.is_none() {
             return Err("retrieval requires an explicit [cache] mode: memory or persistent".into());
@@ -618,6 +696,27 @@ bind = "127.0.0.1:8082"
         ))
         .unwrap();
         assert_eq!(config.source.url.url(), "https://example.test/source");
+        assert!(config.validate_transport_security().is_ok());
+        let no_mtls: Config = toml::from_str(&format!(
+            "{base}\n[source]\nurl = 'https://example.test/source'\n[limits.rate_limit.verified_tunnel]\ncalls_per_second = 2\nburst = 2"
+        )).unwrap();
+        assert!(no_mtls.validate_transport_security().is_err());
+        let no_http_tls: Config = toml::from_str(&format!(
+            "{base}\n[source]\nurl = 'https://example.test/source'\n[edge_mtls]\nclient_ca_file = 'ca.pem'\nrequired_client_dns_san = 'oxibelt.openlegal.internal'"
+        )).unwrap();
+        assert!(no_http_tls.validate_transport_security().is_err());
+        for invalid_san in [
+            "*.openlegal.internal",
+            "bad name",
+            "127.0.0.1",
+            "-edge.test",
+        ] {
+            let edge = EdgeMtlsConfig {
+                client_ca_file: "ca.pem".into(),
+                required_client_dns_san: invalid_san.into(),
+            };
+            assert!(edge.validate().is_err(), "{invalid_san}");
+        }
     }
 }
 

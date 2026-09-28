@@ -2584,12 +2584,14 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
  "url",
  "wtransport",
+ "x509-parser",
 ]
 
 [[package]]

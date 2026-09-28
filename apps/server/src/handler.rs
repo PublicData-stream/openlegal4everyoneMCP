@@ -36,6 +36,8 @@ pub struct McpHandler {
     limits: Arc<Limits>,
     calls: Arc<Semaphore>,
     rate: Arc<RateLimiter>,
+    verified_rate: Option<Arc<RateLimiter>>,
+    verified_tunnel: bool,
     pub counters: Arc<Counters>,
 }
 
@@ -91,10 +93,27 @@ impl McpHandler {
             source,
             resources: Arc::new(resources),
             calls: Arc::new(Semaphore::new(limits.max_in_flight)),
-            rate: Arc::new(RateLimiter::new(limits.rate_limit.clone())),
+            rate: Arc::new(RateLimiter::new(
+                limits.rate_limit.enabled,
+                limits.rate_limit.calls_per_second,
+                limits.rate_limit.burst,
+            )),
+            verified_rate: limits
+                .rate_limit
+                .verified_tunnel
+                .as_ref()
+                .map(|config| Arc::new(RateLimiter::verified_tunnel(config))),
+            verified_tunnel: false,
             limits,
             counters: Arc::new(Counters::default()),
         })
+    }
+
+    /// Select the shared alternate bucket only after the transport verifies edge mTLS.
+    pub(crate) fn for_verified_tunnel(&self) -> Self {
+        let mut handler = self.clone();
+        handler.verified_tunnel = true;
+        handler
     }
 }
 
@@ -219,7 +238,12 @@ impl ServerHandler for McpHandler {
             .try_acquire_owned()
             .map_err(|_| ErrorData::internal_error("server busy", None))?;
         self.counters.calls.fetch_add(1, Ordering::Relaxed);
-        if !self.rate.try_admit().await {
+        let rate = if self.verified_tunnel {
+            self.verified_rate.as_ref().unwrap_or(&self.rate)
+        } else {
+            &self.rate
+        };
+        if !rate.try_admit().await {
             self.counters.failures.fetch_add(1, Ordering::Relaxed);
             self.counters.rate_limited.fetch_add(1, Ordering::Relaxed);
             return Ok(map_tool_error(ToolError::RateLimited)?.into());

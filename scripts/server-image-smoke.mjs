@@ -1,12 +1,19 @@
 // Synthetic image acceptance only. No external requests or runtime dependencies.
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import https from 'node:https';
 import { readFile } from 'node:fs/promises';
 
 const modern = '2026-07-28';
 const legacy = '2025-11-25';
 const { source, authority, retained = false } = JSON.parse(await readFile('/fixture/client.json', 'utf8'));
 const expected = retained ? JSON.parse(await readFile('/fixture/expected.json', 'utf8')) : undefined;
+const tunnelTls = retained ? {
+  ca: await readFile('/fixture/tls/tls.crt'),
+  cert: await readFile('/fixture/edge-client/tls.crt'),
+  key: await readFile('/fixture/edge-client/tls.key'),
+  servername: 'server',
+} : undefined;
 const maxBody = 16 * 1024 * 1024;
 
 function exchange(path, body, protocol = legacy, session, overrides = {}) {
@@ -25,9 +32,10 @@ function exchange(path, body, protocol = legacy, session, overrides = {}) {
       }
     }
     Object.assign(headers, overrides);
-    const request = http.request({
+    const request = (body && retained ? https : http).request({
       hostname: 'server', port: body ? 8080 : 9090, path,
       method: body ? 'POST' : 'GET', headers,
+      ...(body && retained ? tunnelTls : {}),
     });
     // An absolute deadline also bounds peers which continually trickle bytes.
     const timer = setTimeout(() => request.destroy(new Error('request deadline exceeded')), 10000);

@@ -26,11 +26,11 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use wtransport::{Endpoint as QuicEndpoint, Identity, ServerConfig, tls::rustls};
+use wtransport::{Endpoint as QuicEndpoint, ServerConfig, tls::rustls};
 
 use crate::{
     ServerError,
-    config::AccessPolicy,
+    config::{AccessPolicy, EdgeMtlsConfig},
     endpoint::{Binding, BoundEndpoint, Endpoint, EndpointContext, Network},
     framing::{FrameReader, write_json},
     handler::McpHandler,
@@ -44,6 +44,7 @@ pub struct WebTransportEndpoint {
     pub certificate: PathBuf,
     pub private_key: PathBuf,
     pub access: AccessPolicy,
+    pub edge_mtls: Option<EdgeMtlsConfig>,
 }
 
 impl Endpoint for WebTransportEndpoint {
@@ -59,23 +60,21 @@ impl Endpoint for WebTransportEndpoint {
     async fn bind(self, context: EndpointContext) -> Result<BoundEndpoint, ServerError> {
         self.access.validate()?;
         context.limits.validate()?;
-        let identity = Identity::load_pemfiles(&self.certificate, &self.private_key).await?;
+        if context.limits.rate_limit.verified_tunnel.is_some() && self.edge_mtls.is_none() {
+            return Err("verified tunnel rate limit requires WebTransport edge mTLS".into());
+        }
         // Preserve wtransport's ring/TLS 1.3 defaults, but propagate invalid identity
         // errors: its default TLS builder panics on empty chains or mismatched keys.
-        let certificates = identity
-            .certificate_chain()
-            .as_slice()
-            .iter()
-            .map(|certificate| rustls::pki_types::CertificateDer::from(certificate.der().to_vec()))
-            .collect();
-        let private_key = rustls::pki_types::PrivateKeyDer::try_from(
-            identity.private_key().secret_der().to_vec(),
-        )?;
+        let (certificates, private_key) =
+            crate::edge_mtls::server_identity(&self.certificate, &self.private_key).await?;
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
+        .with_client_cert_verifier(match &self.edge_mtls {
+            Some(edge_mtls) => crate::edge_mtls::client_verifier(edge_mtls)?,
+            None => rustls::server::WebPkiClientVerifier::no_client_auth(),
+        })
         .with_single_cert(certificates, private_key)?;
         tls.alpn_protocols = vec![wtransport::tls::WEBTRANSPORT_ALPN.to_vec()];
         // Flow-control credit bounds transport reassembly, not complete JSON frames.
@@ -104,8 +103,10 @@ impl Endpoint for WebTransportEndpoint {
             .incoming_buffer_size_total(context.limits.max_buffer_bytes.min(8 * 1024 * 1024) as u64);
         let endpoint = QuicEndpoint::server(config)?;
         let address = endpoint.local_addr()?;
+        let verified_tunnel = self.edge_mtls.is_some();
+        let access = self.access;
         Ok(BoundEndpoint {
-            id: self.id().into(),
+            id: "webtransport".into(),
             addresses: vec![address],
             run: Box::pin(async move {
                 let mut sessions = JoinSet::new();
@@ -124,11 +125,11 @@ impl Endpoint for WebTransportEndpoint {
                         incoming = endpoint.accept() => {
                             let Ok(permit) = context.connections.clone().try_acquire_owned() else { incoming.refuse(); continue; };
                             let context = context.clone();
-                            let access = self.access.clone();
+                            let access = access.clone();
                             sessions.spawn(async move {
                                 let _permit = permit;
                                 // Connection errors are isolated. Never log peer-controlled payloads.
-                                let _ = serve_connection(incoming, access, context).await;
+                                let _ = serve_connection(incoming, access, context, verified_tunnel).await;
                             });
                         }
                     }
@@ -163,6 +164,7 @@ async fn serve_connection(
     incoming: wtransport::endpoint::IncomingSession,
     access: AccessPolicy,
     context: EndpointContext,
+    verified_tunnel: bool,
 ) -> Result<(), ServerError> {
     let io_timeout = Duration::from_secs(context.limits.io_timeout_secs);
     let request = tokio::select! {
@@ -191,7 +193,8 @@ async fn serve_connection(
             reader: FrameReader::new(recv, context.limits.max_message_bytes, context.buffers.clone(), Duration::from_secs(context.limits.idle_timeout_secs), io_timeout),
             writer: Arc::new(AsyncMutex::new(send)), context: context.clone(), ledger: ledger.clone(), cancel: cancel.clone(), era: Era::Undecided, initialized: false, prefetched: None,
         };
-        let service = TrackedHandler { inner: context.handler.clone(), ledger, cancel: cancel.clone() };
+        let handler = if verified_tunnel { context.handler.for_verified_tunnel() } else { context.handler.clone() };
+        let service = TrackedHandler { inner: handler, ledger, cancel: cancel.clone() };
         let serving = async {
             // Select the lifecycle before entering the SDK. Modern first requests
             // must run concurrently, so their cancellation can already be received.

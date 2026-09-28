@@ -154,6 +154,8 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
         );
         builder
             .register_endpoint(HttpEndpoint {
+                tls: None,
+                edge_mtls: None,
                 bind: "127.0.0.1:0".parse().unwrap(),
                 access: AccessPolicy {
                     allowed_hosts: vec!["demo.test".into()],
@@ -163,6 +165,7 @@ async fn shared_http_and_webtransport_retrieval_progress_and_resources() {
             .unwrap();
         builder
             .register_endpoint(WebTransportEndpoint {
+                edge_mtls: None,
                 bind: format!("127.0.0.1:{port}").parse().unwrap(),
                 certificate,
                 private_key: key,

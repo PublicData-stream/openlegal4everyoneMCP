@@ -2,7 +2,7 @@
 
 use crate::{
     ServerError,
-    config::AccessPolicy,
+    config::{AccessPolicy, EdgeMtlsConfig, HttpTlsConfig},
     endpoint::{Binding, BoundEndpoint, Endpoint, EndpointContext, Network},
 };
 use axum::{
@@ -23,11 +23,18 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::TlsAcceptor;
+use wtransport::tls::rustls;
+
+trait HttpIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> HttpIo for T {}
 
 async fn serve_bounded(
     listener: tokio::net::TcpListener,
     app: Router,
     context: EndpointContext,
+    tls_acceptor: Option<TlsAcceptor>,
 ) -> Result<(), ServerError> {
     use hyper_util::{
         rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -47,8 +54,18 @@ async fn serve_bounded(
                 let Ok(permit) = context.connections.clone().try_acquire_owned() else { continue; };
                 let app = app.clone();
                 let context = context.clone();
+                let tls_acceptor = tls_acceptor.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
+                    let io: Box<dyn HttpIo> = if let Some(acceptor) = tls_acceptor {
+                        let Ok(Ok(stream)) = tokio::time::timeout(
+                            Duration::from_secs(context.limits.io_timeout_secs),
+                            acceptor.accept(stream),
+                        ).await else { return; };
+                        Box::new(stream)
+                    } else {
+                        Box::new(stream)
+                    };
                     let state = crate::timed_io::ConnectionState::new();
                     let app = app.layer(axum::Extension(state.clone()));
                     let mut builder = Builder::new(TokioExecutor::new());
@@ -60,7 +77,7 @@ async fn serve_bounded(
                         .max_header_list_size(32 * 1024)
                         .keep_alive_interval(Duration::from_secs(context.limits.idle_timeout_secs))
                         .keep_alive_timeout(Duration::from_secs(context.limits.io_timeout_secs));
-                    let io = crate::timed_io::TimedIo::new(stream, Duration::from_secs(context.limits.io_timeout_secs));
+                    let io = crate::timed_io::TimedIo::new(io, Duration::from_secs(context.limits.io_timeout_secs));
                     let connection = builder.serve_connection(TokioIo::new(io), TowerToHyperService::new(app));
                     tokio::pin!(connection);
                     tokio::select! {
@@ -83,6 +100,8 @@ async fn serve_bounded(
 pub struct HttpEndpoint {
     pub bind: SocketAddr,
     pub access: AccessPolicy,
+    pub tls: Option<HttpTlsConfig>,
+    pub edge_mtls: Option<EdgeMtlsConfig>,
 }
 
 impl Endpoint for HttpEndpoint {
@@ -97,9 +116,37 @@ impl Endpoint for HttpEndpoint {
     }
     async fn bind(self, context: EndpointContext) -> Result<BoundEndpoint, ServerError> {
         self.access.validate()?;
+        if context.limits.rate_limit.verified_tunnel.is_some() && self.edge_mtls.is_none() {
+            return Err("verified tunnel rate limit requires HTTP edge mTLS".into());
+        }
+        if self.edge_mtls.is_some() && self.tls.is_none() {
+            return Err("HTTP edge mTLS requires HTTP TLS".into());
+        }
+        let tls_acceptor = if let Some(tls) = &self.tls {
+            let (certificates, private_key) =
+                crate::edge_mtls::server_identity(&tls.certificate, &tls.private_key).await?;
+            let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])?;
+            let mut server = if let Some(edge_mtls) = &self.edge_mtls {
+                builder.with_client_cert_verifier(crate::edge_mtls::client_verifier(edge_mtls)?)
+            } else {
+                builder.with_no_client_auth()
+            }
+            .with_single_cert(certificates, private_key)?;
+            server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            Some(TlsAcceptor::from(Arc::new(server)))
+        } else {
+            None
+        };
         let listener = tokio::net::TcpListener::bind(self.bind).await?;
         let address = listener.local_addr()?;
-        let handler = context.handler.clone();
+        let handler = if self.edge_mtls.is_some() {
+            context.handler.for_verified_tunnel()
+        } else {
+            context.handler.clone()
+        };
         // Legacy initialize remains supported; the read-only registry needs no persistent sessions.
         let config = StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
@@ -120,7 +167,7 @@ impl Endpoint for HttpEndpoint {
                     (context.clone(), self.access),
                     guard,
                 ));
-        let run = async move { serve_bounded(listener, app, context).await }.boxed();
+        let run = async move { serve_bounded(listener, app, context, tls_acceptor).await }.boxed();
         Ok(BoundEndpoint {
             id: "http".into(),
             addresses: vec![address],

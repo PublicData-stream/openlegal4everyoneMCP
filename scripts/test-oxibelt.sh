@@ -22,7 +22,7 @@ case "$profile" in
     *) echo "Unknown profile: $profile" >&2; exit 2 ;;
 esac
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-revision=72564d165dfd05cb29a64aeebd19fccd7944ea6f
+revision=e879ac7e263b0af9a86280cd8799de44cbffc05c
 scratch=$(mktemp -d)
 run_id="openlegal-edge-$$"
 image="$run_id:local"
@@ -73,9 +73,9 @@ else
     git -C "$source_checkout" archive "$revision" | tar -x -C "$scratch/source"
     target_dir=${OXIBELT_TARGET_DIR:-"$repo/target/oxibelt"}
     target_dir=$(realpath -m -- "$target_dir")
-    OXIBELT_BUILD_VERSION=0.0.0-dev.g72564d16 \
-    OXIBELT_BUILD_REVISION="$revision" OXIBELT_BUILD_REF=unknown \
-    OXIBELT_BUILD_DIRTY=clean OXIBELT_BUILD_KIND=git_development \
+    OXIBELT_BUILD_VERSION=0.10.0 \
+    OXIBELT_BUILD_REVISION="$revision" OXIBELT_BUILD_REF=refs/tags/0.10.0 \
+    OXIBELT_BUILD_DIRTY=clean OXIBELT_BUILD_KIND=tagged_development \
     CARGO_TARGET_DIR="$target_dir" CARGO_PROFILE_DEV_DEBUG=0 \
         cargo build --manifest-path "$scratch/source/Cargo.toml" \
         -p oxibelt --bin oxibelt --locked -j "${OXIBELT_BUILD_JOBS:-2}"
@@ -85,7 +85,7 @@ fi
 import json, sys
 lines = sys.stdin.read().splitlines()
 identity = next((json.loads(line.split("=", 1)[1]) for line in lines if line.startswith("OXIBELT_BUILD_IDENTITY_V1=")), None)
-assert identity and identity.get("revision") == sys.argv[1] and identity.get("dirty") == "clean", "OxiBelt binary must report the pinned clean revision"
+assert identity and identity.get("revision") == sys.argv[1] and identity.get("dirty") == "clean" and identity.get("version") == "0.10.0" and identity.get("source_ref") == "refs/tags/0.10.0" and identity.get("kind") == "tagged_development", "OxiBelt binary must report the pinned clean 0.10.0 release source"
 print("Verified OxiBelt revision:", identity["revision"])
 ' "$revision"
 mkdir -p "$scratch/bin" "$scratch/fixture/config" "$scratch/fixture/cert"
@@ -112,9 +112,25 @@ for name, maximum in zip(sys.argv[1:], (1024 * 1024, 3 * 1024 * 1024), strict=Tr
 PYBOUND
 cat >> "$scratch/fixture/backend.toml" <<'TOML'
 
+[http.tls]
+certificate = "/fixture/cert/backend.pem"
+private_key = "/fixture/cert/backend-key.pem"
+
 [limits]
 max_message_bytes = 16777216
 max_buffer_bytes = 268435456
+
+[limits.rate_limit]
+calls_per_second = 1
+burst = 1
+
+[limits.rate_limit.verified_tunnel]
+calls_per_second = 1000
+burst = 1000
+
+[edge_mtls]
+client_ca_file = "/fixture/cert/edge-client-ca.pem"
+required_client_dns_san = "oxibelt.openlegal.internal"
 
 [demo]
 upstream = "http://127.0.0.1:8081"
@@ -165,6 +181,10 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
     -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
     -subj /CN=OpenLegal-Untrusted-CA -keyout "$scratch/wrong-ca-key.pem" \
     -out "$scratch/fixture/cert/wrong-ca.pem" >/dev/null 2>&1
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+    -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
+    -subj /CN=OpenLegal-Edge-Client-CA -keyout "$scratch/edge-client-ca-key.pem" \
+    -out "$scratch/fixture/cert/edge-client-ca.pem" >/dev/null 2>&1
 for name in edge backend wrong-backend; do
     openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
         -subj "/CN=$name" -keyout "$scratch/fixture/cert/$name-key.pem" \
@@ -174,6 +194,19 @@ for name in edge backend wrong-backend; do
         -CAkey "$scratch/ca-key.pem" -CAcreateserial -days 2 \
         -extfile "$scratch/$name.ext" -out "$scratch/fixture/cert/$name.pem" >/dev/null 2>&1
 done
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -subj /CN=oxibelt.openlegal.internal \
+    -keyout "$scratch/fixture/cert/openlegal-client-key.pem" \
+    -out "$scratch/edge-client.csr" >/dev/null 2>&1
+printf 'subjectAltName=DNS:oxibelt.openlegal.internal\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n' > "$scratch/edge-client.ext"
+openssl x509 -req -in "$scratch/edge-client.csr" \
+    -CA "$scratch/fixture/cert/edge-client-ca.pem" \
+    -CAkey "$scratch/edge-client-ca-key.pem" -CAcreateserial -days 2 \
+    -extfile "$scratch/edge-client.ext" \
+    -out "$scratch/fixture/cert/openlegal-client.pem" >/dev/null 2>&1
+openssl verify -CAfile "$scratch/fixture/cert/edge-client-ca.pem" \
+    -purpose sslclient -verify_hostname oxibelt.openlegal.internal \
+    "$scratch/fixture/cert/openlegal-client.pem"
 # Verify the negative fixture isolates identity from trust before using it.
 openssl verify -CAfile "$scratch/fixture/cert/ca.pem" "$scratch/fixture/cert/wrong-backend.pem"
 if openssl verify -CAfile "$scratch/fixture/cert/ca.pem" -verify_hostname backend \
@@ -181,13 +214,27 @@ if openssl verify -CAfile "$scratch/fixture/cert/ca.pem" -verify_hostname backen
     echo 'Wrong-SAN fixture unexpectedly identifies backend' >&2
     exit 1
 fi
-# Container's unprivileged user must read these disposable keys.
+# OxiBelt requires the mTLS client key to be unreadable by group and world.
+# The serving UID owns that key inside the disposable fixture volume.
 chmod 444 "$scratch/fixture/cert/"*.pem
+chmod 400 "$scratch/fixture/cert/openlegal-client-key.pem"
 python3 - "$scratch/fixture/config/oxibelt.toml" "$scratch/fixture/backend.toml" <<'PY'
 import pathlib, sys
 source = pathlib.Path(sys.argv[1])
-(source.parent / "oxibelt-untrusted.toml").write_text(source.read_text().replace(
+config = source.read_text()
+(source.parent / "oxibelt-untrusted.toml").write_text(config.replace(
     'trusted_ca_certs = ["ca.pem"]', 'trusted_ca_certs = ["wrong-ca.pem"]'))
+client_identity = ('[upstreams.tls.client_identity]\n'
+                   'cert_chain = "openlegal-client.pem"\n'
+                   'private_key = "openlegal-client-key.pem"\n\n')
+assert config.count(client_identity) == 2, "both upstreams must present the edge client identity"
+(source.parent / "oxibelt-no-client.toml").write_text(config.replace(client_identity, ""))
+assert config.count('rate = "1000r/s"\nburst = 1000') == 1
+(source.parent / "oxibelt-http-throttled.toml").write_text(config.replace(
+    'rate = "1000r/s"\nburst = 1000', 'rate = "1r/s"\nburst = 1'))
+assert config.count('rate = "100r/s"\nburst = 100') == 1
+(source.parent / "oxibelt-wt-throttled.toml").write_text(config.replace(
+    'rate = "100r/s"\nburst = 100', 'rate = "1r/s"\nburst = 1'))
 backend = pathlib.Path(sys.argv[2])
 (backend.parent / "backend-wrong-san.toml").write_text(backend.read_text().replace(
     '/cert/backend.pem', '/cert/wrong-backend.pem').replace(
@@ -202,6 +249,9 @@ docker volume create "$blob_volume" >/dev/null
 tar -c -C "$scratch/fixture" . | docker run --rm -i --network none --user 0:0 \
     --mount "type=volume,source=$fixture_volume,target=/fixture" \
     --entrypoint tar "$image" -x -C /fixture
+docker run --rm --network none --user 0:0 \
+    --mount "type=volume,source=$fixture_volume,target=/fixture" \
+    --entrypoint /bin/sh "$image" -c 'chown 65532:65532 /fixture/cert/openlegal-client-key.pem && chmod 400 /fixture/cert/openlegal-client-key.pem'
 hardening=(--mount "type=volume,source=$fixture_volume,target=/fixture,readonly" --network "$network" --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs "/tmp:rw,noexec,nosuid,size=16m")
 docker run --rm "${hardening[@]}" --entrypoint /usr/local/bin/oxibelt "$image" --config /fixture/config/oxibelt.toml --check
 # The database and immutable blobs are separate disposable persistence components.
@@ -230,7 +280,26 @@ start_backend /fixture/backend.toml
 start_edge() {
     docker run -d --name "$edge" --network-alias edge "${hardening[@]}" --memory 1g --ulimit stack=67108864:67108864 \
         --entrypoint /usr/local/bin/oxibelt "$image" --config "$1" >/dev/null
-    docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/http_smoke.py /fixture/cert/ca.pem --ready
+    if [[ ${2:-ready} == ready ]]; then
+        docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/http_smoke.py /fixture/cert/ca.pem --ready
+    fi
+}
+reject_http_upstream() {
+    docker run --rm "${hardening[@]}" --entrypoint python3 "$image" -c '
+import sys, time
+sys.path.insert(0, "/fixture")
+from http_smoke import MODERN, exchange, request
+deadline = time.monotonic() + 10
+while True:
+    try:
+        status, _, _ = exchange(request("tools/list", MODERN), timeout=2)
+        break
+    except OSError:
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(0.1)
+assert status in (502, 503, 504), f"expected upstream TLS rejection, got HTTP {status}"
+'
 }
 client() {
     docker run --rm "${hardening[@]}" --entrypoint /usr/local/bin/wt_client "$image" "$@"
@@ -272,19 +341,57 @@ done
 reject_client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28 https://rejected.test
 reject_client https://edge:8443/mcp-wt/wrong /fixture/cert/ca.pem 2026-07-28
 reject_client https://edge:8443/mcp-wt/v1 /fixture/cert/wrong-ca.pem 2026-07-28
-# Change only upstream trust, then prove that HTTP still works but QUIC forwarding fails.
+# Exercise the route's own request bucket with a temporary one-token policy.
 docker rm -f "$edge" >/dev/null
-start_edge /fixture/config/oxibelt-untrusted.toml
+start_edge /fixture/config/oxibelt-http-throttled.toml skip-ready
+docker run --rm "${hardening[@]}" --entrypoint python3 "$image" -c '
+import sys, time
+sys.path.insert(0, "/fixture")
+from http_smoke import MODERN, exchange, request
+deadline = time.monotonic() + 10
+while True:
+    try:
+        first, _, _ = exchange(request("tools/list", MODERN), timeout=2)
+        break
+    except OSError:
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(0.1)
+assert first == 200, first
+second, _, _ = exchange(request("tools/list", MODERN))
+assert second == 429, second
+time.sleep(1.2)
+recovered, _, _ = exchange(request("tools/list", MODERN))
+assert recovered == 200, recovered
+print("HTTP edge rate limit: 429 and refill recovery", flush=True)
+'
+# A WebTransport rate limit counts CONNECT handshakes, not calls in a session.
+docker rm -f "$edge" >/dev/null
+start_edge /fixture/config/oxibelt-wt-throttled.toml
+client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
+reject_client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
+sleep 1.2
+client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
+# Change only upstream trust and prove both private TLS handshakes fail.
+docker rm -f "$edge" >/dev/null
+start_edge /fixture/config/oxibelt-untrusted.toml skip-ready
+reject_http_upstream
 reject_client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
 # Restore trust and reconnect to rule out persistent transport/startup failures.
 docker rm -f "$edge" >/dev/null
 start_edge /fixture/config/oxibelt.toml
 client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
+# OxiBelt cannot use either backend transport without a client certificate.
+docker rm -f "$edge" >/dev/null
+start_edge /fixture/config/oxibelt-no-client.toml skip-ready
+reject_http_upstream
+reject_client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
 # Restart both endpoints to rule out reuse of an already authenticated QUIC
 # connection, then change only the backend certificate identity (same trusted CA).
 docker rm -f "$edge" "$backend" >/dev/null
 start_backend /fixture/backend-wrong-san.toml
-start_edge /fixture/config/oxibelt.toml
+start_edge /fixture/config/oxibelt.toml skip-ready
+reject_http_upstream
 reject_client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
 # Restore the valid identity and prove both HTTP readiness and QUIC recovery.
 docker rm -f "$edge" "$backend" >/dev/null

@@ -1,7 +1,7 @@
 //! Public limit behavior through both MCP transports and protocol revisions.
 use openlegal_server::{
     ServerBuilder,
-    config::{AccessPolicy, Limits, RateLimitConfig, SourceOffer},
+    config::{AccessPolicy, EdgeMtlsConfig, HttpTlsConfig, Limits, RateLimitConfig, SourceOffer},
     framing::{FrameReader, write_json},
     http::{HealthEndpoint, HttpEndpoint},
     registry::{ToolError, ToolOptions, ToolOutput, ToolRegistry},
@@ -27,6 +27,12 @@ struct Server {
     health_url: String,
     wt_url: String,
     cert: rustls::pki_types::CertificateDer<'static>,
+    client_cert: Option<rustls::pki_types::CertificateDer<'static>>,
+    client_key: Option<Vec<u8>>,
+    client_identity_pem: Option<Vec<u8>>,
+    wrong_client_cert: Option<rustls::pki_types::CertificateDer<'static>>,
+    wrong_client_key: Option<Vec<u8>>,
+    wrong_client_identity_pem: Option<Vec<u8>>,
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<Result<(), openlegal_server::ServerError>>,
     _directory: tempfile::TempDir,
@@ -41,6 +47,10 @@ impl Drop for Server {
 
 impl Server {
     async fn start(limits: Limits) -> Self {
+        Self::start_with_mtls(limits, false).await
+    }
+
+    async fn start_with_mtls(limits: Limits, mtls: bool) -> Self {
         let source = SourceOffer::new("https://source.test/running").unwrap();
         let mut registry = ToolRegistry::new();
         registry
@@ -82,6 +92,57 @@ impl Server {
         let private_key = directory.path().join("key.pem");
         std::fs::write(&certificate, cert.pem()).unwrap();
         std::fs::write(&private_key, signing_key.serialize_pem()).unwrap();
+        let (
+            edge_mtls,
+            client_cert,
+            client_key,
+            client_identity_pem,
+            wrong_client_cert,
+            wrong_client_key,
+            wrong_client_identity_pem,
+        ) = if mtls {
+            use rcgen::{
+                BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer,
+                KeyPair, KeyUsagePurpose,
+            };
+            let ca_key = KeyPair::generate().unwrap();
+            let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            let ca = ca_params.self_signed(&ca_key).unwrap();
+            let ca_file = directory.path().join("edge-ca.pem");
+            std::fs::write(&ca_file, ca.pem()).unwrap();
+            let issuer = Issuer::from_params(&ca_params, &ca_key);
+            let make_client = |san: &str| {
+                let key = KeyPair::generate().unwrap();
+                let mut params = CertificateParams::new(vec![san.to_owned()]).unwrap();
+                params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+                let certificate = params.signed_by(&key, &issuer).unwrap();
+                (
+                    certificate.der().clone(),
+                    key.serialize_der(),
+                    format!("{}{}", certificate.pem(), key.serialize_pem()).into_bytes(),
+                )
+            };
+            let (client_cert, client_key, client_identity_pem) =
+                make_client("oxibelt.openlegal.internal");
+            let (wrong_client_cert, wrong_client_key, wrong_client_identity_pem) =
+                make_client("wrong.openlegal.internal");
+            (
+                Some(EdgeMtlsConfig {
+                    client_ca_file: ca_file,
+                    required_client_dns_san: "oxibelt.openlegal.internal".into(),
+                }),
+                Some(client_cert),
+                Some(client_key),
+                Some(client_identity_pem),
+                Some(wrong_client_cert),
+                Some(wrong_client_key),
+                Some(wrong_client_identity_pem),
+            )
+        } else {
+            (None, None, None, None, None, None, None)
+        };
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -90,6 +151,11 @@ impl Server {
         let mut builder = ServerBuilder::new(registry, limits, source);
         builder
             .register_endpoint(HttpEndpoint {
+                tls: mtls.then(|| HttpTlsConfig {
+                    certificate: certificate.clone(),
+                    private_key: private_key.clone(),
+                }),
+                edge_mtls: edge_mtls.clone(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 access: AccessPolicy {
                     allowed_hosts: vec!["test.local".into()],
@@ -99,6 +165,7 @@ impl Server {
             .unwrap();
         builder
             .register_endpoint(WebTransportEndpoint {
+                edge_mtls,
                 bind: format!("127.0.0.1:{port}").parse().unwrap(),
                 certificate,
                 private_key,
@@ -124,10 +191,16 @@ impl Server {
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(server.run(shutdown.clone()));
         Self {
-            http_url: format!("http://{http}/mcp"),
+            http_url: format!("{}://{http}/mcp", if mtls { "https" } else { "http" }),
             health_url: format!("http://{health}/metrics"),
             wt_url: format!("https://127.0.0.1:{port}/mcp-wt/v1"),
             cert: cert.der().clone(),
+            client_cert,
+            client_key,
+            client_identity_pem,
+            wrong_client_cert,
+            wrong_client_key,
+            wrong_client_identity_pem,
             shutdown,
             task,
             _directory: directory,
@@ -136,7 +209,16 @@ impl Server {
 
     async fn http(&self, version: &str, method: &str, mut params: Value) -> Value {
         add_meta(version, &mut params);
-        let mut request = reqwest::Client::new()
+        let client = if let Some(identity) = &self.client_identity_pem {
+            reqwest::Client::builder()
+                .add_root_certificate(reqwest::Certificate::from_der(self.cert.as_ref()).unwrap())
+                .identity(reqwest::Identity::from_pem(identity).unwrap())
+                .build()
+                .unwrap()
+        } else {
+            reqwest::Client::new()
+        };
+        let mut request = client
             .post(&self.http_url)
             .header("host", "test.local")
             .header("accept", "application/json, text/event-stream")
@@ -169,23 +251,7 @@ impl Server {
         wtransport::SendStream,
         FrameReader<wtransport::RecvStream>,
     ) {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(self.cert.clone()).unwrap();
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        tls.alpn_protocols = vec![wtransport::tls::WEBTRANSPORT_ALPN.to_vec()];
-        let client = Endpoint::client(
-            ClientConfig::builder()
-                .with_bind_default()
-                .with_custom_tls(tls)
-                .build(),
-        )
-        .unwrap();
+        let client = self.wt_client(self.client_cert.as_ref(), self.client_key.as_deref());
         let connection = client.connect(&self.wt_url).await.unwrap();
         let (tx, rx) = connection.open_bi().await.unwrap().await.unwrap();
         let reader = FrameReader::new(
@@ -196,6 +262,38 @@ impl Server {
             Duration::from_secs(3),
         );
         (client, connection, tx, reader)
+    }
+
+    fn wt_client(
+        &self,
+        cert: Option<&rustls::pki_types::CertificateDer<'static>>,
+        key: Option<&[u8]>,
+    ) -> Endpoint<wtransport::endpoint::endpoint_side::Client> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(self.cert.clone()).unwrap();
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots);
+        let mut tls = match (cert, key) {
+            (Some(cert), Some(key)) => builder
+                .with_client_auth_cert(
+                    vec![cert.clone()],
+                    rustls::pki_types::PrivateKeyDer::try_from(key.to_vec()).unwrap(),
+                )
+                .unwrap(),
+            _ => builder.with_no_client_auth(),
+        };
+        tls.alpn_protocols = vec![wtransport::tls::WEBTRANSPORT_ALPN.to_vec()];
+        Endpoint::client(
+            ClientConfig::builder()
+                .with_bind_default()
+                .with_custom_tls(tls)
+                .build(),
+        )
+        .unwrap()
     }
 }
 
@@ -279,6 +377,7 @@ async fn one_rate_bucket_is_shared_by_both_transports() {
                 enabled: true,
                 calls_per_second: 1,
                 burst: 3,
+                verified_tunnel: None,
             },
             ..Limits::default()
         })
@@ -328,6 +427,128 @@ async fn one_rate_bucket_is_shared_by_both_transports() {
             metrics.contains("openlegal_tool_rate_limited_total 2\n"),
             "{metrics}"
         );
+    }
+}
+
+#[tokio::test]
+async fn verified_edge_uses_one_replacement_bucket_across_transports() {
+    use openlegal_server::config::VerifiedTunnelRateLimitConfig;
+    for version in ["2025-11-25", "2026-07-28"] {
+        let server = Server::start_with_mtls(
+            Limits {
+                max_message_bytes: 4096,
+                rate_limit: RateLimitConfig {
+                    enabled: true,
+                    calls_per_second: 1,
+                    burst: 1,
+                    verified_tunnel: Some(VerifiedTunnelRateLimitConfig {
+                        calls_per_second: 1,
+                        burst: 3,
+                    }),
+                },
+                ..Limits::default()
+            },
+            true,
+        )
+        .await;
+        let (_client, _connection, mut tx, mut rx) = server.wt().await;
+        wt_ready(&mut tx, &mut rx, version).await;
+        let first = server.http(version, "tools/call", call("small")).await;
+        assert_eq!(first["result"]["structuredContent"]["ok"], true);
+        let second = wt_call(&mut tx, &mut rx, version, 2, "tools/call", call("small")).await;
+        assert_eq!(second["result"]["structuredContent"]["ok"], true);
+        let third = server.http(version, "tools/call", call("small")).await;
+        assert_eq!(third["result"]["structuredContent"]["ok"], true);
+        let fourth = wt_call(&mut tx, &mut rx, version, 3, "tools/call", call("small")).await;
+        assert_tool_error(&fourth, "rate_limited");
+
+        let request = || {
+            reqwest::Client::builder()
+                .add_root_certificate(reqwest::Certificate::from_der(server.cert.as_ref()).unwrap())
+        };
+        let anonymous = request()
+            .build()
+            .unwrap()
+            .post(&server.http_url)
+            .header("host", "test.local")
+            .header("x-verified-tunnel", "true")
+            .body("{}")
+            .send()
+            .await;
+        assert!(
+            anonymous.is_err(),
+            "header must not replace edge client authentication"
+        );
+        let wrong = request()
+            .identity(
+                reqwest::Identity::from_pem(server.wrong_client_identity_pem.as_ref().unwrap())
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+            .post(&server.http_url)
+            .header("host", "test.local")
+            .body("{}")
+            .send()
+            .await;
+        assert!(wrong.is_err(), "wrong edge DNS SAN must fail the handshake");
+
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+            KeyUsagePurpose,
+        };
+        let unrelated_ca_key = KeyPair::generate().unwrap();
+        let mut unrelated_ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+        unrelated_ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        unrelated_ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let unrelated_issuer = Issuer::from_params(&unrelated_ca, &unrelated_ca_key);
+        let unrelated_key = KeyPair::generate().unwrap();
+        let mut unrelated_leaf =
+            CertificateParams::new(vec!["oxibelt.openlegal.internal".into()]).unwrap();
+        unrelated_leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let unrelated_cert = unrelated_leaf
+            .signed_by(&unrelated_key, &unrelated_issuer)
+            .unwrap();
+        let unrelated_pem = format!("{}{}", unrelated_cert.pem(), unrelated_key.serialize_pem());
+        let wrong_ca_http = request()
+            .identity(reqwest::Identity::from_pem(unrelated_pem.as_bytes()).unwrap())
+            .build()
+            .unwrap()
+            .post(&server.http_url)
+            .header("host", "test.local")
+            .body("{}")
+            .send()
+            .await;
+        assert!(
+            wrong_ca_http.is_err(),
+            "untrusted edge CA must fail HTTP handshake"
+        );
+
+        let unrelated_der = unrelated_cert.der().clone();
+        let unrelated_key_der = unrelated_key.serialize_der();
+        for (case, cert, key) in [
+            ("missing certificate", None, None),
+            (
+                "wrong DNS SAN",
+                server.wrong_client_cert.as_ref(),
+                server.wrong_client_key.as_deref(),
+            ),
+            (
+                "wrong CA",
+                Some(&unrelated_der),
+                Some(unrelated_key_der.as_slice()),
+            ),
+        ] {
+            let client = server.wt_client(cert, key);
+            let handshake =
+                tokio::time::timeout(Duration::from_secs(5), client.connect(&server.wt_url))
+                    .await
+                    .expect("WebTransport mTLS rejection should finish promptly");
+            assert!(
+                handshake.is_err(),
+                "{case} must fail WebTransport handshake"
+            );
+        }
     }
 }
 

@@ -107,6 +107,9 @@ spec:
             - name: backend-tls
               mountPath: /run/secrets/backend-tls
               readOnly: true
+            - name: edge-client-ca
+              mountPath: /run/secrets/edge-client-ca
+              readOnly: true
             - name: postgres-ca
               mountPath: /run/secrets/postgres-ca
               readOnly: true
@@ -136,6 +139,13 @@ spec:
                 path: tls.crt
               - key: tls.key
                 path: tls.key
+        - name: edge-client-ca
+          secret:
+            secretName: openlegal-edge-client-ca
+            defaultMode: 0440
+            items:
+              - key: ca.crt
+                path: ca.crt
         - name: postgres-ca
           secret:
             secretName: openlegal-postgres-ca

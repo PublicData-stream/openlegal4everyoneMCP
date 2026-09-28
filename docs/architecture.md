@@ -131,9 +131,11 @@ The server uses rmcp, Axum/Hyper and wtransport; startup registration validates 
 names/schemas and endpoint bindings before accepting traffic. Required endpoints
 share admission budgets and cancellation. Read-only modules are trusted Rust code,
 not dynamically loaded or sandboxed plugins. The [server contract](server.md)
-specifies the interfaces, supported revisions, framing and lifecycle. Authentication
-remains future work. The [OxiBelt integration](oxibelt.md) keeps TLS edge configuration
-and its pinned acceptance harness separate from application policy.
+specifies the interfaces, supported revisions, framing and lifecycle. Optional
+backend mTLS authenticates the configured edge on both data transports; public
+caller authentication remains future work. The [OxiBelt integration](oxibelt.md)
+keeps TLS edge configuration and its pinned acceptance harness separate from
+application policy.
 
 ## Tests and fixtures
 

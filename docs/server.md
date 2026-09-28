@@ -57,8 +57,11 @@ see the operator runbook for builds and image acceptance, the ordered
 [first deployment](deployment-kubernetes.md#first-deployment), and
 [upgrades and Secret rotation](deployment-kubernetes.md#upgrade-and-secret-rotation).
 
-HTTP `/mcp` is private plaintext behind the TLS edge. WebTransport `/mcp-wt/v1`
-always uses TLS/QUIC. Both must bind successfully before readiness becomes true.
+HTTP `/mcp` may use private plaintext for existing local configurations or opt
+into TLS with `[http.tls]`. WebTransport `/mcp-wt/v1` always uses TLS/QUIC.
+When `[edge_mtls]` is configured, both listeners require a client certificate
+issued by `client_ca_file` with the exact `required_client_dns_san`; HTTP must
+also configure TLS. Both must bind successfully before readiness becomes true.
 Keep health `/live`, `/ready`, and `/metrics` private; they have no authentication.
 `/metrics` exposes aggregate tool call/failure and rate-rejection counts and, when configured, bounded
 application retrieval metrics, not request payloads.
@@ -265,6 +268,19 @@ errors without spending tokens. A later deserialization failure retains its
 protocol error but may spend a token. Initialization, discovery, resource reads,
 and health requests do not use this bucket. Operators can set `enabled = false`
 explicitly.
+
+Optional `[limits.rate_limit.verified_tunnel]` sets `calls_per_second` and `burst`
+for a second process-wide bucket shared across the two transports. A call selects
+it only after the connection completes required edge mTLS; it replaces the ordinary
+bucket for that call. Both values must be in 1–10,000, and startup rejects the
+override without `[edge_mtls]` on both listeners. When the table is absent,
+authenticated calls retain the ordinary bucket. No HTTP header supplies tunnel
+identity. This authenticates the edge, so all callers forwarded by that edge
+share its bucket. The production templates set 1,000 calls/second and burst 1,000;
+the default configuration remains 100/100. OxiBelt's route limits count HTTP
+requests and WebTransport CONNECT handshakes, while the backend counts valid tool
+calls within sessions.
+Connection and in-flight limits still constrain actual throughput independently.
 
 Budgets are process-local and shared by both data transports. The buffering budget
 is distinct from QUIC flow control: stream receive credit is at most 256 KiB and
