@@ -148,9 +148,12 @@ These are application choices, not claimed upstream service guarantees:
   a public HEAD must come from a fresh live current-list observation.
   A structurally invalid list row is skipped while valid rows are used; a fully
   invalid page is recorded as a gap and the bounded scan continues. An individual
-  404/410 or corrupt downloaded detail is recorded as a gap. Authentication and
-  other unsafe client rejection still suspend provider requests until operator
-  review. Network failures remain unresolved until response handling is known.
+  404/410, bounded download failure (DNS, connection/TLS, request or body timeout,
+  body read, HTTP 408/500/502/504), or corrupt downloaded detail is recorded as
+  a distinct gap. A failed attachment leaves an explicitly incomplete record.
+  TLS verification remains enabled. Authentication and other unsafe client
+  rejection still suspend provider requests until operator review. Explicit
+  cancellation, a dropped request, and failed budget writes remain unresolved.
   The pilot logs each rejected family and a summary when the scan finishes;
   queued candidates and prior valid pages do not establish publication or
   inventory completeness.
@@ -180,15 +183,19 @@ These are application choices, not claimed upstream service guarantees:
   `operator_suspended=true` and blocks further attempts until the operator
   verifies the provider state, clears the suspension and restarts ingestion;
   the recorded `next_allowed_at` still prevents an early retry.
-  Each reserved request remains marked `unresolved_response` until its response
-  is handled. Cancellation before response handling leaves that marker set,
-  even if the request may not have been sent. A crash or failed pause or source
-  suspension write leaves ingestion stopped after restart; the operator must
+  Each reserved request remains marked `unresolved_response` until its outcome
+  is handled. A bounded failed download clears the marker only after its charged
+  attempt is classified for an incomplete page, detail, or attachment.
+  Cancellation before outcome handling leaves that marker set,
+  even if the request may not have been sent. A crash while that marker remains,
+  or a failed pause or source suspension write, leaves ingestion stopped after
+  restart; the operator must
   inspect the provider state before clearing it.
   Deferred claims do not spend another job attempt while
-  the pause holds. Individual 404/410 and corrupt downloaded bytes are classified
-  separately from authentication and unsafe client rejection. The former can be
-  skipped and reported; the latter suspend provider requests. Cancellation
+  the pause holds. Individual 404/410, bounded download failures, and corrupt
+  downloaded bytes are classified separately from authentication and unsafe
+  client rejection. The former can be skipped and reported; the latter suspend
+  provider requests. HTTP 429/503 retain their durable pause. Cancellation
   remains cancellation. Transient sandbox
   unavailability and timeouts remain retryable processing states.
 - The queue holds at most 128 active jobs, with at most three attempts and fenced

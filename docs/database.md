@@ -61,7 +61,8 @@ cannot make the previous HEAD fresh. Historical results do not carry current TTL
 Provider text, extracted attachment text, and OCR are distinct sections. OCR has
 source digest/page provenance and is excluded from search/comparison by default.
 The page excerpts do not alter stored evidence.
-When a Korean provider attachment is unavailable (404/410) or its downloaded
+When a Korean provider attachment is unavailable (404/410), its download fails
+(DNS, connection/TLS, timeout, body read, HTTP 408/500/502/504), or its downloaded
 bytes fail format or document validation after bounded retry, an incomplete capture exposes the identified provider
 body with `metadata.attachment_status="incomplete"`.
 `attachment_expected_count` and `attachment_available_count` are decimal strings;
@@ -81,7 +82,9 @@ dataset gaps. `database.get` and `database.get_metadata` add notices for the
 selected object and its dataset. Each notice has dataset, page/detail scope,
 stable reason code, affected count, last observation and next retry time. These
 operational warnings do not expose unverified legal text or establish a complete
-inventory. The browser displays Korean and English explanations.
+inventory. `download_failed` distinguishes transport and selected HTTP failures
+from `source_unavailable` (404/410) and `source_data_invalid` (bad bytes). The
+browser displays Korean and English explanations.
 
 `database.diff` resolves both selectors for one object and returns the exact capture
 metadata with a text-comparison handle. Its line and character comparison is the

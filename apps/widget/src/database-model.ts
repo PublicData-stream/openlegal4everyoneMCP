@@ -1,7 +1,7 @@
 /** Bounded wire validation for the legal database browser. Fixture data is explicitly synthetic. */
 export type Dataset = 'national_statute' | 'administrative_rule' | 'ordinance' | 'treaty' | 'precedent' | 'constitutional_decision' | 'legal_interpretation' | 'administrative_appeal';
 export type ObjectId = { jurisdiction: string; provider: string; dataset: Dataset; id: string };
-export type CollectionNotice = { dataset: Dataset; scope: 'page' | 'detail'; code: 'source_unavailable' | 'source_data_invalid' | 'attachment_incomplete'; affected_count: number; last_seen_at: number; retry_at: number };
+export type CollectionNotice = { dataset: Dataset; scope: 'page' | 'detail'; code: 'source_unavailable' | 'source_data_invalid' | 'download_failed' | 'attachment_incomplete'; affected_count: number; last_seen_at: number; retry_at: number };
 export type Selector = { kind: 'head' } | { kind: 'revision' | 'capture'; id: string };
 export type Hit = { object: ObjectId; revision_id: string; capture_id: string; title: string; section: string; line: number; text: string; derived_ocr: boolean; match_scope: 'line' | 'object'; excerpt_section: string; includes_ocr: boolean };
 export type SearchPage = { hits: Hit[]; next_cursor: string | null; generation: number; corpus_complete: boolean; index_lag: number; collection_notices: CollectionNotice[] };
@@ -25,7 +25,7 @@ export function sameObject(a: ObjectId, b: ObjectId): boolean { return a.jurisdi
 export function collectionNotices(value: unknown): CollectionNotice[] {
   if (value == null) return [];
   if (!Array.isArray(value) || value.length > 64) throw new Error('The collection notices are invalid.');
-  return value.map(raw => { const n = object(raw); const dataset = text(n.dataset, 32); const scope = text(n.scope, 16); const code = text(n.code, 40); if (!['national_statute','administrative_rule','ordinance','treaty','precedent','constitutional_decision','legal_interpretation','administrative_appeal'].includes(dataset) || !['page','detail'].includes(scope) || !['source_unavailable','source_data_invalid','attachment_incomplete'].includes(code)) throw new Error('The collection notice is unsupported.'); return { dataset: dataset as Dataset, scope: scope as CollectionNotice['scope'], code: code as CollectionNotice['code'], affected_count: number(n.affected_count), last_seen_at: number(n.last_seen_at), retry_at: number(n.retry_at) }; });
+  return value.map(raw => { const n = object(raw); const dataset = text(n.dataset, 32); const scope = text(n.scope, 16); const code = text(n.code, 40); if (!['national_statute','administrative_rule','ordinance','treaty','precedent','constitutional_decision','legal_interpretation','administrative_appeal'].includes(dataset) || !['page','detail'].includes(scope) || !['source_unavailable','source_data_invalid','download_failed','attachment_incomplete'].includes(code)) throw new Error('The collection notice is unsupported.'); return { dataset: dataset as Dataset, scope: scope as CollectionNotice['scope'], code: code as CollectionNotice['code'], affected_count: number(n.affected_count), last_seen_at: number(n.last_seen_at), retry_at: number(n.retry_at) }; });
 }
 export function searchPage(result: unknown): SearchPage {
   const value = data(result);

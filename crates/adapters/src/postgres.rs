@@ -179,6 +179,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0004_provider_collection_gap.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            5,
+            "provider download failures".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0005_provider_download_failure.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

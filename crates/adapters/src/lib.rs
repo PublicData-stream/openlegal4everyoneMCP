@@ -2,6 +2,9 @@
 
 #[cfg(test)]
 extern crate self as openlegal_adapters;
+#[cfg(test)]
+#[path = "../../../test-support/postgres.rs"]
+pub(crate) mod test_support;
 
 pub mod blob;
 mod cache;

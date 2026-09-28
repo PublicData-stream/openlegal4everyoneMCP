@@ -224,10 +224,10 @@ values, raw workload dumps and private host details out of shared evidence.
    attempts over 30 minutes and never resets automatically. After operator review,
    a new pilot may reset only its pilot counter while preserving the daily cap and
    next-request timestamp. Before selecting `mode = "continuous"`, verify an actual
-   provider detail, source and search result in each category without a recorded
-   gap; publish bounded warnings for skipped categories and records. If no category
-   qualifies or authentication/request-budget safeguards fail, remain in retained
-   serving. Continuous collection remains incomplete.
+   provider detail, source and search result in at least one category without a
+   recorded gap in that category; publish bounded warnings for skipped categories
+   and records. If no category qualifies or authentication/request-budget safeguards
+   fail, remain in retained serving. Continuous collection remains incomplete.
 
 ## Upgrade and Secret rotation
 

@@ -5,6 +5,7 @@ test('fictional database bridge pins content pages and shows HEAD freshness', as
   await widget.getByLabel('Search expression').fill('fictional');
   await widget.getByRole('button', { name: 'Search corpus' }).click();
   await expect(widget.getByText('Partial corpus coverage', { exact: false })).toBeVisible();
+  await expect(widget.getByRole('status').first()).toContainText('다운로드 실패 / failed download');
   await expect(widget.locator('article b')).toHaveCount(0);
   await expect(widget.locator('article')).toContainText('Whole-object query match · illustrative excerpt from body');
   await widget.getByRole('button', { name: 'Fictional sample statute' }).click();

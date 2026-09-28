@@ -352,7 +352,9 @@ pub(crate) fn map_error(e: DatabaseError) -> ToolError {
         DatabaseError::SourceUnavailable
         | DatabaseError::SourceDataInvalid
         | DatabaseError::SourceUnauthorized => ToolError::Unavailable,
-        DatabaseError::SourceTransient => ToolError::StorageUnavailable,
+        DatabaseError::SourceTransient | DatabaseError::SourceDownloadFailed => {
+            ToolError::StorageUnavailable
+        }
         DatabaseError::InvalidInput => ToolError::InvalidInput,
         DatabaseError::InvalidRegex => ToolError::InvalidRegex,
         DatabaseError::NotFound => ToolError::NotFound,

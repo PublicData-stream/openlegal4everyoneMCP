@@ -20,6 +20,7 @@ test('collection notices are bounded, validated and retained alongside content',
   const notice = { dataset: 'national_statute', scope: 'detail', code: 'source_data_invalid', affected_count: 1, last_seen_at: 100, retry_at: 3700 };
   assert.deepEqual(metadata({ ...meta, collection_notices: [notice] }, id, { kind: 'capture', id: meta.capture_id }).collection_notices, [notice]);
   assert.deepEqual(searchPage({ structuredContent: { schema_version: 1, hits: [], next_cursor: null, generation: 0, corpus_complete: false, index_lag: 0, collection_notices: [notice] } }).collection_notices, [notice]);
+  assert.deepEqual(metadata({ ...meta, collection_notices: [{ ...notice, code: 'download_failed' }] }, id, { kind: 'capture', id: meta.capture_id }).collection_notices[0].code, 'download_failed');
   assert.throws(() => metadata({ ...meta, collection_notices: [{ ...notice, code: 'unknown' }] }, id, { kind: 'capture', id: meta.capture_id }));
   assert.throws(() => searchPage({ structuredContent: { schema_version: 1, hits: [], collection_notices: Array(65).fill(notice) } }));
 });

@@ -105,6 +105,8 @@ download details already available under a valid cache identity.
 Negative-cache confirmed absence or valid empty searches only when the provider's
 meaning is understood and a bounded lifetime is defined. Never turn authentication
 errors, throttling, timeouts, transport failures, or parser failures into absence.
+An explicit incomplete collection gap may record one failed item for a later
+bounded retry without claiming that the legal item is absent.
 An HTTP status alone may not establish dataset-level absence. Keep temporary
 failure backoff distinct from a negative legal-data result.
 

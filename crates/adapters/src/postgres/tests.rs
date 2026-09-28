@@ -1,12 +1,11 @@
 use super::*;
+use crate::test_support as fixture;
 use openlegal_application::{
     StoredPayload,
     persistence::{PublicationOutcome, PublicationRequest, identity_digest},
 };
 use openlegal_domain::{Provenance, Query, Record, RetrievalData};
 use sha2::{Digest, Sha256};
-#[path = "../../../../test-support/postgres.rs"]
-mod fixture;
 
 fn key() -> PersistentKey {
     PersistentKey {

@@ -251,11 +251,16 @@ impl CorpusRuntime {
                 }
                 Ok(Some(result))
             }
-            Err(error @ (DatabaseError::SourceUnavailable | DatabaseError::SourceDataInvalid)) => {
-                let reason = if error == DatabaseError::SourceUnavailable {
-                    "source_unavailable"
-                } else {
-                    "source_data_invalid"
+            Err(
+                error @ (DatabaseError::SourceUnavailable
+                | DatabaseError::SourceDataInvalid
+                | DatabaseError::SourceDownloadFailed),
+            ) => {
+                let reason = match error {
+                    DatabaseError::SourceUnavailable => "source_unavailable",
+                    DatabaseError::SourceDataInvalid => "source_data_invalid",
+                    DatabaseError::SourceDownloadFailed => "download_failed",
+                    _ => unreachable!(),
                 };
                 self.store
                     .record_page_gap(
@@ -1131,12 +1136,15 @@ impl CorpusRuntime {
                     tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(60))=>{}}
                 }
                 Err(
-                    error @ (DatabaseError::SourceUnavailable | DatabaseError::SourceDataInvalid),
+                    error @ (DatabaseError::SourceUnavailable
+                    | DatabaseError::SourceDataInvalid
+                    | DatabaseError::SourceDownloadFailed),
                 ) => {
-                    let reason = if error == DatabaseError::SourceUnavailable {
-                        "source_unavailable"
-                    } else {
-                        "source_data_invalid"
+                    let reason = match error {
+                        DatabaseError::SourceUnavailable => "source_unavailable",
+                        DatabaseError::SourceDataInvalid => "source_data_invalid",
+                        DatabaseError::SourceDownloadFailed => "download_failed",
+                        _ => unreachable!(),
                     };
                     self.store.skip_claim(&job, reason, now()).await?;
                 }

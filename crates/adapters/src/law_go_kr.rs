@@ -196,6 +196,33 @@ impl LawClient {
         }
         Ok(())
     }
+    async fn settle_fetch<T>(&self, fetched: Result<T, DatabaseError>) -> Result<T, DatabaseError> {
+        match fetched {
+            Ok(value) => {
+                // The complete response is now local evidence. Document work
+                // may time out independently of provider admission.
+                self.complete_request().await?;
+                Ok(value)
+            }
+            Err(error @ (DatabaseError::SourceRejected | DatabaseError::SourceUnauthorized)) => {
+                self.suspend_after_source_rejection().await?;
+                Err(error)
+            }
+            Err(error @ (DatabaseError::Cancelled | DatabaseError::StorageUnavailable)) => {
+                // A reserved attempt might have been sent. Cancellation and
+                // storage failure retain the marker for operator review.
+                Err(error)
+            }
+            Err(error) => {
+                // A bounded download failure spends its reserved GET attempt.
+                // The caller records an incomplete page, detail, or attachment.
+                if !self.operator_suspended.load(Ordering::Acquire) {
+                    self.complete_request().await?;
+                }
+                Err(error)
+            }
+        }
+    }
     /// A transient pause is durable for configured ingestion; the job worker
     /// uses this timestamp without burning another attempt while it waits.
     pub async fn next_admissible_epoch(&self) -> Result<u64, DatabaseError> {
@@ -555,12 +582,22 @@ impl LawClient {
                     .await;
                 let result = match result {
                     Ok(result) => result,
-                    Err(DatabaseError::SourceUnavailable) => {
+                    Err(
+                        error @ (DatabaseError::SourceUnavailable
+                        | DatabaseError::SourceDownloadFailed),
+                    ) => {
+                        record.sections.truncate(section_checkpoint);
+                        total = total_checkpoint;
+                        extracted = extracted_checkpoint;
                         missing.push(MissingAttachment {
                             ordinal: ordinal + 1,
                             expected_format: link.format,
                             response_sha256: None,
-                            reason: "source_unavailable",
+                            reason: if error == DatabaseError::SourceUnavailable {
+                                "source_unavailable"
+                            } else {
+                                "download_failed"
+                            },
                         });
                         break Vec::new();
                     }
@@ -781,7 +818,7 @@ impl LawClient {
         self.reserve_request(&cancel).await?;
         let fetched = async {
         let host = url.host_str().ok_or(DatabaseError::InvalidInput)?;
-        let ips = tokio::select! {_=cancel.cancelled()=>return Err(DatabaseError::Cancelled),r=self.resolver.lookup_ip(format!("{host}."))=>r.map_err(|_|DatabaseError::StorageUnavailable)?};
+        let ips = tokio::select! {_=cancel.cancelled()=>return Err(DatabaseError::Cancelled),r=self.resolver.lookup_ip(format!("{host}."))=>r.map_err(|_|download_failed("dns"))?};
         let mut addresses = Vec::new();
         for ip in ips.iter() {
             if !public_address(ip) || addresses.len() >= 16 {
@@ -790,7 +827,7 @@ impl LawClient {
             addresses.push(SocketAddr::new(ip, 443));
         }
         if addresses.is_empty() {
-            return Err(DatabaseError::StorageUnavailable);
+            return Err(download_failed("dns_empty"));
         }
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -807,7 +844,15 @@ impl LawClient {
                 .header("accept-encoding", "identity")
                 .send()
                 .await
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
+                .map_err(|error| {
+                    download_failed(if error.is_timeout() {
+                        "request_timeout"
+                    } else if error.is_connect() {
+                        "connect_tls"
+                    } else {
+                        "response"
+                    })
+                })?;
             if matches!(
                 response.status(),
                 reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
@@ -856,7 +901,13 @@ impl LawClient {
             while let Some(chunk) = response
                 .chunk()
                 .await
-                .map_err(|_| DatabaseError::StorageUnavailable)?
+                .map_err(|error| {
+                    download_failed(if error.is_timeout() {
+                        "body_timeout"
+                    } else {
+                        "body"
+                    })
+                })?
             {
                 if raw.len().saturating_add(chunk.len()) > max {
                     return Err(DatabaseError::SourceDataInvalid);
@@ -867,31 +918,9 @@ impl LawClient {
         };
         tokio::select! {_ = cancel.cancelled()=>Err(DatabaseError::Cancelled),result=fetch=>result}
         }.await;
-        let (raw, html_content_type) = match fetched {
-            Ok(value) => value,
-            Err(error @ (DatabaseError::SourceRejected | DatabaseError::SourceUnauthorized)) => {
-                // Keep the admission permit until this failure is fenced in
-                // both the process and durable request ledger.
-                self.suspend_after_source_rejection().await?;
-                return Err(error);
-            }
-            Err(error @ (DatabaseError::Cancelled | DatabaseError::StorageUnavailable)) => {
-                // A reserved request may have been sent; preserve the
-                // unresolved marker for operator review after a restart.
-                return Err(error);
-            }
-            Err(error) => {
-                if !self.operator_suspended.load(Ordering::Acquire) {
-                    self.complete_request().await?;
-                }
-                return Err(error);
-            }
-        };
+        let (raw, html_content_type) = self.settle_fetch(fetched).await?;
         let retrieved_at = self.clock.now();
         if attachment_remaining_bytes.is_some() && !expected_document_magic(&raw, format) {
-            if !self.operator_suspended.load(Ordering::Acquire) {
-                self.complete_request().await?;
-            }
             drop(permit);
             return Ok(FetchedDocument::UnexpectedAttachment {
                 html: html_content_type || looks_like_html(&raw),
@@ -929,7 +958,6 @@ impl LawClient {
             .map(FetchedDocument::Processed);
         match &output {
             Err(DatabaseError::SourceDataInvalid) if attachment_remaining_bytes.is_some() => {
-                self.complete_request().await?;
                 return Ok(FetchedDocument::UnexpectedAttachment {
                     raw,
                     html: false,
@@ -942,9 +970,6 @@ impl LawClient {
             }
             Err(DatabaseError::Cancelled) => return Err(DatabaseError::Cancelled),
             _ => {}
-        }
-        if !self.operator_suspended.load(Ordering::Acquire) {
-            self.complete_request().await?;
         }
         drop(permit);
         output
@@ -1094,6 +1119,10 @@ fn parse_inventory_tree(
         incomplete,
     })
 }
+fn download_failed(stage: &'static str) -> DatabaseError {
+    eprintln!("law provider: download failed at {stage}");
+    DatabaseError::SourceDownloadFailed
+}
 fn http_status_error(status: reqwest::StatusCode) -> Option<DatabaseError> {
     if status.is_success() {
         None
@@ -1107,6 +1136,18 @@ fn http_status_error(status: reqwest::StatusCode) -> Option<DatabaseError> {
         reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
     ) {
         Some(DatabaseError::SourceUnavailable)
+    } else if matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    ) {
+        eprintln!(
+            "law provider: download failed at http_status_{}",
+            status.as_u16()
+        );
+        Some(DatabaseError::SourceDownloadFailed)
     } else if status.is_server_error() {
         Some(DatabaseError::SourceTransient)
     } else {
@@ -1728,6 +1769,93 @@ fn project_additional(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openlegal_application::persistence::PersistentStore;
+
+    struct UnusedProcessor;
+    impl DocumentProcessor for UnusedProcessor {
+        fn process(
+            &self,
+            _input: DocumentInput,
+            _cancellation: CancellationToken,
+        ) -> futures::future::BoxFuture<'static, Result<DocumentOutput, DocumentError>> {
+            Box::pin(async { Err(DocumentError::InvalidInput) })
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn settled_download_failure_allows_next_attempt_but_cancellation_blocks_it() {
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let store = fixture.open(100).await;
+        let pool = store.pool();
+        let client = LawClient::new("fixture-credential".into(), Arc::new(UnusedProcessor))
+            .unwrap()
+            .with_request_budget(pool.clone(), RequestBudgetMode::Pilot);
+        LawClient::reserve_provider_request_budget(
+            &pool,
+            &RequestBudgetMode::Pilot,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client
+                .settle_fetch::<()>(Err(DatabaseError::SourceDownloadFailed))
+                .await,
+            Err(DatabaseError::SourceDownloadFailed)
+        );
+        let flags: (i32, bool) = sqlx::query_as(
+            "SELECT pilot_used,unresolved_response FROM openlegal.provider_request_budget WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(flags, (1, false));
+        sqlx::query("UPDATE openlegal.provider_request_budget SET next_allowed_at=0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        LawClient::reserve_provider_request_budget(
+            &pool,
+            &RequestBudgetMode::Pilot,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.settle_fetch(Ok(())).await, Ok(()));
+        let flags: (i32, bool) = sqlx::query_as(
+            "SELECT pilot_used,unresolved_response FROM openlegal.provider_request_budget WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(flags, (2, false));
+        sqlx::query("UPDATE openlegal.provider_request_budget SET next_allowed_at=0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        LawClient::reserve_provider_request_budget(
+            &pool,
+            &RequestBudgetMode::Pilot,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client
+                .settle_fetch::<()>(Err(DatabaseError::Cancelled))
+                .await,
+            Err(DatabaseError::Cancelled)
+        );
+        let flags: (i32, bool) = sqlx::query_as(
+            "SELECT pilot_used,unresolved_response FROM openlegal.provider_request_budget WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(flags, (3, true));
+        store.close().await.unwrap();
+    }
     #[test]
     fn mixed_inventory_keeps_valid_rows_and_marks_page_incomplete() {
         let tree = branch(
@@ -1798,6 +1926,24 @@ mod tests {
         );
         assert_eq!(
             http_status_error(StatusCode::INTERNAL_SERVER_ERROR),
+            Some(DatabaseError::SourceDownloadFailed)
+        );
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert_eq!(
+                http_status_error(status),
+                Some(DatabaseError::SourceDownloadFailed)
+            );
+        }
+        assert_eq!(
+            http_status_error(StatusCode::SERVICE_UNAVAILABLE),
+            Some(DatabaseError::SourceTransient)
+        );
+        assert_eq!(
+            http_status_error(StatusCode::NOT_IMPLEMENTED),
             Some(DatabaseError::SourceTransient)
         );
         assert_eq!(
@@ -2069,7 +2215,7 @@ mod tests {
         }
         assert_eq!(
             http_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
-            Some(DatabaseError::SourceTransient)
+            Some(DatabaseError::SourceDownloadFailed)
         );
         assert_eq!(
             document_error(DocumentError::Cancelled),

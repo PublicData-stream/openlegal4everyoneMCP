@@ -96,9 +96,15 @@ async fn collection_gaps_are_durable_bounded_notices_and_retries() {
         .unwrap();
     let job = store.claim_job(4001).await.unwrap().unwrap();
     store
-        .skip_claim(&job, "source_unavailable", 4002)
+        .skip_claim(&job, "download_failed", 4002)
         .await
         .unwrap();
+    let notices = store
+        .collection_notices(&[Dataset::NationalStatute], Some(&job.object))
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].code, "download_failed");
     assert!(
         store
             .detail_gap_active(&job.object, &job.revision_id)

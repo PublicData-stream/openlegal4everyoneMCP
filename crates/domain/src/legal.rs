@@ -334,6 +334,8 @@ pub enum DatabaseError {
     SourceUnavailable,
     /// Downloaded provider bytes failed bounded format or content validation.
     SourceDataInvalid,
+    /// A bounded provider download failed at DNS, TLS, transport, timeout, or selected HTTP status.
+    SourceDownloadFailed,
     /// A provider authentication/authorization response requires operator review.
     SourceUnauthorized,
     /// A completed provider response indicates a temporary server failure.
