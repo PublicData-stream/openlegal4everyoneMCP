@@ -10,6 +10,8 @@ spec:
         values:
           - openlegal-server
           - openlegal-admin
+          - openlegal-collection-scheduler
+          - openlegal-collection-job
   policyTypes:
     - Egress
   egress:

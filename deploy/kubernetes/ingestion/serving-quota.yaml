@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: collection-pod-budget
+  namespace: openlegal-serving
+spec:
+  hard:
+    # Serving + scheduler + up to sixteen on-demand collection Jobs.
+    pods: "18"

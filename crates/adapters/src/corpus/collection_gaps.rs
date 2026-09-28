@@ -162,7 +162,7 @@ impl PgCorpusStore {
         for row in &rows {
             let id: uuid::Uuid = row.try_get("id").map_err(db)?;
             let gap: String = row.try_get("gap_key").map_err(db)?;
-            sqlx::query("UPDATE openlegal.corpus_job SET status='pending',attempts=0,lease_until=NULL,error_category=NULL WHERE id=$1")
+            sqlx::query("UPDATE openlegal.corpus_job SET status='pending',attempts=0,lease_until=NULL,error_category=NULL,source_metadata=source_metadata - 'collection_origin' WHERE id=$1")
                 .bind(id).execute(&mut *tx).await.map_err(db)?;
             sqlx::query(
                 "UPDATE openlegal.provider_collection_gap SET retry_at=$2 WHERE gap_key=$1",

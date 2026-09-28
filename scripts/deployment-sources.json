@@ -80,8 +80,8 @@
       ]
     },
     {
-      "path": "deploy/kubernetes/ingestion/deployment-patch.yaml",
-      "role": "patch",
+      "path": "deploy/kubernetes/ingestion/collection-job.json",
+      "role": "configuration",
       "owners": [
         "ingestion"
       ]
@@ -101,13 +101,6 @@
       ]
     },
     {
-      "path": "deploy/kubernetes/ingestion/pilot-candidates.json",
-      "role": "configuration",
-      "owners": [
-        "ingestion"
-      ]
-    },
-    {
       "path": "deploy/kubernetes/ingestion/rbac/kustomization.yaml",
       "role": "kustomization",
       "owners": [
@@ -122,6 +115,27 @@
       ]
     },
     {
+      "path": "deploy/kubernetes/ingestion/scheduler-deployment.yaml",
+      "role": "resource",
+      "owners": [
+        "ingestion"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/ingestion/scheduler-role.yaml",
+      "role": "resource",
+      "owners": [
+        "ingestion"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/ingestion/scheduler-service-account.yaml",
+      "role": "resource",
+      "owners": [
+        "ingestion"
+      ]
+    },
+    {
       "path": "deploy/kubernetes/ingestion/server.toml",
       "role": "configuration",
       "owners": [
@@ -130,6 +144,13 @@
     },
     {
       "path": "deploy/kubernetes/ingestion/service-account.yaml",
+      "role": "resource",
+      "owners": [
+        "ingestion"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/ingestion/serving-quota.yaml",
       "role": "resource",
       "owners": [
         "ingestion"

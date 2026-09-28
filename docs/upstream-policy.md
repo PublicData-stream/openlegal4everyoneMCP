@@ -102,6 +102,13 @@ If these capabilities are unavailable, use bounded scheduled or demand-driven
 refresh. Do not perform full-corpus refresh for each user request or repeatedly
 download details already available under a valid cache identity.
 
+For the Korean corpus, ordinary MCP lookup/search tools never schedule provider
+traffic. `database.request_collection` is an explicit mutation that stores one
+coalesced request for a dedicated collection Job Pod; `database.collection_status`
+only reads its state. The scheduler and request Jobs share provider spacing and
+single-call admission. Continuous and explicit collection each have an operator
+cap of 1,000 reserved attempts per UTC day, for at most 2,000 in total.
+
 Negative-cache confirmed absence or valid empty searches only when the provider's
 meaning is understood and a bounded lifetime is defined. Never turn authentication
 errors, throttling, timeouts, transport failures, or parser failures into absence.

@@ -5,6 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod collection;
 pub mod history;
 pub mod legal;
 pub mod search_query;

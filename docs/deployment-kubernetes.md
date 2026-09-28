@@ -1215,167 +1215,54 @@ there is no runtime download or ambient dictionary discovery.
 
 ## Optional ingestion integration
 
-Retained serving is the default. The [ingestion overlay](../deploy/kubernetes/ingestion/)
-enables managed background LAW OPEN DATA traffic as soon as its server starts.
-Applying it is an operator decision requiring separate live-provider authorization;
-rendering it offline does not authorize traffic. It uses the same one-replica
-Deployment and storage, not a second independently budgeted crawler.
+Retained serving stays on the ordinary server image and read-only ConfigMap. The
+[collection overlay](../deploy/kubernetes/ingestion/) adds one scheduler Deployment
+and a separate collection ConfigMap. Only the scheduler and its request Job Pods
+mount `Secret/openlegal-law-provider`; the serving Pod has neither that Secret nor
+a Kubernetes controller identity. The scheduler runs `--collection-scheduler` in
+`continuous` mode and launches a `--collection-job` Pod for each coalesced explicit
+MCP collection request. Applying this overlay starts live provider traffic and
+requires operator authorization and the provider ledger checks below.
+Until the scheduler publishes a fresh heartbeat, retained serving rejects new
+collection requests without storing them; ordinary database reads remain local.
+The scheduler's ServiceAccount can create request Jobs in the serving namespace;
+request Job Pods use a separate ServiceAccount with only the document-controller
+permission required for disposable processing Pods.
 
-### Ingestion image and configuration
+Build and publish the digest-pinned `runtime-ingestion` target from
+`apps/server/Dockerfile` for the scheduler and request Jobs. Stamp the same exact
+image digest in `scheduler-deployment.yaml` and `collection-job.json`, and stamp
+the accepted document-worker image digest in `server.toml`. The ordinary serving
+Deployment continues using the `runtime` image and its own generated ConfigMap.
+The collector ConfigMap contains `[database.ingestion]` with `mode = "continuous"`,
+`detail_timeout_secs = 3600`, and `document_worker.pool_limit = 16`. The detail
+deadline accepts 60–7200 seconds and is read at startup. A claimed detail job's
+lease covers that deadline plus validation and publication.
 
-Build the explicit target for each server architecture:
+The overlay keeps the scheduler and request Jobs in `openlegal-serving` so they
+can mount the existing corpus and cache PVCs. `ResourceQuota/collection-pod-budget`
+allows 18 Pods in that namespace: one serving Pod, one scheduler Pod, and up to
+16 request Job Pods. The document namespace has its separate 16 Pod quota, with
+CPU, memory and scratch totals matching its worker settings. Physical node
+capacity may permit fewer simultaneous Pods. Request Jobs use a 7,500 second
+Kubernetes deadline and no automatic retry; an uncertain Job creation outcome
+stops the scheduler for reconciliation rather than creating a possible duplicate.
 
-```sh
-docker build --platform linux/amd64 --target runtime-ingestion \
-  -f apps/server/Dockerfile --build-arg REVISION="$(git rev-parse HEAD)" \
-  --build-arg VERSION=development -t openlegal-server-ingestion:local-amd64 .
-docker build --platform linux/arm64 --target runtime-ingestion \
-  -f apps/server/Dockerfile --build-arg REVISION="$(git rev-parse HEAD)" \
-  --build-arg VERSION=development -t openlegal-server-ingestion:local-arm64 .
-```
+The scheduler ServiceAccount can create Jobs in `openlegal-serving` and is bound
+to the existing document-controller Role in `openlegal-documents`. Automatic
+ServiceAccount token mounting is disabled. The explicit kubeconfig uses a
+rotating projected token; collection Pods get no Secret or log listing rights.
+Apply the document namespace/Role, the separate RoleBinding root, tailored DNS,
+PostgreSQL, API-server and provider NetworkPolicies, then the collection overlay.
+Confirm the provider Secret reference, exact images, Pod quotas, node placement,
+PVC access, and provider ledger before enabling the scheduler. The serving Pod's
+MCP queries remain local-only; `database.request_collection` is the explicit
+write operation and `database.collection_status` is read-only.
 
-The final/default Docker target remains minimal `runtime`. Both targets preserve
-UID/GID 10004, hardening, widgets and source metadata. Only ingestion includes the
-checksum-verified kubectl v1.37.0 at `/usr/local/bin/kubectl` and its redistribution
-notices. Initial API-server targets are Kubernetes 1.36–1.37, within the upstream
-[version-skew policy](https://kubernetes.io/releases/version-skew-policy/).
-The document worker remains separately built for amd64/x86-64-v3: qualify only
-compatible worker nodes with `openlegal.document-sandbox/ready=true`. ARM64 server
-support does not imply ARM64 document-worker support.
-
-The overlay replaces the generated server ConfigMap with retained configuration
-plus `[database.ingestion]`. Its fixed context is `openlegal-document-controller`,
-its namespace is `openlegal-documents`, and history-body ingestion remains disabled.
-The optional `[database.ingestion.document_worker]` table selects per-Pod `cpu`,
-`memory`, `scratch` and `pool_limit`. The committed values and omitted-field defaults
-are `2`, `4Gi`, `2Gi` and `2`. Edit the operator copy of
-`ResourceQuota/document-budget` to set `pods` to `pool_limit` and both
-`requests` and `limits` for CPU, memory and ephemeral storage to exactly
-`pool_limit × cpu`, `pool_limit × memory` and `pool_limit × scratch`.
-Kubernetes Quantity spellings may differ if they normalize to the same value;
-the offline validator and controller compare normalized values. Leave the
-quota unscoped. Requests remain equal to limits, and each worker Pod's
-`emptyDir` size follows `scratch`.
-After rendering the tailored overlay, validate the selected TOML and quota
-together with `scripts/deployment_validation.py RETAINED_RENDERED.yaml
---ingestion-manifest INGESTION_RENDERED.yaml --document-boundary
-DOCUMENT_BOUNDARY.yaml`; the committed offline gate still checks the default
-examples. This validation checks source/rendered invariants, not cluster admission.
-The same ConfigMap mounts `pilot-candidates.json` at the explicit
-`manual_candidates_path`. Its committed default is empty. To use operator-held
-list exports, run:
-
-```bash
-python3 scripts/prepare-law-pilot-candidates.py \
-  --input-dir /absolute/operator/list-exports \
-  --output /absolute/operator/ingestion/pilot-candidates.json \
-  --allow-incomplete
-```
-
-Inspect the reported skips and file hashes. The
-generator selects at most two untrusted IDs per category; a missing category
-falls back to a bounded live list query. Replace only the JSON in the tailored
-ingestion overlay. It does not seed public records or imply inventory coverage;
-the running adapter fetches and checks live detail before revision-only
-publication. A fresh live current-list observation is required before a
-manual candidate can become public HEAD.
-Replace both non-pullable server/worker digest sentinels with the accepted
-`openlegal-server-ingestion` and `openlegal-document-worker` digests from the
-[release artifact](#ghcr-release-images), and set the corresponding-source
-revision in an operator copy. Keep all retained configuration fields consistent
-with the shared serving/admin base when changing endpoints or storage.
-Administrative Jobs keep their original minimal image and ingestion-free ConfigMap;
-the ingestion ConfigMap has a different content hash by design.
-
-Create `Secret/openlegal-law-provider` outside Git in `openlegal-serving`, with key
-`OPENLEGAL_LAW_PROVIDER_CREDENTIAL`. Only the serving container references it. Never
-put its value in TOML, kubeconfig, image layers, command arguments or test artifacts.
-The server continues to receive only runtime PostgreSQL credentials.
-
-### Explicit projected identity
-
-The overlay creates `ServiceAccount/openlegal-document-controller` with automatic
-token mounting disabled, also disabled on the Pod. A dedicated directory projection
-supplies a token requested for 3,600 seconds and `kube-root-ca.crt`; omitting audience
-uses the API server default. The actual token expiry is determined by the API server.
-UID/GID 10004 can read the 0440 projection through the Pod's fsGroup. Do not use
-`subPath`: directory projection must receive token rotation updates.
-
-The nonsecret kubeconfig at
-`/run/secrets/document-controller/config/kubeconfig` contains exactly one cluster,
-user and context. It references absolute CA/token paths under the sibling
-`/run/secrets/document-controller/identity` mount and defaults to
-`https://kubernetes.default.svc:443`. There is no inline token, authentication plugin,
-proxy URL or insecure TLS setting. See Kubernetes' [token projection guidance](https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#serviceaccount-token-volume-projection).
-
-Apply the existing document namespace and `Role/document-controller` as sandbox
-prerequisites. The separate [RoleBinding root](../deploy/kubernetes/ingestion/rbac/)
-binds that unchanged Role in `openlegal-documents` to the ServiceAccount in
-`openlegal-serving`; do not import it under a serving namespace transformer.
-The controller has no Secret/log access or cluster-wide binding. Sandbox acceptance
-uses a separate operator identity with the additional inspection permissions it
-needs; do not broaden the controller Role to run that harness.
-
-Every kubectl subprocess receives only fixed PATH/HOME/TMPDIR values and explicit
-kubeconfig/context/namespace/cache arguments. Server credentials, ambient Kubernetes
-configuration and proxy variables are not inherited. The executable remains trusted
-code in the serving container, not a separate security sandbox. Existing external
-controller setups relying on inherited proxy/plugin variables must be adapted.
-
-Only ingestion mounts a writable 64 MiB disk-backed `emptyDir` at `/tmp`, with
-ephemeral-storage request/limit of 64/128 MiB. This provisional budget covers kubectl
-discovery/schema caches and logs and must be measured on the target cluster.
-Kubernetes accounting/eviction is not a synchronous filesystem quota. The root
-filesystem stays read-only; no new persistent application storage is introduced.
-
-### Network preparation, activation and rollback
-
-The overlay imports only the existing default-deny policy. Independently tailor and
-apply [API egress](../deploy/kubernetes/network/ingestion-api/) and
-[provider egress](../deploy/kubernetes/network/ingestion-provider/) examples. Both
-select the serving application plus `openlegal.ingestion/enabled=true`; neither
-selects administrative Jobs, retained-only Pods or document workers. The examples
-use documentation-only /32 addresses and TCP 443. Replace these with verified
-API/provider host addresses and actual API ports; never replace them with an
-unrestricted internet or namespace-wide allow.
-
-Apply an existing DNS allow policy for `kubernetes.default.svc` and `www.law.go.kr`.
-Determine whether the CNI evaluates API Service traffic before or after DNAT, then
-allow only the necessary Service/backend IPs and ports. Maintain provider address
-changes explicitly, including /128 entries if using IPv6. Stale lists fail closed;
-there is no automatic address update or broader-network fallback. NetworkPolicy
-does not enforce provider hostnames; the existing HTTPS/destination policy remains
-the application boundary. Parser Pods retain deny-all networking and receive no
-controller token or provider credential.
-
-Operator sequence (commands refer to an explicitly tailored copy):
-
-1. Complete retained-serving acceptance and stop the sole backend during the
-   activation window. Do not run an additional ingestion process against its index.
-   For a resource/pool change, stop ingestion first and reconcile all old worker
-   Pods before applying the matching edited quota. Then start only with the matching
-   ingestion TOML and qualify that selected profile.
-2. Prepare compatible document nodes and complete the separately configured
-   [sandbox acceptance gate](document-sandbox.md#cluster-preparation-and-acceptance).
-3. Provision immutable images, provider Secret, controller identity/RoleBinding and
-   explicit DNS/API/provider policies. Inspect rendered namespace references before
-   applying anything. Record real-cluster token rotation, RBAC denial outside the
-   intended namespace, CNI enforcement and worker credential isolation.
-4. Obtain separate authorization for bounded live-provider acceptance. Only then
-   apply the ingestion overlay and complete that acceptance; its startup immediately
-   enables managed upstream requests. Keep production acceptance pending until
-   the required evidence is recorded.
-5. Verify the single Pod becomes Ready, provider/sandbox failures remain bounded,
-   and corpus freshness/coverage is reported honestly. Private readiness is not
-   proof of successful ingestion or corpus completeness.
-
-To disable ingestion, replace the Deployment/configuration with the retained root
-and wait for the ingestion Pod to terminate. Explicitly delete its two allow
-policies, RoleBinding and ServiceAccount once no ingestion Pod uses them; remove
-the unused provider Secret/controller ConfigMap according to operator policy.
-Reconcile leftover worker Pods with the operator identity. Applying a different
-Kustomize root alone does not prune these separately applied objects. Do not delete
-the shared document Role/namespace, retained storage or base network policies.
+For rollback, stop the collection scheduler and allow active request/document
+Pods to finish or reconcile them explicitly. Keep the ordinary serving Deployment
+and its PVCs. Applying the retained root alone does not prune the scheduler,
+RoleBinding or separate NetworkPolicies.
 
 ### Offline acceptance
 

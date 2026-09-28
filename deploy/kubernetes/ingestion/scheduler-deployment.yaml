@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openlegal-collection-scheduler
+  namespace: openlegal-serving
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openlegal-collection-scheduler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openlegal-collection-scheduler
+        openlegal.ingestion/enabled: "true"
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      serviceAccountName: openlegal-collection-scheduler
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        kubernetes.io/os: linux
+        openlegal.server/ready: "true"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10004
+        runAsGroup: 10004
+        fsGroup: 10004
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: scheduler
+          image: registry.example/openlegal-server-ingestion@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          args: ["--collection-scheduler", "/etc/openlegal/server.toml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: OPENLEGAL_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: openlegal-runtime-db
+                  key: OPENLEGAL_DATABASE_URL
+            - name: OPENLEGAL_LAW_PROVIDER_CREDENTIAL
+              valueFrom:
+                secretKeyRef:
+                  name: openlegal-law-provider
+                  key: OPENLEGAL_LAW_PROVIDER_CREDENTIAL
+          resources:
+            requests: {cpu: "500m", memory: 2Gi, ephemeral-storage: 128Mi}
+            limits: {cpu: "2", memory: 4Gi, ephemeral-storage: 2Gi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/openlegal, readOnly: true}
+            - {name: postgres-ca, mountPath: /run/secrets/postgres-ca, readOnly: true}
+            - {name: controller-config, mountPath: /run/secrets/document-controller/config, readOnly: true}
+            - {name: controller-identity, mountPath: /run/secrets/document-controller/identity, readOnly: true}
+            - {name: cache-blobs, mountPath: /var/lib/openlegal/cache-blobs}
+            - {name: corpus-blobs, mountPath: /var/lib/openlegal/corpus-blobs}
+            - {name: mecab-ko-dictionary, mountPath: /var/lib/openlegal/mecab-ko-dictionary, readOnly: true}
+            - {name: scratch, mountPath: /tmp}
+      volumes:
+        - name: config
+          configMap: {name: openlegal-collection-config, defaultMode: 0444}
+        - name: postgres-ca
+          secret: {secretName: openlegal-postgres-ca, defaultMode: 0440}
+        - name: controller-config
+          configMap: {name: openlegal-document-controller-config, defaultMode: 0444}
+        - name: controller-identity
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken: {path: token, expirationSeconds: 3600}
+              - configMap: {name: kube-root-ca.crt, items: [{key: ca.crt, path: ca.crt}]}
+        - name: cache-blobs
+          persistentVolumeClaim: {claimName: openlegal-cache-blobs}
+        - name: corpus-blobs
+          persistentVolumeClaim: {claimName: openlegal-corpus-blobs}
+        - name: mecab-ko-dictionary
+          persistentVolumeClaim: {claimName: openlegal-mecab-dictionary, readOnly: true}
+        - name: scratch
+          emptyDir: {sizeLimit: 2Gi}

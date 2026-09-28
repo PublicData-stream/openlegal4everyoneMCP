@@ -10,5 +10,8 @@ roleRef:
   name: document-controller
 subjects:
   - kind: ServiceAccount
-    name: openlegal-document-controller
+    name: openlegal-collection-controller
+    namespace: openlegal-serving
+  - kind: ServiceAccount
+    name: openlegal-collection-scheduler
     namespace: openlegal-serving

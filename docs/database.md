@@ -197,17 +197,18 @@ claim until inventories are verified again.
 Background ingestion requires explicit `[database.ingestion]` configuration with
 `enabled = true`, a credential environment variable name, absolute kubectl and
 kubeconfig paths, an explicit context/namespace, and a worker image pinned by digest.
-A claimed ingestion attempt allows at most 500 seconds for provider/detail processing,
-10 seconds for index admission, and 40 seconds for publication, within its 600-second
-lease. Deterministic source/access/format failures are terminal for that attempt;
+`detail_timeout_secs` controls provider/detail processing (default 3600 seconds,
+valid range 60–7200). The job lease adds 120 seconds for index admission and
+publication. Deterministic source/access/format failures are terminal for that attempt;
 transient failures have at most three attempts and honor provider Retry-After.
 No live provider calls occur in ordinary tests. Refer to the
 [Korean provider profile](providers/kr-law-go-kr.md) and
 [document sandbox](document-sandbox.md) for evidence and deployment gates.
 The [Kubernetes ingestion overlay](deployment-kubernetes.md#optional-ingestion-integration)
 supplies the optional image, projected identity and network templates. Its enabled
-startup initiates background traffic; applying it requires separate operator
-authorization after sandbox acceptance. Retained serving remains independent.
+startup initiates background traffic in a separate scheduler Pod; applying it
+requires separate operator authorization after sandbox acceptance. The serving
+Pod has no provider credential and its lookups do not schedule collection.
 
 Current HEAD data is retained independently of ordinary historical retention.
 Historical bodies are retained for 30 days, with bounded session extensions;

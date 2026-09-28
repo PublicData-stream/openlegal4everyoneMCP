@@ -66,10 +66,12 @@ kubeconfig = "/run/secrets/document-controller/config/kubeconfig"
 context = "openlegal-document-controller"
 namespace = "openlegal-documents"
 worker_image = "registry.example/openlegal-document-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+collection_namespace = "openlegal-serving"
+collection_job_template_path = "/etc/openlegal/collection-job.json"
 enabled = true
-mode = "pilot"
-manual_candidates_path = "/etc/openlegal/pilot-candidates.json"
+mode = "continuous"
 retain_history_bodies = false
+detail_timeout_secs = 3600
 
 # Match deploy/document-sandbox/namespace.yaml ResourceQuota/document-budget.
 # Omitting this table retains these defaults.
@@ -77,4 +79,4 @@ retain_history_bodies = false
 cpu = "2"
 memory = "4Gi"
 scratch = "2Gi"
-pool_limit = 2
+pool_limit = 16

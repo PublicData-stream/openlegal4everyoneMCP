@@ -11,6 +11,7 @@ use openlegal_application::{
     document::{DocumentError, DocumentInput, DocumentOutput, DocumentProcessor},
     persistence::PersistentStore,
 };
+use openlegal_domain::collection::{CollectionRequest, CollectionTarget};
 use openlegal_domain::legal::*;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
@@ -35,6 +36,153 @@ impl openlegal_application::Clock for FixtureClock {
 }
 fn token() -> CancellationToken {
     CancellationToken::new()
+}
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn explicit_collection_requests_coalesce_and_clear_completed_payloads() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("explicit-requests"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::new(base.pool(), blobs);
+    let mut requested = object();
+    requested.provider = "law_go_kr".into();
+    let request = CollectionRequest {
+        target: CollectionTarget::Object { object: requested },
+    };
+    assert_eq!(
+        store.request_collection(request.clone()).await.err(),
+        Some(DatabaseError::Capacity)
+    );
+    store.heartbeat_collection_scheduler().await.unwrap();
+    let first = store.request_collection(request.clone()).await.unwrap();
+    let second = store.request_collection(request).await.unwrap();
+    assert_eq!(first.request_id, second.request_id);
+    assert_eq!(first.status, "queued");
+    let (id, claimed) = store.claim_collection_request().await.unwrap().unwrap();
+    assert_eq!(id, first.request_id);
+    claimed.validate().unwrap();
+    store
+        .mark_collection_running(&id, "openlegal-request-test")
+        .await
+        .unwrap();
+    assert!(store.load_collection_request(&id).await.is_ok());
+    store
+        .settle_collection_request(&id, "deferred")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.request_collection(claimed).await.unwrap().status,
+        "deferred"
+    );
+    sqlx::query("UPDATE openlegal.collection_request SET lease_until=floor(extract(epoch from clock_timestamp()))::bigint-1 WHERE id=$1")
+        .bind(uuid::Uuid::parse_str(&id).unwrap()).execute(&base.pool()).await.unwrap();
+    let (reclaimed, _) = store.claim_collection_request().await.unwrap().unwrap();
+    assert_eq!(reclaimed, id);
+    store
+        .mark_collection_running(&id, "openlegal-request-test")
+        .await
+        .unwrap();
+    store.settle_collection_request(&id, "done").await.unwrap();
+    assert_eq!(store.collection_status(&id).await.unwrap().status, "done");
+    assert!(store.load_collection_request(&id).await.is_err());
+    base.close().await.unwrap();
+}
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn explicit_detail_job_is_fenced_and_incomplete_capture_retries_without_freshness_claim() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("explicit-detail"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(base.pool(), blobs, Arc::new(FixtureClock));
+    let mut metadata = BTreeMap::new();
+    metadata.insert("collection_origin".into(), "explicit".into());
+    metadata.insert("title".into(), "Fictional statute".into());
+    let queued = store
+        .enqueue_job_with_metadata_fenced(
+            object(),
+            "r1".into(),
+            None,
+            true,
+            false,
+            100,
+            metadata.clone(),
+            Some(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .enqueue_job_with_metadata_fenced(
+                object(),
+                "r1".into(),
+                None,
+                true,
+                false,
+                101,
+                metadata,
+                Some(0)
+            )
+            .await
+            .err(),
+        Some(DatabaseError::Conflict)
+    );
+    assert!(store.claim_job(101).await.unwrap().is_none());
+    let claimed = store
+        .claim_explicit_job(&queued.id, 101, 3720)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut incomplete = record("r1", "partial body");
+    incomplete
+        .metadata
+        .insert("attachment_status".into(), "incomplete".into());
+    let first = store
+        .publish(
+            Publication {
+                record: incomplete.clone(),
+                raw: b"partial body".to_vec(),
+                additional_evidence: vec![],
+                processor_version: "fixture_v1".into(),
+                retrieved_at: 102,
+                now: 102,
+                expected_version: claimed.expected_version,
+                install_head: true,
+                job_id: Some(claimed.id),
+            },
+            token(),
+        )
+        .await
+        .unwrap();
+    assert!(store.detail_gap_active(&object(), "r1").await.unwrap());
+    assert_eq!(store.requeue_due_details(3702).await.unwrap(), 1);
+    let retry = store.claim_job(3703).await.unwrap().unwrap();
+    let same = store
+        .publish(
+            Publication {
+                record: incomplete,
+                raw: b"partial body".to_vec(),
+                additional_evidence: vec![],
+                processor_version: "fixture_v1".into(),
+                retrieved_at: 3703,
+                now: 3703,
+                expected_version: retry.expected_version,
+                install_head: true,
+                job_id: Some(retry.id),
+            },
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(same.capture_id, first.capture_id);
+    assert_eq!(same.validated_at, first.validated_at);
+    let head_validated_at: String = sqlx::query_scalar("SELECT validated_at::text FROM openlegal.corpus_object WHERE object_key=(SELECT object_key FROM openlegal.corpus_capture WHERE id=$1)")
+        .bind(&first.capture_id).fetch_one(&base.pool()).await.unwrap();
+    assert_eq!(head_validated_at, "102");
+    base.close().await.unwrap();
 }
 #[tokio::test]
 #[ignore = "requires scripts/test-postgres.sh"]
@@ -264,6 +412,29 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
     .await
     .unwrap();
     assert_eq!(counts, (1000, 100));
+    sqlx::query("UPDATE openlegal.provider_request_budget SET on_demand_used=999,unresolved_response=false,next_allowed_at=0")
+        .execute(&pool).await.unwrap();
+    LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::OnDemand, &token())
+        .await
+        .unwrap();
+    let counts: (i32, i32) = sqlx::query_as(
+        "SELECT daily_used,on_demand_used FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1000, 1000));
+    sqlx::query(
+        "UPDATE openlegal.provider_request_budget SET unresolved_response=false,next_allowed_at=0",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::OnDemand, &token())
+            .await,
+        Err(DatabaseError::BudgetExhausted)
+    );
     let blobs = FsBlobStore::open(&fixture.directory.path().join("budget-corpus"))
         .await
         .unwrap();

@@ -239,8 +239,9 @@ def _guard(raw, parsed, path):
                     require(normalized not in ("url", "migrationurl"), path, "inline-database-url")
                 if key in ("image", "worker_image"):
                     placeholder = ("openlegal-document-worker" if key == "worker_image" else
-                                   "openlegal-server-ingestion" if path ==
-                                   "deploy/kubernetes/ingestion/deployment-patch.yaml" else "openlegal-server")
+                                   "openlegal-server-ingestion" if path in (
+                                       "deploy/kubernetes/ingestion/scheduler-deployment.yaml",
+                                       "deploy/kubernetes/ingestion/collection-job.json") else "openlegal-server")
                     try:
                         digest_image(item, placeholder)
                     except ValidationError:
@@ -273,11 +274,15 @@ def _local_target(repo, source, reference, sources):
 def _edges(repo, path, parsed, sources):
     require(isinstance(parsed, list) and len(parsed) == 1, path, "kustomization-document")
     config = parsed[0]
-    allowed = {"apiVersion", "kind", "namespace", "resources", "configMapGenerator", "patches"}
+    allowed = {"apiVersion", "kind", "namespace", "resources", "configMapGenerator", "generatorOptions", "patches"}
     require(set(config) <= allowed and config.get("apiVersion") == "kustomize.config.k8s.io/v1beta1"
             and config.get("kind") == "Kustomization", path, "unsupported-kustomization")
     if "namespace" in config:
         require(config["namespace"] == "openlegal-serving", path, "kustomization-namespace")
+    if "generatorOptions" in config:
+        require(path == "deploy/kubernetes/ingestion/kustomization.yaml"
+                and config["generatorOptions"] == {"disableNameSuffixHash": True},
+                path, "unsupported-generator-options")
     edges = set()
 
     def add(reference, roles):
@@ -298,7 +303,7 @@ def _edges(repo, path, parsed, sources):
                 and {"name", "files"} <= set(generator), path, "unsupported-generator")
         name = generator["name"]
         require(isinstance(name, str) and name in
-                ("openlegal-server-config", "openlegal-document-controller-config")
+                ("openlegal-server-config", "openlegal-collection-config", "openlegal-document-controller-config")
                 and name not in names, path, "generator-name")
         names.add(name)
         if "behavior" in generator:

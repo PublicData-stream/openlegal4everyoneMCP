@@ -4,14 +4,17 @@ namespace: openlegal-serving
 resources:
   - ../serving
   - service-account.yaml
+  - scheduler-service-account.yaml
+  - scheduler-deployment.yaml
+  - scheduler-role.yaml
+  - serving-quota.yaml
+generatorOptions:
+  disableNameSuffixHash: true
 configMapGenerator:
-  - name: openlegal-server-config
-    behavior: replace
+  - name: openlegal-collection-config
     files:
       - server.toml
-      - pilot-candidates.json
+      - collection-job.json
   - name: openlegal-document-controller-config
     files:
       - kubeconfig
-patches:
-  - path: deployment-patch.yaml

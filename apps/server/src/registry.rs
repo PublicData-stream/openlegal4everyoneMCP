@@ -1,4 +1,4 @@
-//! Startup-only registration of trusted, read-only tool implementations.
+//! Startup-only registration of trusted tool implementations.
 
 use crate::{ServerError, progress::ProgressReporter};
 use futures::{FutureExt, future::BoxFuture};
@@ -179,6 +179,7 @@ impl ToolRegistry {
                         | "text.diff.delete"
                         | "text.attachment.upload"
                         | "text.attachment.delete"
+                        | "database.request_collection"
                 ))
         {
             return Err("anonymous extension tools must be read-only".into());
@@ -301,6 +302,29 @@ impl ToolRegistry {
             return Err("unsupported built-in transient operation".into());
         }
         self.register_typed_internal(name, description, options, handler, true)
+    }
+
+    /// The only durable public mutation: a bounded, coalesced collection request.
+    pub(crate) fn register_collection_request<I, O, F, Fut>(
+        &mut self,
+        handler: F,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: serde::Serialize + JsonSchema + Send + 'static,
+        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
+    {
+        self.register_typed_internal(
+            "database.request_collection",
+            "Explicitly request bounded collection of one Korean national statute or simple search candidates. This queues a background provider job; use database.collection_status and then requery the corpus.",
+            ToolOptions {
+                annotations: ToolAnnotations::from_raw(None, Some(false), Some(false), Some(true), Some(true)),
+                meta: None,
+            },
+            handler,
+            true,
+        )
     }
 
     fn register_typed_internal<I, O, F, Fut>(

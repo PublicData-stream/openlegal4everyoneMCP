@@ -77,7 +77,7 @@ ADMIN = {
 NETWORK_VARIANTS = ("base", "edge", "postgres-in-cluster", "postgres-external",
                     "dns-cluster", "dns-fixed", "monitoring", "ingestion-api", "ingestion-provider")
 
-DOCUMENT_WORKER_DEFAULTS = {"cpu": "2", "memory": "4Gi", "scratch": "2Gi", "pool_limit": 2}
+DOCUMENT_WORKER_DEFAULTS = {"cpu": "2", "memory": "4Gi", "scratch": "2Gi", "pool_limit": 16}
 QUANTITY_SCALE = {
     "": 1, "n": Fraction(1, 10**9), "u": Fraction(1, 10**6),
     "m": Fraction(1, 1000), "k": 10**3, "M": 10**6, "G": 10**9,
@@ -156,7 +156,7 @@ def network_example(variant):
     require(variant in NETWORK_VARIANTS, "unknown network example")
     serving = {"matchLabels": {"app.kubernetes.io/name": "openlegal-server"}}
     database_clients = {"matchExpressions": [{"key": "app.kubernetes.io/name",
-                        "operator": "In", "values": ["openlegal-server", "openlegal-admin"]}]}
+                        "operator": "In", "values": ["openlegal-server", "openlegal-admin", "openlegal-collection-scheduler", "openlegal-collection-job"]}]}
 
     def selected_peer(namespace, key, value):
         return {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": namespace}},
@@ -198,8 +198,7 @@ def network_example(variant):
             ports = [port("TCP", 9090)]
         selector = (serving if ingress else database_clients)
         if variant.startswith("ingestion-"):
-            selector = {"matchLabels": {"app.kubernetes.io/name": "openlegal-server",
-                                        "openlegal.ingestion/enabled": "true"}}
+            selector = {"matchLabels": {"openlegal.ingestion/enabled": "true"}}
         spec = {"podSelector": selector,
                 "policyTypes": ["Ingress" if ingress else "Egress"],
                 direction: [{"from" if ingress else "to": [peer], "ports": ports}]}
@@ -466,115 +465,173 @@ def digest_image(image, placeholder):
 
 
 def validate_ingestion(documents, retained_documents):
-    """Require the explicit opt-in additions and exact retained behavior parity."""
+    """Keep serving immutable and inspect the isolated scheduler and Job contract."""
     retained_raw = validate(retained_documents)
     actual = resource_index(documents)
-    expected_documents = copy.deepcopy(retained_documents)
-
-    def one(kind, prefix=None):
-        matches = [obj for obj in documents if obj["kind"] == kind
-                   and (prefix is None or obj["metadata"]["name"].startswith(prefix))]
-        require(len(matches) == 1, f"expected one ingestion {kind} {prefix or ''}")
-        return matches[0]
-
-    server_cm = one("ConfigMap", "openlegal-server-config-")
-    controller_cm = one("ConfigMap", "openlegal-document-controller-config-")
-    for cm, prefix in ((server_cm, "openlegal-server-config"),
-                       (controller_cm, "openlegal-document-controller-config")):
-        require(re.fullmatch(prefix + r"-[a-z0-9]{10}", cm["metadata"]["name"]),
-                "ingestion ConfigMap must retain content hash")
-        keys(cm.get("data"), ("server.toml", "pilot-candidates.json") if cm is server_cm else ("kubeconfig",), "ingestion ConfigMap data")
-    raw = server_cm["data"]["server.toml"]
-    require(isinstance(raw, str), "ingestion server.toml must be text")
-    candidate_raw = server_cm["data"]["pilot-candidates.json"]
-    require(isinstance(candidate_raw, str) and len(candidate_raw.encode()) <= 32 * 1024,
-            "ingestion pilot candidate manifest size")
-    try:
-        candidate_manifest = json.loads(candidate_raw)
-    except (ValueError, TypeError):
-        raise ValidationError("ingestion pilot candidate manifest syntax") from None
-    require(isinstance(candidate_manifest, dict) and candidate_manifest.get("version") == 1
-            and isinstance(candidate_manifest.get("candidates"), list)
-            and len(candidate_manifest["candidates"]) <= 18,
-            "ingestion pilot candidate manifest shape")
+    retained = resource_index(retained_documents)
+    require(set(retained).issubset(actual), "ingestion overlay removed retained resources")
+    for identity, expected in retained.items():
+        equal(actual[identity], expected, f"retained {identity[-1]}")
+    additions = [obj for identity, obj in actual.items() if identity not in retained]
+    equal({(obj["kind"], obj["metadata"]["name"]) for obj in additions}, {
+        ("ConfigMap", "openlegal-collection-config"),
+        ("ConfigMap", "openlegal-document-controller-config"),
+        ("ServiceAccount", "openlegal-collection-controller"),
+        ("ServiceAccount", "openlegal-collection-scheduler"),
+        ("Deployment", "openlegal-collection-scheduler"),
+        ("Role", "collection-scheduler"),
+        ("RoleBinding", "collection-scheduler"),
+        ("ResourceQuota", "collection-pod-budget"),
+    }, "ingestion resource set")
+    def added(kind, name):
+        return next(obj for obj in additions if obj["kind"] == kind and obj["metadata"]["name"] == name)
+    cm = added("ConfigMap", "openlegal-collection-config")
+    keys(cm["data"], ("server.toml", "collection-job.json"), "collection configuration")
+    raw = cm["data"]["server.toml"]
     config = tomllib.loads(raw)
-    require(isinstance(config.get("database"), dict), "ingestion database configuration required")
     ingestion = config["database"].pop("ingestion", None)
     require(isinstance(ingestion, dict), "ingestion configuration required")
-    equal(config, tomllib.loads(retained_raw), "ingestion retained configuration parity")
+    equal(config, tomllib.loads(retained_raw), "retained configuration parity")
     document_worker_settings(ingestion)
-    ingestion.pop("document_worker", None)
-    worker = ingestion.get("worker_image")
+    worker = ingestion.pop("worker_image", None)
     digest_image(worker, "openlegal-document-worker")
+    ingestion.pop("document_worker", None)
     equal(ingestion, {
-        "credential_env": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "kubectl": "/usr/local/bin/kubectl",
+        "credential_env": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL",
+        "kubectl": "/usr/local/bin/kubectl",
         "kubeconfig": "/run/secrets/document-controller/config/kubeconfig",
         "context": "openlegal-document-controller", "namespace": "openlegal-documents",
-        "worker_image": worker, "enabled": True, "mode": "pilot",
-        "manual_candidates_path": "/etc/openlegal/pilot-candidates.json",
-        "retain_history_bodies": False,
-    }, "ingestion configuration")
-    identity = "/run/secrets/document-controller/identity"
+        "collection_namespace": "openlegal-serving",
+        "collection_job_template_path": "/etc/openlegal/collection-job.json",
+        "enabled": True, "mode": "continuous", "retain_history_bodies": False,
+        "detail_timeout_secs": 3600,
+    }, "continuous collection configuration")
+    equal(added("ServiceAccount", "openlegal-collection-controller"), {
+        "apiVersion": "v1", "kind": "ServiceAccount", "metadata": {
+            "name": "openlegal-collection-controller", "namespace": "openlegal-serving"},
+        "automountServiceAccountToken": False,
+    }, "request Job ServiceAccount")
+    equal(added("ServiceAccount", "openlegal-collection-scheduler"), {
+        "apiVersion": "v1", "kind": "ServiceAccount", "metadata": {
+            "name": "openlegal-collection-scheduler", "namespace": "openlegal-serving"},
+        "automountServiceAccountToken": False,
+    }, "scheduler ServiceAccount")
+    equal(added("Role", "collection-scheduler"), {
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+        "metadata": {"name": "collection-scheduler", "namespace": "openlegal-serving"},
+        "rules": [{"apiGroups": ["batch"], "resources": ["jobs"],
+                   "verbs": ["create", "get", "list", "watch"]}],
+    }, "scheduler Job permissions")
+    equal(added("RoleBinding", "collection-scheduler"), {
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+        "metadata": {"name": "collection-scheduler", "namespace": "openlegal-serving"},
+        "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role",
+                    "name": "collection-scheduler"},
+        "subjects": [{"kind": "ServiceAccount", "name": "openlegal-collection-scheduler",
+                      "namespace": "openlegal-serving"}],
+    }, "scheduler Job RoleBinding")
     kubeconfig = {
         "apiVersion": "v1", "kind": "Config",
         "clusters": [{"name": "document-cluster", "cluster": {
-            "server": "https://kubernetes.default.svc:443", "certificate-authority": identity + "/ca.crt"}}],
-        "users": [{"name": "openlegal-document-controller", "user": {"tokenFile": identity + "/token"}}],
+            "server": "https://kubernetes.default.svc:443",
+            "certificate-authority": "/run/secrets/document-controller/identity/ca.crt"}}],
+        "users": [{"name": "openlegal-document-controller", "user": {
+            "tokenFile": "/run/secrets/document-controller/identity/token"}}],
         "contexts": [{"name": "openlegal-document-controller", "context": {
-            "cluster": "document-cluster", "user": "openlegal-document-controller", "namespace": "openlegal-documents"}}],
+            "cluster": "document-cluster", "user": "openlegal-document-controller",
+            "namespace": "openlegal-documents"}}],
         "current-context": "openlegal-document-controller",
     }
-    require(isinstance(controller_cm["data"]["kubeconfig"], str), "kubeconfig must be text")
-    parsed_kubeconfig = load_documents(controller_cm["data"]["kubeconfig"])
-    equal(parsed_kubeconfig, [kubeconfig], "dedicated kubeconfig")
-    expected_controller = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {
-        "name": controller_cm["metadata"]["name"], "namespace": "openlegal-serving"},
-        "data": {"kubeconfig": controller_cm["data"]["kubeconfig"]}}
-    expected_documents.extend([expected_controller, {
-        "apiVersion": "v1", "kind": "ServiceAccount", "metadata": {
-            "name": "openlegal-document-controller", "namespace": "openlegal-serving"},
-        "automountServiceAccountToken": False}])
-    base_cm = next(obj for obj in expected_documents if obj["kind"] == "ConfigMap"
-                   and obj["metadata"]["name"].startswith("openlegal-server-config-"))
-    require(base_cm["metadata"]["name"] != server_cm["metadata"]["name"], "ingestion needs a distinct configuration hash")
-    base_cm["metadata"]["name"] = server_cm["metadata"]["name"]
-    base_cm["data"]["server.toml"] = raw
-    base_cm["data"]["pilot-candidates.json"] = candidate_raw
-    template = next(obj for obj in expected_documents if obj["kind"] == "Deployment")["spec"]["template"]
-    template["metadata"]["labels"]["openlegal.ingestion/enabled"] = "true"
-    pod = template["spec"]
-    pod["serviceAccountName"] = "openlegal-document-controller"
-    container = pod["containers"][0]
-    image = one("Deployment")["spec"]["template"]["spec"]["containers"][0].get("image")
-    digest_image(image, "openlegal-server-ingestion")
-    container["image"] = image
-    container["env"].append({"name": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "valueFrom": {
-        "secretKeyRef": {"name": "openlegal-law-provider", "key": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL"}}})
-    container["resources"]["requests"]["ephemeral-storage"] = "64Mi"
-    container["resources"]["limits"]["ephemeral-storage"] = "128Mi"
-    container["volumeMounts"].extend([
-        {"name": "controller-config", "mountPath": "/run/secrets/document-controller/config", "readOnly": True},
-        {"name": "controller-identity", "mountPath": identity, "readOnly": True},
-        {"name": "kubectl-tmp", "mountPath": "/tmp", "readOnly": False}])
-    next(volume for volume in pod["volumes"] if volume["name"] == "config")["configMap"]["name"] = server_cm["metadata"]["name"]
-    pod["volumes"].extend([
-        {"name": "controller-config", "configMap": {"name": controller_cm["metadata"]["name"], "defaultMode": 0o444}},
-        {"name": "controller-identity", "projected": {"defaultMode": 0o440, "sources": [
-            {"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}},
-            {"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}}]}},
-        {"name": "kubectl-tmp", "emptyDir": {"sizeLimit": "64Mi"}}])
-    # Kustomize prepends strategic-merge entries. Order is irrelevant for these
-    # unique named items; duplicate names remain rejected by exact list equality.
-    actual = copy.deepcopy(actual)
-    expected = resource_index(expected_documents)
-    for indexed in (actual, expected):
-        deployment = next(obj for obj in indexed.values() if obj["kind"] == "Deployment")
-        spec = deployment["spec"]["template"]["spec"]
-        for items in (spec["volumes"], spec["containers"][0]["volumeMounts"], spec["containers"][0]["env"]):
-            items.sort(key=lambda item: item.get("name", ""))
-    require(actual.keys() == expected.keys(), "unexpected or missing ingestion resources")
-    for identity_key, obj in expected.items():
-        equal(actual[identity_key], obj, f"ingestion {identity_key[-1]}")
+    controller_cm = added("ConfigMap", "openlegal-document-controller-config")
+    keys(controller_cm["data"], ("kubeconfig",), "controller ConfigMap")
+    equal(load_documents(controller_cm["data"]["kubeconfig"]), [kubeconfig], "dedicated kubeconfig")
+    job = json.loads(cm["data"]["collection-job.json"])
+    require(job.get("kind") == "Job" and job["spec"].get("activeDeadlineSeconds") == 7500
+            and job["spec"].get("backoffLimit") == 0, "bounded collection Job")
+    job_pod = job["spec"]["template"]["spec"]
+    digest_image(job_pod["containers"][0]["image"], "openlegal-server-ingestion")
+    require(job_pod.get("serviceAccountName") == "openlegal-collection-controller"
+            and job_pod.get("automountServiceAccountToken") is False,
+            "collection Job identity")
+    scheduler = added("Deployment", "openlegal-collection-scheduler")
+    scheduler_pod = scheduler["spec"]["template"]["spec"]
+    digest_image(scheduler_pod["containers"][0]["image"], "openlegal-server-ingestion")
+    require(scheduler_pod["containers"][0]["args"] == ["--collection-scheduler", "/etc/openlegal/server.toml"]
+            and scheduler_pod.get("serviceAccountName") == "openlegal-collection-scheduler"
+            and scheduler_pod.get("automountServiceAccountToken") is False,
+            "scheduler command and identity")
+    require(scheduler["spec"].get("replicas") == 1, "one collection scheduler")
+    identity = "/run/secrets/document-controller/identity"
+    for pod in (job_pod, scheduler_pod):
+        require(set(pod) == {"automountServiceAccountToken", "containers", "enableServiceLinks",
+                             "nodeSelector", "securityContext", "serviceAccountName",
+                             "terminationGracePeriodSeconds", "volumes"}
+                | ({"restartPolicy"} if pod is job_pod else set()), "collector Pod fields")
+        require(len(pod["containers"]) == 1 and pod.get("enableServiceLinks") is False
+                and pod.get("terminationGracePeriodSeconds") == 30,
+                "isolated collector Pod")
+        require(pod.get("nodeSelector") == {"kubernetes.io/os": "linux",
+                                             "openlegal.server/ready": "true"},
+                "collector node placement")
+        equal(pod["securityContext"], {"runAsNonRoot": True, "runAsUser": 10004,
+              "runAsGroup": 10004, "fsGroup": 10004,
+              "seccompProfile": {"type": "RuntimeDefault"}}, "collector Pod security")
+        container = pod["containers"][0]
+        require(set(container) == {"name", "image", "imagePullPolicy", "args", "env",
+                                   "resources", "securityContext", "volumeMounts"},
+                "collector container fields")
+        equal(container["securityContext"], {"allowPrivilegeEscalation": False,
+              "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]}},
+              "collector container security")
+        volumes = {item["name"]: item for item in pod["volumes"]}
+        mounts = {item["name"]: item for item in container["volumeMounts"]}
+        require(len(volumes) == len(pod["volumes"]) == 8 and
+                len(mounts) == len(container["volumeMounts"]) == 8 and
+                set(volumes) == set(mounts) == {"config", "postgres-ca", "controller-config",
+                                             "controller-identity", "cache-blobs", "corpus-blobs",
+                                             "mecab-ko-dictionary", "scratch"},
+                "collector volumes and mounts")
+        equal(volumes["config"], {"name": "config", "configMap": {
+            "name": "openlegal-collection-config", "defaultMode": 0o444}},
+            "collector configuration volume")
+        equal(volumes["postgres-ca"], {"name": "postgres-ca", "secret": {
+            "secretName": "openlegal-postgres-ca", "defaultMode": 0o440}},
+            "collector database CA")
+        equal(volumes["controller-config"], {"name": "controller-config", "configMap": {
+            "name": "openlegal-document-controller-config", "defaultMode": 0o444}},
+            "controller configuration volume")
+        for name, claim, read_only in (("cache-blobs", "openlegal-cache-blobs", False),
+                                       ("corpus-blobs", "openlegal-corpus-blobs", False),
+                                       ("mecab-ko-dictionary", "openlegal-mecab-dictionary", True)):
+            expected_claim = {"claimName": claim}
+            if read_only:
+                expected_claim["readOnly"] = True
+            equal(volumes[name], {"name": name, "persistentVolumeClaim": expected_claim},
+                  f"collector {name} PVC")
+        equal(volumes["controller-identity"], {"name": "controller-identity", "projected": {
+            "defaultMode": 0o440, "sources": [
+                {"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}},
+                {"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}}]}},
+            "projected controller identity")
+        equal(mounts["controller-identity"], {"name": "controller-identity", "mountPath": identity,
+              "readOnly": True}, "controller identity mount")
+        equal(mounts["controller-config"], {"name": "controller-config",
+              "mountPath": "/run/secrets/document-controller/config", "readOnly": True},
+              "controller kubeconfig mount")
+        equal(volumes["scratch"], {"name": "scratch", "emptyDir": {"sizeLimit": "2Gi"}},
+              "bounded scratch")
+        equal(container["resources"], {"requests": {"cpu": "500m" if pod is scheduler_pod else "250m",
+            "memory": "2Gi" if pod is scheduler_pod else "1Gi", "ephemeral-storage": "128Mi"},
+            "limits": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "2Gi"}},
+            "collector resources")
+    for pod in (job_pod, scheduler_pod):
+        env = {item["name"]: item for item in pod["containers"][0]["env"]}
+        equal(env, {name: {"name": name, "valueFrom": {"secretKeyRef": {"name": secret, "key": name}}}
+                    for name, secret in (("OPENLEGAL_DATABASE_URL", "openlegal-runtime-db"),
+                                         ("OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "openlegal-law-provider"))},
+              "collector credential set")
+    quota = added("ResourceQuota", "collection-pod-budget")
+    equal(quota["spec"], {"hard": {"pods": "18"}}, "separate on-demand Pod budget")
     return raw
 
 
@@ -595,7 +652,10 @@ def validate_ingestion_rbac(documents):
         "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
         "metadata": {"name": "openlegal-document-controller", "namespace": "openlegal-documents"},
         "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "document-controller"},
-        "subjects": [{"kind": "ServiceAccount", "name": "openlegal-document-controller", "namespace": "openlegal-serving"}],
+        "subjects": [
+            {"kind": "ServiceAccount", "name": "openlegal-collection-controller", "namespace": "openlegal-serving"},
+            {"kind": "ServiceAccount", "name": "openlegal-collection-scheduler", "namespace": "openlegal-serving"},
+        ],
     }], "controller namespace-scoped binding")
 
 

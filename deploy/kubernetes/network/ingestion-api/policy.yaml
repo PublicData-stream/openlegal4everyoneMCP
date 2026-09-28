@@ -7,7 +7,6 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: openlegal-server
       openlegal.ingestion/enabled: "true"
   policyTypes: [Egress]
   egress:

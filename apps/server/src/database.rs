@@ -9,6 +9,7 @@ use openlegal_application::{
     text_diff::TextDiffService,
 };
 use openlegal_domain::{
+    collection::{CollectionReceipt, CollectionRequest, CollectionStatusInput},
     legal::*,
     legal_search::{SearchPage, SearchRequest},
     text_diff::{CompareInput, ComparisonSummary},
@@ -269,6 +270,29 @@ impl ToolModule for DatabaseTools {
                 },
             )?;
         }
+        let requests = self.store.clone();
+        registry.register_collection_request::<CollectionRequest, CollectionReceipt, _, _>(
+            move |input, _| {
+                let requests = requests.clone();
+                async move {
+                    requests
+                        .request_collection(input)
+                        .await
+                        .map(output)
+                        .map_err(map_error)
+                }
+            },
+        )?;
+        let requests = self.store.clone();
+        registry.register_typed::<CollectionStatusInput, CollectionReceipt, _, _>(
+            "database.collection_status",
+            "Read the status of an explicit collection request by request_id. This does not initiate collection.",
+            ToolOptions::default(),
+            move |input, _| {
+                let requests = requests.clone();
+                async move { requests.collection_status(&input.request_id).await.map(output).map_err(map_error) }
+            },
+        )?;
         let service = self.database;
         let comparison = self.comparison;
         registry.register_typed::<DiffInput, DiffOutput, _, _>(

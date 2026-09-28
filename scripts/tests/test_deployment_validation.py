@@ -429,13 +429,14 @@ class IngestionValidationTests(unittest.TestCase):
 
     def setUp(self):
         self.docs = copy.deepcopy(self.baseline)
-        self.deployment = next(obj for obj in self.docs if obj["kind"] == "Deployment")
+        self.deployment = next(obj for obj in self.docs if obj["kind"] == "Deployment"
+                               and obj["metadata"]["name"] == "openlegal-collection-scheduler")
         self.pod = self.deployment["spec"]["template"]["spec"]
         self.container = self.pod["containers"][0]
         self.mounts = {item["name"]: item for item in self.container["volumeMounts"]}
         self.volumes = {item["name"]: item for item in self.pod["volumes"]}
         self.config = next(obj for obj in self.docs if obj["kind"] == "ConfigMap"
-                           and "server.toml" in obj["data"])
+                           and obj["metadata"]["name"] == "openlegal-collection-config")
         self.controller_config = next(obj for obj in self.docs if obj["kind"] == "ConfigMap"
                                       and "kubeconfig" in obj["data"])
 
@@ -458,7 +459,7 @@ class IngestionValidationTests(unittest.TestCase):
     def test_document_worker_options_are_optional_and_bounded(self):
         raw = self.config["data"]["server.toml"]
         default_block = ('[database.ingestion.document_worker]\n'
-                         'cpu = "2"\nmemory = "4Gi"\nscratch = "2Gi"\npool_limit = 2\n')
+                         'cpu = "2"\nmemory = "4Gi"\nscratch = "2Gi"\npool_limit = 16\n')
         self.assertIn(default_block, raw)
         self.config["data"]["server.toml"] = raw.replace(default_block, "")
         validate_ingestion(self.docs, self.retained)
@@ -491,8 +492,8 @@ class IngestionValidationTests(unittest.TestCase):
             (self.mounts["controller-identity"], "subPath", "token"),
             (self.mounts["controller-config"], "readOnly", False),
             (self.mounts["controller-identity"], "readOnly", False),
-            (self.volumes["kubectl-tmp"]["emptyDir"], "medium", "Memory"),
-            (self.volumes["kubectl-tmp"]["emptyDir"], "sizeLimit", "1Gi"),
+            (self.volumes["scratch"]["emptyDir"], "medium", "Memory"),
+            (self.volumes["scratch"]["emptyDir"], "sizeLimit", "1Gi"),
             (self.container["resources"]["limits"], "ephemeral-storage", "1Gi"),
             (self.deployment["spec"], "replicas", 2),
         ):
@@ -694,7 +695,8 @@ class NetworkValidationTests(unittest.TestCase):
         for workload in self.workloads + [labels, {"openlegal.ingestion/enabled": "true"},
                                           {"app.kubernetes.io/name": "openlegal-document-worker"}]:
             for address in ("192.0.2.40", "192.0.2.50"):
-                self.assertEqual(self.permits(docs, workload, "egress", "TCP", 443, address=address), workload == labels)
+                self.assertEqual(self.permits(docs, workload, "egress", "TCP", 443, address=address),
+                                 workload.get("openlegal.ingestion/enabled") == "true")
                 self.assertFalse(self.permits(docs, workload, "egress", "UDP", 443, address=address))
                 self.assertFalse(self.permits(docs, workload, "egress", "TCP", 6443, address=address))
             for address in ("192.0.2.41", "192.0.2.51", "198.51.100.1"):

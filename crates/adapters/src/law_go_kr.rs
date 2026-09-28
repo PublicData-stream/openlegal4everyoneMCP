@@ -13,7 +13,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -97,11 +97,13 @@ pub struct LawClient {
     operator_suspended: Arc<AtomicBool>,
     clock: Arc<dyn openlegal_application::Clock>,
     budget: Option<(PgPool, RequestBudgetMode)>,
+    local_cap: Option<Arc<AtomicU32>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestBudgetMode {
     Pilot,
     Continuous,
+    OnDemand,
 }
 impl LawClient {
     pub fn new(
@@ -134,6 +136,7 @@ impl LawClient {
             next_request: Arc::new(Mutex::new(Some(Instant::now()))),
             operator_suspended: Arc::new(AtomicBool::new(false)),
             budget: None,
+            local_cap: None,
         })
     }
     /// The database migration must be applied before an enabled client starts.
@@ -142,9 +145,26 @@ impl LawClient {
         self.budget = Some((pool, mode));
         self
     }
+    pub fn with_local_cap(mut self, attempts: u32) -> Self {
+        self.local_cap = Some(Arc::new(AtomicU32::new(attempts)));
+        self
+    }
+    pub fn on_demand_client(&self) -> Result<Self, DatabaseError> {
+        let (pool, _) = self.budget.as_ref().ok_or(DatabaseError::InvalidInput)?;
+        Ok(self
+            .clone()
+            .with_request_budget(pool.clone(), RequestBudgetMode::OnDemand)
+            .with_local_cap(32))
+    }
     async fn reserve_request(&self, cancel: &CancellationToken) -> Result<(), DatabaseError> {
         if self.operator_suspended.load(Ordering::Acquire) {
             return Err(DatabaseError::BudgetExhausted);
+        }
+        if let Some(cap) = &self.local_cap {
+            cap.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .map_err(|_| DatabaseError::BudgetExhausted)?;
         }
         let Some((pool, mode)) = &self.budget else {
             return Ok(());
@@ -226,17 +246,21 @@ impl LawClient {
     /// A transient pause is durable for configured ingestion; the job worker
     /// uses this timestamp without burning another attempt while it waits.
     pub async fn next_admissible_epoch(&self) -> Result<u64, DatabaseError> {
-        let Some((pool, _)) = &self.budget else {
+        let Some((pool, mode)) = &self.budget else {
             return Err(DatabaseError::InvalidInput);
         };
-        let row = sqlx::query("SELECT utc_day,daily_used,next_allowed_at,operator_suspended,unresolved_response,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton")
+        let row = sqlx::query("SELECT utc_day,daily_used,on_demand_used,next_allowed_at,operator_suspended,unresolved_response,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton")
             .fetch_one(pool).await.map_err(|_| DatabaseError::StorageUnavailable)?;
         let now: i64 = row
             .try_get("now")
             .map_err(|_| DatabaseError::StorageUnavailable)?;
         let day = now / 86_400;
         let used: i32 = row
-            .try_get("daily_used")
+            .try_get(if *mode == RequestBudgetMode::OnDemand {
+                "on_demand_used"
+            } else {
+                "daily_used"
+            })
             .map_err(|_| DatabaseError::StorageUnavailable)?;
         let stored_day: i64 = row
             .try_get("utc_day")
@@ -277,7 +301,7 @@ impl LawClient {
                 .begin()
                 .await
                 .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let row = sqlx::query("SELECT utc_day,daily_used,next_allowed_at,operator_suspended,unresolved_response,pilot_started_at,pilot_used,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
+            let row = sqlx::query("SELECT utc_day,daily_used,on_demand_used,next_allowed_at,operator_suspended,unresolved_response,pilot_started_at,pilot_used,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
                 .fetch_one(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
             let now: i64 = row
                 .try_get("now")
@@ -288,6 +312,12 @@ impl LawClient {
                 .map_err(|_| DatabaseError::StorageUnavailable)?;
             let daily_used: i32 = if previous_day == day {
                 row.try_get("daily_used")
+                    .map_err(|_| DatabaseError::StorageUnavailable)?
+            } else {
+                0
+            };
+            let on_demand_used: i32 = if previous_day == day {
+                row.try_get("on_demand_used")
                     .map_err(|_| DatabaseError::StorageUnavailable)?
             } else {
                 0
@@ -307,7 +337,11 @@ impl LawClient {
                 || row
                     .try_get::<bool, _>("unresolved_response")
                     .map_err(|_| DatabaseError::StorageUnavailable)?
-                || daily_used >= 1000
+                || (if *mode == RequestBudgetMode::OnDemand {
+                    on_demand_used
+                } else {
+                    daily_used
+                }) >= 1000
                 || (*mode == RequestBudgetMode::Pilot
                     && (pilot_used >= 100
                         || pilot_started
@@ -324,8 +358,11 @@ impl LawClient {
                 tokio::select! {_ = cancel.cancelled() => return Err(DatabaseError::Cancelled), _ = tokio::time::sleep(Duration::from_secs(delay)) => {}}
                 continue;
             }
-            sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=$1,daily_used=$2,next_allowed_at=$3,unresolved_response=true,pilot_started_at=CASE WHEN $4 THEN COALESCE(pilot_started_at,$5) ELSE pilot_started_at END,pilot_used=pilot_used+CASE WHEN $4 THEN 1 ELSE 0 END WHERE singleton")
-                .bind(day).bind(daily_used + 1).bind(now.saturating_add(6))
+            sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=$1,daily_used=$2,on_demand_used=$3,next_allowed_at=$4,unresolved_response=true,pilot_started_at=CASE WHEN $5 THEN COALESCE(pilot_started_at,$6) ELSE pilot_started_at END,pilot_used=pilot_used+CASE WHEN $5 THEN 1 ELSE 0 END WHERE singleton")
+                .bind(day)
+                .bind(daily_used + i32::from(*mode != RequestBudgetMode::OnDemand))
+                .bind(on_demand_used + i32::from(*mode == RequestBudgetMode::OnDemand))
+                .bind(now.saturating_add(6))
                 .bind(*mode == RequestBudgetMode::Pilot).bind(now)
                 .execute(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
             tx.commit()
@@ -377,6 +414,56 @@ impl LawClient {
         treaty_class: Option<u8>,
         cancel: CancellationToken,
     ) -> Result<InventoryPage, DatabaseError> {
+        self.inventory_page_class_filtered(
+            dataset,
+            page,
+            historical,
+            object_id,
+            treaty_class,
+            None,
+            cancel,
+        )
+        .await
+    }
+    pub async fn inventory_search_page_class(
+        &self,
+        dataset: Dataset,
+        page: u32,
+        term: &str,
+        literal: bool,
+        treaty_class: Option<u8>,
+        cancel: CancellationToken,
+    ) -> Result<InventoryPage, DatabaseError> {
+        if term.is_empty()
+            || term.len() > 128
+            || term
+                .chars()
+                .any(|ch| !(ch.is_alphanumeric() || ch == ' ' || ch == '-'))
+        {
+            return Err(DatabaseError::InvalidInput);
+        }
+        self.inventory_page_class_filtered(
+            dataset,
+            page,
+            false,
+            None,
+            treaty_class,
+            Some((term, literal)),
+            cancel,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn inventory_page_class_filtered(
+        &self,
+        dataset: Dataset,
+        page: u32,
+        historical: bool,
+        object_id: Option<&str>,
+        treaty_class: Option<u8>,
+        search: Option<(&str, bool)>,
+        cancel: CancellationToken,
+    ) -> Result<InventoryPage, DatabaseError> {
         if treaty_class.is_some_and(|c| dataset != Dataset::Treaty || !matches!(c, 1 | 2)) {
             return Err(DatabaseError::InvalidInput);
         }
@@ -411,6 +498,14 @@ impl LawClient {
         url.query_pairs_mut()
             .append_pair("display", "100")
             .append_pair("page", &page.to_string());
+        if let Some((term, literal)) = search {
+            let query = if literal {
+                format!("\"{term}\"")
+            } else {
+                term.to_owned()
+            };
+            url.query_pairs_mut().append_pair("query", &query);
+        }
         if let Some(class) = treaty_class {
             url.query_pairs_mut().append_pair("cls", &class.to_string());
         }

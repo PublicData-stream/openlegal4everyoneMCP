@@ -68,7 +68,7 @@ class DeploymentSourceTests(unittest.TestCase):
         # Includes secretKeyRef, secret volumes, tokenFile, projected token path,
         # private-key paths, env names, and ../ / ../../ local resource references.
         validate_sources(self.repo)
-        self.assertEqual(len(self.inventory()["sources"]), 50)
+        self.assertEqual(len(self.inventory()["sources"]), 53)
 
     def test_unknown_file_cannot_escape_even_without_known_extension(self):
         self.write("deploy/kubernetes/operator-credentials", SENTINEL)
@@ -152,9 +152,9 @@ class DeploymentSourceTests(unittest.TestCase):
     def test_inline_and_remote_patches_are_rejected(self):
         path = "deploy/kubernetes/ingestion/kustomization.yaml"
         original = (self.repo / path).read_text()
-        self.write(path, original.replace("path: deployment-patch.yaml", "patch: " + SENTINEL))
+        self.write(path, original + "\npatches:\n  - patch: " + SENTINEL + "\n")
         self.rejected("unsupported-patch")
-        self.write(path, original.replace("deployment-patch.yaml", "https://example.invalid/" + SENTINEL))
+        self.write(path, original + "\npatches:\n  - path: https://example.invalid/" + SENTINEL + "\n")
         self.rejected("local-reference-required")
 
     def test_reference_role_and_cycles_are_rejected(self):
@@ -228,8 +228,8 @@ class DeploymentSourceTests(unittest.TestCase):
         self.append(KUSTOMIZATION, "\nsecretGenerator: []\n")
         self.rejected("secret-generator")
 
-    def test_mutable_images_in_source_patch_are_rejected(self):
-        path = "deploy/kubernetes/ingestion/deployment-patch.yaml"
+    def test_mutable_images_in_source_scheduler_are_rejected(self):
+        path = "deploy/kubernetes/ingestion/scheduler-deployment.yaml"
         self.replace(path, "registry.example/openlegal-server-ingestion@sha256:" + "0" * 64,
                      "registry.example/server:latest")
         self.rejected("image-digest")

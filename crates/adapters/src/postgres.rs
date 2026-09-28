@@ -186,6 +186,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0005_provider_download_failure.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            6,
+            "explicit collection requests".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0006_collection_requests.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

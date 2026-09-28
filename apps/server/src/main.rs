@@ -7,18 +7,20 @@ use openlegal_server::{
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     Serve,
     Migrate,
     Maintain,
     RebuildCorpusIndex,
+    CollectionScheduler,
+    CollectionJob(String),
 }
 
 fn main() -> Result<(), ServerError> {
     let mut args = std::env::args_os().skip(1);
     let first = args.next().ok_or(
-        "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index] CONFIG.toml",
+        "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index|--collection-scheduler|--collection-job ID] CONFIG.toml",
     )?;
     if first == "--text-diff-worker" {
         if args.next().is_some() {
@@ -27,29 +29,43 @@ fn main() -> Result<(), ServerError> {
         openlegal_adapters::text_diff::run_worker()?;
         return Ok(());
     }
-    let (command, path) =
-        if first == "--migrate" || first == "--maintain" || first == "--rebuild-corpus-index" {
-            let command = if first == "--migrate" {
-                Command::Migrate
-            } else if first == "--maintain" {
-                Command::Maintain
-            } else {
-                Command::RebuildCorpusIndex
-            };
-            (
-                command,
-                args.next()
-                    .ok_or("storage administration requires CONFIG.toml")?,
-            )
+    let (command, path) = if first == "--collection-job" {
+        let id = args.next().ok_or("collection job requires request id")?;
+        let id = id
+            .into_string()
+            .map_err(|_| "collection request id must be UTF-8")?;
+        (
+            Command::CollectionJob(id),
+            args.next().ok_or("collection job requires CONFIG.toml")?,
+        )
+    } else if first == "--migrate"
+        || first == "--maintain"
+        || first == "--rebuild-corpus-index"
+        || first == "--collection-scheduler"
+    {
+        let command = if first == "--migrate" {
+            Command::Migrate
+        } else if first == "--maintain" {
+            Command::Maintain
+        } else if first == "--collection-scheduler" {
+            Command::CollectionScheduler
         } else {
-            if first.to_string_lossy().starts_with("--") {
-                return Err("unknown server command".into());
-            }
-            (Command::Serve, first)
+            Command::RebuildCorpusIndex
         };
+        (
+            command,
+            args.next()
+                .ok_or("storage administration requires CONFIG.toml")?,
+        )
+    } else {
+        if first.to_string_lossy().starts_with("--") {
+            return Err("unknown server command".into());
+        }
+        (Command::Serve, first)
+    };
     if args.next().is_some() {
         return Err(
-            "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index] CONFIG.toml"
+            "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index|--collection-scheduler|--collection-job ID] CONFIG.toml"
                 .into(),
         );
     }
@@ -98,6 +114,82 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     logging_subscriber(filter, std::io::stdout).init();
     let config: Config = toml::from_str(&tokio::fs::read_to_string(path).await?)?;
+    if matches!(
+        command,
+        Command::CollectionScheduler | Command::CollectionJob(_)
+    ) {
+        config.validate_storage()?;
+        let database = config
+            .database
+            .as_ref()
+            .ok_or("collection requires [database]")?;
+        let ingestion = database
+            .ingestion
+            .as_ref()
+            .filter(|ingestion| ingestion.enabled)
+            .ok_or("collection requires enabled [database.ingestion]")?;
+        let cache = config
+            .cache
+            .as_ref()
+            .ok_or("collection requires persistent storage")?;
+        let persistent =
+            open_storage(cache, openlegal_adapters::postgres::StartupMode::Serve).await?;
+        let runtime =
+            openlegal_server::corpus_runtime::CorpusRuntime::open_background(database, &persistent)
+                .await?;
+        let cancel = CancellationToken::new();
+        let signal_cancel = cancel.clone();
+        let signal = tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            signal_cancel.cancel();
+        });
+        let result = match &command {
+            Command::CollectionScheduler => {
+                let background = runtime.clone();
+                let collector = cancel.child_token();
+                tokio::select! {
+                    result = run_collection_scheduler(runtime.store.clone(), ingestion, collector.clone()) => {
+                        collector.cancel();
+                        result
+                    },
+                    result = background.run(collector.clone()) => {
+                        collector.cancel();
+                        result
+                    },
+                }
+            }
+            Command::CollectionJob(id) => {
+                let id = id.clone();
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(7200),
+                    runtime.execute_collection_request(&id, cancel.clone()),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(ServerError::from),
+                    Err(_) => {
+                        cancel.cancel();
+                        runtime
+                            .store
+                            .settle_collection_request(&id, "failed")
+                            .await?;
+                        Err("collection request exceeded two hours".into())
+                    }
+                }
+            }
+            _ => unreachable!(),
+        };
+        signal.abort();
+        let closed = runtime.close().await;
+        let storage_closed = {
+            use openlegal_application::persistence::PersistentStore;
+            persistent.close().await
+        };
+        result?;
+        closed?;
+        storage_closed?;
+        return Ok(());
+    }
     if command != Command::Serve {
         let cache = config
             .cache
@@ -330,6 +422,89 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         }
     }
     result
+}
+
+async fn run_collection_scheduler(
+    store: std::sync::Arc<openlegal_adapters::corpus::PgCorpusStore>,
+    ingestion: &openlegal_server::config::IngestionConfig,
+    cancel: CancellationToken,
+) -> Result<(), ServerError> {
+    use tokio::io::AsyncWriteExt;
+    let template = tokio::fs::read(&ingestion.collection_job_template_path).await?;
+    if template.len() > 64 * 1024 {
+        return Err("collection Job template exceeds 64 KiB".into());
+    }
+    let template: serde_json::Value = serde_json::from_slice(&template)?;
+    if template
+        .pointer("/spec/activeDeadlineSeconds")
+        .and_then(serde_json::Value::as_u64)
+        != Some(7500)
+        || template
+            .pointer("/spec/template/spec/containers")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|items| items.len() != 1)
+    {
+        return Err("invalid collection Job template deadline or containers".into());
+    }
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        store.heartbeat_collection_scheduler().await?;
+        store.reap_stale_collection_requests().await?;
+        let Some((id, _request)) = store.claim_collection_request().await? else {
+            tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
+            continue;
+        };
+        let name = format!("openlegal-request-{}", id.replace('-', ""));
+        let mut job = template.clone();
+        job["metadata"]["name"] = name.clone().into();
+        job["metadata"]["namespace"] = ingestion.collection_namespace.clone().into();
+        job["spec"]["template"]["spec"]["containers"][0]["args"] =
+            serde_json::json!(["--collection-job", id, "/etc/openlegal/server.toml"]);
+        let bytes = serde_json::to_vec(&job)?;
+        let mut child = tokio::process::Command::new(&ingestion.kubectl)
+            .args([
+                "--kubeconfig",
+                ingestion
+                    .kubeconfig
+                    .to_str()
+                    .ok_or("invalid kubeconfig path")?,
+                "--context",
+                &ingestion.context,
+                "-n",
+                &ingestion.collection_namespace,
+                "create",
+                "-f",
+                "-",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", "/tmp")
+            .env("TMPDIR", "/tmp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or("kubectl stdin unavailable")?
+            .write_all(&bytes)
+            .await?;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
+        match outcome {
+            Ok(Ok(status)) if status.success() => {
+                store.mark_collection_running(&id, &name).await?;
+            }
+            _ => {
+                // Creation may have reached the API server. Keep the claim
+                // fenced until its Job deadline and operator reconciliation.
+                return Err("collection Job creation outcome uncertain".into());
+            }
+        }
+    }
 }
 
 fn logging_subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subscriber + Send + Sync

@@ -13,13 +13,13 @@ metadata:
   namespace: openlegal-documents
 spec:
   hard:
-    pods: "2"
-    requests.cpu: "4"
-    limits.cpu: "4"
-    requests.memory: 8Gi
-    limits.memory: 8Gi
-    requests.ephemeral-storage: 4Gi
-    limits.ephemeral-storage: 4Gi
+    pods: "16"
+    requests.cpu: "32"
+    limits.cpu: "32"
+    requests.memory: 64Gi
+    limits.memory: 64Gi
+    requests.ephemeral-storage: 32Gi
+    limits.ephemeral-storage: 32Gi
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

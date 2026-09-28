@@ -1,4 +1,4 @@
-//! Operator-selected corpus composition. Public tools never launch ingestion themselves.
+//! Operator-selected corpus composition. Public lookups never launch ingestion.
 use crate::{
     ServerError,
     config::{DatabaseConfig, IngestionMode},
@@ -17,6 +17,7 @@ use openlegal_application::{
     database::{DatabaseService, DatabaseStore, Publication},
     search::SearchService,
 };
+use openlegal_domain::collection::{CollectionRequest, CollectionSearchMode, CollectionTarget};
 use openlegal_domain::legal::{DatabaseError, Dataset, RevisionSelector};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -26,16 +27,37 @@ pub struct CorpusRuntime {
     pub reader: Arc<openlegal_application::database_read::DatabaseReader>,
     pub search: Arc<SearchService>,
     index: Arc<CorpusIndex>,
-    lease: CorpusRuntimeLease,
+    lease: Option<CorpusRuntimeLease>,
     blobs: Arc<FsBlobStore>,
     provider: Option<LawClient>,
     retain_history_bodies: bool,
+    detail_timeout_secs: u64,
     ingestion_mode: Option<IngestionMode>,
     pilot_candidates: Vec<InventoryItem>,
     inventory_verified: Arc<std::sync::atomic::AtomicBool>,
 }
 fn now() -> u64 {
     SystemClock::default().now()
+}
+
+fn comparable_dates_advance(
+    current_effective: Option<&str>,
+    current_publication: Option<&str>,
+    previous_effective: Option<&str>,
+    previous_publication: Option<&str>,
+) -> bool {
+    let pairs = [
+        current_effective.zip(previous_effective),
+        current_publication.zip(previous_publication),
+    ];
+    pairs
+        .iter()
+        .flatten()
+        .any(|(current, previous)| current > previous)
+        && pairs
+            .iter()
+            .flatten()
+            .all(|(current, previous)| current >= previous)
 }
 
 #[derive(serde::Deserialize)]
@@ -216,6 +238,320 @@ async fn apply_index_event(
     Ok(())
 }
 impl CorpusRuntime {
+    /// Execute one explicit collection in an isolated request Job Pod. The
+    /// temporary index is used only to validate what serving can later index.
+    pub async fn execute_collection_request(
+        &self,
+        id: &str,
+        cancel: CancellationToken,
+    ) -> Result<(), DatabaseError> {
+        let request = self.store.load_collection_request(id).await?;
+        let provider = self
+            .provider
+            .as_ref()
+            .ok_or(DatabaseError::InvalidInput)?
+            .on_demand_client()?;
+        let result = self.collect_explicit(&provider, request, cancel).await;
+        let status = match &result {
+            Ok(0) => "skipped",
+            Ok(_) => "done",
+            Err(DatabaseError::BudgetExhausted | DatabaseError::Capacity) => "deferred",
+            Err(
+                DatabaseError::SourceUnavailable
+                | DatabaseError::SourceDataInvalid
+                | DatabaseError::SourceDownloadFailed,
+            ) => "skipped",
+            Err(DatabaseError::NotFound) => "skipped",
+            Err(_) => "failed",
+        };
+        self.store.settle_collection_request(id, status).await?;
+        match result {
+            Ok(_)
+            | Err(
+                DatabaseError::BudgetExhausted
+                | DatabaseError::Capacity
+                | DatabaseError::NotFound
+                | DatabaseError::SourceUnavailable
+                | DatabaseError::SourceDataInvalid
+                | DatabaseError::SourceDownloadFailed,
+            ) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn collect_explicit(
+        &self,
+        provider: &LawClient,
+        request: CollectionRequest,
+        cancel: CancellationToken,
+    ) -> Result<usize, DatabaseError> {
+        let mut published = 0;
+        match request.target {
+            CollectionTarget::Object { object } => {
+                let list_started_at = now();
+                let page = provider
+                    .inventory_page_class(
+                        object.dataset,
+                        1,
+                        false,
+                        Some(&object.id),
+                        None,
+                        cancel.clone(),
+                    )
+                    .await?;
+                let item = page
+                    .items
+                    .into_iter()
+                    .find(|item| item.object == object)
+                    .ok_or(DatabaseError::NotFound)?;
+                published += usize::from(
+                    self.collect_explicit_item(provider, item, list_started_at, cancel)
+                        .await?,
+                );
+            }
+            CollectionTarget::Search {
+                mode,
+                term,
+                datasets,
+            } => {
+                let datasets = if datasets.is_empty() {
+                    vec![
+                        Dataset::NationalStatute,
+                        Dataset::AdministrativeRule,
+                        Dataset::Ordinance,
+                        Dataset::Treaty,
+                        Dataset::Precedent,
+                        Dataset::ConstitutionalDecision,
+                        Dataset::LegalInterpretation,
+                        Dataset::AdministrativeAppeal,
+                    ]
+                } else {
+                    datasets
+                };
+                for dataset in datasets {
+                    let classes: &[Option<u8>] = if dataset == Dataset::Treaty {
+                        &[Some(1), Some(2)]
+                    } else {
+                        &[None]
+                    };
+                    for class in classes {
+                        let list_started_at = now();
+                        let page = match provider
+                            .inventory_search_page_class(
+                                dataset,
+                                1,
+                                &term,
+                                matches!(mode, CollectionSearchMode::Literal),
+                                *class,
+                                cancel.clone(),
+                            )
+                            .await
+                        {
+                            Ok(page) => page,
+                            Err(
+                                DatabaseError::SourceUnavailable
+                                | DatabaseError::SourceDataInvalid
+                                | DatabaseError::SourceDownloadFailed,
+                            ) => continue,
+                            Err(error) => return Err(error),
+                        };
+                        for item in page.items.into_iter().take(20) {
+                            match self
+                                .collect_explicit_item(
+                                    provider,
+                                    item,
+                                    list_started_at,
+                                    cancel.clone(),
+                                )
+                                .await
+                            {
+                                Ok(true) => published += 1,
+                                Ok(false)
+                                | Err(
+                                    DatabaseError::SourceUnavailable
+                                    | DatabaseError::SourceDataInvalid
+                                    | DatabaseError::SourceDownloadFailed,
+                                ) => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(published)
+    }
+
+    async fn collect_explicit_item(
+        &self,
+        provider: &LawClient,
+        item: InventoryItem,
+        list_started_at: u64,
+        cancel: CancellationToken,
+    ) -> Result<bool, DatabaseError> {
+        let observed = self.store.state(&item.object).await?;
+        if observed.pending {
+            return Ok(false);
+        }
+        if observed.head_capture.is_some() {
+            match self
+                .store
+                .resolve(
+                    item.object.clone(),
+                    RevisionSelector::Head,
+                    now(),
+                    cancel.clone(),
+                )
+                .await
+            {
+                Ok(head) if head.record.revision_id != item.revision_id => {
+                    let newer_observation =
+                        head.captured_at >= list_started_at || head.validated_at >= list_started_at;
+                    let newer_source_date = comparable_dates_advance(
+                        item.effective_date.as_deref(),
+                        item.publication_date.as_deref(),
+                        head.record.effective_date.as_deref(),
+                        head.record.publication_date.as_deref(),
+                    );
+                    if newer_observation || !newer_source_date {
+                        return Ok(false);
+                    }
+                }
+                Ok(_) => {}
+                Err(DatabaseError::NotFound | DatabaseError::RevisionUnavailable) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if self
+            .store
+            .head_revision_ready(&item.object, &item.revision_id, now())
+            .await?
+        {
+            return Ok(false);
+        }
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("collection_origin".into(), "explicit".into());
+        metadata.insert("title".into(), item.title.clone());
+        if let Some(value) = &item.data_source {
+            metadata.insert("data_source".into(), value.clone());
+        }
+        if let Some(value) = &item.case_number {
+            metadata.insert("case_number".into(), value.clone());
+        }
+        if let Some(value) = &item.treaty_class_code {
+            metadata.insert("treaty_class_code".into(), value.clone());
+        }
+        let queued = self
+            .store
+            .enqueue_job_with_metadata_fenced(
+                item.object.clone(),
+                item.revision_id.clone(),
+                item.effective_date.clone(),
+                true,
+                false,
+                now(),
+                metadata,
+                Some(observed.version),
+            )
+            .await?;
+        if queued
+            .source_metadata
+            .get("collection_origin")
+            .map(String::as_str)
+            != Some("explicit")
+        {
+            return Ok(false);
+        }
+        let Some(job) = self
+            .store
+            .claim_explicit_job(
+                &queued.id,
+                now(),
+                self.detail_timeout_secs.saturating_add(120).max(600),
+            )
+            .await?
+        else {
+            self.store
+                .release_unclaimed_explicit_job(&queued.id)
+                .await?;
+            return Err(DatabaseError::Capacity);
+        };
+        let attempt = cancel.child_token();
+        let detail = tokio::time::timeout(
+            Duration::from_secs(self.detail_timeout_secs),
+            provider.detail(&item, attempt.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            attempt.cancel();
+            Err(DatabaseError::Capacity)
+        });
+        let detail = match detail {
+            Ok(detail) => detail,
+            Err(
+                error @ (DatabaseError::SourceUnavailable
+                | DatabaseError::SourceDataInvalid
+                | DatabaseError::SourceDownloadFailed),
+            ) => {
+                let reason = match error {
+                    DatabaseError::SourceUnavailable => "source_unavailable",
+                    DatabaseError::SourceDataInvalid => "source_data_invalid",
+                    _ => "download_failed",
+                };
+                self.store.skip_claim(&job, reason, now()).await?;
+                return Err(error);
+            }
+            Err(error) => {
+                self.store.fail_claim(&job, false).await?;
+                return Err(error);
+            }
+        };
+        let index = self.index.clone();
+        let record = detail.record.clone();
+        let worker_cancel = cancel.clone();
+        let validation = tokio::task::spawn_blocking(move || {
+            index.validate_record_with_budget(
+                &record,
+                std::time::Instant::now() + Duration::from_secs(10),
+                &worker_cancel,
+            )
+        })
+        .await
+        .map_err(|_| DatabaseError::Capacity)
+        .and_then(|result| result);
+        if let Err(error) = validation {
+            self.store.fail_claim(&job, false).await?;
+            return Err(error);
+        }
+        match self
+            .store
+            .publish(
+                Publication {
+                    record: detail.record,
+                    raw: detail.raw,
+                    additional_evidence: detail.additional_evidence,
+                    processor_version: detail.processor_version,
+                    retrieved_at: detail.retrieved_at,
+                    now: now(),
+                    expected_version: job.expected_version,
+                    install_head: true,
+                    job_id: Some(job.id.clone()),
+                },
+                cancel,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(DatabaseError::Conflict) => {
+                self.store.fail_claim(&job, false).await?;
+                Ok(false)
+            }
+            Err(error) => {
+                self.store.fail_claim(&job, false).await?;
+                Err(error)
+            }
+        }
+    }
     async fn observed_page(
         &self,
         provider: &LawClient,
@@ -284,6 +620,26 @@ impl CorpusRuntime {
         config: &DatabaseConfig,
         persistent: &Arc<openlegal_adapters::postgres::PostgresStore>,
     ) -> Result<Arc<Self>, ServerError> {
+        Self::open_inner(config, persistent, true).await
+    }
+
+    /// Background collection uses a disposable validation index and never owns
+    /// the serving index or its process-lifetime lease.
+    pub async fn open_background(
+        config: &DatabaseConfig,
+        persistent: &Arc<openlegal_adapters::postgres::PostgresStore>,
+    ) -> Result<Arc<Self>, ServerError> {
+        let mut background = config.clone();
+        background.index_path =
+            std::env::temp_dir().join(format!("openlegal-collection-{}", std::process::id()));
+        Self::open_inner(&background, persistent, false).await
+    }
+
+    async fn open_inner(
+        config: &DatabaseConfig,
+        persistent: &Arc<openlegal_adapters::postgres::PostgresStore>,
+        serving: bool,
+    ) -> Result<Arc<Self>, ServerError> {
         config.validate()?;
         let pilot_candidates = load_pilot_candidates(config).await?;
         let provider = if let Some(c) = config.ingestion.as_ref().filter(|c| c.enabled) {
@@ -319,12 +675,16 @@ impl CorpusRuntime {
             let _ = blobs.close().await;
             return Err(e.into());
         }
-        let lease = match store.acquire_runtime_lease().await {
-            Ok(lease) => lease,
-            Err(error) => {
-                let _ = blobs.close().await;
-                return Err(error.into());
+        let lease = if serving {
+            match store.acquire_runtime_lease().await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let _ = blobs.close().await;
+                    return Err(error.into());
+                }
             }
+        } else {
+            None
         };
         // The incremental scanner cannot preserve a prior release's complete
         // inventory claim, even when this serving instance has ingestion off.
@@ -333,8 +693,12 @@ impl CorpusRuntime {
             Dataset::AdministrativeRule,
             Dataset::Ordinance,
         ] {
-            if let Err(error) = store.mark_dataset_inventory_complete(dataset, false).await {
-                let _ = lease.close().await;
+            if serving
+                && let Err(error) = store.mark_dataset_inventory_complete(dataset, false).await
+            {
+                if let Some(lease) = &lease {
+                    let _ = lease.close().await;
+                }
                 let _ = blobs.close().await;
                 return Err(error.into());
             }
@@ -347,8 +711,8 @@ impl CorpusRuntime {
             })
             .await??;
             let generation = index.snapshot()?.generation;
-            if generation < store.acknowledged_index().await?
-                || generation > store.watermark().await?
+            if serving && (generation < store.acknowledged_index().await?
+                || generation > store.watermark().await?)
             {
                 return Err("corpus index generation is incompatible with PostgreSQL; stop serving and run --rebuild-corpus-index with a fresh index_path".into());
             }
@@ -358,7 +722,9 @@ impl CorpusRuntime {
         let index = match opened {
             Ok(index) => index,
             Err(error) => {
-                let _ = lease.close().await;
+                if let Some(lease) = &lease {
+                    let _ = lease.close().await;
+                }
                 let _ = blobs.close().await;
                 return Err(error);
             }
@@ -399,11 +765,19 @@ impl CorpusRuntime {
                 .ingestion
                 .as_ref()
                 .is_some_and(|c| c.retain_history_bodies),
+            detail_timeout_secs: config
+                .ingestion
+                .as_ref()
+                .map_or(3600, |c| c.detail_timeout_secs),
         }))
     }
     pub async fn close(&self) -> Result<(), ServerError> {
         let blobs = self.blobs.close().await;
-        let lease = self.lease.close().await;
+        let lease = if let Some(lease) = &self.lease {
+            lease.close().await
+        } else {
+            Ok(())
+        };
         blobs?;
         lease?;
         Ok(())
@@ -448,17 +822,18 @@ impl CorpusRuntime {
                     _ => Err(DatabaseError::StorageUnavailable),
                 },
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if let Err(e) = self.lease.check().await {
-                        break Err(e);
-                    }
-                    if let Err(e) = self.index_events(&child).await {
-                        break Err(e);
+                    if let Some(lease) = &self.lease {
+                        if let Err(e) = lease.check().await { break Err(e); }
+                        if let Err(e) = self.index_events(&child).await { break Err(e); }
                     }
                     if let Err(e) = self.store.health().await {
                         break Err(e);
                     }
-                    if maintenance.elapsed() >= Duration::from_secs(60) {
+                    if self.lease.is_some() && maintenance.elapsed() >= Duration::from_secs(60) {
                         if let Err(e) = self.store.maintain(now(), now().saturating_sub(30 * 86400)).await {
+                            break Err(e);
+                        }
+                        if let Err(e) = self.store.prune_collection_requests().await {
                             break Err(e);
                         }
                         maintenance = tokio::time::Instant::now();
@@ -482,7 +857,11 @@ impl CorpusRuntime {
             if event.sequence != generation + 1 {
                 return Err(DatabaseError::StorageCorrupt);
             }
-            self.lease.check().await?;
+            self.lease
+                .as_ref()
+                .ok_or(DatabaseError::StorageUnavailable)?
+                .check()
+                .await?;
             let sequence = event.sequence;
             apply_index_event(&self.index, &self.store, event, cancel).await?;
             generation = sequence;
@@ -735,7 +1114,8 @@ impl CorpusRuntime {
         head: bool,
         cancel: &CancellationToken,
     ) -> Result<bool, DatabaseError> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.detail_timeout_secs.saturating_add(120).max(900));
         loop {
             if cancel.is_cancelled() {
                 return Ok(false);
@@ -1034,7 +1414,11 @@ impl CorpusRuntime {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            let Some(job) = self.store.claim_job(now()).await? else {
+            let Some(job) = self
+                .store
+                .claim_job_with_lease(now(), self.detail_timeout_secs.saturating_add(120).max(600))
+                .await?
+            else {
                 tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(1))=>{}}
                 continue;
             };
@@ -1055,7 +1439,7 @@ impl CorpusRuntime {
             let attempt = cancel.child_token();
             let _attempt_guard = attempt.clone().drop_guard();
             let detail = match tokio::time::timeout(
-                Duration::from_secs(500),
+                Duration::from_secs(self.detail_timeout_secs),
                 provider.detail(&item, attempt.clone()),
             )
             .await
@@ -1177,8 +1561,36 @@ impl CorpusRuntime {
 
 #[cfg(test)]
 mod manual_pilot_tests {
-    use super::load_pilot_candidates;
+    use super::{comparable_dates_advance, load_pilot_candidates};
     use crate::config::{DatabaseConfig, IngestionConfig, IngestionMode};
+
+    #[test]
+    fn explicit_head_date_guard_accepts_only_nonregressing_known_dates() {
+        assert!(comparable_dates_advance(
+            Some("20261001"),
+            Some("20260901"),
+            Some("20260901"),
+            Some("20260901")
+        ));
+        assert!(!comparable_dates_advance(
+            Some("20261001"),
+            Some("20260801"),
+            Some("20260901"),
+            Some("20260901")
+        ));
+        assert!(!comparable_dates_advance(
+            None,
+            None,
+            Some("20260901"),
+            None
+        ));
+        assert!(!comparable_dates_advance(
+            Some("20260901"),
+            Some("20260901"),
+            Some("20260901"),
+            Some("20260901")
+        ));
+    }
 
     #[tokio::test]
     async fn explicit_manifest_accepts_bounded_identity_hints_and_rejects_duplicates() {
@@ -1196,11 +1608,14 @@ mod manual_pilot_tests {
                 context: "test".into(),
                 namespace: "test".into(),
                 worker_image: "example.invalid/worker@sha256:placeholder".into(),
+                collection_namespace: "openlegal-serving".into(),
+                collection_job_template_path: "/etc/openlegal/collection-job.json".into(),
                 document_worker: Default::default(),
                 enabled: true,
                 mode: IngestionMode::Pilot,
                 manual_candidates_path: Some(path.clone()),
                 retain_history_bodies: false,
+                detail_timeout_secs: 3600,
             }),
         };
         let item = serde_json::json!({

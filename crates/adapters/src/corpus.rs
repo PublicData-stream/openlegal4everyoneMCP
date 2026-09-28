@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod collection_gaps;
+mod collection_requests;
 pub use collection_gaps::PageGapObservation;
 mod lifecycle;
 mod runtime_lease;
@@ -739,11 +740,13 @@ impl PgCorpusStore {
             && old.raw_sha256 == hex(&digest)
             && previous_still_current
         {
-            if p.install_head {
-                sqlx::query("UPDATE openlegal.corpus_object SET validated_at=$2::text::numeric,pending=false,version=version+1 WHERE object_key=$1").bind(&k).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
+            if p.install_head && !attachment_incomplete {
+                sqlx::query("UPDATE openlegal.corpus_object SET validated_at=$2::text::numeric,pending=false,version=version+1,desired_head_revision=$3 WHERE object_key=$1").bind(&k).bind(p.now.to_string()).bind(&p.record.revision_id).execute(&mut *tx).await.map_err(db)?;
             }
-            sqlx::query("UPDATE openlegal.corpus_revision SET last_validated_at=$3::text::numeric WHERE object_key=$1 AND revision_id=$2 AND latest_capture=$4")
-                .bind(&k).bind(&p.record.revision_id).bind(p.now.to_string()).bind(&old.capture_id).execute(&mut *tx).await.map_err(db)?;
+            if !attachment_incomplete {
+                sqlx::query("UPDATE openlegal.corpus_revision SET last_validated_at=$3::text::numeric WHERE object_key=$1 AND revision_id=$2 AND latest_capture=$4")
+                    .bind(&k).bind(&p.record.revision_id).bind(p.now.to_string()).bind(&old.capture_id).execute(&mut *tx).await.map_err(db)?;
+            }
             for (location, d, n) in &staged_blobs {
                 sqlx::query("INSERT INTO openlegal.corpus_blob_deletion VALUES($1,$2,$3)")
                     .bind(location)
@@ -778,7 +781,9 @@ impl PgCorpusStore {
             }
             check(&cancel)?;
             tx.commit().await.map_err(db)?;
-            old.validated_at = p.now;
+            if !attachment_incomplete {
+                old.validated_at = p.now;
+            }
             return Ok(old);
         }
         let historical_add = if publish_head {
@@ -844,7 +849,7 @@ impl PgCorpusStore {
         // A different desired revision keeps HEAD pending, so the old capture
         // cannot be served with a fresh claim after its replacement was seen.
         let clear_pending = publish_head || preserve_revision;
-        sqlx::query("UPDATE openlegal.corpus_object SET version=version+1,next_capture=next_capture+1,head_capture=CASE WHEN $2 THEN $3 ELSE head_capture END,validated_at=CASE WHEN $2 THEN $4::text::numeric ELSE validated_at END,pending=CASE WHEN $5 THEN false ELSE pending END WHERE object_key=$1").bind(&k).bind(publish_head).bind(&capture_id).bind(p.now.to_string()).bind(clear_pending).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_object SET version=version+1,next_capture=next_capture+1,head_capture=CASE WHEN $2 THEN $3 ELSE head_capture END,validated_at=CASE WHEN $2 THEN $4::text::numeric ELSE validated_at END,pending=CASE WHEN $5 THEN false ELSE pending END,desired_head_revision=CASE WHEN $2 THEN $6 ELSE desired_head_revision END WHERE object_key=$1").bind(&k).bind(publish_head).bind(&capture_id).bind(p.now.to_string()).bind(clear_pending).bind(&capture.record.revision_id).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("INSERT INTO openlegal.corpus_outbox SELECT next_event,$1,$2,$3,false,$4,false FROM openlegal.corpus_control").bind(&k).bind(version+1).bind(&capture_id).bind(publish_head).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_control SET next_event=next_event+1,raw_bytes=raw_bytes+$1,staged_bytes=staged_bytes-$1").bind(total_size as i64).execute(&mut *tx).await.map_err(db)?;
         for (location, _, _) in &staged_blobs {

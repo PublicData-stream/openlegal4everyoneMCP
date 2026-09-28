@@ -855,6 +855,11 @@ pub struct IngestionConfig {
     pub context: String,
     pub namespace: String,
     pub worker_image: String,
+    /// Scheduler-owned namespace and immutable Job Pod template.
+    #[serde(default = "default_collection_namespace")]
+    pub collection_namespace: String,
+    #[serde(default = "default_collection_job_template_path")]
+    pub collection_job_template_path: PathBuf,
     #[serde(default)]
     pub document_worker: DocumentWorkerConfig,
     /// Explicit operator authorization for managed background upstream traffic.
@@ -865,6 +870,19 @@ pub struct IngestionConfig {
     pub manual_candidates_path: Option<PathBuf>,
     #[serde(default)]
     pub retain_history_bodies: bool,
+    /// Maximum time allowed for one provider detail request and its attachments.
+    #[serde(default = "default_detail_timeout_secs")]
+    pub detail_timeout_secs: u64,
+}
+
+fn default_detail_timeout_secs() -> u64 {
+    3600
+}
+fn default_collection_namespace() -> String {
+    "openlegal-serving".into()
+}
+fn default_collection_job_template_path() -> PathBuf {
+    "/etc/openlegal/collection-job.json".into()
 }
 
 /// Operator-selected capacity for disposable document Pods.
@@ -929,6 +947,13 @@ impl DatabaseConfig {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 || !i.kubectl.is_absolute()
                 || !i.kubeconfig.is_absolute()
+                || !i.collection_job_template_path.is_absolute()
+                || i.collection_namespace.is_empty()
+                || i.collection_namespace.len() > 63
+                || !i
+                    .collection_namespace
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
                 || i.manual_candidates_path
                     .as_ref()
                     .is_some_and(|p| !p.is_absolute())
@@ -938,6 +963,9 @@ impl DatabaseConfig {
         }
         if let Some(i) = &self.ingestion {
             i.document_worker.limits()?;
+            if !(60..=7200).contains(&i.detail_timeout_secs) {
+                return Err("detail_timeout_secs must be between 60 and 7200".into());
+            }
         }
         Ok(())
     }

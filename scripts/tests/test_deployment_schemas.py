@@ -133,7 +133,7 @@ class SchemaIntegrationTests(unittest.TestCase):
 
     def test_all_current_resources_against_both_versions(self):
         with patch.object(schemas, "download", side_effect=AssertionError("network attempted")):
-            self.assertEqual(schemas.validate(self.tools, self.rendered, self.repo), 47)
+            self.assertEqual(schemas.validate(self.tools, self.rendered, self.repo), 53)
 
     def test_unknown_fields_types_and_resource_types_rejected_by_both_versions(self):
         invalid = [

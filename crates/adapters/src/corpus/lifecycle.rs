@@ -62,6 +62,30 @@ impl PgCorpusStore {
         now: u64,
         source_metadata: std::collections::BTreeMap<String, String>,
     ) -> Result<Job, DatabaseError> {
+        self.enqueue_job_with_metadata_fenced(
+            object,
+            revision_id,
+            effective_date,
+            install_head,
+            mark_head_pending,
+            now,
+            source_metadata,
+            None,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_job_with_metadata_fenced(
+        &self,
+        object: ObjectId,
+        revision_id: String,
+        effective_date: Option<String>,
+        install_head: bool,
+        mark_head_pending: bool,
+        now: u64,
+        source_metadata: std::collections::BTreeMap<String, String>,
+        observed_version: Option<u64>,
+    ) -> Result<Job, DatabaseError> {
         if source_metadata.len() > 128
             || source_metadata
                 .iter()
@@ -96,6 +120,14 @@ impl PgCorpusStore {
         }
         if row.try_get::<bool, _>("withdrawn").map_err(db)? {
             return Err(DatabaseError::Withdrawn);
+        }
+        if observed_version.is_some_and(|expected| {
+            row.try_get::<i64, _>("version")
+                .ok()
+                .and_then(|v| u64::try_from(v).ok())
+                != Some(expected)
+        }) {
+            return Err(DatabaseError::Conflict);
         }
         let head_changed = install_head
             && (row
@@ -151,8 +183,42 @@ impl PgCorpusStore {
             attempts: 0,
         })
     }
-    /// Ten-minute leases are bounded; a dead worker is retried at most three times.
+    /// A dead worker is retried at most three times. The lease must cover the
+    /// configured detail deadline plus validation and publication.
     pub async fn claim_job(&self, now: u64) -> Result<Option<Job>, DatabaseError> {
+        self.claim_job_with_lease(now, SESSION_SECONDS).await
+    }
+    pub async fn claim_job_with_lease(
+        &self,
+        now: u64,
+        lease_seconds: u64,
+    ) -> Result<Option<Job>, DatabaseError> {
+        self.claim_job_inner(now, lease_seconds, None).await
+    }
+    pub async fn claim_explicit_job(
+        &self,
+        id: &str,
+        now: u64,
+        lease_seconds: u64,
+    ) -> Result<Option<Job>, DatabaseError> {
+        let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
+        self.claim_job_inner(now, lease_seconds, Some(id)).await
+    }
+    pub async fn release_unclaimed_explicit_job(&self, id: &str) -> Result<(), DatabaseError> {
+        let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
+        sqlx::query("UPDATE openlegal.corpus_job SET source_metadata=source_metadata - 'collection_origin' WHERE id=$1 AND status='pending' AND source_metadata->>'collection_origin'='explicit'")
+            .bind(id).execute(&self.pool).await.map_err(db)?;
+        Ok(())
+    }
+    async fn claim_job_inner(
+        &self,
+        now: u64,
+        lease_seconds: u64,
+        explicit_id: Option<Uuid>,
+    ) -> Result<Option<Job>, DatabaseError> {
+        if !(SESSION_SECONDS..=7320).contains(&lease_seconds) {
+            return Err(DatabaseError::InvalidInput);
+        }
         self.gate().await?;
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
@@ -160,12 +226,12 @@ impl PgCorpusStore {
             .await
             .map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_job SET status='failed',error_category='attempts_exhausted' WHERE attempts>=3 AND status='running' AND lease_until<=$1::text::numeric").bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
-        let row=sqlx::query("SELECT j.id,j.revision_id,j.expected_version,j.attempts,j.effective_date,j.install_head,j.source_metadata,o.identity,o.version AS object_version,j.object_key FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE NOT o.withdrawn AND (NOT j.install_head OR j.revision_id=o.desired_head_revision) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>$1::text::numeric) AND j.attempts<3 AND (j.status='pending' OR (j.status='running' AND j.lease_until<=$1::text::numeric)) ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED").bind(now.to_string()).fetch_optional(&mut *tx).await.map_err(db)?;
+        let row=sqlx::query("SELECT j.id,j.revision_id,j.expected_version,j.attempts,j.effective_date,j.install_head,j.source_metadata,o.identity,o.version AS object_version,j.object_key FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE NOT o.withdrawn AND (NOT j.install_head OR j.revision_id=o.desired_head_revision) AND (($2::uuid IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit') OR (j.id=$2 AND j.source_metadata->>'collection_origin'='explicit')) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>$1::text::numeric) AND j.attempts<3 AND (j.status='pending' OR (j.status='running' AND j.lease_until<=$1::text::numeric)) ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED").bind(now.to_string()).bind(explicit_id).fetch_optional(&mut *tx).await.map_err(db)?;
         let Some(row) = row else {
             return Ok(None);
         };
         let id: Uuid = row.try_get("id").map_err(db)?;
-        sqlx::query("UPDATE openlegal.corpus_job SET status='running',attempts=attempts+1,lease_until=$2::text::numeric,expected_version=$3 WHERE id=$1").bind(id).bind(now.saturating_add(SESSION_SECONDS).to_string()).bind(row.try_get::<i64,_>("object_version").map_err(db)?+1).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_job SET status='running',attempts=attempts+1,lease_until=$2::text::numeric,expected_version=$3 WHERE id=$1").bind(id).bind(now.saturating_add(lease_seconds).to_string()).bind(row.try_get::<i64,_>("object_version").map_err(db)?+1).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_object SET version=version+1 WHERE object_key=$1")
             .bind(row.try_get::<String, _>("object_key").map_err(db)?)
             .execute(&mut *tx)

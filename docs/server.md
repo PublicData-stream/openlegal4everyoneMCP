@@ -124,9 +124,11 @@ implements Serde deserialization and Schemars JSON Schema. The asynchronous hand
 receives typed input and `ToolContext`, returning `Result<Value, ToolError>`.
 `register_with_annotations` supplies accurate MCP annotations; public registration
 accepts only read-only modules. A crate-private registration path permits only the
-built-in comparison deletion aliases and managed attachment upload/deletion operations.
-Their annotations describe transient bearer-controlled mutations; database tools remain
-read-only. Possession of a valid comparison or attachment handle authorizes its
+built-in comparison deletion aliases, managed attachment upload/deletion operations,
+and `database.request_collection`. Existing database lookup and search tools keep
+`readOnlyHint: true` and never enqueue work. The explicit request tool has
+`readOnlyHint: false`, `destructiveHint: false`, and a separate read-only status tool.
+Possession of a valid comparison or attachment handle authorizes its
 permitted reads/deletion. Uploads only allocate bounded temporary text, and patch
 application only returns a new temporary result. These exceptions do not enable
 arbitrary filesystem or legal corpus writes. Annotations are descriptive,
@@ -355,14 +357,25 @@ metadata requirements remain unchanged.
 Existing comparison tool names and schemas remain compatibility wrappers. See
 [text comparison](text-diff.md) for exact algorithms, patch restrictions and budgets.
 
-`[database]` additionally registers the six requested database operations plus
-`database.show`. Shared HTTP/WebTransport handlers use the same application services,
+`[database]` additionally registers the six database operations, `database.show`,
+`database.request_collection`, and `database.collection_status`. Shared HTTP/WebTransport handlers use the same application services,
 result/error contracts and limits. Details, configuration, freshness, body/catalog
 paging and provider acceptance boundaries are in [legal corpus](database.md).
-No public ingestion, corpus mutation, arbitrary SQL or filesystem-search tool is
-registered. Operator ingestion configuration is a separate startup decision.
+`database.request_collection` explicitly queues bounded provider collection for a
+verified national-statute ID or a simple term and dataset selection. It does not
+return an upstream search result. Equivalent requests coalesce for 24 hours; use
+`database.collection_status` and then rerun the ordinary local lookup/search.
+Deferred requests are retried by the scheduler after one hour while their 24-hour
+request window remains open.
+New requests require a fresh collection-scheduler heartbeat; without the optional
+overlay the tool returns a resource-limit error and leaves no queued request.
+A cached HEAD with another revision is replaced only when the provider list has
+a later comparable date and that HEAD has not changed since the list began.
+Equal or missing dates are skipped conservatively.
+No public arbitrary URL, SQL, filesystem search, or direct corpus mutation tool is registered.
+Operator ingestion configuration is a separate startup decision.
 The [optional Kubernetes ingestion overlay](deployment-kubernetes.md#optional-ingestion-integration)
-uses the existing explicit kubeconfig/context fields with a projected token; it
-adds no public API or ambient authentication mode. See the
+uses a separate scheduler and request Job Pods with explicit kubeconfig/context
+and projected tokens. The serving Pod has no provider credential. See the
 [document controller contract](document-sandbox.md#input-output-and-lifecycle)
 for subprocess environment and credential boundaries.

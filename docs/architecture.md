@@ -75,7 +75,9 @@ inputs through pipes. The application owns the typed patch-and-highlights engine
 interface and validates worker results before paging/publication. Public scalar
 range representations belong to domain. This is not a normalizer or retrieval
 cache implementation; callers cannot choose executables, paths or options. The
-sole public mutation deletes a temporary comparison using its bearer handle; generic module registration remains read-only. See the
+public mutations are bounded temporary comparison/attachment operations and
+the explicit, coalesced `database.request_collection` tool; generic module
+registration and existing database lookups remain read-only. See the
 [text comparison contract](text-diff.md) for bounds and lifecycle.
 
 The composition entrypoint loads configuration, constructs adapters and shared

@@ -173,9 +173,11 @@ These are application choices, not claimed upstream service guarantees:
   records keep the existing capture, while corrected content creates a new
   capture. A body past its 30-day public retention age must be recaptured.
   Identical observations do not advance publication fences or sequences.
-- Admission allows one fetch at a time, reserves an attempt before DNS, spaces
-  attempts by at least five seconds across restarts and caps all requests at
-  1,000 per UTC day in PostgreSQL. The next admissible time is conservatively
+- Admission allows one fetch at a time, reserves an attempt before DNS, and spaces
+  attempts by at least five seconds across restarts. PostgreSQL caps continuous
+  collection at 1,000 attempts per UTC day and explicit on-demand collection at
+  a separate 1,000 attempts per UTC day. These are independent operator budgets;
+  the aggregate admitted maximum is 2,000 attempts per UTC day. The next admissible time is conservatively
   rounded to a whole second. These limits are operator policy, not a provider
   quota assertion.
   HTTP 429/503 persists admission pauses from `Retry-After` across restarts,
