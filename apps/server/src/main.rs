@@ -446,65 +446,81 @@ async fn run_collection_scheduler(
     {
         return Err("invalid collection Job template deadline or containers".into());
     }
-    loop {
-        if cancel.is_cancelled() {
-            return Ok(());
-        }
-        store.heartbeat_collection_scheduler().await?;
-        store.reap_stale_collection_requests().await?;
-        let Some((id, _request)) = store.claim_collection_request().await? else {
-            tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
-            continue;
-        };
-        let name = format!("openlegal-request-{}", id.replace('-', ""));
-        let mut job = template.clone();
-        job["metadata"]["name"] = name.clone().into();
-        job["metadata"]["namespace"] = ingestion.collection_namespace.clone().into();
-        job["spec"]["template"]["spec"]["containers"][0]["args"] =
-            serde_json::json!(["--collection-job", id, "/etc/openlegal/server.toml"]);
-        let bytes = serde_json::to_vec(&job)?;
-        let mut child = tokio::process::Command::new(&ingestion.kubectl)
-            .args([
-                "--kubeconfig",
-                ingestion
-                    .kubeconfig
-                    .to_str()
-                    .ok_or("invalid kubeconfig path")?,
-                "--context",
-                &ingestion.context,
-                "-n",
-                &ingestion.collection_namespace,
-                "create",
-                "-f",
-                "-",
-            ])
-            .env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("HOME", "/tmp")
-            .env("TMPDIR", "/tmp")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .ok_or("kubectl stdin unavailable")?
-            .write_all(&bytes)
-            .await?;
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
-        match outcome {
-            Ok(Ok(status)) if status.success() => {
-                store.mark_collection_running(&id, &name).await?;
+    let heartbeat_store = store.clone();
+    let heartbeat = async {
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(());
             }
-            _ => {
-                // Creation may have reached the API server. Keep the claim
-                // fenced until its Job deadline and operator reconciliation.
-                return Err("collection Job creation outcome uncertain".into());
+            heartbeat_store.heartbeat_collection_scheduler().await?;
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
             }
         }
-    }
+    };
+    let dispatch = async {
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            store.reap_stale_collection_requests().await?;
+            let Some((id, _request)) = store.claim_collection_request().await? else {
+                tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
+                continue;
+            };
+            let name = format!("openlegal-request-{}", id.replace('-', ""));
+            let mut job = template.clone();
+            job["metadata"]["name"] = name.clone().into();
+            job["metadata"]["namespace"] = ingestion.collection_namespace.clone().into();
+            job["spec"]["template"]["spec"]["containers"][0]["args"] =
+                serde_json::json!(["--collection-job", id, "/etc/openlegal/server.toml"]);
+            let bytes = serde_json::to_vec(&job)?;
+            let mut child = tokio::process::Command::new(&ingestion.kubectl)
+                .args([
+                    "--kubeconfig",
+                    ingestion
+                        .kubeconfig
+                        .to_str()
+                        .ok_or("invalid kubeconfig path")?,
+                    "--context",
+                    &ingestion.context,
+                    "-n",
+                    &ingestion.collection_namespace,
+                    "create",
+                    "-f",
+                    "-",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("HOME", "/tmp")
+                .env("TMPDIR", "/tmp")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            child
+                .stdin
+                .take()
+                .ok_or("kubectl stdin unavailable")?
+                .write_all(&bytes)
+                .await?;
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
+            match outcome {
+                Ok(Ok(status)) if status.success() => {
+                    store.mark_collection_running(&id, &name).await?;
+                }
+                _ => {
+                    // Creation may have reached the API server. Keep the claim
+                    // fenced until its Job deadline and operator reconciliation.
+                    return Err("collection Job creation outcome uncertain".into());
+                }
+            }
+        }
+    };
+    tokio::select! { result = heartbeat => result, result = dispatch => result }
 }
 
 fn logging_subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subscriber + Send + Sync

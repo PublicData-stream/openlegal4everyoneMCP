@@ -56,6 +56,13 @@ async fn explicit_collection_requests_coalesce_and_clear_completed_payloads() {
         Some(DatabaseError::Capacity)
     );
     store.heartbeat_collection_scheduler().await.unwrap();
+    sqlx::query("UPDATE openlegal.corpus_control SET collection_scheduler_seen_at=floor(extract(epoch from clock_timestamp()))::bigint-31 WHERE singleton")
+        .execute(&base.pool()).await.unwrap();
+    assert_eq!(
+        store.request_collection(request.clone()).await.err(),
+        Some(DatabaseError::Capacity)
+    );
+    store.heartbeat_collection_scheduler().await.unwrap();
     let first = store.request_collection(request.clone()).await.unwrap();
     let second = store.request_collection(request).await.unwrap();
     assert_eq!(first.request_id, second.request_id);
