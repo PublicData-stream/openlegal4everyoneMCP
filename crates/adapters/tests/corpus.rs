@@ -612,6 +612,12 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
         .unwrap();
     assert!(
         store
+            .active_detail_job(&object(), "r1", true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
             .head_revision_ready(&object(), "r1", 100)
             .await
             .unwrap()
@@ -648,6 +654,12 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
     );
     let old_head_job = store.claim_job(101).await.unwrap().unwrap();
     store.fail_claim(&old_head_job, false).await.unwrap();
+    assert!(
+        !store
+            .active_detail_job(&object(), "r1", true)
+            .await
+            .unwrap()
+    );
     let mut manual = BTreeMap::new();
     manual.insert("title".into(), "untrusted manual title".into());
     store
@@ -827,6 +839,53 @@ async fn object_status_distinguishes_unobserved_processing_and_incomplete() {
             .err(),
         Some(DatabaseError::CollectionIncomplete)
     );
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn expired_explicit_jobs_become_claimable_by_continuous_workers() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("orphan-explicit"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::new(base.pool(), blobs);
+    let mut metadata = BTreeMap::new();
+    metadata.insert("collection_origin".into(), "explicit".into());
+    let pending = store
+        .enqueue_job_with_metadata(
+            object(),
+            "pending-orphan".into(),
+            None,
+            true,
+            true,
+            100,
+            metadata.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(store.claim_job(101).await.unwrap().is_none());
+    store.requeue_due_details(8201).await.unwrap();
+    assert_eq!(store.claim_job(8202).await.unwrap().unwrap().id, pending.id);
+
+    let mut second = object();
+    second.id = "running-orphan".into();
+    let running = store
+        .enqueue_job_with_metadata(second, "r1".into(), None, true, true, 100, metadata)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .claim_explicit_job(&running.id, 101, 600)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        running.id
+    );
+    store.requeue_due_details(702).await.unwrap();
+    assert_eq!(store.claim_job(703).await.unwrap().unwrap().id, running.id);
     base.close().await.unwrap();
 }
 

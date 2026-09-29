@@ -41,6 +41,18 @@ impl PgCorpusStore {
             .bind(dataset).fetch_one(&self.pool).await.map_err(db)?;
         count.try_into().map_err(|_| DatabaseError::StorageCorrupt)
     }
+    pub async fn active_detail_job(
+        &self,
+        object: &ObjectId,
+        revision_id: &str,
+        install_head: bool,
+    ) -> Result<bool, DatabaseError> {
+        self.gate().await?;
+        let object_key = key(object)?;
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_job WHERE object_key=$1 AND revision_id=$2 AND status IN ('pending','running') AND (NOT $3 OR install_head))")
+            .bind(object_key).bind(revision_id).bind(install_head)
+            .fetch_one(&self.pool).await.map_err(db)
+    }
     pub(super) async fn update_published_detail_gap(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -158,6 +170,11 @@ impl PgCorpusStore {
     }
     pub async fn requeue_due_details(&self, now: u64) -> Result<u64, DatabaseError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
+        // An isolated request Pod may disappear after enqueue or claim. After
+        // its deadline (or the claim lease) the continuous worker may safely
+        // adopt the stranded job without issuing a duplicate provider call.
+        sqlx::query("UPDATE openlegal.corpus_job SET source_metadata=source_metadata - 'collection_origin' WHERE source_metadata->>'collection_origin'='explicit' AND ((status='pending' AND created_at<=$1::text::numeric-8100) OR (status='running' AND lease_until<=$1::text::numeric))")
+            .bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("DELETE FROM openlegal.provider_collection_gap WHERE resolved_at IS NOT NULL AND resolved_at<$1")
             .bind(now.saturating_sub(30*86400) as i64).execute(&mut *tx).await.map_err(db)?;
         let queued: i64 = sqlx::query_scalar(

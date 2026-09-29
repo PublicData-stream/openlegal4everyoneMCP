@@ -1118,7 +1118,7 @@ impl CorpusRuntime {
                 if offset > items.len() {
                     offset = 0;
                 }
-                if let Some(missing) = self.first_unpublished_item(&items, true, &cancel).await? {
+                if let Some(missing) = self.first_unscheduled_item(&items, true, &cancel).await? {
                     offset = offset.min(missing);
                 }
                 while offset < items.len() {
@@ -1141,10 +1141,18 @@ impl CorpusRuntime {
                 if offset < items.len() {
                     continue;
                 }
-                if let Some(missing) = self.first_unpublished_item(&items, true, &cancel).await? {
-                    self.store
-                        .set_inventory_item_offset(dataset, false, page, missing)
-                        .await?;
+                if self
+                    .first_unpublished_item(&items, true, &cancel)
+                    .await?
+                    .is_some()
+                {
+                    if let Some(missing) =
+                        self.first_unscheduled_item(&items, true, &cancel).await?
+                    {
+                        self.store
+                            .set_inventory_item_offset(dataset, false, page, missing)
+                            .await?;
+                    }
                     continue;
                 }
                 self.store
@@ -1222,7 +1230,7 @@ impl CorpusRuntime {
                 }
                 if self.retain_history_bodies
                     && let Some(missing) =
-                        self.first_unpublished_item(&items, false, &cancel).await?
+                        self.first_unscheduled_item(&items, false, &cancel).await?
                 {
                     offset = offset.min(missing);
                 }
@@ -1258,12 +1266,18 @@ impl CorpusRuntime {
                     continue;
                 }
                 if self.retain_history_bodies
-                    && let Some(missing) =
-                        self.first_unpublished_item(&items, false, &cancel).await?
+                    && self
+                        .first_unpublished_item(&items, false, &cancel)
+                        .await?
+                        .is_some()
                 {
-                    self.store
-                        .set_inventory_item_offset(dataset, true, page, missing)
-                        .await?;
+                    if let Some(missing) =
+                        self.first_unscheduled_item(&items, false, &cancel).await?
+                    {
+                        self.store
+                            .set_inventory_item_offset(dataset, true, page, missing)
+                            .await?;
+                    }
                     continue;
                 }
                 self.store
@@ -1306,6 +1320,46 @@ impl CorpusRuntime {
                 .store
                 .revision_capture_published(&item.object, &item.revision_id, now())
                 .await?
+            {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+    /// Move the saved page offset only to work that has neither published nor
+    /// been queued. Rewinding to an active first-page job would starve later
+    /// entries each time the list is revisited.
+    async fn first_unscheduled_item(
+        &self,
+        items: &[InventoryItem],
+        head: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Option<usize>, DatabaseError> {
+        for (index, item) in items.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(DatabaseError::Cancelled);
+            }
+            if self
+                .store
+                .detail_gap_active(&item.object, &item.revision_id)
+                .await?
+            {
+                continue;
+            }
+            let published = if head {
+                self.store
+                    .head_revision_published(&item.object, &item.revision_id)
+                    .await?
+            } else {
+                self.store
+                    .revision_capture_published(&item.object, &item.revision_id, now())
+                    .await?
+            };
+            if !published
+                && !self
+                    .store
+                    .active_detail_job(&item.object, &item.revision_id, head)
+                    .await?
             {
                 return Ok(Some(index));
             }

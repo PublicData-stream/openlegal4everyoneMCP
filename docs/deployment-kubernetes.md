@@ -1251,6 +1251,9 @@ CPU, memory and scratch totals matching its worker settings. Physical node
 capacity may permit fewer simultaneous Pods. Request Jobs use a 7,500 second
 Kubernetes deadline and no automatic retry; an uncertain Job creation outcome
 stops the scheduler for reconciliation rather than creating a possible duplicate.
+An explicit detail job left pending by a lost request Pod becomes eligible for
+continuous workers after 8,100 seconds; a running job becomes eligible after
+its claim lease expires. Both paths retain the provider request ledger.
 
 The scheduler ServiceAccount can create Jobs in `openlegal-serving` and is bound
 to the existing document-controller Role in `openlegal-documents`. Automatic
