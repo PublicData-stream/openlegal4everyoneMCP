@@ -72,6 +72,7 @@ enabled = true
 mode = "continuous"
 retain_history_bodies = false
 detail_timeout_secs = 3600
+detail_job_workers = 4
 
 # Match deploy/document-sandbox/namespace.yaml ResourceQuota/document-budget.
 # Omitting this table retains these defaults.

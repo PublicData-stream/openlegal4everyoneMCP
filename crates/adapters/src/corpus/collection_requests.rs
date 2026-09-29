@@ -27,7 +27,7 @@ impl PgCorpusStore {
         job_name: &str,
     ) -> Result<(), DatabaseError> {
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
-        sqlx::query("UPDATE openlegal.collection_request SET status='failed',payload='{}'::jsonb,lease_until=NULL WHERE id=$1 AND ((status='running' AND job_name=$2) OR (status='launching' AND job_name IS NULL))")
+        sqlx::query("UPDATE openlegal.collection_request SET status='failed',payload='{}'::jsonb,lease_until=NULL,reason='worker_failed' WHERE id=$1 AND ((status='running' AND job_name=$2) OR (status='launching' AND job_name IS NULL))")
             .bind(id).bind(job_name).execute(&self.pool).await.map_err(db)?;
         Ok(())
     }
@@ -118,12 +118,38 @@ impl PgCorpusStore {
         id: &str,
         status: &str,
     ) -> Result<(), DatabaseError> {
+        self.settle_collection_request_with_reason(id, status, None)
+            .await
+    }
+
+    pub async fn settle_collection_request_with_reason(
+        &self,
+        id: &str,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<(), DatabaseError> {
         if !matches!(status, "done" | "skipped" | "deferred" | "failed") {
             return Err(DatabaseError::InvalidInput);
         }
+        if reason.is_some_and(|value| {
+            !matches!(
+                value,
+                "ambiguous"
+                    | "source_inventory_incomplete"
+                    | "not_found"
+                    | "source_data_invalid"
+                    | "source_unavailable"
+                    | "download_failed"
+                    | "identity_conflict"
+                    | "worker_failed"
+                    | "worker_lost"
+            )
+        }) {
+            return Err(DatabaseError::InvalidInput);
+        }
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
-        let changed = sqlx::query("UPDATE openlegal.collection_request SET status=$2,payload=CASE WHEN $2='deferred' THEN payload ELSE '{}'::jsonb END,lease_until=CASE WHEN $2='deferred' THEN floor(extract(epoch from clock_timestamp()))::bigint+3600 ELSE NULL END WHERE id=$1 AND status IN ('launching','running')")
-            .bind(id).bind(status).execute(&self.pool).await.map_err(db)?.rows_affected();
+        let changed = sqlx::query("UPDATE openlegal.collection_request SET status=$2,payload=CASE WHEN $2='deferred' THEN payload ELSE '{}'::jsonb END,lease_until=CASE WHEN $2='deferred' THEN floor(extract(epoch from clock_timestamp()))::bigint+3600 ELSE NULL END,reason=$3 WHERE id=$1 AND status IN ('launching','running')")
+            .bind(id).bind(status).bind(reason).execute(&self.pool).await.map_err(db)?.rows_affected();
         if changed != 1 {
             return Err(DatabaseError::Conflict);
         }
@@ -150,7 +176,7 @@ impl PgCorpusStore {
                 .await
                 .map_err(db)?;
         let scheduler_seen: i64 = sqlx::query_scalar(
-            "SELECT collection_scheduler_seen_at FROM openlegal.corpus_control WHERE singleton",
+            "SELECT collection_scheduler_seen_at FROM openlegal.corpus_control WHERE singleton FOR UPDATE",
         )
         .fetch_one(&mut *tx)
         .await
@@ -158,21 +184,39 @@ impl PgCorpusStore {
         if scheduler_seen < now.saturating_sub(30) {
             return Err(DatabaseError::Capacity);
         }
-        if let Some(row) = sqlx::query("SELECT id,status,expires_at FROM openlegal.collection_request WHERE request_key=$1 FOR UPDATE")
+        if let Some(row) = sqlx::query("SELECT id,status,reason,created_at,expires_at FROM openlegal.collection_request WHERE request_key=$1 FOR UPDATE")
             .bind(&request_key).fetch_optional(&mut *tx).await.map_err(db)? {
             let id: Uuid = row.try_get("id").map_err(db)?;
             let status: String = row.try_get("status").map_err(db)?;
+            let reason: Option<String> = row.try_get("reason").map_err(db)?;
+            let created: i64 = row.try_get("created_at").map_err(db)?;
             let expires: i64 = row.try_get("expires_at").map_err(db)?;
-            if expires > now || matches!(status.as_str(), "launching" | "running") {
+            let terminal_retry_due = matches!(status.as_str(), "failed" | "skipped")
+                && created.saturating_add(3600) <= now;
+            if (expires > now && !terminal_retry_due)
+                || matches!(status.as_str(), "launching" | "running")
+            {
                 tx.commit().await.map_err(db)?;
                 let retry_after_seconds = if status == "deferred" { 3600 } else if matches!(status.as_str(), "queued" | "launching" | "running") { 10 } else { 0 };
-                return Ok(CollectionReceipt { request_id: id.to_string(), status, retry_after_seconds });
+                return Ok(CollectionReceipt { request_id: id.to_string(), status, retry_after_seconds, reason });
             }
-            let new_id: Uuid = sqlx::query_scalar("UPDATE openlegal.collection_request SET id=pg_catalog.uuidv7(),payload=$2,status='queued',created_at=$3,expires_at=$4,lease_until=NULL,job_name=NULL WHERE request_key=$1 RETURNING id")
+            if !matches!(status.as_str(), "queued" | "launching" | "running") {
+                let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.collection_request WHERE status IN ('queued','launching','running')")
+                    .fetch_one(&mut *tx).await.map_err(db)?;
+                if queued >= 128 {
+                    return Err(DatabaseError::Capacity);
+                }
+            }
+            // A terminal receipt remains addressable by its original ID until
+            // expiry, even when an equal request is retried after an hour.
+            let old_key = hex(&bytes_hash(format!("retired:{request_key}:{id}").as_bytes()));
+            sqlx::query("UPDATE openlegal.collection_request SET request_key=$2 WHERE id=$1")
+                .bind(id).bind(old_key).execute(&mut *tx).await.map_err(db)?;
+            let new_id: Uuid = sqlx::query_scalar("INSERT INTO openlegal.collection_request(request_key,payload,status,created_at,expires_at) VALUES($1,$2,'queued',$3,$4) RETURNING id")
                 .bind(&request_key).bind(payload).bind(now).bind(now+86400)
                 .fetch_one(&mut *tx).await.map_err(db)?;
             tx.commit().await.map_err(db)?;
-            return Ok(CollectionReceipt { request_id: new_id.to_string(), status: "queued".into(), retry_after_seconds: 10 });
+            return Ok(CollectionReceipt { request_id: new_id.to_string(), status: "queued".into(), retry_after_seconds: 10, reason: None });
         }
         let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.collection_request WHERE status IN ('queued','launching','running')")
             .fetch_one(&mut *tx).await.map_err(db)?;
@@ -187,19 +231,21 @@ impl PgCorpusStore {
             request_id: id.to_string(),
             status: "queued".into(),
             retry_after_seconds: 10,
+            reason: None,
         })
     }
 
     pub async fn collection_status(&self, id: &str) -> Result<CollectionReceipt, DatabaseError> {
         self.gate().await?;
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
-        let row = sqlx::query("SELECT status FROM openlegal.collection_request WHERE id=$1")
+        let row = sqlx::query("SELECT status,reason FROM openlegal.collection_request WHERE id=$1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .map_err(db)?
             .ok_or(DatabaseError::NotFound)?;
         let status: String = row.try_get("status").map_err(db)?;
+        let reason: Option<String> = row.try_get("reason").map_err(db)?;
         let retry_after_seconds = if status == "deferred" {
             3600
         } else if matches!(status.as_str(), "queued" | "launching" | "running") {
@@ -211,6 +257,7 @@ impl PgCorpusStore {
             request_id: id.to_string(),
             status,
             retry_after_seconds,
+            reason,
         })
     }
 
@@ -221,7 +268,7 @@ impl PgCorpusStore {
     }
     pub async fn reap_stale_collection_requests(&self) -> Result<(), DatabaseError> {
         self.gate().await?;
-        sqlx::query("UPDATE openlegal.collection_request SET status='failed',payload='{}'::jsonb,lease_until=NULL WHERE status IN ('launching','running') AND lease_until < floor(extract(epoch from clock_timestamp()))::bigint")
+        sqlx::query("UPDATE openlegal.collection_request SET status='failed',payload='{}'::jsonb,lease_until=NULL,reason='worker_lost' WHERE status IN ('launching','running') AND lease_until < floor(extract(epoch from clock_timestamp()))::bigint")
             .execute(&self.pool).await.map_err(db)?;
         Ok(())
     }

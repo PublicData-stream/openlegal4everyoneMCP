@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 mod collection_gaps;
 mod collection_requests;
+mod object_status;
 pub use collection_gaps::PageGapObservation;
 mod lifecycle;
 mod runtime_lease;
@@ -83,6 +84,20 @@ impl PgCorpusStore {
             .fetch_optional(&self.pool).await.map_err(db)?;
         Ok(ready.unwrap_or(false))
     }
+    /// Publication progress is independent of the one-hour freshness window.
+    /// An older accepted capture still satisfies a list page while the cursor
+    /// moves through other objects on that page.
+    pub async fn head_revision_published(
+        &self,
+        object: &ObjectId,
+        revision_id: &str,
+    ) -> Result<bool, DatabaseError> {
+        self.gate().await?;
+        let identity = key(object)?;
+        let published: Option<bool> = sqlx::query_scalar("SELECT NOT o.withdrawn AND NOT o.pending AND o.desired_head_revision=$2 AND c.revision_id=$2 AND COALESCE(c.payload->'record'->'metadata'->>'attachment_status','complete') <> 'incomplete' FROM openlegal.corpus_object o JOIN openlegal.corpus_capture c ON c.id=o.head_capture WHERE o.object_key=$1")
+            .bind(identity).bind(revision_id).fetch_optional(&self.pool).await.map_err(db)?;
+        Ok(published.unwrap_or(false))
+    }
     /// Internal ingestion lookup for a recently validated retained capture. Public revision
     /// selectors remain unsupported for datasets without provider history.
     pub async fn revision_capture_recent(
@@ -97,6 +112,18 @@ impl PgCorpusStore {
             .bind(identity).bind(revision_id).bind(now.to_string())
             .fetch_one(&self.pool).await.map_err(db)?;
         Ok(ready)
+    }
+    pub async fn revision_capture_published(
+        &self,
+        object: &ObjectId,
+        revision_id: &str,
+        now: u64,
+    ) -> Result<bool, DatabaseError> {
+        self.gate().await?;
+        let identity = key(object)?;
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_revision r JOIN openlegal.corpus_capture c ON c.id=r.latest_capture JOIN openlegal.corpus_object o ON o.object_key=r.object_key WHERE r.object_key=$1 AND r.revision_id=$2 AND COALESCE(c.payload->'record'->'metadata'->>'attachment_status','complete') <> 'incomplete' AND (o.head_capture=c.id OR c.captured_at>$3::text::numeric-2592000) AND (c.expires_at IS NULL OR c.expires_at>$3::text::numeric))")
+            .bind(identity).bind(revision_id).bind(now.to_string())
+            .fetch_one(&self.pool).await.map_err(db)
     }
     pub async fn inventory_cursor(
         &self,
@@ -138,10 +165,47 @@ impl PgCorpusStore {
                 .checked_add(1)
                 .ok_or(DatabaseError::Capacity)?
         };
-        let rows = sqlx::query("UPDATE openlegal.provider_inventory_cursor SET next_page=$1 WHERE dataset=$2 AND next_page=$3")
+        let rows = sqlx::query("UPDATE openlegal.provider_inventory_cursor SET next_page=$1,item_offset=0 WHERE dataset=$2 AND next_page=$3")
             .bind(i32::try_from(next).map_err(corrupt)?)
             .bind(&name)
             .bind(i32::try_from(observed_page).map_err(corrupt)?)
+            .execute(&self.pool).await.map_err(db)?.rows_affected();
+        if rows != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        Ok(())
+    }
+    pub async fn inventory_item_offset(
+        &self,
+        dataset: Dataset,
+        historical: bool,
+        page: u32,
+    ) -> Result<usize, DatabaseError> {
+        self.gate().await?;
+        let name = format!(
+            "{}:{historical}",
+            serde_json::to_string(&dataset).map_err(corrupt)?
+        );
+        let offset: Option<i32> = sqlx::query_scalar("SELECT item_offset FROM openlegal.provider_inventory_cursor WHERE dataset=$1 AND next_page=$2")
+            .bind(name).bind(i32::try_from(page).map_err(corrupt)?)
+            .fetch_optional(&self.pool).await.map_err(db)?;
+        usize::try_from(offset.ok_or(DatabaseError::Conflict)?).map_err(corrupt)
+    }
+    pub async fn set_inventory_item_offset(
+        &self,
+        dataset: Dataset,
+        historical: bool,
+        page: u32,
+        offset: usize,
+    ) -> Result<(), DatabaseError> {
+        self.gate().await?;
+        let name = format!(
+            "{}:{historical}",
+            serde_json::to_string(&dataset).map_err(corrupt)?
+        );
+        let rows = sqlx::query("UPDATE openlegal.provider_inventory_cursor SET item_offset=$1 WHERE dataset=$2 AND next_page=$3")
+            .bind(i32::try_from(offset).map_err(corrupt)?)
+            .bind(name).bind(i32::try_from(page).map_err(corrupt)?)
             .execute(&self.pool).await.map_err(db)?.rows_affected();
         if rows != 1 {
             return Err(DatabaseError::Conflict);
@@ -196,6 +260,7 @@ impl PgCorpusStore {
         let row=sqlx::query("SELECT identity,version,catalog_version,head_capture,pending,withdrawn,inventory_complete FROM openlegal.corpus_object WHERE object_key=$1").bind(k).fetch_optional(&self.pool).await.map_err(db)?;
         let Some(row) = row else {
             return Ok(ObjectState {
+                observed: false,
                 catalog_version: 0,
                 version: 0,
                 head_capture: None,
@@ -210,6 +275,7 @@ impl PgCorpusStore {
             return Err(DatabaseError::StorageCorrupt);
         }
         Ok(ObjectState {
+            observed: true,
             catalog_version: row
                 .try_get::<i64, _>("catalog_version")
                 .map_err(db)?
@@ -377,10 +443,20 @@ impl PgCorpusStore {
         }
         let id = match selector {
             RevisionSelector::Head => {
-                if state.pending {
-                    return Err(DatabaseError::ProcessingPending);
+                if !state.observed {
+                    return Err(DatabaseError::NotObserved);
                 }
-                state.head_capture.ok_or(DatabaseError::ProcessingPending)?
+                if state.pending || state.head_capture.is_none() {
+                    return Err(match self.object_status(&object, now).await?.state {
+                        ObjectCollectionState::ProcessingPending => {
+                            DatabaseError::ProcessingPending
+                        }
+                        _ => DatabaseError::CollectionIncomplete,
+                    });
+                }
+                state
+                    .head_capture
+                    .ok_or(DatabaseError::CollectionIncomplete)?
             }
             RevisionSelector::Capture { id } => id,
             RevisionSelector::Revision { id } => {
@@ -767,7 +843,7 @@ impl PgCorpusStore {
                 .await
                 .map_err(db)?;
             if let Some(job) = p.job_id {
-                sqlx::query("UPDATE openlegal.corpus_job SET status='done',lease_until=NULL WHERE id=$1 AND object_key=$2 AND expected_version=$3").bind(Uuid::parse_str(&job).map_err(|_|DatabaseError::InvalidInput)?).bind(&k).bind(version).execute(&mut *tx).await.map_err(db)?;
+                sqlx::query("UPDATE openlegal.corpus_job SET status='done',lease_until=NULL,completed_at=$4::text::numeric WHERE id=$1 AND object_key=$2 AND expected_version=$3").bind(Uuid::parse_str(&job).map_err(|_|DatabaseError::InvalidInput)?).bind(&k).bind(version).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
             }
             if update_job_gap {
                 self.update_published_detail_gap(
@@ -861,7 +937,7 @@ impl PgCorpusStore {
         }
         if let Some(job) = p.job_id {
             let job = Uuid::parse_str(&job).map_err(|_| DatabaseError::InvalidInput)?;
-            sqlx::query("UPDATE openlegal.corpus_job SET status='done',lease_until=NULL WHERE id=$1 AND object_key=$2 AND expected_version=$3").bind(job).bind(&k).bind(version).execute(&mut *tx).await.map_err(db)?;
+            sqlx::query("UPDATE openlegal.corpus_job SET status='done',lease_until=NULL,completed_at=$4::text::numeric WHERE id=$1 AND object_key=$2 AND expected_version=$3").bind(job).bind(&k).bind(version).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
         }
         if update_job_gap {
             self.update_published_detail_gap(

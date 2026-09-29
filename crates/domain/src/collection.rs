@@ -15,6 +15,11 @@ pub enum CollectionTarget {
     Object {
         object: ObjectId,
     },
+    PrecedentCase {
+        case_number: String,
+        #[serde(default)]
+        expected_id: Option<String>,
+    },
     Search {
         mode: CollectionSearchMode,
         term: String,
@@ -39,6 +44,22 @@ impl CollectionRequest {
                     || object.provider != "law_go_kr"
                     || object.dataset != Dataset::NationalStatute
                     || !object.id.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(DatabaseError::InvalidInput);
+                }
+            }
+            CollectionTarget::PrecedentCase {
+                case_number,
+                expected_id,
+            } => {
+                if case_number.is_empty()
+                    || case_number.len() > 64
+                    || !case_number
+                        .chars()
+                        .all(|ch| ch.is_alphanumeric() || ch == '-')
+                    || expected_id.as_deref().is_some_and(|id| {
+                        id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_digit())
+                    })
                 {
                     return Err(DatabaseError::InvalidInput);
                 }
@@ -143,6 +164,20 @@ mod tests {
             },
         };
         assert!(request.validate().is_err());
+
+        let case = |case_number: &str, expected_id: Option<&str>| CollectionRequest {
+            target: CollectionTarget::PrecedentCase {
+                case_number: case_number.into(),
+                expected_id: expected_id.map(str::to_owned),
+            },
+        };
+        assert!(case("2018도14262", Some("204234")).validate().is_ok());
+        for invalid in ["", " 2018도14262", "2018도14262,2019도1", "2018도14262\n"] {
+            assert!(case(invalid, None).validate().is_err(), "{invalid:?}");
+        }
+        for invalid in ["", "20a234", " 204234"] {
+            assert!(case("2018도14262", Some(invalid)).validate().is_err());
+        }
     }
 }
 
@@ -152,6 +187,8 @@ pub struct CollectionReceipt {
     pub request_id: String,
     pub status: String,
     pub retry_after_seconds: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]

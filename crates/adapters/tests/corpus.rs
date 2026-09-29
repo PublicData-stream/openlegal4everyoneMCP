@@ -88,9 +88,18 @@ async fn explicit_collection_requests_coalesce_and_clear_completed_payloads() {
         "running"
     );
     store
-        .settle_collection_request(&id, "deferred")
+        .settle_collection_request_with_reason(&id, "deferred", Some("source_inventory_incomplete"))
         .await
         .unwrap();
+    assert_eq!(
+        store
+            .collection_status(&id)
+            .await
+            .unwrap()
+            .reason
+            .as_deref(),
+        Some("source_inventory_incomplete")
+    );
     assert_eq!(
         store.request_collection(claimed).await.unwrap().status,
         "deferred"
@@ -105,6 +114,7 @@ async fn explicit_collection_requests_coalesce_and_clear_completed_payloads() {
         .unwrap();
     store.settle_collection_request(&id, "done").await.unwrap();
     assert_eq!(store.collection_status(&id).await.unwrap().status, "done");
+    assert!(store.collection_status(&id).await.unwrap().reason.is_none());
     assert!(store.load_collection_request(&id).await.is_err());
     assert!(store.unsettled_collection_jobs().await.unwrap().is_empty());
     base.close().await.unwrap();
@@ -122,12 +132,10 @@ async fn terminal_failed_job_clears_request_without_touching_provider_budget() {
     store.heartbeat_collection_scheduler().await.unwrap();
     let mut requested = object();
     requested.provider = "law_go_kr".into();
-    let receipt = store
-        .request_collection(CollectionRequest {
-            target: CollectionTarget::Object { object: requested },
-        })
-        .await
-        .unwrap();
+    let request = CollectionRequest {
+        target: CollectionTarget::Object { object: requested },
+    };
+    let receipt = store.request_collection(request.clone()).await.unwrap();
     let (id, _) = store.claim_collection_request().await.unwrap().unwrap();
     assert_eq!(id, receipt.request_id);
     store
@@ -138,7 +146,9 @@ async fn terminal_failed_job_clears_request_without_touching_provider_budget() {
         .fail_finished_collection_job(&id, "openlegal-request-failed")
         .await
         .unwrap();
-    assert_eq!(store.collection_status(&id).await.unwrap().status, "failed");
+    let failed = store.collection_status(&id).await.unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.reason.as_deref(), Some("worker_failed"));
     assert!(store.unsettled_collection_jobs().await.unwrap().is_empty());
     assert!(store.load_collection_request(&id).await.is_err());
     store
@@ -168,6 +178,20 @@ async fn terminal_failed_job_clears_request_without_touching_provider_budget() {
         store.collection_status(&launch_id).await.unwrap().status,
         "failed"
     );
+    let coalesced = store.request_collection(request.clone()).await.unwrap();
+    assert_eq!(coalesced.request_id, id);
+    sqlx::query("UPDATE openlegal.collection_request SET created_at=created_at-3601 WHERE id=$1")
+        .bind(uuid::Uuid::parse_str(&id).unwrap())
+        .execute(&base.pool())
+        .await
+        .unwrap();
+    let retried = store.request_collection(request).await.unwrap();
+    assert_ne!(retried.request_id, id);
+    assert_eq!(retried.status, "queued");
+    assert!(retried.reason.is_none());
+    let original = store.collection_status(&id).await.unwrap();
+    assert_eq!(original.status, "failed");
+    assert_eq!(original.reason.as_deref(), Some("worker_failed"));
     base.close().await.unwrap();
 }
 #[tokio::test]
@@ -532,9 +556,27 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
         1
     );
     store
+        .set_inventory_item_offset(Dataset::Treaty, false, 1, 16)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .inventory_item_offset(Dataset::Treaty, false, 1)
+            .await
+            .unwrap(),
+        16
+    );
+    store
         .advance_inventory_cursor(Dataset::Treaty, false, 1, false)
         .await
         .unwrap();
+    assert_eq!(
+        store
+            .inventory_item_offset(Dataset::Treaty, false, 2)
+            .await
+            .unwrap(),
+        0
+    );
     assert_eq!(
         store
             .inventory_cursor(Dataset::Treaty, false)
@@ -583,6 +625,12 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
     assert!(
         !store
             .head_revision_ready(&object(), "r1", 3701)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .head_revision_published(&object(), "r1")
             .await
             .unwrap()
     );
@@ -705,6 +753,81 @@ async fn publish(store: &PgCorpusStore, revision: &str, body: &str, now: u64) ->
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn object_status_distinguishes_unobserved_processing_and_incomplete() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("object-status"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::new(base.pool(), blobs);
+    let absent = store.object_status(&object(), 100).await.unwrap();
+    assert_eq!(absent.state, ObjectCollectionState::NotObserved);
+    assert!(absent.job.is_none());
+    assert_eq!(
+        store
+            .resolve(object(), RevisionSelector::Head, 100, token())
+            .await
+            .err(),
+        Some(DatabaseError::NotObserved)
+    );
+    store
+        .enqueue_job(object(), "r1".into(), None, true, true, 100)
+        .await
+        .unwrap();
+    let waiting = store.object_status(&object(), 100).await.unwrap();
+    assert_eq!(waiting.state, ObjectCollectionState::ProcessingPending);
+    assert_eq!(waiting.job.unwrap().status, "pending");
+    let claimed = store.claim_job(101).await.unwrap().unwrap();
+    let running = store.object_status(&object(), 101).await.unwrap();
+    assert_eq!(running.state, ObjectCollectionState::ProcessingPending);
+    assert_eq!(running.job.as_ref().unwrap().started_at, Some(101));
+    assert!(matches!(running.eta, ObjectCompletionEta::Unknown { .. }));
+    for sample in 0..20 {
+        let mut other = object();
+        other.id = format!("eta-sample-{sample}");
+        store
+            .enqueue_job(other.clone(), "r1".into(), None, true, true, 80)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE openlegal.corpus_job j SET status='done',started_at=80,completed_at=$2 FROM openlegal.corpus_object o WHERE j.object_key=o.object_key AND o.identity->>'id'=$1")
+            .bind(&other.id)
+            .bind(90 + sample)
+            .execute(&base.pool())
+            .await
+            .unwrap();
+    }
+    let estimated = store.object_status(&object(), 101).await.unwrap();
+    assert!(matches!(
+        estimated.eta,
+        ObjectCompletionEta::Range {
+            earliest_at: 115,
+            latest_at: 128,
+            sample_size: 20
+        }
+    ));
+    store
+        .skip_claim(&claimed, "source_data_invalid", 102)
+        .await
+        .unwrap();
+    let incomplete = store.object_status(&object(), 102).await.unwrap();
+    assert_eq!(
+        incomplete.state,
+        ObjectCollectionState::CollectionIncomplete
+    );
+    assert_eq!(incomplete.retry_at, Some(3702));
+    assert_eq!(incomplete.job.unwrap().completed_at, Some(102));
+    assert_eq!(
+        store
+            .resolve(object(), RevisionSelector::Head, 102, token())
+            .await
+            .err(),
+        Some(DatabaseError::CollectionIncomplete)
+    );
+    base.close().await.unwrap();
 }
 
 #[tokio::test]

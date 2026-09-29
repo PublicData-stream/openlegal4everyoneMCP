@@ -32,6 +32,15 @@ pub(super) fn detail_key(object_key: &str, revision: &str) -> String {
     )
 }
 impl PgCorpusStore {
+    /// Bound each dataset's share of the global 128-job queue so a large first
+    /// page cannot prevent the other datasets from being observed and queued.
+    pub async fn active_jobs_for_dataset(&self, dataset: Dataset) -> Result<u64, DatabaseError> {
+        self.gate().await?;
+        let dataset = dataset_name(dataset)?;
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE j.status IN ('pending','running') AND o.identity->>'dataset'=$1")
+            .bind(dataset).fetch_one(&self.pool).await.map_err(db)?;
+        count.try_into().map_err(|_| DatabaseError::StorageCorrupt)
+    }
     pub(super) async fn update_published_detail_gap(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -114,8 +123,9 @@ impl PgCorpusStore {
         self.ensure_gap_capacity(&gap).await?;
         let id = uuid::Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
         let mut tx = self.pool.begin().await.map_err(db)?;
-        let rows = sqlx::query("UPDATE openlegal.corpus_job SET status='failed',lease_until=NULL,error_category=$2 WHERE id=$1 AND expected_version=$3 AND attempts=$4 AND status='running'")
+        let rows = sqlx::query("UPDATE openlegal.corpus_job SET status='failed',lease_until=NULL,error_category=$2,completed_at=$5::text::numeric WHERE id=$1 AND expected_version=$3 AND attempts=$4 AND status='running'")
             .bind(id).bind(reason).bind(job.expected_version as i64).bind(job.attempts as i32)
+            .bind(now.to_string())
             .execute(&mut *tx).await.map_err(db)?.rows_affected();
         if rows != 1 {
             return Err(DatabaseError::Conflict);
@@ -162,7 +172,7 @@ impl PgCorpusStore {
         for row in &rows {
             let id: uuid::Uuid = row.try_get("id").map_err(db)?;
             let gap: String = row.try_get("gap_key").map_err(db)?;
-            sqlx::query("UPDATE openlegal.corpus_job SET status='pending',attempts=0,lease_until=NULL,error_category=NULL,source_metadata=source_metadata - 'collection_origin' WHERE id=$1")
+            sqlx::query("UPDATE openlegal.corpus_job SET status='pending',attempts=0,lease_until=NULL,error_category=NULL,started_at=NULL,completed_at=NULL,source_metadata=source_metadata - 'collection_origin' WHERE id=$1")
                 .bind(id).execute(&mut *tx).await.map_err(db)?;
             sqlx::query(
                 "UPDATE openlegal.provider_collection_gap SET retry_at=$2 WHERE gap_key=$1",

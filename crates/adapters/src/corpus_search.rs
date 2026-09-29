@@ -114,7 +114,7 @@ impl CorpusSearch {
             let (prepared, returned_budget) = tokio::task::spawn_blocking(move || {
                 let prepared = (|| {
                     let query = if matches!(mode, SearchMode::Query) {
-                        let parsed = SearchQueryProcessor::new(&["title", "body"])
+                        let parsed = SearchQueryProcessor::new(&["title", "body", "case_number"])
                             .map_err(|_| E::InvalidInput)?
                             .parse(&query_text)
                             .map_err(|_| E::InvalidInput)?;
@@ -158,7 +158,10 @@ impl CorpusSearch {
                 expires: now() + 600,
                 corpus_complete: !request.include_history
                     && !request.include_ocr
-                    && request.sections.iter().all(|s| s == "title" || s == "body")
+                    && request
+                        .sections
+                        .iter()
+                        .all(|s| s == "title" || s == "body" || s == "case_number")
                     && self
                         .inventory_verified
                         .load(std::sync::atomic::Ordering::Acquire)
@@ -328,9 +331,16 @@ fn scan(
             ("title".to_string(), doc.capture.record.title.clone(), false),
             ("body".to_string(), doc.capture.record.body.clone(), false),
         ];
+        // The stored capture payload contains metadata even in existing index
+        // generations, so this projection does not require an index rebuild.
+        if let Some(case_number) = doc.capture.record.metadata.get("case_number") {
+            sections.push(("case_number".into(), case_number.clone(), false));
+        }
         for s in &doc.capture.record.sections {
             if s.kind != SectionKind::ProviderText
                 && (s.kind != SectionKind::Ocr || request.include_ocr)
+                && !(s.id == "case_number"
+                    && doc.capture.record.metadata.contains_key("case_number"))
             {
                 sections.push((s.id.clone(), s.text.clone(), s.kind == SectionKind::Ocr));
             }
@@ -338,7 +348,11 @@ fn scan(
         if !request.sections.is_empty() {
             sections.retain(|(id, _, _)| request.sections.contains(id));
             for s in &doc.capture.record.sections {
-                if request.sections.contains(&s.id) && s.kind == SectionKind::ProviderText {
+                if request.sections.contains(&s.id)
+                    && s.kind == SectionKind::ProviderText
+                    && !(s.id == "case_number"
+                        && doc.capture.record.metadata.contains_key("case_number"))
+                {
                     sections.push((s.id.clone(), s.text.clone(), false));
                 }
             }
@@ -355,9 +369,15 @@ fn scan(
         }
         scanned += bytes;
         if let Some(expression) = &expression {
+            let has_metadata_case = doc.capture.record.metadata.contains_key("case_number");
+            if !sections.iter().any(|(name, _, _)| name == "case_number") {
+                doc.capture.record.metadata.remove("case_number");
+            }
             doc.capture.record.body = sections
                 .iter()
-                .filter(|(name, _, _)| name != "title")
+                .filter(|(name, _, _)| {
+                    name != "title" && (name != "case_number" || !has_metadata_case)
+                })
                 .map(|(_, text, _)| text.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -367,7 +387,7 @@ fn scan(
                 doc.capture.record.title.clear();
                 doc.title_tokens.clear();
             }
-            if index.matches(expression, &doc) {
+            if index.matches(expression, &doc, budget.deadline, cancel)? {
                 let (name, source, ocr) = sections
                     .iter()
                     .find(|(_, text, _)| !text.is_empty())
@@ -474,5 +494,181 @@ fn hit(
         byte_start: start,
         byte_end: end,
         derived_ocr: ocr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::korean_analysis::KoreanAnalyzer;
+    use openlegal_domain::{
+        legal::{Capture, Dataset, LegalRecord, ObjectId},
+        legal_search::Filters,
+    };
+    use tokio::sync::Semaphore;
+
+    fn capture(id: &str) -> Capture {
+        Capture {
+            capture_id: format!("{id:0>64}"),
+            sequence: 1,
+            record: LegalRecord {
+                object: ObjectId {
+                    jurisdiction: "kr".into(),
+                    provider: "fixture".into(),
+                    dataset: Dataset::Precedent,
+                    id: id.into(),
+                },
+                revision_id: "r1".into(),
+                title: "Fictional judgment".into(),
+                body: "Unrelated text".into(),
+                metadata: BTreeMap::from([("case_number".into(), "2018도14262".into())]),
+                publication_date: None,
+                effective_date: None,
+                source_url: "https://example.test/fictional".into(),
+                representation: "fictional_text".into(),
+                sections: vec![],
+            },
+            retrieved_at: 1,
+            captured_at: 1,
+            validated_at: 1,
+            processor_version: "fixture_v1".into(),
+            raw_sha256: "c".repeat(64),
+        }
+    }
+
+    fn request(query: &str, sections: &[&str], limit: usize) -> SearchRequest {
+        SearchRequest {
+            query: query.into(),
+            filters: Filters::default(),
+            include_history: false,
+            include_ocr: false,
+            sections: sections.iter().map(|s| (*s).into()).collect(),
+            limit,
+            cursor: None,
+            literal: false,
+            ignore_case: false,
+            context_lines: 0,
+        }
+    }
+
+    fn budget() -> SearchBudget {
+        SearchBudget {
+            bytes: 64 * 1024 * 1024,
+            deadline: Instant::now() + std::time::Duration::from_secs(10),
+            lease: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+        }
+    }
+
+    fn session(index: &CorpusIndex, mode: SearchMode, query: &str) -> Session {
+        let parsed = SearchQueryProcessor::new(&["title", "body", "case_number"])
+            .unwrap()
+            .parse(query)
+            .unwrap();
+        let query = matches!(mode, SearchMode::Query).then(|| {
+            Arc::new(
+                index
+                    .compile_query(
+                        &parsed.expression,
+                        Instant::now() + std::time::Duration::from_secs(10),
+                        &CancellationToken::new(),
+                    )
+                    .unwrap(),
+            )
+        });
+        let regex = matches!(mode, SearchMode::Ripgrep).then(|| {
+            Arc::new(
+                RegexMatcherBuilder::new()
+                    .multi_line(true)
+                    .line_terminator(Some(b'\n'))
+                    .build(&parsed.source)
+                    .unwrap(),
+            )
+        });
+        Session {
+            snapshot: index.snapshot().unwrap(),
+            fingerprint: String::new(),
+            expires: now() + 600,
+            corpus_complete: false,
+            query,
+            regex,
+        }
+    }
+
+    #[test]
+    fn existing_capture_metadata_is_searchable_without_index_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
+        index.apply_capture(capture("1"), true, 1).unwrap();
+        drop(index);
+        let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
+        for (query, sections, expected) in [
+            ("\"2018도14262\"", vec![], 1),
+            ("2018도14262", vec![], 1),
+            ("in:case_number:\"2018도14262\"", vec![], 1),
+            ("in:body:\"2018도14262\"", vec![], 0),
+            ("\"2018도14262\"", vec!["body"], 0),
+        ] {
+            let result = scan(
+                &index,
+                &session(&index, SearchMode::Query, query),
+                &request(query, &sections, 20),
+                Position::default(),
+                &budget(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(result.0.len(), expected, "{query} {sections:?}");
+        }
+        for (sections, expected) in [(vec![], 1), (vec!["case_number"], 1), (vec!["body"], 0)] {
+            let result = scan(
+                &index,
+                &session(&index, SearchMode::Ripgrep, "2018도14262"),
+                &request("2018도14262", &sections, 20),
+                Position::default(),
+                &budget(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(result.0.len(), expected, "{sections:?}");
+            if expected == 1 {
+                let hit = &result.0[0];
+                assert_eq!(hit.section, "case_number");
+                assert_eq!(hit.line, 1);
+                assert_eq!((hit.byte_start, hit.byte_end), (0, "2018도14262".len()));
+            }
+        }
+    }
+
+    #[test]
+    fn case_number_rg_cursor_resumes_after_one_hit_per_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
+        for id in ["1", "2"] {
+            index
+                .apply_capture(capture(id), true, id.parse().unwrap())
+                .unwrap();
+        }
+        let search = session(&index, SearchMode::Ripgrep, "2018도14262");
+        let first = scan(
+            &index,
+            &search,
+            &request("2018도14262", &[], 1),
+            Position::default(),
+            &budget(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(first.0.len(), 1);
+        let second = scan(
+            &index,
+            &search,
+            &request("2018도14262", &[], 1),
+            first.1.unwrap(),
+            &budget(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(second.0.len(), 1);
+        assert_ne!(first.0[0].object.id, second.0[0].object.id);
     }
 }

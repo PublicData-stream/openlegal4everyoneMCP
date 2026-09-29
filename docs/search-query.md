@@ -146,8 +146,18 @@ Deterministic generated cases check successful trees and error spans without
 panics; these are bounded regression tests, not exhaustive fuzzing. See the
 [implementation review](search-query-review.md) for checks and independent review.
 
-Future execution must specify analyzer behavior, admission before expensive work,
-field capabilities, result completeness/pagination, and search-semantics versioning.
+The managed `database.query` executor currently accepts `in:title:`, `in:body:`,
+and `in:case_number:`. The last field reads the capture's retained
+`metadata.case_number`. An unscoped exact phrase or analyzed term also searches
+that value. `database.rg` exposes the same metadata value as a `case_number`
+section, including in default searches; `sections: ["case_number"]` restricts
+matching to that value. The stored capture payload already contains metadata, so
+existing index generations need no rebuild to gain these searches. Search results
+still cover only captured objects, and `index_lag: 0` does not establish complete
+provider coverage.
+
+Other future executors must specify analyzer behavior, admission before expensive
+work, field capabilities, result completeness/pagination, and search-semantics versioning.
 Do not add this syntax validation to the existing `Query::validate` without a
 compatibility design: existing retained query identities can contain literal text
 that this grammar would reject. No persistence migration or change to existing

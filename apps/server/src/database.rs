@@ -4,6 +4,7 @@ use crate::{
     registry::{ToolError, ToolModule, ToolOptions, ToolOutput, ToolRegistry},
 };
 use openlegal_application::{
+    Clock,
     database::DatabaseService,
     search::{SearchMode, SearchService},
     text_diff::TextDiffService,
@@ -92,6 +93,11 @@ struct DiffOutput {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ObjectStatusInput {
+    object: ObjectId,
+}
 #[derive(Serialize, JsonSchema)]
 struct Show {
     schema_version: u32,
@@ -214,6 +220,28 @@ impl ToolModule for DatabaseTools {
                 }
             },
         )?;
+        let status_store = self.store.clone();
+        registry.register_typed::<ObjectStatusInput, ObjectStatus, _, _>(
+            "database.object_status",
+            "Read local observation, current collection job, index visibility and a bounded processing estimate for one legal object. This does not contact the provider or enqueue collection.",
+            ToolOptions::default(),
+            move |input, ctx| {
+                let store = status_store.clone();
+                async move {
+                    if ctx.request.cancellation.is_cancelled() {
+                        return Err(ToolError::Unavailable);
+                    }
+                    let result = store
+                        .object_status(&input.object, openlegal_application::SystemClock::default().now())
+                        .await
+                        .map_err(map_error)?;
+                    if ctx.request.cancellation.is_cancelled() {
+                        return Err(ToolError::Unavailable);
+                    }
+                    Ok(output(result))
+                }
+            },
+        )?;
         let service = self.database.clone();
         registry.register_typed::<HistoryInput, HistoryPage, _, _>(
             "database.history",
@@ -240,12 +268,12 @@ impl ToolModule for DatabaseTools {
             (
                 "database.query",
                 SearchMode::Query,
-                "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, title/body fields, analyzed words and prefixes). Korean Lindera and MeCab-Ko analysis uses NFC and ASCII lowercase with no stopwords. Positive expressions must match within one engine; NOT excludes a match by either engine. Double quotes require an exact source substring. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit.",
+                "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, title/body/case_number fields, analyzed words and prefixes). Korean Lindera and MeCab-Ko analysis uses NFC and ASCII lowercase with no stopwords. Positive expressions must match within one engine; NOT excludes a match by either engine. Double quotes require an exact source substring. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit.",
             ),
             (
                 "database.rg",
                 SearchMode::Ripgrep,
-                "Search managed legal content using bounded ripgrep regex matching, case sensitive and line oriented by default. Typed literal, ignore_case, context_lines and filters are supported; filesystem paths and CLI arguments are never accepted. Continuations retain a fixed corpus generation for ten minutes.",
+                "Search managed legal content and case numbers using bounded ripgrep regex matching, case sensitive and line oriented by default. Typed literal, ignore_case, context_lines and filters are supported; filesystem paths and CLI arguments are never accepted. Continuations retain a fixed corpus generation for ten minutes.",
             ),
         ] {
             let search = self.search.clone();
@@ -382,10 +410,14 @@ pub(crate) fn map_error(e: DatabaseError) -> ToolError {
         DatabaseError::InvalidInput => ToolError::InvalidInput,
         DatabaseError::InvalidRegex => ToolError::InvalidRegex,
         DatabaseError::NotFound => ToolError::NotFound,
+        DatabaseError::NotObserved => ToolError::NotObserved,
+        DatabaseError::CollectionIncomplete => ToolError::CollectionIncomplete,
+        DatabaseError::SourceInventoryIncomplete => ToolError::SourceInventoryIncomplete,
         DatabaseError::StorageUnavailable => ToolError::StorageUnavailable,
         DatabaseError::StorageCorrupt => ToolError::StorageCorrupt,
         DatabaseError::Capacity | DatabaseError::BudgetExhausted => ToolError::ResourceLimit,
         DatabaseError::AmbiguousRevision => ToolError::Ambiguous,
+        DatabaseError::AmbiguousCollection => ToolError::Ambiguous,
         DatabaseError::FreshnessUnavailable => ToolError::FreshnessUnavailable,
         DatabaseError::RevisionUnavailable => ToolError::SnapshotUnavailable,
         DatabaseError::ProcessingPending => ToolError::ProcessingPending,

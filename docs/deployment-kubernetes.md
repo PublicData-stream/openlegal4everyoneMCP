@@ -1235,9 +1235,13 @@ image digest in `scheduler-deployment.yaml` and `collection-job.json`, and stamp
 the accepted document-worker image digest in `server.toml`. The ordinary serving
 Deployment continues using the `runtime` image and its own generated ConfigMap.
 The collector ConfigMap contains `[database.ingestion]` with `mode = "continuous"`,
-`detail_timeout_secs = 3600`, and `document_worker.pool_limit = 16`. The detail
+`detail_timeout_secs = 3600`, `detail_job_workers = 4`, and
+`document_worker.pool_limit = 16`. The detail
 deadline accepts 60–7200 seconds and is read at startup. A claimed detail job's
 lease covers that deadline plus validation and publication.
+Increase `detail_job_workers` to 8, then 16 only after at least one hour of
+healthy runtime at each stage, with provider usage, queue progress, Pod capacity,
+and error rates checked before each change.
 
 The overlay keeps the scheduler and request Jobs in `openlegal-serving` so they
 can mount the existing corpus and cache PVCs. `ResourceQuota/collection-pod-budget`

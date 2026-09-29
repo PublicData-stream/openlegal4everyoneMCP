@@ -15,7 +15,14 @@ pub enum CompiledQuery {
     Not(Box<Self>),
     And(Vec<Self>),
     Or(Vec<Self>),
-    Field { title: bool, child: Box<Self> },
+    Field { field: QueryField, child: Box<Self> },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum QueryField {
+    Title,
+    Body,
+    CaseNumber,
 }
 
 impl CompiledQuery {
@@ -53,9 +60,10 @@ impl CompiledQuery {
                 Self::Or(children.iter().map(compile).collect::<Result<_, _>>()?)
             }
             ExprKind::Field { name, expression } => Self::Field {
-                title: match name.as_str() {
-                    "title" => true,
-                    "body" => false,
+                field: match name.as_str() {
+                    "title" => QueryField::Title,
+                    "body" => QueryField::Body,
+                    "case_number" => QueryField::CaseNumber,
                     _ => return Err(E::InvalidInput),
                 },
                 child: Box::new(compile(expression)?),
@@ -70,12 +78,14 @@ impl CompiledQuery {
         title_tokens: &AnalyzedText,
         body: &str,
         body_tokens: &AnalyzedText,
+        case_number: &str,
+        case_number_tokens: &AnalyzedText,
     ) -> bool {
-        let mut fields = [
-            Field::new(title, title_tokens),
-            Field::new(body, body_tokens),
+        let fields = [
+            Field::new(QueryField::Title, title, title_tokens),
+            Field::new(QueryField::Body, body, body_tokens),
+            Field::new(QueryField::CaseNumber, case_number, case_number_tokens),
         ];
-        fields[0].title = true;
         let [lindera, mecab] = self.evaluate(&fields);
         lindera || mecab
     }
@@ -112,11 +122,11 @@ impl CompiledQuery {
                 let b = child.evaluate(fields);
                 [a[0] || b[0], a[1] || b[1]]
             }),
-            Self::Field { title, child } => {
+            Self::Field { field, child } => {
                 // The parser prohibits nested field scopes; preserve field identity nonetheless.
                 let selected: Vec<_> = fields
                     .iter()
-                    .filter(|field| field.title == *title)
+                    .filter(|candidate| candidate.kind == *field)
                     .cloned()
                     .collect();
                 child.evaluate(&selected)
@@ -127,14 +137,14 @@ impl CompiledQuery {
 
 #[derive(Clone)]
 struct Field<'a> {
-    title: bool,
+    kind: QueryField,
     text: &'a str,
     tokens: [HashSet<&'a str>; 2],
 }
 impl<'a> Field<'a> {
-    fn new(text: &'a str, tokens: &'a AnalyzedText) -> Self {
+    fn new(kind: QueryField, text: &'a str, tokens: &'a AnalyzedText) -> Self {
         Self {
-            title: false,
+            kind,
             text,
             tokens: [
                 tokens.lindera.iter().map(String::as_str).collect(),
@@ -165,6 +175,8 @@ mod tests {
                 lindera: vec!["a".into()],
                 mecab: vec!["b".into()],
             },
+            "",
+            &AnalyzedText::default(),
         )
     }
     #[test]
@@ -196,13 +208,27 @@ mod tests {
             tokens: tokens.clone(),
             prefix: false,
         };
-        assert!(exact.matches("", &AnalyzedText::default(), "대한민국", &tokens));
+        assert!(exact.matches(
+            "",
+            &AnalyzedText::default(),
+            "대한민국",
+            &tokens,
+            "",
+            &AnalyzedText::default()
+        ));
         // Neither engine may borrow the other's document tokens.
         let swapped = AnalyzedText {
             lindera: tokens.mecab.clone(),
             mecab: tokens.lindera.clone(),
         };
-        assert!(!exact.matches("", &AnalyzedText::default(), "대한민국", &swapped));
+        assert!(!exact.matches(
+            "",
+            &AnalyzedText::default(),
+            "대한민국",
+            &swapped,
+            "",
+            &AnalyzedText::default()
+        ));
         let prefix = CompiledQuery::Term {
             tokens: AnalyzedText {
                 lindera: vec!["대한".into(), "민".into()],
@@ -210,17 +236,71 @@ mod tests {
             },
             prefix: true,
         };
-        assert!(prefix.matches("", &AnalyzedText::default(), "대한민국", &tokens));
+        assert!(prefix.matches(
+            "",
+            &AnalyzedText::default(),
+            "대한민국",
+            &tokens,
+            "",
+            &AnalyzedText::default()
+        ));
         let scoped = CompiledQuery::Field {
-            title: true,
+            field: QueryField::Title,
             child: Box::new(exact.clone()),
         };
-        assert!(!scoped.matches("", &AnalyzedText::default(), "대한민국", &tokens));
-        assert!(scoped.matches("대한민국", &tokens, "", &AnalyzedText::default()));
+        assert!(!scoped.matches(
+            "",
+            &AnalyzedText::default(),
+            "대한민국",
+            &tokens,
+            "",
+            &AnalyzedText::default()
+        ));
+        assert!(scoped.matches(
+            "대한민국",
+            &tokens,
+            "",
+            &AnalyzedText::default(),
+            "",
+            &AnalyzedText::default()
+        ));
         let excluded_body = CompiledQuery::Not(Box::new(CompiledQuery::Field {
-            title: false,
+            field: QueryField::Body,
             child: Box::new(exact),
         }));
-        assert!(!excluded_body.matches("", &AnalyzedText::default(), "대한민국", &tokens));
+        assert!(!excluded_body.matches(
+            "",
+            &AnalyzedText::default(),
+            "대한민국",
+            &tokens,
+            "",
+            &AnalyzedText::default()
+        ));
+    }
+    #[test]
+    fn case_number_exact_and_scoped_terms_use_metadata_field() {
+        let tokens = AnalyzedText {
+            lindera: vec!["2018".into(), "도".into(), "14262".into()],
+            mecab: vec!["2018".into(), "도".into(), "14262".into()],
+        };
+        let matches = |query: CompiledQuery| {
+            query.matches(
+                "unrelated title",
+                &AnalyzedText::default(),
+                "unrelated body",
+                &AnalyzedText::default(),
+                "2018도14262",
+                &tokens,
+            )
+        };
+        assert!(matches(CompiledQuery::Exact("2018도14262".into())));
+        assert!(matches(CompiledQuery::Field {
+            field: QueryField::CaseNumber,
+            child: Box::new(term("2018")),
+        }));
+        assert!(!matches(CompiledQuery::Field {
+            field: QueryField::Body,
+            child: Box::new(CompiledQuery::Exact("2018도14262".into())),
+        }));
     }
 }

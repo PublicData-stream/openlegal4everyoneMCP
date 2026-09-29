@@ -136,6 +136,7 @@ async fn offline_rebuild_preserves_ack_retirement_withdrawal_and_previous_index(
         manual_candidates_path: None,
         retain_history_bodies: false,
         detail_timeout_secs: 3600,
+        detail_job_workers: 1,
     });
     let lease = store.acquire_runtime_lease().await.unwrap();
     assert!(

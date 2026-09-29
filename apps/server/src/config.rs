@@ -873,10 +873,16 @@ pub struct IngestionConfig {
     /// Maximum time allowed for one provider detail request and its attachments.
     #[serde(default = "default_detail_timeout_secs")]
     pub detail_timeout_secs: u64,
+    /// Background detail jobs claimed concurrently by this scheduler process.
+    #[serde(default = "default_detail_job_workers")]
+    pub detail_job_workers: u32,
 }
 
 fn default_detail_timeout_secs() -> u64 {
     3600
+}
+fn default_detail_job_workers() -> u32 {
+    1
 }
 fn default_collection_namespace() -> String {
     "openlegal-serving".into()
@@ -965,6 +971,9 @@ impl DatabaseConfig {
             i.document_worker.limits()?;
             if !(60..=7200).contains(&i.detail_timeout_secs) {
                 return Err("detail_timeout_secs must be between 60 and 7200".into());
+            }
+            if !(1..=16).contains(&i.detail_job_workers) {
+                return Err("detail_job_workers must be between 1 and 16".into());
             }
         }
         Ok(())

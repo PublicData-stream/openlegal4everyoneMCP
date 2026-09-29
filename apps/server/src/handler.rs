@@ -337,7 +337,19 @@ fn map_tool_error(error: ToolError) -> Result<CallToolResult, ErrorData> {
         }
         ToolError::ProcessingPending => (
             "processing_pending",
-            "An observed source replacement is awaiting processing.",
+            "An observed source object is awaiting processing.",
+        ),
+        ToolError::NotObserved => (
+            "not_observed",
+            "This object has not been observed in the local corpus; upstream absence is unknown.",
+        ),
+        ToolError::CollectionIncomplete => (
+            "collection_incomplete",
+            "This observed object has no publishable current representation.",
+        ),
+        ToolError::SourceInventoryIncomplete => (
+            "source_inventory_incomplete",
+            "The bounded provider inventory did not establish a complete result.",
         ),
         ToolError::UnsupportedHistory => (
             "unsupported_history",

@@ -453,6 +453,45 @@ impl LawClient {
         )
         .await
     }
+    /// The precedent list documents `nb` as its case-number filter. Keep this
+    /// separate from `query`, which searches the case title by default.
+    pub async fn inventory_precedent_case_page(
+        &self,
+        case_number: &str,
+        page: u32,
+        cancel: CancellationToken,
+    ) -> Result<InventoryPage, DatabaseError> {
+        let url = self.precedent_case_search_url(case_number, page)?;
+        let (parsed, _) = self
+            .fetch_parse(url, DocumentFormat::Xml, false, cancel)
+            .await?;
+        let tree = parsed
+            .tree
+            .as_ref()
+            .ok_or(DatabaseError::SourceDataInvalid)?;
+        parse_inventory_tree(tree, Dataset::Precedent, page)
+    }
+    fn precedent_case_search_url(
+        &self,
+        case_number: &str,
+        page: u32,
+    ) -> Result<Url, DatabaseError> {
+        if !(1..=3).contains(&page)
+            || case_number.is_empty()
+            || case_number.len() > 64
+            || !case_number
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || ch == '-')
+        {
+            return Err(DatabaseError::InvalidInput);
+        }
+        let mut url = self.api("lawSearch.do", "prec")?;
+        url.query_pairs_mut()
+            .append_pair("display", "100")
+            .append_pair("page", &page.to_string())
+            .append_pair("nb", case_number);
+        Ok(url)
+    }
     #[allow(clippy::too_many_arguments)]
     async fn inventory_page_class_filtered(
         &self,
@@ -1606,6 +1645,14 @@ pub fn project(
         if id != item.object.id {
             return Err(DatabaseError::StorageCorrupt);
         }
+        if item.object.dataset == Dataset::Precedent
+            && item
+                .case_number
+                .as_deref()
+                .is_some_and(|expected| first(tree, "사건번호").as_deref() != Some(expected))
+        {
+            return Err(DatabaseError::StorageCorrupt);
+        }
         if let Some(returned) = first(
             tree,
             match item.object.dataset {
@@ -1999,6 +2046,74 @@ mod tests {
         let page = parse_inventory_tree(&contradictory_total, Dataset::Precedent, 1).unwrap();
         assert_eq!(page.items.len(), 1);
         assert!(page.incomplete);
+    }
+    #[tokio::test]
+    async fn precedent_case_list_uses_documented_nb_filter_without_title_query() {
+        let client =
+            LawClient::new("fixture-credential".into(), Arc::new(UnusedProcessor)).unwrap();
+        let url = client.precedent_case_search_url("2018도14262", 1).unwrap();
+        let pairs: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(url.path(), "/DRF/lawSearch.do");
+        assert_eq!(pairs.get("target").map(String::as_str), Some("prec"));
+        assert_eq!(pairs.get("nb").map(String::as_str), Some("2018도14262"));
+        assert_eq!(pairs.get("display").map(String::as_str), Some("100"));
+        assert!(!pairs.contains_key("query"));
+        assert!(
+            client
+                .precedent_case_search_url("2018도14262,2019도1", 1)
+                .is_err()
+        );
+        assert!(client.precedent_case_search_url("2018도14262", 4).is_err());
+    }
+
+    #[test]
+    fn precedent_case_list_row_keeps_number_and_serial_for_exact_match() {
+        let tree = branch(
+            "PrecSearch",
+            vec![
+                field("totalCnt", "1"),
+                branch(
+                    "prec",
+                    vec![
+                        field("판례일련번호", "204234"),
+                        field("사건명", "Fictional case"),
+                        field("사건번호", "2018도14262"),
+                    ],
+                ),
+            ],
+        );
+        let page = parse_inventory_tree(&tree, Dataset::Precedent, 1).unwrap();
+        assert!(page.done);
+        assert!(!page.incomplete);
+        assert_eq!(page.items[0].object.id, "204234");
+        assert_eq!(page.items[0].revision_id, "204234");
+        assert_eq!(page.items[0].case_number.as_deref(), Some("2018도14262"));
+    }
+
+    #[test]
+    fn precedent_detail_must_match_case_number_from_list() {
+        let mut item = item();
+        item.object.dataset = Dataset::Precedent;
+        item.object.id = "204234".into();
+        item.revision_id = "204234".into();
+        item.effective_date = None;
+        item.case_number = Some("2018도14262".into());
+        let detail = |case_number: &str| {
+            output(branch(
+                "PrecService",
+                vec![
+                    field("판례정보일련번호", "204234"),
+                    field("사건명", "Fictional case"),
+                    field("사건번호", case_number),
+                    field("판례내용", "Fictional body"),
+                ],
+            ))
+        };
+        assert!(project(&item, &detail("2018도14262")).is_ok());
+        assert_eq!(
+            project(&item, &detail("2018도14263")).unwrap_err(),
+            DatabaseError::StorageCorrupt
+        );
     }
     #[test]
     fn provider_response_classification_preserves_auth_and_pause_boundaries() {

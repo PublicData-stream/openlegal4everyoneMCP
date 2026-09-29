@@ -203,6 +203,7 @@ pub struct Publication {
 }
 #[derive(Clone, Debug)]
 pub struct ObjectState {
+    pub observed: bool,
     pub catalog_version: u64,
     pub version: u64,
     pub head_capture: Option<String>,

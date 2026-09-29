@@ -32,6 +32,7 @@ pub struct CorpusRuntime {
     provider: Option<LawClient>,
     retain_history_bodies: bool,
     detail_timeout_secs: u64,
+    detail_job_workers: u32,
     ingestion_mode: Option<IngestionMode>,
     pilot_candidates: Vec<InventoryItem>,
     inventory_verified: Arc<std::sync::atomic::AtomicBool>,
@@ -58,6 +59,65 @@ fn comparable_dates_advance(
             .iter()
             .flatten()
             .all(|(current, previous)| current >= previous)
+}
+
+fn select_precedent_case(
+    pages: &[InventoryPage],
+    case_number: &str,
+    expected_id: Option<&str>,
+) -> Result<InventoryItem, DatabaseError> {
+    let observed = pages
+        .iter()
+        .map(|page| page.items.len() as u64)
+        .sum::<u64>();
+    let complete = pages.last().is_some_and(|page| page.done)
+        && pages.first().and_then(|page| page.total) == Some(observed)
+        && pages.iter().all(|page| {
+            !page.incomplete
+                && page.items.iter().all(|item| {
+                    item.case_number
+                        .as_deref()
+                        .is_some_and(|case| !case.is_empty())
+                })
+                && page.total == pages[0].total
+        });
+    // Offset pagination is not an atomic snapshot. A multi-page response can
+    // identify a caller-specified provider ID, but cannot prove uniqueness of
+    // a case number across page movements.
+    if !complete || (pages.len() > 1 && expected_id.is_none()) {
+        return Err(DatabaseError::SourceInventoryIncomplete);
+    }
+    let mut exact = pages
+        .iter()
+        .flat_map(|page| &page.items)
+        .filter(|item| item.case_number.as_deref() == Some(case_number));
+    if let Some(id) = expected_id {
+        if let Some(item) = exact.find(|item| item.object.id == id) {
+            return Ok(item.clone());
+        }
+        if pages
+            .iter()
+            .flat_map(|page| &page.items)
+            .any(|item| item.object.id == id || item.case_number.as_deref() == Some(case_number))
+        {
+            return Err(DatabaseError::Conflict);
+        }
+        return Err(DatabaseError::NotFound);
+    }
+    let first = exact.next().ok_or(DatabaseError::NotFound)?;
+    if exact.any(|item| item.object.id != first.object.id) {
+        return Err(DatabaseError::AmbiguousCollection);
+    }
+    Ok(first.clone())
+}
+
+fn provider_failure_reason(error: DatabaseError) -> &'static str {
+    match error {
+        DatabaseError::SourceUnavailable => "source_unavailable",
+        DatabaseError::SourceDataInvalid => "source_data_invalid",
+        DatabaseError::SourceDownloadFailed => "download_failed",
+        _ => "worker_failed",
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -252,19 +312,24 @@ impl CorpusRuntime {
             .ok_or(DatabaseError::InvalidInput)?
             .on_demand_client()?;
         let result = self.collect_explicit(&provider, request, cancel).await;
-        let status = match &result {
-            Ok(0) => "skipped",
-            Ok(_) => "done",
-            Err(DatabaseError::BudgetExhausted | DatabaseError::Capacity) => "deferred",
-            Err(
-                DatabaseError::SourceUnavailable
-                | DatabaseError::SourceDataInvalid
-                | DatabaseError::SourceDownloadFailed,
-            ) => "skipped",
-            Err(DatabaseError::NotFound) => "skipped",
-            Err(_) => "failed",
+        let (status, reason) = match &result {
+            Ok((0, reason)) => ("skipped", *reason),
+            Ok((_, reason)) => ("done", *reason),
+            Err(DatabaseError::BudgetExhausted | DatabaseError::Capacity) => ("deferred", None),
+            Err(DatabaseError::SourceUnavailable) => ("skipped", Some("source_unavailable")),
+            Err(DatabaseError::SourceDataInvalid) => ("skipped", Some("source_data_invalid")),
+            Err(DatabaseError::SourceDownloadFailed) => ("skipped", Some("download_failed")),
+            Err(DatabaseError::NotFound) => ("skipped", Some("not_found")),
+            Err(DatabaseError::AmbiguousCollection) => ("failed", Some("ambiguous")),
+            Err(DatabaseError::SourceInventoryIncomplete) => {
+                ("failed", Some("source_inventory_incomplete"))
+            }
+            Err(DatabaseError::Conflict) => ("failed", Some("identity_conflict")),
+            Err(_) => ("failed", Some("worker_failed")),
         };
-        self.store.settle_collection_request(id, status).await?;
+        self.store
+            .settle_collection_request_with_reason(id, status, reason)
+            .await?;
         match result {
             Ok(_)
             | Err(
@@ -284,8 +349,9 @@ impl CorpusRuntime {
         provider: &LawClient,
         request: CollectionRequest,
         cancel: CancellationToken,
-    ) -> Result<usize, DatabaseError> {
+    ) -> Result<(usize, Option<&'static str>), DatabaseError> {
         let mut published = 0;
+        let mut partial_reason = None;
         match request.target {
             CollectionTarget::Object { object } => {
                 let list_started_at = now();
@@ -304,6 +370,28 @@ impl CorpusRuntime {
                     .into_iter()
                     .find(|item| item.object == object)
                     .ok_or(DatabaseError::NotFound)?;
+                published += usize::from(
+                    self.collect_explicit_item(provider, item, list_started_at, cancel)
+                        .await?,
+                );
+            }
+            CollectionTarget::PrecedentCase {
+                case_number,
+                expected_id,
+            } => {
+                let list_started_at = now();
+                let mut pages = Vec::new();
+                for page_number in 1..=3 {
+                    let page = provider
+                        .inventory_precedent_case_page(&case_number, page_number, cancel.clone())
+                        .await?;
+                    let done = page.done;
+                    pages.push(page);
+                    if done {
+                        break;
+                    }
+                }
+                let item = select_precedent_case(&pages, &case_number, expected_id.as_deref())?;
                 published += usize::from(
                     self.collect_explicit_item(provider, item, list_started_at, cancel)
                         .await?,
@@ -349,10 +437,13 @@ impl CorpusRuntime {
                         {
                             Ok(page) => page,
                             Err(
-                                DatabaseError::SourceUnavailable
+                                error @ (DatabaseError::SourceUnavailable
                                 | DatabaseError::SourceDataInvalid
-                                | DatabaseError::SourceDownloadFailed,
-                            ) => continue,
+                                | DatabaseError::SourceDownloadFailed),
+                            ) => {
+                                partial_reason.get_or_insert(provider_failure_reason(error));
+                                continue;
+                            }
                             Err(error) => return Err(error),
                         };
                         for item in page.items.into_iter().take(20) {
@@ -366,12 +457,14 @@ impl CorpusRuntime {
                                 .await
                             {
                                 Ok(true) => published += 1,
-                                Ok(false)
-                                | Err(
-                                    DatabaseError::SourceUnavailable
+                                Ok(false) => {}
+                                Err(
+                                    error @ (DatabaseError::SourceUnavailable
                                     | DatabaseError::SourceDataInvalid
-                                    | DatabaseError::SourceDownloadFailed,
-                                ) => {}
+                                    | DatabaseError::SourceDownloadFailed),
+                                ) => {
+                                    partial_reason.get_or_insert(provider_failure_reason(error));
+                                }
                                 Err(error) => return Err(error),
                             }
                         }
@@ -379,7 +472,7 @@ impl CorpusRuntime {
                 }
             }
         }
-        Ok(published)
+        Ok((published, partial_reason))
     }
 
     async fn collect_explicit_item(
@@ -769,6 +862,10 @@ impl CorpusRuntime {
                 .ingestion
                 .as_ref()
                 .map_or(3600, |c| c.detail_timeout_secs),
+            detail_job_workers: config
+                .ingestion
+                .as_ref()
+                .map_or(1, |c| c.detail_job_workers),
         }))
     }
     pub async fn close(&self) -> Result<(), ServerError> {
@@ -807,9 +904,11 @@ impl CorpusRuntime {
                     None => Err(DatabaseError::InvalidInput),
                 }
             });
-            let runtime = self.clone();
-            let token = ingestion;
-            tasks.spawn(async move { runtime.process_jobs(token).await });
+            for slot in 0..self.detail_job_workers {
+                let runtime = self.clone();
+                let token = ingestion.clone();
+                tasks.spawn(async move { runtime.process_jobs(slot, token).await });
+            }
         }
         let mut maintenance = tokio::time::Instant::now();
         let result = loop {
@@ -913,14 +1012,17 @@ impl CorpusRuntime {
                                 Ok(Some(revisited)) => {
                                     for item in revisited.items {
                                         let expected = if class == 1 { "440101" } else { "440102" };
-                                        if item.treaty_class_code.as_deref() == Some(expected) {
-                                            self.refresh_with_backpressure(
-                                                provider,
-                                                item,
-                                                true,
-                                                cancel.clone(),
-                                            )
-                                            .await?;
+                                        if item.treaty_class_code.as_deref() == Some(expected)
+                                            && !self
+                                                .refresh_with_fair_capacity(
+                                                    provider,
+                                                    item,
+                                                    true,
+                                                    cancel.clone(),
+                                                )
+                                                .await?
+                                        {
+                                            break;
                                         }
                                     }
                                 }
@@ -948,13 +1050,17 @@ impl CorpusRuntime {
                     {
                         Ok(Some(overlap)) => {
                             for item in overlap.items {
-                                self.refresh_with_backpressure(
-                                    provider,
-                                    item,
-                                    true,
-                                    cancel.clone(),
-                                )
-                                .await?;
+                                if !self
+                                    .refresh_with_fair_capacity(
+                                        provider,
+                                        item,
+                                        true,
+                                        cancel.clone(),
+                                    )
+                                    .await?
+                                {
+                                    break;
+                                }
                             }
                         }
                         Ok(None) => {}
@@ -971,13 +1077,17 @@ impl CorpusRuntime {
                     {
                         Ok(Some(revisited)) => {
                             for item in revisited.items {
-                                self.refresh_with_backpressure(
-                                    provider,
-                                    item,
-                                    true,
-                                    cancel.clone(),
-                                )
-                                .await?;
+                                if !self
+                                    .refresh_with_fair_capacity(
+                                        provider,
+                                        item,
+                                        true,
+                                        cancel.clone(),
+                                    )
+                                    .await?
+                                {
+                                    break;
+                                }
                             }
                         }
                         Ok(None) => {}
@@ -1001,11 +1111,40 @@ impl CorpusRuntime {
                 };
                 let items = page_data.items;
                 let done = page_data.done;
-                for item in &items {
-                    self.refresh_with_backpressure(provider, item.clone(), true, cancel.clone())
-                        .await?;
+                let mut offset = self
+                    .store
+                    .inventory_item_offset(dataset, false, page)
+                    .await?;
+                if offset > items.len() {
+                    offset = 0;
                 }
-                if !self.await_page_publication(&items, true, &cancel).await? {
+                if let Some(missing) = self.first_unpublished_item(&items, true, &cancel).await? {
+                    offset = offset.min(missing);
+                }
+                while offset < items.len() {
+                    if !self
+                        .refresh_with_fair_capacity(
+                            provider,
+                            items[offset].clone(),
+                            true,
+                            cancel.clone(),
+                        )
+                        .await?
+                    {
+                        break;
+                    }
+                    offset += 1;
+                }
+                self.store
+                    .set_inventory_item_offset(dataset, false, page, offset)
+                    .await?;
+                if offset < items.len() {
+                    continue;
+                }
+                if let Some(missing) = self.first_unpublished_item(&items, true, &cancel).await? {
+                    self.store
+                        .set_inventory_item_offset(dataset, false, page, missing)
+                        .await?;
                     continue;
                 }
                 self.store
@@ -1039,14 +1178,17 @@ impl CorpusRuntime {
                                         now(),
                                     )
                                     .await?;
-                                if self.retain_history_bodies {
-                                    self.refresh_with_backpressure(
-                                        provider,
-                                        item,
-                                        false,
-                                        cancel.clone(),
-                                    )
-                                    .await?;
+                                if self.retain_history_bodies
+                                    && !self
+                                        .refresh_with_fair_capacity(
+                                            provider,
+                                            item,
+                                            false,
+                                            cancel.clone(),
+                                        )
+                                        .await?
+                                {
+                                    break;
                                 }
                             }
                         }
@@ -1071,7 +1213,21 @@ impl CorpusRuntime {
                 };
                 let items = page_data.items;
                 let done = page_data.done;
-                for item in &items {
+                let mut offset = self
+                    .store
+                    .inventory_item_offset(dataset, true, page)
+                    .await?;
+                if offset > items.len() {
+                    offset = 0;
+                }
+                if self.retain_history_bodies
+                    && let Some(missing) =
+                        self.first_unpublished_item(&items, false, &cancel).await?
+                {
+                    offset = offset.min(missing);
+                }
+                while offset < items.len() {
+                    let item = &items[offset];
                     self.store
                         .record_revision_catalog(
                             &item.object,
@@ -1081,19 +1237,33 @@ impl CorpusRuntime {
                             now(),
                         )
                         .await?;
-                    if self.retain_history_bodies {
-                        self.refresh_with_backpressure(
-                            provider,
-                            item.clone(),
-                            false,
-                            cancel.clone(),
-                        )
-                        .await?;
+                    if self.retain_history_bodies
+                        && !self
+                            .refresh_with_fair_capacity(
+                                provider,
+                                item.clone(),
+                                false,
+                                cancel.clone(),
+                            )
+                            .await?
+                    {
+                        break;
                     }
+                    offset += 1;
+                }
+                self.store
+                    .set_inventory_item_offset(dataset, true, page, offset)
+                    .await?;
+                if offset < items.len() {
+                    continue;
                 }
                 if self.retain_history_bodies
-                    && !self.await_page_publication(&items, false, &cancel).await?
+                    && let Some(missing) =
+                        self.first_unpublished_item(&items, false, &cancel).await?
                 {
+                    self.store
+                        .set_inventory_item_offset(dataset, true, page, missing)
+                        .await?;
                     continue;
                 }
                 self.store
@@ -1105,61 +1275,42 @@ impl CorpusRuntime {
             tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(3600))=>{}}
         }
     }
-    /// A page cursor only passes records whose required detail publication has
-    /// succeeded. Failed jobs keep that page due for a later scan instead of
-    /// disappearing behind a durable cursor.
-    async fn await_page_publication(
+    /// Check publication without waiting for a slow detail job. A page remains
+    /// due until every required capture is published or has a durable gap.
+    async fn first_unpublished_item(
         &self,
         items: &[InventoryItem],
         head: bool,
         cancel: &CancellationToken,
-    ) -> Result<bool, DatabaseError> {
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_secs(self.detail_timeout_secs.saturating_add(120).max(900));
-        loop {
+    ) -> Result<Option<usize>, DatabaseError> {
+        for (index, item) in items.iter().enumerate() {
             if cancel.is_cancelled() {
-                return Ok(false);
+                return Err(DatabaseError::Cancelled);
             }
-            let mut ready = true;
-            for item in items {
-                if self
-                    .store
-                    .detail_gap_active(&item.object, &item.revision_id)
-                    .await?
-                {
-                    continue;
-                }
-                if head {
-                    if !self
-                        .store
-                        .head_revision_ready(&item.object, &item.revision_id, now())
-                        .await?
-                    {
-                        ready = false;
-                        break;
-                    }
-                    continue;
-                }
+            if self
+                .store
+                .detail_gap_active(&item.object, &item.revision_id)
+                .await?
+            {
+                continue;
+            }
+            if head {
                 if !self
                     .store
-                    .revision_capture_recent(&item.object, &item.revision_id, now())
+                    .head_revision_published(&item.object, &item.revision_id)
                     .await?
                 {
-                    ready = false;
-                    break;
+                    return Ok(Some(index));
                 }
-            }
-            if ready {
-                return Ok(true);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(false);
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(false),
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            } else if !self
+                .store
+                .revision_capture_published(&item.object, &item.revision_id, now())
+                .await?
+            {
+                return Ok(Some(index));
             }
         }
+        Ok(None)
     }
     /// Select a few identities from each documented list family. The pilot
     /// never certifies inventory completeness or walks historical catalogs.
@@ -1319,6 +1470,27 @@ impl CorpusRuntime {
         }
         Ok(())
     }
+    async fn refresh_with_fair_capacity(
+        &self,
+        provider: &LawClient,
+        item: InventoryItem,
+        install_head: bool,
+        cancel: CancellationToken,
+    ) -> Result<bool, DatabaseError> {
+        if self
+            .store
+            .active_jobs_for_dataset(item.object.dataset)
+            .await?
+            >= 16
+        {
+            return Ok(false);
+        }
+        match self.refresh(provider, item, install_head, cancel).await {
+            Ok(()) => Ok(true),
+            Err(DatabaseError::Capacity) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
     async fn refresh_with_backpressure(
         &self,
         provider: &LawClient,
@@ -1357,6 +1529,8 @@ impl CorpusRuntime {
                 Ok(c) => c.record.revision_id != item.revision_id,
                 Err(
                     DatabaseError::NotFound
+                    | DatabaseError::NotObserved
+                    | DatabaseError::CollectionIncomplete
                     | DatabaseError::ProcessingPending
                     | DatabaseError::RevisionUnavailable,
                 ) => true,
@@ -1408,17 +1582,47 @@ impl CorpusRuntime {
             .await?;
         Ok(())
     }
-    async fn process_jobs(&self, cancel: CancellationToken) -> Result<(), DatabaseError> {
+    async fn process_jobs(
+        &self,
+        slot: u32,
+        cancel: CancellationToken,
+    ) -> Result<(), DatabaseError> {
         let provider = self.provider.as_ref().ok_or(DatabaseError::InvalidInput)?;
+        const DATASETS: [Dataset; 8] = [
+            Dataset::NationalStatute,
+            Dataset::AdministrativeRule,
+            Dataset::Ordinance,
+            Dataset::Treaty,
+            Dataset::Precedent,
+            Dataset::ConstitutionalDecision,
+            Dataset::LegalInterpretation,
+            Dataset::AdministrativeAppeal,
+        ];
+        let mut next_dataset = slot as usize % DATASETS.len();
         loop {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            let Some(job) = self
+            let preferred = DATASETS[next_dataset];
+            next_dataset = (next_dataset + 1) % DATASETS.len();
+            let claim = self
                 .store
-                .claim_job_with_lease(now(), self.detail_timeout_secs.saturating_add(120).max(600))
-                .await?
-            else {
+                .claim_job_with_lease_for_dataset(
+                    now(),
+                    self.detail_timeout_secs.saturating_add(120).max(600),
+                    preferred,
+                )
+                .await?;
+            let Some(job) = (if claim.is_some() {
+                claim
+            } else {
+                self.store
+                    .claim_job_with_lease(
+                        now(),
+                        self.detail_timeout_secs.saturating_add(120).max(600),
+                    )
+                    .await?
+            }) else {
                 tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(1))=>{}}
                 continue;
             };
@@ -1561,8 +1765,88 @@ impl CorpusRuntime {
 
 #[cfg(test)]
 mod manual_pilot_tests {
-    use super::{comparable_dates_advance, load_pilot_candidates};
+    use super::{comparable_dates_advance, load_pilot_candidates, select_precedent_case};
     use crate::config::{DatabaseConfig, IngestionConfig, IngestionMode};
+    use openlegal_adapters::law_go_kr::{InventoryItem, InventoryPage};
+    use openlegal_domain::legal::{DatabaseError, Dataset, ObjectId};
+
+    fn precedent_page(
+        cases: &[(&str, Option<&str>)],
+        total: u64,
+        done: bool,
+        incomplete: bool,
+    ) -> InventoryPage {
+        InventoryPage {
+            items: cases
+                .iter()
+                .map(|(id, case_number)| InventoryItem {
+                    object: ObjectId {
+                        jurisdiction: "kr".into(),
+                        provider: "law_go_kr".into(),
+                        dataset: Dataset::Precedent,
+                        id: (*id).into(),
+                    },
+                    revision_id: (*id).into(),
+                    effective_date: None,
+                    publication_date: None,
+                    title: "Fictional precedent".into(),
+                    data_source: None,
+                    case_number: case_number.map(str::to_owned),
+                    treaty_class_code: None,
+                })
+                .collect(),
+            done,
+            total: Some(total),
+            rejected_rows: usize::from(incomplete),
+            incomplete,
+        }
+    }
+
+    #[test]
+    fn explicit_precedent_case_needs_complete_exact_unique_provider_identity() {
+        let one = precedent_page(&[("204234", Some("2018도14262"))], 1, true, false);
+        assert_eq!(
+            select_precedent_case(&[one], "2018도14262", Some("204234"))
+                .unwrap()
+                .object
+                .id,
+            "204234"
+        );
+        let many = precedent_page(
+            &[
+                ("204234", Some("2018도14262")),
+                ("204235", Some("2018도14262")),
+            ],
+            2,
+            true,
+            false,
+        );
+        assert_eq!(
+            select_precedent_case(&[many], "2018도14262", None).unwrap_err(),
+            DatabaseError::AmbiguousCollection
+        );
+        let wrong_id = precedent_page(&[("204235", Some("2018도14262"))], 1, true, false);
+        assert_eq!(
+            select_precedent_case(&[wrong_id], "2018도14262", Some("204234")).unwrap_err(),
+            DatabaseError::Conflict
+        );
+        let absent = precedent_page(&[("204235", Some("2019도1"))], 1, true, false);
+        assert_eq!(
+            select_precedent_case(&[absent], "2018도14262", None).unwrap_err(),
+            DatabaseError::NotFound
+        );
+        for page in [
+            precedent_page(&[("204234", Some("2018도14262"))], 2, false, false),
+            precedent_page(&[("204234", Some("2018도14262"))], 2, true, false),
+            precedent_page(&[("204234", Some("2018도14262"))], 1, true, true),
+            precedent_page(&[("204234", None)], 1, true, false),
+        ] {
+            assert_eq!(
+                select_precedent_case(&[page], "2018도14262", Some("204234")).unwrap_err(),
+                DatabaseError::SourceInventoryIncomplete
+            );
+        }
+    }
 
     #[test]
     fn explicit_head_date_guard_accepts_only_nonregressing_known_dates() {
@@ -1616,6 +1900,7 @@ mod manual_pilot_tests {
                 manual_candidates_path: Some(path.clone()),
                 retain_history_bodies: false,
                 detail_timeout_secs: 3600,
+                detail_job_workers: 1,
             }),
         };
         let item = serde_json::json!({

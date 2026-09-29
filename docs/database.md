@@ -1,7 +1,7 @@
 # Legal corpus tools
 
 The optional `[database]` configuration registers `database.query`, `database.rg`,
-`database.get`, `database.get_metadata`, `database.history`, `database.diff`, and
+`database.get`, `database.get_metadata`, `database.object_status`, `database.history`, `database.diff`, and
 `database.show` on both existing MCP transports. It requires PostgreSQL persistence
 and the text comparison service. The synthetic demo remains a separate dataset.
 
@@ -51,6 +51,16 @@ capture ID, session, same section, and `next_offset`. Section catalogs also have
 continuation offset. Sessions last ten minutes and do not extend on access. They
 pin exact content against ordinary retention; withdrawal invalidates sessions.
 `database.get_metadata` returns provenance and timing without body text.
+An unknown local object returns `not_observed`, which does not mean that the
+provider lacks the object. A current observation with queued or running work
+returns `processing_pending`; an observed object with no publishable HEAD and
+no active job returns `collection_incomplete`. The read-only
+`database.object_status` tool reports these local states, the current job and
+retry time, and whether a published HEAD has reached the index. Its ETA is
+`unknown` except for a running job in a dataset with at least 20 successful
+start-to-completion samples from the previous 24 hours and an available budget
+for that job's provider mode. A range derived from
+those samples is an operational estimate, not an upstream completion promise.
 
 HEAD includes retrieval time, last validation time, publication-transaction time (returned only after durable commit),
 served time, age, freshness state, expiry times and remaining TTLs. Freshness lasts

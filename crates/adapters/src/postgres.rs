@@ -193,6 +193,27 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0006_collection_requests.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            7,
+            "corpus job timing".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0007_corpus_job_timing.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            8,
+            "collection request reason".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0008_collection_request_reason.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            9,
+            "inventory item offset".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0009_inventory_item_offset.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

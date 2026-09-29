@@ -264,13 +264,33 @@ impl CorpusIndex {
         self.reader.reload().map_err(err)?;
         Ok(())
     }
-    pub fn matches(&self, expression: &CompiledQuery, doc: &IndexedCapture) -> bool {
-        expression.matches(
+    pub fn matches(
+        &self,
+        expression: &CompiledQuery,
+        doc: &IndexedCapture,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<bool, E> {
+        let case_number = doc
+            .capture
+            .record
+            .metadata
+            .get("case_number")
+            .map(String::as_str)
+            .unwrap_or_default();
+        let case_number_tokens = if case_number.is_empty() {
+            AnalyzedText::default()
+        } else {
+            self.tokens_with_budget(case_number, deadline, cancel)?
+        };
+        Ok(expression.matches(
             &doc.capture.record.title,
             &doc.title_tokens,
             &doc.capture.record.body,
             &doc.body_tokens,
-        )
+            case_number,
+            &case_number_tokens,
+        ))
     }
 }
 impl IndexSnapshot {
@@ -665,16 +685,20 @@ mod tests {
             ("cafe\u{301}", true),
         ] {
             assert_eq!(
-                index.matches(
-                    &index
-                        .compile_query(
-                            &parser.parse(query).unwrap().expression,
-                            Instant::now() + std::time::Duration::from_secs(10),
-                            &CancellationToken::new()
-                        )
-                        .unwrap(),
-                    &doc
-                ),
+                index
+                    .matches(
+                        &index
+                            .compile_query(
+                                &parser.parse(query).unwrap().expression,
+                                Instant::now() + std::time::Duration::from_secs(10),
+                                &CancellationToken::new()
+                            )
+                            .unwrap(),
+                        &doc,
+                        Instant::now() + std::time::Duration::from_secs(10),
+                        &CancellationToken::new(),
+                    )
+                    .unwrap(),
                 expected,
                 "{query}"
             );

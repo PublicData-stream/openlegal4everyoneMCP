@@ -138,7 +138,7 @@ impl PgCorpusStore {
                 || (mark_head_pending && !row.try_get::<bool, _>("pending").map_err(db)?));
         let version = row.try_get::<i64, _>("version").map_err(db)? + i64::from(head_changed);
         if install_head {
-            sqlx::query("UPDATE openlegal.corpus_job SET status='failed',lease_until=NULL,error_category='superseded' WHERE object_key=$1 AND install_head AND revision_id<>$2 AND status IN ('pending','running')").bind(&k).bind(&revision_id).execute(&mut *tx).await.map_err(db)?;
+            sqlx::query("UPDATE openlegal.corpus_job SET status='failed',lease_until=NULL,error_category='superseded',completed_at=floor(extract(epoch from clock_timestamp()))::bigint WHERE object_key=$1 AND install_head AND revision_id<>$2 AND status IN ('pending','running')").bind(&k).bind(&revision_id).execute(&mut *tx).await.map_err(db)?;
             sqlx::query("UPDATE openlegal.corpus_object SET desired_head_revision=$2,pending=pending OR $3,version=$4 WHERE object_key=$1").bind(&k).bind(&revision_id).bind(mark_head_pending).bind(version).execute(&mut *tx).await.map_err(db)?;
         }
         if let Some(job)=sqlx::query("SELECT id,expected_version,attempts,install_head,source_metadata FROM openlegal.corpus_job WHERE object_key=$1 AND revision_id=$2 AND effective_date=$3 AND status IN ('pending','running')").bind(&k).bind(&revision_id).bind(date).fetch_optional(&mut *tx).await.map_err(db)? {
@@ -148,7 +148,7 @@ impl PgCorpusStore {
                 // A claimed manual revision hint may still be using its old
                 // metadata. Fence that attempt and queue a fresh list-backed
                 // HEAD job with the current observation's metadata.
-                sqlx::query("UPDATE openlegal.corpus_job SET install_head=true,source_metadata=$2,expected_version=$3,status='pending',attempts=0,created_at=$4::text::numeric,lease_until=NULL,error_category=NULL WHERE id=$1")
+                sqlx::query("UPDATE openlegal.corpus_job SET install_head=true,source_metadata=$2,expected_version=$3,status='pending',attempts=0,created_at=$4::text::numeric,lease_until=NULL,error_category=NULL,started_at=NULL,completed_at=NULL WHERE id=$1")
                     .bind(id).bind(serde_json::to_value(&source_metadata).map_err(corrupt)?).bind(version).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
                 tx.commit().await.map_err(db)?;
                 return Ok(Job{source_metadata,id:id.to_string(),object,revision_id,effective_date,install_head:true,expected_version:version.try_into().map_err(corrupt)?,attempts:0});
@@ -170,7 +170,7 @@ impl PgCorpusStore {
             tx.commit().await.map_err(db)?;
             return Err(DatabaseError::Capacity);
         }
-        let job:Uuid=sqlx::query_scalar("INSERT INTO openlegal.corpus_job(object_key,revision_id,effective_date,install_head,expected_version,status,created_at,source_metadata) VALUES($1,$2,$3,$4,$5,'pending',$6::text::numeric,$7) ON CONFLICT(object_key,revision_id,effective_date) DO UPDATE SET source_metadata=EXCLUDED.source_metadata,expected_version=EXCLUDED.expected_version,install_head=EXCLUDED.install_head,status='pending',attempts=0,created_at=EXCLUDED.created_at,lease_until=NULL,error_category=NULL RETURNING id").bind(&k).bind(&revision_id).bind(date).bind(install_head).bind(version).bind(now.to_string()).bind(serde_json::to_value(&source_metadata).map_err(corrupt)?).fetch_one(&mut *tx).await.map_err(db)?;
+        let job:Uuid=sqlx::query_scalar("INSERT INTO openlegal.corpus_job(object_key,revision_id,effective_date,install_head,expected_version,status,created_at,source_metadata) VALUES($1,$2,$3,$4,$5,'pending',$6::text::numeric,$7) ON CONFLICT(object_key,revision_id,effective_date) DO UPDATE SET source_metadata=EXCLUDED.source_metadata,expected_version=EXCLUDED.expected_version,install_head=EXCLUDED.install_head,status='pending',attempts=0,created_at=EXCLUDED.created_at,lease_until=NULL,error_category=NULL,started_at=NULL,completed_at=NULL RETURNING id").bind(&k).bind(&revision_id).bind(date).bind(install_head).bind(version).bind(now.to_string()).bind(serde_json::to_value(&source_metadata).map_err(corrupt)?).fetch_one(&mut *tx).await.map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok(Job {
             source_metadata,
@@ -193,7 +193,16 @@ impl PgCorpusStore {
         now: u64,
         lease_seconds: u64,
     ) -> Result<Option<Job>, DatabaseError> {
-        self.claim_job_inner(now, lease_seconds, None).await
+        self.claim_job_inner(now, lease_seconds, None, None).await
+    }
+    pub async fn claim_job_with_lease_for_dataset(
+        &self,
+        now: u64,
+        lease_seconds: u64,
+        dataset: Dataset,
+    ) -> Result<Option<Job>, DatabaseError> {
+        self.claim_job_inner(now, lease_seconds, None, Some(dataset))
+            .await
     }
     pub async fn claim_explicit_job(
         &self,
@@ -202,7 +211,8 @@ impl PgCorpusStore {
         lease_seconds: u64,
     ) -> Result<Option<Job>, DatabaseError> {
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
-        self.claim_job_inner(now, lease_seconds, Some(id)).await
+        self.claim_job_inner(now, lease_seconds, Some(id), None)
+            .await
     }
     pub async fn release_unclaimed_explicit_job(&self, id: &str) -> Result<(), DatabaseError> {
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
@@ -215,6 +225,7 @@ impl PgCorpusStore {
         now: u64,
         lease_seconds: u64,
         explicit_id: Option<Uuid>,
+        preferred_dataset: Option<Dataset>,
     ) -> Result<Option<Job>, DatabaseError> {
         if !(SESSION_SECONDS..=7320).contains(&lease_seconds) {
             return Err(DatabaseError::InvalidInput);
@@ -225,13 +236,23 @@ impl PgCorpusStore {
             .fetch_one(&mut *tx)
             .await
             .map_err(db)?;
-        sqlx::query("UPDATE openlegal.corpus_job SET status='failed',error_category='attempts_exhausted' WHERE attempts>=3 AND status='running' AND lease_until<=$1::text::numeric").bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
-        let row=sqlx::query("SELECT j.id,j.revision_id,j.expected_version,j.attempts,j.effective_date,j.install_head,j.source_metadata,o.identity,o.version AS object_version,j.object_key FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE NOT o.withdrawn AND (NOT j.install_head OR j.revision_id=o.desired_head_revision) AND (($2::uuid IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit') OR (j.id=$2 AND j.source_metadata->>'collection_origin'='explicit')) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>$1::text::numeric) AND j.attempts<3 AND (j.status='pending' OR (j.status='running' AND j.lease_until<=$1::text::numeric)) ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED").bind(now.to_string()).bind(explicit_id).fetch_optional(&mut *tx).await.map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_job SET status='failed',error_category='attempts_exhausted',completed_at=$1::text::numeric WHERE attempts>=3 AND status='running' AND lease_until<=$1::text::numeric").bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
+        let dataset_name: Option<String> = preferred_dataset
+            .map(|dataset| serde_json::to_value(dataset).map_err(corrupt))
+            .transpose()?
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or(DatabaseError::StorageCorrupt)
+                    .map(str::to_owned)
+            })
+            .transpose()?;
+        let row=sqlx::query("SELECT j.id,j.revision_id,j.expected_version,j.attempts,j.effective_date,j.install_head,j.source_metadata,o.identity,o.version AS object_version,j.object_key FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE NOT o.withdrawn AND (NOT j.install_head OR j.revision_id=o.desired_head_revision) AND (($2::uuid IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit') OR (j.id=$2 AND j.source_metadata->>'collection_origin'='explicit')) AND ($3::text IS NULL OR o.identity->>'dataset'=$3) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>$1::text::numeric) AND j.attempts<3 AND (j.status='pending' OR (j.status='running' AND j.lease_until<=$1::text::numeric)) ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED").bind(now.to_string()).bind(explicit_id).bind(dataset_name).fetch_optional(&mut *tx).await.map_err(db)?;
         let Some(row) = row else {
             return Ok(None);
         };
         let id: Uuid = row.try_get("id").map_err(db)?;
-        sqlx::query("UPDATE openlegal.corpus_job SET status='running',attempts=attempts+1,lease_until=$2::text::numeric,expected_version=$3 WHERE id=$1").bind(id).bind(now.saturating_add(lease_seconds).to_string()).bind(row.try_get::<i64,_>("object_version").map_err(db)?+1).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_job SET status='running',attempts=attempts+1,lease_until=$2::text::numeric,expected_version=$3,started_at=$4::text::numeric,completed_at=NULL WHERE id=$1").bind(id).bind(now.saturating_add(lease_seconds).to_string()).bind(row.try_get::<i64,_>("object_version").map_err(db)?+1).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_object SET version=version+1 WHERE object_key=$1")
             .bind(row.try_get::<String, _>("object_key").map_err(db)?)
             .execute(&mut *tx)
@@ -259,7 +280,7 @@ impl PgCorpusStore {
     }
     pub async fn fail_job(&self, id: &str, retry: bool) -> Result<(), DatabaseError> {
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
-        sqlx::query("UPDATE openlegal.corpus_job SET status=CASE WHEN $2 AND attempts<3 THEN 'pending' ELSE 'failed' END,lease_until=NULL,error_category='processing_failed' WHERE id=$1 AND status='running'").bind(id).bind(retry).execute(&self.pool).await.map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_job SET status=CASE WHEN $2 AND attempts<3 THEN 'pending' ELSE 'failed' END,lease_until=NULL,error_category='processing_failed',completed_at=CASE WHEN $2 AND attempts<3 THEN NULL ELSE floor(extract(epoch from clock_timestamp()))::bigint END WHERE id=$1 AND status='running'").bind(id).bind(retry).execute(&self.pool).await.map_err(db)?;
         Ok(())
     }
     /// Provider inventory metadata survives body eviction. This does not claim
@@ -380,7 +401,7 @@ impl PgCorpusStore {
     }
     pub async fn fail_claim(&self, job: &Job, retry: bool) -> Result<(), DatabaseError> {
         let id = Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
-        sqlx::query("UPDATE openlegal.corpus_job SET status=CASE WHEN $2 AND attempts<3 THEN 'pending' ELSE 'failed' END,lease_until=NULL,error_category='processing_failed' WHERE id=$1 AND expected_version=$3 AND attempts=$4 AND status='running'").bind(id).bind(retry).bind(i64::try_from(job.expected_version).map_err(|_|DatabaseError::InvalidInput)?).bind(job.attempts as i32).execute(&self.pool).await.map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_job SET status=CASE WHEN $2 AND attempts<3 THEN 'pending' ELSE 'failed' END,lease_until=NULL,error_category='processing_failed',completed_at=CASE WHEN $2 AND attempts<3 THEN NULL ELSE floor(extract(epoch from clock_timestamp()))::bigint END WHERE id=$1 AND expected_version=$3 AND attempts=$4 AND status='running'").bind(id).bind(retry).bind(i64::try_from(job.expected_version).map_err(|_|DatabaseError::InvalidInput)?).bind(job.attempts as i32).execute(&self.pool).await.map_err(db)?;
         Ok(())
     }
     /// A daily upstream cap is admission policy, not a failed processing

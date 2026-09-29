@@ -19,6 +19,9 @@ pub struct ToolContext {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolError {
     ProcessingPending,
+    NotObserved,
+    CollectionIncomplete,
+    SourceInventoryIncomplete,
     UnsupportedHistory,
     HistoryIncomplete,
     SessionExpired,
@@ -317,7 +320,7 @@ impl ToolRegistry {
     {
         self.register_typed_internal(
             "database.request_collection",
-            "Explicitly request bounded collection of one Korean national statute or simple search candidates. This queues a background provider job; use database.collection_status and then requery the corpus.",
+            "Explicitly request bounded collection of one Korean national statute, one precedent case by exact case number, or simple search candidates. This queues a background provider job; use database.collection_status and then requery the corpus.",
             ToolOptions {
                 annotations: ToolAnnotations::from_raw(None, Some(false), Some(false), Some(true), Some(true)),
                 meta: None,

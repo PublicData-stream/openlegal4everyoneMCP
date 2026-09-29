@@ -326,6 +326,54 @@ pub struct HistoryPage {
     pub inventory_complete: bool,
 }
 
+/// Local collection state; unobserved never asserts absence from the provider.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectCollectionState {
+    NotObserved,
+    ProcessingPending,
+    CollectionIncomplete,
+    Published,
+    Withdrawn,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObjectCompletionEta {
+    Unknown {
+        reason: String,
+    },
+    Range {
+        earliest_at: u64,
+        latest_at: u64,
+        sample_size: u32,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ObjectJobStatus {
+    pub id: String,
+    pub status: String,
+    pub attempts: u32,
+    pub created_at: u64,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
+    pub error_category: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ObjectStatus {
+    pub schema_version: u32,
+    pub object: ObjectId,
+    pub state: ObjectCollectionState,
+    pub head_capture_id: Option<String>,
+    /// None when no published HEAD can be compared with the index watermark.
+    pub indexed: Option<bool>,
+    pub job: Option<ObjectJobStatus>,
+    pub retry_at: Option<u64>,
+    pub eta: ObjectCompletionEta,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DatabaseError {
@@ -343,8 +391,14 @@ pub enum DatabaseError {
     InvalidInput,
     InvalidRegex,
     NotFound,
+    /// The object has no retained provider observation in this corpus.
+    NotObserved,
+    /// Provider observation exists, but no publishable current HEAD is available.
+    CollectionIncomplete,
     RevisionUnavailable,
     AmbiguousRevision,
+    AmbiguousCollection,
+    SourceInventoryIncomplete,
     HistoryIncomplete,
     UnsupportedHistory,
     ProcessingPending,

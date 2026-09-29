@@ -358,15 +358,21 @@ Existing comparison tool names and schemas remain compatibility wrappers. See
 [text comparison](text-diff.md) for exact algorithms, patch restrictions and budgets.
 
 `[database]` additionally registers the six database operations, `database.show`,
-`database.request_collection`, and `database.collection_status`. Shared HTTP/WebTransport handlers use the same application services,
+`database.request_collection`, `database.collection_status`, and the read-only
+`database.object_status`. Shared HTTP/WebTransport handlers use the same application services,
 result/error contracts and limits. Details, configuration, freshness, body/catalog
 paging and provider acceptance boundaries are in [legal corpus](database.md).
 `database.request_collection` explicitly queues bounded provider collection for a
-verified national-statute ID or a simple term and dataset selection. It does not
+verified national-statute ID, exact precedent case number with optional expected provider ID, or a simple term and dataset selection. It does not
 return an upstream search result. Equivalent requests coalesce for 24 hours; use
 `database.collection_status` and then rerun the ordinary local lookup/search.
-Deferred requests are retried by the scheduler after one hour while their 24-hour
+Failed or skipped requests can be resubmitted after one hour; successful requests
+continue to coalesce for 24 hours. Deferred requests are retried by the scheduler after one hour while their 24-hour
 request window remains open.
+The original request ID remains readable until its expiry after a retry. A search
+request can report `done` with a provider failure reason when some candidates
+published and other bounded source attempts failed; `skipped` with that reason
+means none published.
 New requests require a fresh collection-scheduler heartbeat; without the optional
 overlay the tool returns a resource-limit error and leaves no queued request.
 A cached HEAD with another revision is replaced only when the provider list has
