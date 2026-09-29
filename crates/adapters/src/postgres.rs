@@ -236,7 +236,11 @@ fn database_error(error: sqlx::Error) -> Error {
         _ => Error::StorageUnavailable,
     }
 }
-async fn pool(url: &str, options: PostgresOptions) -> Result<PgPool, Error> {
+async fn pool(
+    url: &str,
+    options: PostgresOptions,
+    acquire_timeout: Duration,
+) -> Result<PgPool, Error> {
     if !(1..=64).contains(&options.max_connections) || url.len() > 8192 {
         return Err(Error::InvalidInput);
     }
@@ -277,7 +281,7 @@ async fn pool(url: &str, options: PostgresOptions) -> Result<PgPool, Error> {
     PgPoolOptions::new()
         .max_connections(options.max_connections)
         .min_connections(0)
-        .acquire_timeout(Duration::from_secs(1))
+        .acquire_timeout(acquire_timeout)
         .max_lifetime(Duration::from_secs(1800))
         .after_connect(|connection, _| {
             Box::pin(async move {
@@ -347,7 +351,9 @@ impl PostgresStore {
         self.inner.pool.clone()
     }
     pub async fn migrate(url: &str, options: PostgresOptions) -> Result<(), StartupError> {
-        let pool = pool(url, options).await?;
+        // A fresh administrative Pod must establish a new TLS connection after
+        // PostgreSQL restarts. Keep this startup budget separate from serving.
+        let pool = pool(url, options, Duration::from_secs(15)).await?;
         let result = async {
             startup_version(&pool).await?;
             migrator()
@@ -375,8 +381,8 @@ impl PostgresStore {
         probe_options.max_connections = 1;
         let mut data_options = options;
         data_options.max_connections -= 1;
-        let pool = pool(url, data_options).await?;
-        let probe_pool = match self::pool(url, probe_options).await {
+        let pool = pool(url, data_options, Duration::from_secs(1)).await?;
+        let probe_pool = match self::pool(url, probe_options, Duration::from_secs(1)).await {
             Ok(pool) => pool,
             Err(error) => {
                 pool.close().await;
