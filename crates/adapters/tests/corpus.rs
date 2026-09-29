@@ -886,7 +886,7 @@ async fn incomplete_attachment_evidence_never_replaces_a_complete_head() {
             .resolve(object(), RevisionSelector::Head, 202, token())
             .await
             .err(),
-        Some(DatabaseError::ProcessingPending)
+        Some(DatabaseError::CollectionIncomplete)
     );
     let retained = store
         .resolve(
@@ -1601,7 +1601,7 @@ async fn corpus_queue_capacity_preserves_observed_head_replacement() {
         store
             .resolve(object(), RevisionSelector::Head, 103, token())
             .await,
-        Err(DatabaseError::ProcessingPending)
+        Err(DatabaseError::CollectionIncomplete)
     ));
     assert!(matches!(
         store
