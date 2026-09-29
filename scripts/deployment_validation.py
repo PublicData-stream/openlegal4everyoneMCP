@@ -504,7 +504,7 @@ def validate_ingestion(documents, retained_documents):
         "collection_namespace": "openlegal-serving",
         "collection_job_template_path": "/etc/openlegal/collection-job.json",
         "enabled": True, "mode": "continuous", "retain_history_bodies": False,
-        "detail_timeout_secs": 3600,
+        "detail_timeout_secs": 3600, "detail_job_workers": 4,
     }, "continuous collection configuration")
     equal(added("ServiceAccount", "openlegal-collection-controller"), {
         "apiVersion": "v1", "kind": "ServiceAccount", "metadata": {
