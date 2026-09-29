@@ -26,6 +26,38 @@ pub enum QueryField {
 }
 
 impl CompiledQuery {
+    pub fn needs_tokens(&self) -> bool {
+        match self {
+            Self::Term { .. } => true,
+            Self::Not(child) | Self::Field { child, .. } => child.needs_tokens(),
+            Self::And(children) | Self::Or(children) => children.iter().any(Self::needs_tokens),
+            Self::All | Self::Exact(_) => false,
+        }
+    }
+
+    pub fn only_title(&self) -> bool {
+        match self {
+            Self::Field { field, .. } => *field == QueryField::Title,
+            Self::Not(child) => child.only_title(),
+            Self::And(children) | Self::Or(children) => children.iter().all(Self::only_title),
+            Self::All | Self::Term { .. } | Self::Exact(_) => false,
+        }
+    }
+
+    pub fn needs_case_tokens(&self) -> bool {
+        match self {
+            Self::Term { .. } => true,
+            Self::Field { field, child } => {
+                *field == QueryField::CaseNumber && child.needs_tokens()
+            }
+            Self::Not(child) => child.needs_case_tokens(),
+            Self::And(children) | Self::Or(children) => {
+                children.iter().any(Self::needs_case_tokens)
+            }
+            Self::All | Self::Exact(_) => false,
+        }
+    }
+
     pub fn compile(
         expr: &Expr,
         analyzer: &KoreanAnalyzer,
@@ -36,7 +68,7 @@ impl CompiledQuery {
             return Err(E::Cancelled);
         }
         if Instant::now() >= deadline {
-            return Err(E::Capacity);
+            return Err(E::BudgetExhausted);
         }
         let compile = |e: &Expr| Self::compile(e, analyzer, deadline, cancel);
         Ok(match &expr.kind {

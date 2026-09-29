@@ -11,6 +11,7 @@ use openlegal_application::{
     database::DatabaseStore,
     search::{SearchBackend, SearchBudget, SearchMode},
 };
+use openlegal_domain::search_query::ParseErrorKind;
 use openlegal_domain::{
     legal::{DatabaseError as E, RevisionSelector, SectionKind},
     legal_search::{SearchHit, SearchPage, SearchRequest},
@@ -34,6 +35,7 @@ struct Session {
     expires: u64,
     corpus_complete: bool,
     query: Option<Arc<CompiledQuery>>,
+    literal: Option<Arc<RegexMatcher>>,
     regex: Option<Arc<RegexMatcher>>,
 }
 #[derive(Clone)]
@@ -45,6 +47,53 @@ struct Cursor {
 struct State {
     sessions: BTreeMap<String, Session>,
     cursors: BTreeMap<String, Cursor>,
+}
+struct SearchSessionGuard {
+    id: String,
+    state: Arc<Mutex<State>>,
+    store: Arc<PgCorpusStore>,
+    armed: bool,
+}
+impl SearchSessionGuard {
+    fn new(id: String, state: Arc<Mutex<State>>, store: Arc<PgCorpusStore>) -> Self {
+        Self {
+            id,
+            state,
+            store,
+            armed: true,
+        }
+    }
+    fn clear_local(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.sessions.remove(&self.id);
+            state.cursors.retain(|_, cursor| cursor.session != self.id);
+        }
+    }
+    async fn release(&mut self) -> Result<(), E> {
+        self.clear_local();
+        self.store.release_session(&self.id).await?;
+        self.armed = false;
+        Ok(())
+    }
+    fn retain(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for SearchSessionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.clear_local();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let store = self.store.clone();
+                let id = self.id.clone();
+                handle.spawn(async move {
+                    // A canceled request has no response channel for cleanup errors.
+                    // The durable pin also has its own ten-minute expiry.
+                    let _ = store.release_session(&id).await;
+                });
+            }
+        }
+    }
 }
 #[derive(Clone)]
 pub struct CorpusSearch {
@@ -95,6 +144,7 @@ impl CorpusSearch {
             },
             serde_json::to_string(&request).map_err(|_| E::InvalidInput)?
         );
+        let mut new_guard: Option<SearchSessionGuard> = None;
         let (id, session, position) = if let Some(cursor) = supplied {
             let state = self.state.lock().map_err(|_| E::Capacity)?;
             let c = state.cursors.get(&cursor).ok_or(E::SessionExpired)?;
@@ -113,16 +163,32 @@ impl CorpusSearch {
             let deadline = budget.deadline;
             let (prepared, returned_budget) = tokio::task::spawn_blocking(move || {
                 let prepared = (|| {
-                    let query = if matches!(mode, SearchMode::Query) {
+                    let query = if matches!(mode, SearchMode::Query) && !request.literal {
                         let parsed = SearchQueryProcessor::new(&["title", "body", "case_number"])
                             .map_err(|_| E::InvalidInput)?
                             .parse(&query_text)
-                            .map_err(|_| E::InvalidInput)?;
+                            .map_err(|error| match error.kind {
+                                ParseErrorKind::FieldShorthand => E::InvalidFieldShorthand,
+                                _ => E::InvalidInput,
+                            })?;
                         Some(Arc::new(snapshot_index.compile_query(
                             &parsed.expression,
                             deadline,
                             &compile_cancel,
                         )?))
+                    } else {
+                        None
+                    };
+                    let literal = if matches!(mode, SearchMode::Query) && request.literal {
+                        Some(Arc::new(
+                            RegexMatcherBuilder::new()
+                                .case_insensitive(request.ignore_case)
+                                .fixed_strings(true)
+                                .size_limit(1024 * 1024)
+                                .dfa_size_limit(1024 * 1024)
+                                .build(&query_text)
+                                .map_err(|_| E::InvalidInput)?,
+                        ))
                     } else {
                         None
                     };
@@ -141,18 +207,19 @@ impl CorpusSearch {
                     } else {
                         None
                     };
-                    Ok::<_, E>((snapshot_index.snapshot()?, query, regex))
+                    Ok::<_, E>((snapshot_index.snapshot()?, query, literal, regex))
                 })();
                 (prepared, budget)
             })
             .await
             .map_err(|_| E::Capacity)?;
             budget = returned_budget;
-            let (snapshot, query, regex) = prepared?;
+            let (snapshot, query, literal, regex) = prepared?;
             let id = random()?;
             let session = Session {
                 snapshot: snapshot.clone(),
                 query,
+                literal,
                 regex,
                 fingerprint,
                 expires: now() + 600,
@@ -179,18 +246,14 @@ impl CorpusSearch {
                 }
                 state.sessions.insert(id.clone(), session.clone());
             }
-            if let Err(e) = self
-                .store
+            new_guard = Some(SearchSessionGuard::new(
+                id.clone(),
+                self.state.clone(),
+                self.store.clone(),
+            ));
+            self.store
                 .pin_session(id.clone(), session.snapshot.generation, Vec::new(), now())
-                .await
-            {
-                self.state
-                    .lock()
-                    .map_err(|_| E::Capacity)?
-                    .sessions
-                    .remove(&id);
-                return Err(e);
-            }
+                .await?;
             (id, session, Position::default())
         };
         self.store.check_session(&id, now()).await?;
@@ -242,6 +305,15 @@ impl CorpusSearch {
                 )
                 .await?;
         }
+        let collection_notices = self
+            .store
+            .collection_notices(&notice_datasets, None)
+            .await?;
+        let index_lag = self
+            .store
+            .watermark()
+            .await?
+            .saturating_sub(session.snapshot.generation);
         let next_cursor = if let Some(position) = result.1 {
             let token = random()?;
             let mut state = self.state.lock().map_err(|_| E::Capacity)?;
@@ -251,7 +323,7 @@ impl CorpusSearch {
             state.cursors.insert(
                 token.clone(),
                 Cursor {
-                    session: id,
+                    session: id.clone(),
                     position,
                 },
             );
@@ -259,11 +331,8 @@ impl CorpusSearch {
         } else {
             None
         };
-        let collection_notices = self
-            .store
-            .collection_notices(&notice_datasets, None)
-            .await?;
-        Ok(SearchPage {
+        let terminal = next_cursor.is_none();
+        let page = SearchPage {
             schema_version: 1,
             hits: result.0,
             next_cursor,
@@ -271,13 +340,21 @@ impl CorpusSearch {
             corpus_complete: session.corpus_complete && collection_notices.is_empty(),
             scanned_bytes: result.2 as u64,
             analyzer_version: session.snapshot.analyzer_version.clone(),
-            index_lag: self
-                .store
-                .watermark()
-                .await?
-                .saturating_sub(session.snapshot.generation),
+            index_lag,
             collection_notices,
-        })
+        };
+        if terminal {
+            if let Some(guard) = new_guard.as_mut() {
+                guard.release().await?;
+            } else {
+                SearchSessionGuard::new(id.clone(), self.state.clone(), self.store.clone())
+                    .release()
+                    .await?;
+            }
+        } else if let Some(guard) = new_guard.as_mut() {
+            guard.retain();
+        }
+        Ok(page)
     }
 }
 impl SearchBackend for CorpusSearch {
@@ -303,17 +380,27 @@ fn scan(
 ) -> Result<ScanResult, E> {
     let snapshot = &session.snapshot;
     let expression = session.query.as_deref();
+    let literal = session.literal.as_deref();
     let regex = session.regex.as_deref();
+    let scan_deadline = budget
+        .deadline
+        .checked_sub(std::time::Duration::from_secs(2))
+        .unwrap_or(budget.deadline);
     let mut hits = Vec::new();
     let mut scanned = 0usize;
     loop {
         if cancel.is_cancelled() {
             return Err(E::Cancelled);
         }
-        if Instant::now() >= budget.deadline || scanned >= budget.bytes {
+        if Instant::now() >= scan_deadline || scanned >= budget.bytes {
             return Ok((hits, Some(position), scanned));
         }
-        let batch = snapshot.batch(&position.after, 1, budget.deadline, cancel)?;
+        let batch = match snapshot.batch(&position.after, 1, scan_deadline, cancel) {
+            Err(E::BudgetExhausted) => {
+                return Ok((hits, Some(position), scanned));
+            }
+            result => result?,
+        };
         let Some((key, mut doc)) = batch.into_iter().next() else {
             return Ok((hits, None, scanned));
         };
@@ -373,21 +460,44 @@ fn scan(
             if !sections.iter().any(|(name, _, _)| name == "case_number") {
                 doc.capture.record.metadata.remove("case_number");
             }
-            doc.capture.record.body = sections
-                .iter()
-                .filter(|(name, _, _)| {
-                    name != "title" && (name != "case_number" || !has_metadata_case)
-                })
-                .map(|(_, text, _)| text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            doc.body_tokens =
-                index.tokens_with_budget(&doc.capture.record.body, budget.deadline, cancel)?;
+            if expression.only_title() {
+                doc.capture.record.body.clear();
+                doc.body_tokens.clear();
+            } else {
+                let selected_body = sections
+                    .iter()
+                    .filter(|(name, _, _)| {
+                        name != "title" && (name != "case_number" || !has_metadata_case)
+                    })
+                    .map(|(_, text, _)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if expression.needs_tokens() && selected_body != doc.capture.record.body {
+                    doc.body_tokens =
+                        match index.tokens_with_budget(&selected_body, scan_deadline, cancel) {
+                            Err(E::BudgetExhausted) => {
+                                return Ok((hits, Some(position), scanned - bytes));
+                            }
+                            result => result?,
+                        };
+                }
+                doc.capture.record.body = selected_body;
+            }
+            if !expression.needs_tokens() {
+                doc.body_tokens.clear();
+                doc.title_tokens.clear();
+            }
             if !sections.iter().any(|(name, _, _)| name == "title") {
                 doc.capture.record.title.clear();
                 doc.title_tokens.clear();
             }
-            if index.matches(expression, &doc, budget.deadline, cancel)? {
+            let matches = match index.matches(expression, &doc, scan_deadline, cancel) {
+                Err(E::BudgetExhausted) => {
+                    return Ok((hits, Some(position), scanned - bytes));
+                }
+                result => result?,
+            };
+            if matches {
                 let (name, source, ocr) = sections
                     .iter()
                     .find(|(_, text, _)| !text.is_empty())
@@ -405,6 +515,30 @@ fn scan(
                 after: key,
                 line: 0,
             };
+        } else if let Some(literal) = literal {
+            let mut matched = None;
+            for (name, source, ocr) in &sections {
+                if literal
+                    .find(source.as_bytes())
+                    .map_err(|_| E::InvalidInput)?
+                    .is_some()
+                {
+                    matched = Some((name, source, ocr));
+                    break;
+                }
+            }
+            if let Some((name, source, ocr)) = matched {
+                let text = source.chars().take(512).collect::<String>();
+                let mut found = hit(&doc, "object", 0, 0, text.len(), text, *ocr);
+                found.title = original_title;
+                found.excerpt_section = name.clone();
+                found.includes_ocr = sections.iter().any(|(_, _, o)| *o);
+                hits.push(found);
+            }
+            position = Position {
+                after: key,
+                line: 0,
+            };
         } else if let Some(regex) = &regex {
             let mut line_index = 0;
             let mut next_line = position.line;
@@ -415,7 +549,7 @@ fn scan(
                     if cancel.is_cancelled() {
                         return Err(E::Cancelled);
                     }
-                    if Instant::now() >= budget.deadline {
+                    if Instant::now() >= scan_deadline {
                         return Ok((
                             hits,
                             Some(Position {
@@ -502,7 +636,7 @@ mod tests {
     use super::*;
     use crate::korean_analysis::KoreanAnalyzer;
     use openlegal_domain::{
-        legal::{Capture, Dataset, LegalRecord, ObjectId},
+        legal::{Capture, Dataset, LegalRecord, LegalSection, ObjectId},
         legal_search::Filters,
     };
     use tokio::sync::Semaphore;
@@ -590,6 +724,7 @@ mod tests {
             expires: now() + 600,
             corpus_complete: false,
             query,
+            literal: None,
             regex,
         }
     }
@@ -670,5 +805,107 @@ mod tests {
         .unwrap();
         assert_eq!(second.0.len(), 1);
         assert_ne!(first.0[0].object.id, second.0[0].object.id);
+    }
+
+    #[test]
+    fn literal_query_matches_contiguous_source_text_and_respects_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
+        let mut separated = capture("1");
+        separated.record.body = "119 구조".into();
+        let mut contiguous = capture("2");
+        contiguous.record.body = "119구조".into();
+        index.apply_capture(separated, true, 1).unwrap();
+        index.apply_capture(contiguous, true, 2).unwrap();
+        for (query, ignore_case, expected) in [
+            ("119구조", false, 1),
+            ("119 구조", false, 1),
+            ("119구조", true, 1),
+            ("FICTIONAL", false, 0),
+            ("FICTIONAL", true, 2),
+        ] {
+            let mut search = session(&index, SearchMode::Query, "");
+            search.query = None;
+            search.literal = Some(Arc::new(
+                RegexMatcherBuilder::new()
+                    .fixed_strings(true)
+                    .case_insensitive(ignore_case)
+                    .build(query)
+                    .unwrap(),
+            ));
+            let result = scan(
+                &index,
+                &search,
+                &request(query, &[], 20),
+                Position::default(),
+                &budget(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(result.0.len(), expected, "{query} {ignore_case}");
+            if query == "119구조" {
+                assert_eq!(result.0[0].object.id, "2");
+                assert_eq!(result.0[0].excerpt_section, "body");
+            }
+        }
+    }
+
+    #[test]
+    fn title_scope_does_not_analyze_unrelated_extracted_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
+        let mut record = capture("1");
+        record.record.sections.push(LegalSection {
+            id: "attachment".into(),
+            title: "Fictional attachment".into(),
+            text: "x".repeat(129),
+            kind: SectionKind::Extracted,
+            source_document_sha256: None,
+            page: None,
+        });
+        index.apply_capture(record, true, 1).unwrap();
+        let query = "in:title:Fictional";
+        let result = scan(
+            &index,
+            &session(&index, SearchMode::Query, query),
+            &request(query, &[], 20),
+            Position::default(),
+            &budget(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(result.0.len(), 1);
+        assert_eq!(result.0[0].object.id, "1");
+    }
+
+    #[test]
+    fn deadline_page_can_resume_without_skipping_a_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
+        index.apply_capture(capture("1"), true, 1).unwrap();
+        let query = "in:title:Fictional";
+        let search = session(&index, SearchMode::Query, query);
+        let mut short = budget();
+        short.deadline = Instant::now() + std::time::Duration::from_millis(10);
+        let first = scan(
+            &index,
+            &search,
+            &request(query, &[], 20),
+            Position::default(),
+            &short,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(first.0.is_empty());
+        let resumed = scan(
+            &index,
+            &search,
+            &request(query, &[], 20),
+            first.1.unwrap(),
+            &budget(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(resumed.0.len(), 1);
     }
 }

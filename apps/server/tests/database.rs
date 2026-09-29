@@ -35,7 +35,7 @@ async fn call(url: &str, revision: &str, name: &str, arguments: Value) -> Result
         .send()
         .await
         .map_err(|e| context("send", format!("{e:?}")))?;
-    if response.status() != 200 {
+    if response.status() != 200 && !(revision == "2026-07-28" && response.status() == 400) {
         return Err(context("status", response.status().to_string()));
     }
     let text = response
@@ -311,6 +311,87 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
                     "{protocol} index catch-up: {result}"
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let scoped = call(
+                &url,
+                protocol,
+                "database.query",
+                json!({"query":"in:title:ABC","limit":1}),
+            )
+            .await?;
+            assert_eq!(
+                scoped["result"]["structuredContent"]["hits"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1,
+                "{scoped}"
+            );
+            let shorthand = call(
+                &url,
+                protocol,
+                "database.query",
+                json!({"query":"title:ABC"}),
+            )
+            .await?;
+            assert_eq!(shorthand["error"]["code"], -32602, "{shorthand}");
+            assert!(
+                shorthand["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("in:title:"),
+                "{shorthand}"
+            );
+            let exact = call(
+                &url,
+                protocol,
+                "database.query",
+                json!({"query":"abc","literal":true}),
+            )
+            .await?;
+            assert!(
+                exact["result"]["structuredContent"]["hits"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "{exact}"
+            );
+            let insensitive = call(
+                &url,
+                protocol,
+                "database.query",
+                json!({"query":"abc","literal":true,"ignore_case":true}),
+            )
+            .await?;
+            assert_eq!(
+                insensitive["result"]["structuredContent"]["hits"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1,
+                "{insensitive}"
+            );
+            let invalid_mode = call(
+                &url,
+                protocol,
+                "database.query",
+                json!({"query":"ABC","ignore_case":true}),
+            )
+            .await?;
+            assert_eq!(invalid_mode["error"]["code"], -32602, "{invalid_mode}");
+            for _ in 0..34 {
+                let terminal = call(
+                    &url,
+                    protocol,
+                    "database.query",
+                    json!({"query":"\"missing fictional phrase\""}),
+                )
+                .await?;
+                assert!(terminal["error"].is_null(), "{terminal}");
+                assert!(
+                    terminal["result"]["structuredContent"]["next_cursor"].is_null(),
+                    "{terminal}"
+                );
             }
             let regex = call(&url, protocol, "database.rg", json!({"query":"^after$"})).await?;
             let hits = regex["result"]["structuredContent"]["hits"]

@@ -68,12 +68,15 @@ expression, or unary negation. Thus `in:title:license contract` scopes only lice
 and both `in:title:-license` and `-in:title:license` are accepted. A field scope
 anywhere inside another field scope is an error; use separate scopes, such as
 `in:title:license OR in:body:contract`.
+Unescaped configured field names such as `title:license` at the start of a term
+are rejected as ambiguous shorthand. Use `in:title:license` for a field search;
+quote or escape `title:license` to search those literal characters.
 
 Fields are case-sensitive, explicit caller choices. At most 64 unique names are
 allowed, each 1–64 ASCII bytes matching `[a-z][a-z0-9_]*`. Duplicate/invalid names
 and excess configuration entries return configuration errors. An empty allowlist
-is valid and disables field scopes. Unknown query fields are errors. Only
-token-initial unescaped `in:` is reserved; other colons, as in `article:5` or
+is valid and disables field scopes. Unknown query fields are errors. Token-initial
+unescaped `in:` and configured field-name shorthand are reserved; other colons, as in `article:5` or
 `https://example.test`, remain literal. No URL is followed.
 
 ### Quotes, escapes, and punctuation
@@ -160,5 +163,5 @@ Other future executors must specify analyzer behavior, admission before expensiv
 work, field capabilities, result completeness/pagination, and search-semantics versioning.
 Do not add this syntax validation to the existing `Query::validate` without a
 compatibility design: existing retained query identities can contain literal text
-that this grammar would reject. No persistence migration or change to existing
-search results is part of this implementation.
+that this grammar would reject. The managed `database.query` shorthand and literal
+changes affect query responses, but need no persistence migration or index rebuild.

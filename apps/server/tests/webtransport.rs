@@ -150,6 +150,7 @@ impl Server {
                 |input, _| async move {
                     Err(match input.kind.as_str() {
                         "invalid" => ToolError::InvalidInput,
+                        "invalid_field_shorthand" => ToolError::InvalidFieldShorthand,
                         "invalid_regex" => ToolError::InvalidRegex,
                         "patch_conflict" => ToolError::PatchConflict,
                         "invalid_utf8_boundary" => ToolError::InvalidUtf8Boundary { offset: 8 },
@@ -481,6 +482,7 @@ async fn typed_tool_errors_preserve_input_and_operational_categories() {
         }
         for (id, kind, expected) in [
             (1, "invalid", None),
+            (12, "invalid_field_shorthand", None),
             (
                 2,
                 "invalid_regex",

@@ -278,7 +278,7 @@ impl CorpusIndex {
             .get("case_number")
             .map(String::as_str)
             .unwrap_or_default();
-        let case_number_tokens = if case_number.is_empty() {
+        let case_number_tokens = if case_number.is_empty() || !expression.needs_case_tokens() {
             AnalyzedText::default()
         } else {
             self.tokens_with_budget(case_number, deadline, cancel)?
@@ -311,7 +311,7 @@ impl IndexSnapshot {
                 return Err(E::Cancelled);
             }
             if Instant::now() >= deadline {
-                return Err(E::Capacity);
+                return Err(E::BudgetExhausted);
             }
             let inverted = segment.inverted_index(self.key).map_err(err)?;
             let mut stream = inverted
@@ -326,7 +326,7 @@ impl IndexSnapshot {
                     return Err(E::Cancelled);
                 }
                 if Instant::now() >= deadline {
-                    return Err(E::Capacity);
+                    return Err(E::BudgetExhausted);
                 }
                 let key = String::from_utf8(stream.key().to_vec()).map_err(err)?;
                 let mut postings = inverted

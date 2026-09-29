@@ -48,6 +48,13 @@ impl SearchService {
         cancel: CancellationToken,
     ) -> Result<SearchPage, DatabaseError> {
         validate(&request)?;
+        if matches!(mode, SearchMode::Query)
+            && (request.context_lines != 0
+                || (request.ignore_case && !request.literal)
+                || (request.literal && request.query.chars().any(char::is_control)))
+        {
+            return Err(DatabaseError::InvalidInput);
+        }
         let cancel = cancel.child_token();
         let _guard = cancel.clone().drop_guard();
         let permit = self

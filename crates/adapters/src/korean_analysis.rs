@@ -54,7 +54,7 @@ fn budget(deadline: Instant, cancel: &CancellationToken) -> Result<(), E> {
         return Err(E::Cancelled);
     }
     if Instant::now() >= deadline {
-        return Err(E::Capacity);
+        return Err(E::BudgetExhausted);
     }
     Ok(())
 }
@@ -328,7 +328,7 @@ mod tests {
             analyzer
                 .analyze("가", Instant::now(), &CancellationToken::new())
                 .unwrap_err(),
-            E::Capacity
+            E::BudgetExhausted
         );
     }
 

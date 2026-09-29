@@ -37,10 +37,13 @@ pub struct SearchRequest {
     #[serde(default = "default_limit")]
     pub limit: usize,
     pub cursor: Option<String>,
+    /// Query: search the whole query as a source substring. Rg: use a fixed-string pattern.
     #[serde(default)]
     pub literal: bool,
+    /// Query: valid only with literal=true. Rg: apply to the pattern.
     #[serde(default)]
     pub ignore_case: bool,
+    /// Context lines are supported only by database.rg.
     #[serde(default)]
     pub context_lines: u8,
 }

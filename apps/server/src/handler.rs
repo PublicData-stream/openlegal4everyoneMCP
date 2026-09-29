@@ -328,6 +328,12 @@ fn map_tool_error(error: ToolError) -> Result<CallToolResult, ErrorData> {
         ToolError::InvalidInput => {
             return Err(ErrorData::invalid_params("invalid tool arguments", None));
         }
+        ToolError::InvalidFieldShorthand => {
+            return Err(ErrorData::invalid_params(
+                "use in:title:, in:body:, or in:case_number: for field search",
+                None,
+            ));
+        }
         ToolError::InvalidUtf8Boundary { offset } => {
             return Ok(CallToolResult::structured_error(serde_json::json!({
                 "code": "invalid_utf8_boundary",

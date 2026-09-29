@@ -110,10 +110,19 @@ bounds. Default page size is 20; maximum is 100. Results use stable object/revis
 capture/section ordering and retain one index reader for ten minutes.
 
 `database.query` uses the existing [query DSL](search-query.md): words, prefixes,
-Boolean expressions, grouping, and title/body fields. Lindera and the Rust MeCab-Ko
+Boolean expressions, grouping, and `in:title:`, `in:body:`, and
+`in:case_number:` fields. Bare `title:`, `body:`, and `case_number:` are invalid;
+the error points to the `in:` form. Set `literal: true` to search the entire query
+as a case-sensitive original-text substring without DSL parsing.
+`ignore_case: true` applies only to literal query mode; it does not change DSL
+exact phrases.
+`context_lines` applies only to `database.rg`. Lindera and the Rust MeCab-Ko
 engine analyze NFC/ASCII-lowercase search surfaces independently, without stopword,
 stemming, or POS filters. Original legal text is preserved. Double-quoted strings
 remain exact source substrings, including under NOT.
+Clients that previously used a bare field prefix as ordinary text must quote or
+escape it. This search change needs no index rebuild; a server restart expires
+existing search cursors.
 
 Terms, prefixes, AND and OR are evaluated separately for each engine. At every NOT
 node, the union of its child's two engine results is negated and shared by both

@@ -75,6 +75,7 @@ impl Server {
             .unwrap();
         for (name, error) in [
             ("invalid", ToolError::InvalidInput),
+            ("invalid_field_shorthand", ToolError::InvalidFieldShorthand),
             ("invalid_regex", ToolError::InvalidRegex),
             ("patch_conflict", ToolError::PatchConflict),
             (
@@ -325,6 +326,7 @@ async fn long_tool_can_finish_after_io_interval_and_errors_stay_typed() {
     for version in ["2026-07-28", "2025-11-25"] {
         for (name, expected) in [
             ("invalid", None),
+            ("invalid_field_shorthand", None),
             (
                 "invalid_regex",
                 Some(

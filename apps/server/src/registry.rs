@@ -32,6 +32,7 @@ pub enum ToolError {
     StorageCapacity,
     SnapshotUnavailable,
     InvalidInput,
+    InvalidFieldShorthand,
     InvalidUtf8Boundary { offset: usize },
     InvalidRegex,
     PatchConflict,

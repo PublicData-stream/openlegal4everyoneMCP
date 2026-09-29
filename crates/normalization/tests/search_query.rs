@@ -52,6 +52,34 @@ fn processor() -> SearchQueryProcessor {
     SearchQueryProcessor::new(&["title", "body"]).unwrap()
 }
 
+#[test]
+fn field_shorthand_is_rejected_but_explicit_literals_remain_available() {
+    let parser = processor();
+    for input in [
+        "title:계약",
+        "body:119구조",
+        "title:119구조ㆍ구급",
+        "title:계약*",
+    ] {
+        assert_eq!(
+            parser.parse(input).unwrap_err().kind,
+            ParseErrorKind::FieldShorthand
+        );
+    }
+    assert_eq!(
+        shape(&parser.parse("in:title:계약").unwrap().expression),
+        field("title", term("계약"))
+    );
+    assert_eq!(
+        shape(&parser.parse("\\title:계약").unwrap().expression),
+        term("title:계약")
+    );
+    assert_eq!(
+        shape(&parser.parse("\"title:계약\"").unwrap().expression),
+        Shape::Exact("title:계약".into())
+    );
+}
+
 fn check_span(source: &str, span: ByteSpan) {
     assert!(span.start <= span.end, "reversed span: {span:?}");
     assert!(span.end <= source.len(), "span outside source: {span:?}");

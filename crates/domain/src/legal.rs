@@ -389,6 +389,7 @@ pub enum DatabaseError {
     /// A completed provider response indicates a temporary server failure.
     SourceTransient,
     InvalidInput,
+    InvalidFieldShorthand,
     InvalidRegex,
     NotFound,
     /// The object has no retained provider observation in this corpus.

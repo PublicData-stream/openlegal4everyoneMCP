@@ -73,6 +73,7 @@ pub enum ParseErrorKind {
     TrailingEscape,
     InvalidWildcard,
     InvalidFieldSyntax,
+    FieldShorthand,
     UnknownField,
     NestedField,
 }

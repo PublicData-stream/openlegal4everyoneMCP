@@ -335,6 +335,18 @@ impl Parser<'_> {
         Ok(Expr { kind, span })
     }
 
+    fn reject_shorthand(&self, range: ByteSpan) -> Result<(), ParseError> {
+        let source = &self.scanner.input[range.start..range.end];
+        if self.fields.iter().any(|field| {
+            source
+                .strip_prefix(field)
+                .is_some_and(|rest| rest.starts_with(':'))
+        }) {
+            return Err(error(ParseErrorKind::FieldShorthand, range));
+        }
+        Ok(())
+    }
+
     fn nested(&self, depth: usize, span: ByteSpan) -> Result<usize, ParseError> {
         if depth >= MAX_QUERY_NESTING {
             return Err(error(ParseErrorKind::NestingTooDeep, span));
@@ -403,9 +415,15 @@ impl Parser<'_> {
     fn operand(&mut self, depth: usize, scoped: bool) -> Result<Expr, ParseError> {
         let token = self.take()?;
         match token.kind {
-            TokenKind::Term(value) => self.node(ExprKind::Term(value), token.span),
+            TokenKind::Term(value) => {
+                self.reject_shorthand(token.span)?;
+                self.node(ExprKind::Term(value), token.span)
+            }
+            TokenKind::Prefix(value) => {
+                self.reject_shorthand(token.span)?;
+                self.node(ExprKind::Prefix(value), token.span)
+            }
             TokenKind::Exact(value) => self.node(ExprKind::Exact(value), token.span),
-            TokenKind::Prefix(value) => self.node(ExprKind::Prefix(value), token.span),
             TokenKind::Not | TokenKind::Minus => {
                 let inner_depth = self.nested(depth, token.span)?;
                 let inner = self.operand(inner_depth, scoped)?;

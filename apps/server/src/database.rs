@@ -268,7 +268,7 @@ impl ToolModule for DatabaseTools {
             (
                 "database.query",
                 SearchMode::Query,
-                "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, title/body/case_number fields, analyzed words and prefixes). Korean Lindera and MeCab-Ko analysis uses NFC and ASCII lowercase with no stopwords. Positive expressions must match within one engine; NOT excludes a match by either engine. Double quotes require an exact source substring. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit.",
+                "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, in:title:, in:body:, in:case_number:, analyzed words and prefixes). Bare title:, body:, and case_number: are invalid; use the in: prefix. Double quotes require an exact case-sensitive source substring. Alternatively, literal: true searches the entire query as a source substring; ignore_case applies only with literal: true. Korean Lindera and MeCab-Ko analysis uses NFC and ASCII lowercase with no stopwords. Positive expressions must match within one engine; NOT excludes a match by either engine. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit.",
             ),
             (
                 "database.rg",
@@ -408,6 +408,7 @@ pub(crate) fn map_error(e: DatabaseError) -> ToolError {
             ToolError::StorageUnavailable
         }
         DatabaseError::InvalidInput => ToolError::InvalidInput,
+        DatabaseError::InvalidFieldShorthand => ToolError::InvalidFieldShorthand,
         DatabaseError::InvalidRegex => ToolError::InvalidRegex,
         DatabaseError::NotFound => ToolError::NotFound,
         DatabaseError::NotObserved => ToolError::NotObserved,
