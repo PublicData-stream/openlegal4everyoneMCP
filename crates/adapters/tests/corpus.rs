@@ -4,7 +4,7 @@ mod support;
 use openlegal_adapters::{
     blob::FsBlobStore,
     corpus::{PageGapObservation, PgCorpusStore},
-    law_go_kr::{LawClient, RequestBudgetMode},
+    law_go_kr::{LawClient, ProviderRequestLimits, RequestBudgetMode},
 };
 use openlegal_application::{
     database::{DatabaseStore, Publication},
@@ -690,6 +690,242 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
     assert!(store.claim_job(999).await.unwrap().is_none());
     let resumed = store.claim_job(1000).await.unwrap().unwrap();
     assert_eq!(resumed.attempts, 1);
+    store.fail_claim(&resumed, false).await.unwrap();
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn provider_policy_migration_preserves_legacy_attempts_and_extreme_pauses() {
+    let fixture = support::TestDatabase::new().await;
+    let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
+    // Recreate the version-11 budget shape in this disposable migrated database.
+    sqlx::raw_sql("ALTER TABLE openlegal.provider_request_budget DROP CONSTRAINT provider_request_budget_daily_used_check, DROP CONSTRAINT provider_request_budget_on_demand_used_check, DROP COLUMN continuous_daily_limit, DROP COLUMN on_demand_daily_limit, DROP COLUMN min_interval_secs, DROP COLUMN next_request_at_ms, ADD CONSTRAINT provider_request_budget_daily_used_check CHECK(daily_used BETWEEN 0 AND 1000), ADD CONSTRAINT provider_request_budget_on_demand_used_check CHECK(on_demand_used BETWEEN 0 AND 1000); UPDATE openlegal.provider_request_budget SET daily_used=1000,on_demand_used=9,pilot_used=78,operator_suspended=true,unresolved_response=true,next_allowed_at=922337203685477580; DELETE FROM public._sqlx_migrations WHERE version=12;")
+        .execute(&pool).await.unwrap();
+    let checksums: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT version,checksum FROM public._sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    openlegal_adapters::postgres::PostgresStore::migrate(&fixture.url, support::options())
+        .await
+        .unwrap();
+    let after: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT version,checksum FROM public._sqlx_migrations WHERE version<=11 ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(checksums, after);
+    let ledger: (i32,i32,i32,bool,bool,i64,i64,i32,i32,i32) = sqlx::query_as("SELECT daily_used,on_demand_used,pilot_used,operator_suspended,unresolved_response,next_allowed_at,next_request_at_ms,continuous_daily_limit,on_demand_daily_limit,min_interval_secs FROM openlegal.provider_request_budget WHERE singleton").fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        ledger,
+        (
+            1000,
+            9,
+            78,
+            true,
+            true,
+            922337203685477580,
+            9223372036854775000,
+            1000,
+            1000,
+            5
+        )
+    );
+    let limits = ProviderRequestLimits::new(50_000, 1000, 1).unwrap();
+    LawClient::configure_provider_request_limits(&pool, &limits)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openlegal.provider_request_budget SET operator_suspended=false,unresolved_response=false").execute(&pool).await.unwrap();
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::Continuous, &token())
+            .await,
+        Err(DatabaseError::BudgetExhausted)
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn provider_policy_preserves_counters_spacing_and_independent_caps() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let pool = base.pool();
+    sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=floor(extract(epoch from clock_timestamp()))::bigint/86400,daily_used=1000,on_demand_used=1")
+        .execute(&pool).await.unwrap();
+    let selected = ProviderRequestLimits::new(50_000, 1000, 1).unwrap();
+    assert_eq!(
+        LawClient::configure_provider_request_limits(&pool, &selected)
+            .await
+            .unwrap(),
+        0
+    );
+    let mode = RequestBudgetMode::Continuous;
+    LawClient::reserve_provider_request_budget(&pool, &mode, &token())
+        .await
+        .unwrap();
+    let first: i64 = sqlx::query_scalar(
+        "SELECT next_request_at_ms FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &mode, &token()).await,
+        Err(DatabaseError::BudgetExhausted)
+    );
+    sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false")
+        .execute(&pool)
+        .await
+        .unwrap();
+    LawClient::reserve_provider_request_budget(&pool, &mode, &token())
+        .await
+        .unwrap();
+    let second: i64 = sqlx::query_scalar(
+        "SELECT next_request_at_ms FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        second - first >= 1001,
+        "durable one-second spacing must survive separate reservations"
+    );
+    let counts: (i32, i32) = sqlx::query_as(
+        "SELECT daily_used,on_demand_used FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1002, 1));
+    sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false,daily_used=50000,next_request_at_ms=0").execute(&pool).await.unwrap();
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &mode, &token()).await,
+        Err(DatabaseError::BudgetExhausted)
+    );
+    LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::OnDemand, &token())
+        .await
+        .unwrap();
+    let lower = ProviderRequestLimits::new(500, 1, 1).unwrap();
+    LawClient::configure_provider_request_limits(&pool, &lower)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false,next_request_at_ms=0").execute(&pool).await.unwrap();
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &mode, &token()).await,
+        Err(DatabaseError::BudgetExhausted)
+    );
+    assert_eq!(
+        LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::OnDemand, &token())
+            .await,
+        Err(DatabaseError::BudgetExhausted)
+    );
+    let counts: (i32, i32) = sqlx::query_as(
+        "SELECT daily_used,on_demand_used FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (50000, 2));
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn provider_policy_wakes_only_budget_waits_and_preserves_pauses_and_claim_fences() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let pool = base.pool();
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("policy-wake"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::new(pool.clone(), blobs);
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp()))::bigint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    store
+        .enqueue_job(object(), "policy-wait".into(), None, true, true, now as u64)
+        .await
+        .unwrap();
+    let old = store.claim_job(now as u64).await.unwrap().unwrap();
+    store
+        .defer_budget_claim(&old, (now + 86400) as u64)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=floor(extract(epoch from clock_timestamp()))::bigint/86400,daily_used=1000,on_demand_used=1,operator_suspended=true,next_allowed_at=$1")
+        .bind(now+120).execute(&pool).await.unwrap();
+    let selected = ProviderRequestLimits::new(50_000, 1000, 1).unwrap();
+    assert_eq!(
+        LawClient::configure_provider_request_limits(&pool, &selected)
+            .await
+            .unwrap(),
+        0
+    );
+    let default = ProviderRequestLimits::new(1000, 1000, 5).unwrap();
+    LawClient::configure_provider_request_limits(&pool, &default)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openlegal.provider_request_budget SET operator_suspended=false,unresolved_response=true").execute(&pool).await.unwrap();
+    assert_eq!(
+        LawClient::configure_provider_request_limits(&pool, &selected)
+            .await
+            .unwrap(),
+        0
+    );
+    LawClient::configure_provider_request_limits(&pool, &default)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        LawClient::configure_provider_request_limits(&pool, &selected)
+            .await
+            .unwrap(),
+        1
+    );
+    let lease: String =
+        sqlx::query_scalar("SELECT lease_until::text FROM openlegal.corpus_job WHERE id=$1::uuid")
+            .bind(&old.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        lease.parse::<i64>().unwrap(),
+        now + 120,
+        "Retry-After must survive wake"
+    );
+    assert!(store.claim_job((now + 119) as u64).await.unwrap().is_none());
+    let resumed = store.claim_job((now + 120) as u64).await.unwrap().unwrap();
+    assert_eq!(resumed.attempts, 1);
+    assert!(resumed.expected_version > old.expected_version);
+    assert_eq!(
+        store.defer_budget_claim(&old, (now + 500) as u64).await,
+        Err(DatabaseError::Conflict)
+    );
+    let category: Option<String> =
+        sqlx::query_scalar("SELECT error_category FROM openlegal.corpus_job WHERE id=$1::uuid")
+            .bind(&old.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(category, None);
+    LawClient::configure_provider_request_limits(&pool, &default)
+        .await
+        .unwrap();
+    assert_eq!(
+        LawClient::configure_provider_request_limits(&pool, &selected)
+            .await
+            .unwrap(),
+        0,
+        "a reclaimed job must not be woken again"
+    );
+    let counts: (i32, i32, bool, bool) = sqlx::query_as("SELECT daily_used,on_demand_used,operator_suspended,unresolved_response FROM openlegal.provider_request_budget WHERE singleton").fetch_one(&pool).await.unwrap();
+    assert_eq!(counts, (1000, 1, false, false));
     store.fail_claim(&resumed, false).await.unwrap();
     base.close().await.unwrap();
 }

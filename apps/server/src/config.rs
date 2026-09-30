@@ -905,6 +905,9 @@ pub struct IngestionConfig {
     pub collection_job_template_path: PathBuf,
     #[serde(default)]
     pub document_worker: DocumentWorkerConfig,
+    /// Deployment-wide provider admission policy, shared by collection modes.
+    #[serde(default)]
+    pub provider_requests: ProviderRequestConfig,
     /// Explicit operator authorization for managed background upstream traffic.
     pub enabled: bool,
     /// A pilot is a single bounded sample pass; continuous mode revisits full inventories.
@@ -919,8 +922,14 @@ pub struct IngestionConfig {
     /// Background detail jobs claimed concurrently by this scheduler process.
     #[serde(default = "default_detail_job_workers")]
     pub detail_job_workers: u32,
+    /// Delay between completed incremental inventory scan passes.
+    #[serde(default = "default_scan_interval_secs")]
+    pub scan_interval_secs: u64,
 }
 
+fn default_scan_interval_secs() -> u64 {
+    3600
+}
 fn default_detail_timeout_secs() -> u64 {
     3600
 }
@@ -932,6 +941,38 @@ fn default_collection_namespace() -> String {
 }
 fn default_collection_job_template_path() -> PathBuf {
     "/etc/openlegal/collection-job.json".into()
+}
+
+/// Operator budgets for automatic and explicit upstream collection attempts.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderRequestConfig {
+    pub continuous_daily_limit: u32,
+    pub on_demand_daily_limit: u32,
+    pub min_interval_secs: u32,
+}
+
+impl Default for ProviderRequestConfig {
+    fn default() -> Self {
+        Self {
+            continuous_daily_limit: 1000,
+            on_demand_daily_limit: 1000,
+            min_interval_secs: 5,
+        }
+    }
+}
+
+impl ProviderRequestConfig {
+    pub fn limits(
+        &self,
+    ) -> Result<openlegal_adapters::law_go_kr::ProviderRequestLimits, ServerError> {
+        openlegal_adapters::law_go_kr::ProviderRequestLimits::new(
+            self.continuous_daily_limit,
+            self.on_demand_daily_limit,
+            self.min_interval_secs,
+        )
+        .map_err(|_| "invalid provider request limits".into())
+    }
 }
 
 /// Operator-selected capacity for disposable document Pods.
@@ -1012,6 +1053,10 @@ impl DatabaseConfig {
         }
         if let Some(i) = &self.ingestion {
             i.document_worker.limits()?;
+            i.provider_requests.limits()?;
+            if !(60..=86400).contains(&i.scan_interval_secs) {
+                return Err("scan_interval_secs must be between 60 and 86400".into());
+            }
             if !(60..=7200).contains(&i.detail_timeout_secs) {
                 return Err("detail_timeout_secs must be between 60 and 7200".into());
             }
@@ -1025,7 +1070,7 @@ impl DatabaseConfig {
 
 #[cfg(test)]
 mod database_config_tests {
-    use super::{DatabaseConfig, DocumentWorkerConfig};
+    use super::{DatabaseConfig, DocumentWorkerConfig, ProviderRequestConfig};
 
     #[test]
     fn corpus_requires_an_explicit_dictionary_without_loading_it() {
@@ -1066,5 +1111,79 @@ mod database_config_tests {
             assert!(invalid.limits().is_err(), "{raw}");
         }
         assert!(toml::from_str::<DocumentWorkerConfig>("unknown = 1").is_err());
+    }
+
+    #[test]
+    fn provider_budget_defaults_partial_settings_and_validation() {
+        let defaults: ProviderRequestConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.continuous_daily_limit, 1000);
+        assert_eq!(defaults.on_demand_daily_limit, 1000);
+        assert_eq!(defaults.min_interval_secs, 5);
+        defaults.limits().unwrap();
+
+        let selected: ProviderRequestConfig =
+            toml::from_str("continuous_daily_limit = 50000\nmin_interval_secs = 1").unwrap();
+        assert_eq!(selected.on_demand_daily_limit, 1000);
+        selected.limits().unwrap();
+        for raw in [
+            "continuous_daily_limit = 0",
+            "on_demand_daily_limit = 0",
+            "min_interval_secs = 0",
+            "continuous_daily_limit = 1000001",
+            "on_demand_daily_limit = 1000001",
+            "min_interval_secs = 3601",
+        ] {
+            let invalid: ProviderRequestConfig = toml::from_str(raw).unwrap();
+            assert!(invalid.limits().is_err(), "{raw}");
+        }
+        for raw in [
+            "unknown = 1",
+            "continuous_daily_limit = -1",
+            "min_interval_secs = 4294967296",
+        ] {
+            assert!(
+                toml::from_str::<ProviderRequestConfig>(raw).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_scan_interval_is_bounded_without_changing_other_defaults() {
+        let base = concat!(
+            "blob_path='blobs'\nindex_path='index'\nwidget_html='widget'\n",
+            "mecab_dictionary_path='dictionary'\n[ingestion]\n",
+            "credential_env='PROVIDER_CREDENTIAL'\nkubectl='/usr/bin/kubectl'\n",
+            "kubeconfig='/run/kubeconfig'\ncontext='test'\nnamespace='documents'\n",
+            "worker_image='example.invalid/worker@sha256:placeholder'\n",
+            "enabled=false\nmode='continuous'\n",
+        );
+        let defaults: DatabaseConfig = toml::from_str(base).unwrap();
+        defaults.validate().unwrap();
+        let ingestion = defaults.ingestion.as_ref().unwrap();
+        assert_eq!(ingestion.scan_interval_secs, 3600);
+        assert_eq!(ingestion.detail_timeout_secs, 3600);
+        assert_eq!(ingestion.detail_job_workers, 1);
+        assert_eq!(ingestion.provider_requests.min_interval_secs, 5);
+        for seconds in [60, 300, 86400] {
+            let configured: DatabaseConfig =
+                toml::from_str(&format!("{base}scan_interval_secs={seconds}\n")).unwrap();
+            configured.validate().unwrap();
+        }
+        for seconds in [0, 59, 86401] {
+            let configured: DatabaseConfig =
+                toml::from_str(&format!("{base}scan_interval_secs={seconds}\n")).unwrap();
+            assert!(configured.validate().is_err(), "{seconds}");
+        }
+        for setting in [
+            "continuous_daily_limit=0",
+            "on_demand_daily_limit=0",
+            "min_interval_secs=0",
+        ] {
+            let configured: DatabaseConfig =
+                toml::from_str(&format!("{base}[ingestion.provider_requests]\n{setting}\n"))
+                    .unwrap();
+            assert!(configured.validate().is_err(), "{setting}");
+        }
     }
 }

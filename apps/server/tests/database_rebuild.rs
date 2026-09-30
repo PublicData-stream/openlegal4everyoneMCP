@@ -131,12 +131,14 @@ async fn offline_rebuild_preserves_ack_retirement_withdrawal_and_previous_index(
         collection_namespace: "openlegal-serving".into(),
         collection_job_template_path: "/etc/openlegal/collection-job.json".into(),
         document_worker: Default::default(),
+        provider_requests: Default::default(),
         enabled: true,
         mode: openlegal_server::config::IngestionMode::Pilot,
         manual_candidates_path: None,
         retain_history_bodies: false,
         detail_timeout_secs: 3600,
         detail_job_workers: 1,
+        scan_interval_secs: 3600,
     });
     let lease = store.acquire_runtime_lease().await.unwrap();
     assert!(

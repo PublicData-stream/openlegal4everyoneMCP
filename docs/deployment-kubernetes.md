@@ -1235,13 +1235,25 @@ image digest in `scheduler-deployment.yaml` and `collection-job.json`, and stamp
 the accepted document-worker image digest in `server.toml`. The ordinary serving
 Deployment continues using the `runtime` image and its own generated ConfigMap.
 The collector ConfigMap contains `[database.ingestion]` with `mode = "continuous"`,
-`detail_timeout_secs = 3600`, `detail_job_workers = 4`, and
+`detail_timeout_secs = 3600`, `detail_job_workers = 4`, `scan_interval_secs = 300`, and
 `document_worker.pool_limit = 16`. The detail
 deadline accepts 60–7200 seconds and is read at startup. A claimed detail job's
 lease covers that deadline plus validation and publication.
 Increase `detail_job_workers` to 8, then 16 only after at least one hour of
 healthy runtime at each stage, with provider usage, queue progress, Pod capacity,
 and error rates checked before each change.
+
+`[database.ingestion.provider_requests]` selects 50,000 automatic attempts per
+UTC day, 1,000 explicit on-demand attempts per UTC day and a shared one-second
+minimum interval. These are operator policy values, not documented provider
+quotas or achieved collection throughput. The omitted-table defaults remain
+1,000/1,000 attempts and five-second spacing. On enabled-ingestion startup the
+durable provider ledger receives this policy before client use; already charged
+counts, `Retry-After` pauses, unresolved responses and operator suspension remain
+in force. An increased budget can wake collection jobs deferred solely by the
+old daily budget. The scan interval is a delay after a completed pass; it does
+not shorten freshness periods or gap retry eligibility. Deploy scheduler and
+request Jobs with the same ConfigMap policy.
 
 The overlay keeps the scheduler and request Jobs in `openlegal-serving` so they
 can mount the existing corpus and cache PVCs. `ResourceQuota/collection-pod-budget`

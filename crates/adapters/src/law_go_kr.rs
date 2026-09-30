@@ -105,7 +105,107 @@ pub enum RequestBudgetMode {
     Continuous,
     OnDemand,
 }
+/// Operator policy persisted once for every client using the same provider ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderRequestLimits {
+    continuous_daily_limit: u32,
+    on_demand_daily_limit: u32,
+    min_interval_secs: u32,
+}
+impl ProviderRequestLimits {
+    pub fn new(
+        continuous_daily_limit: u32,
+        on_demand_daily_limit: u32,
+        min_interval_secs: u32,
+    ) -> Result<Self, DatabaseError> {
+        if !(1..=1_000_000).contains(&continuous_daily_limit)
+            || !(1..=1_000_000).contains(&on_demand_daily_limit)
+            || !(1..=3600).contains(&min_interval_secs)
+        {
+            return Err(DatabaseError::InvalidInput);
+        }
+        Ok(Self {
+            continuous_daily_limit,
+            on_demand_daily_limit,
+            min_interval_secs,
+        })
+    }
+}
 impl LawClient {
+    /// Change admission policy without resetting attempts or clearing provider evidence.
+    /// Only exhausted-budget waits gain an earlier lease when their budget increases.
+    pub async fn configure_provider_request_limits(
+        pool: &PgPool,
+        limits: &ProviderRequestLimits,
+    ) -> Result<u64, DatabaseError> {
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        // Match the corpus claim lock order; a newly claimed job clears budget_wait.
+        sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        let row = sqlx::query("SELECT utc_day,daily_used,on_demand_used,continuous_daily_limit,on_demand_daily_limit,min_interval_secs,next_allowed_at,next_request_at_ms,operator_suspended,unresolved_response,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
+            .fetch_one(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
+        let get = |name| {
+            row.try_get::<i64, _>(name)
+                .map_err(|_| DatabaseError::StorageUnavailable)
+        };
+        let get_count = |name| {
+            row.try_get::<i32, _>(name)
+                .map_err(|_| DatabaseError::StorageUnavailable)
+        };
+        let now = get("now")?;
+        let current_day = get("utc_day")? == now / 86_400;
+        let old_continuous = get_count("continuous_daily_limit")?;
+        let old_on_demand = get_count("on_demand_daily_limit")?;
+        let continuous_used = if current_day {
+            get_count("daily_used")?
+        } else {
+            0
+        };
+        let on_demand_used = if current_day {
+            get_count("on_demand_used")?
+        } else {
+            0
+        };
+        let continuous = i32::try_from(limits.continuous_daily_limit)
+            .map_err(|_| DatabaseError::InvalidInput)?;
+        let on_demand =
+            i32::try_from(limits.on_demand_daily_limit).map_err(|_| DatabaseError::InvalidInput)?;
+        let wake_continuous = continuous > old_continuous
+            && continuous_used >= old_continuous
+            && continuous_used < continuous;
+        let wake_on_demand = on_demand > old_on_demand
+            && on_demand_used >= old_on_demand
+            && on_demand_used < on_demand;
+        let paused = row
+            .try_get::<bool, _>("operator_suspended")
+            .map_err(|_| DatabaseError::StorageUnavailable)?
+            || row
+                .try_get::<bool, _>("unresolved_response")
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+        sqlx::query("UPDATE openlegal.provider_request_budget SET continuous_daily_limit=$1,on_demand_daily_limit=$2,min_interval_secs=$3 WHERE singleton")
+            .bind(continuous).bind(on_demand).bind(limits.min_interval_secs as i32)
+            .execute(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
+        let mut woken = 0;
+        if !paused && (wake_continuous || wake_on_demand) {
+            let spacing = get("next_request_at_ms")?;
+            let resume_at = now
+                .saturating_add(1)
+                .max(get("next_allowed_at")?)
+                .max(spacing / 1000 + i64::from(spacing % 1000 != 0));
+            woken = sqlx::query("UPDATE openlegal.corpus_job SET lease_until=$1::text::numeric WHERE status='running' AND error_category='budget_wait' AND lease_until>$1::text::numeric AND ((source_metadata->>'collection_origin'='explicit' AND $2) OR (source_metadata->>'collection_origin' IS DISTINCT FROM 'explicit' AND $3))")
+                .bind(resume_at.to_string()).bind(wake_on_demand).bind(wake_continuous)
+                .execute(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?.rows_affected();
+        }
+        tx.commit()
+            .await
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        Ok(woken)
+    }
     pub fn new(
         credential: String,
         processor: Arc<dyn DocumentProcessor>,
@@ -249,7 +349,7 @@ impl LawClient {
         let Some((pool, mode)) = &self.budget else {
             return Err(DatabaseError::InvalidInput);
         };
-        let row = sqlx::query("SELECT utc_day,daily_used,on_demand_used,next_allowed_at,operator_suspended,unresolved_response,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton")
+        let row = sqlx::query("SELECT utc_day,daily_used,on_demand_used,continuous_daily_limit,on_demand_daily_limit,next_allowed_at,next_request_at_ms,operator_suspended,unresolved_response,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton")
             .fetch_one(pool).await.map_err(|_| DatabaseError::StorageUnavailable)?;
         let now: i64 = row
             .try_get("now")
@@ -278,7 +378,18 @@ impl LawClient {
             return u64::try_from(now.saturating_add(3600))
                 .map_err(|_| DatabaseError::StorageUnavailable);
         }
-        let daily = if stored_day == day && used >= 1000 {
+        let limit: i32 = row
+            .try_get(if *mode == RequestBudgetMode::OnDemand {
+                "on_demand_daily_limit"
+            } else {
+                "continuous_daily_limit"
+            })
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        let spacing: i64 = row
+            .try_get("next_request_at_ms")
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        let next = next.max(spacing / 1000 + i64::from(spacing % 1000 != 0));
+        let daily = if stored_day == day && used >= limit {
             (day + 1) * 86_400 + 10
         } else {
             now + 10
@@ -301,11 +412,12 @@ impl LawClient {
                 .begin()
                 .await
                 .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let row = sqlx::query("SELECT utc_day,daily_used,on_demand_used,next_allowed_at,operator_suspended,unresolved_response,pilot_started_at,pilot_used,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
+            let row = sqlx::query("SELECT utc_day,daily_used,on_demand_used,continuous_daily_limit,on_demand_daily_limit,min_interval_secs,next_allowed_at,next_request_at_ms,operator_suspended,unresolved_response,pilot_started_at,pilot_used,floor(extract(epoch from clock_timestamp())*1000)::bigint AS now_ms FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
                 .fetch_one(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
-            let now: i64 = row
-                .try_get("now")
+            let now_ms: i64 = row
+                .try_get("now_ms")
                 .map_err(|_| DatabaseError::StorageUnavailable)?;
+            let now = now_ms / 1000;
             let day = now / 86_400;
             let previous_day: i64 = row
                 .try_get("utc_day")
@@ -325,6 +437,20 @@ impl LawClient {
             let next: i64 = row
                 .try_get("next_allowed_at")
                 .map_err(|_| DatabaseError::StorageUnavailable)?;
+            let spacing: i64 = row
+                .try_get("next_request_at_ms")
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+            let next = next.saturating_mul(1000).max(spacing);
+            let interval: i32 = row
+                .try_get("min_interval_secs")
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+            let limit: i32 = row
+                .try_get(if *mode == RequestBudgetMode::OnDemand {
+                    "on_demand_daily_limit"
+                } else {
+                    "continuous_daily_limit"
+                })
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
             let pilot_started: Option<i64> = row
                 .try_get("pilot_started_at")
                 .map_err(|_| DatabaseError::StorageUnavailable)?;
@@ -341,7 +467,7 @@ impl LawClient {
                     on_demand_used
                 } else {
                     daily_used
-                }) >= 1000
+                }) >= limit
                 || (*mode == RequestBudgetMode::Pilot
                     && (pilot_used >= 100
                         || pilot_started
@@ -349,20 +475,20 @@ impl LawClient {
             {
                 return Err(DatabaseError::BudgetExhausted);
             }
-            if next > now {
+            if next > now_ms {
                 drop(tx);
-                if next - now > 30 {
+                if next - now_ms > 30_000 {
                     return Err(DatabaseError::BudgetExhausted);
                 }
-                let delay = (next - now).min(30) as u64;
-                tokio::select! {_ = cancel.cancelled() => return Err(DatabaseError::Cancelled), _ = tokio::time::sleep(Duration::from_secs(delay)) => {}}
+                let delay = (next - now_ms).min(30_000) as u64;
+                tokio::select! {_ = cancel.cancelled() => return Err(DatabaseError::Cancelled), _ = tokio::time::sleep(Duration::from_millis(delay)) => {}}
                 continue;
             }
-            sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=$1,daily_used=$2,on_demand_used=$3,next_allowed_at=$4,unresolved_response=true,pilot_started_at=CASE WHEN $5 THEN COALESCE(pilot_started_at,$6) ELSE pilot_started_at END,pilot_used=pilot_used+CASE WHEN $5 THEN 1 ELSE 0 END WHERE singleton")
+            sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=$1,daily_used=$2,on_demand_used=$3,next_request_at_ms=$4,unresolved_response=true,pilot_started_at=CASE WHEN $5 THEN COALESCE(pilot_started_at,$6) ELSE pilot_started_at END,pilot_used=pilot_used+CASE WHEN $5 THEN 1 ELSE 0 END WHERE singleton")
                 .bind(day)
                 .bind(daily_used + i32::from(*mode != RequestBudgetMode::OnDemand))
                 .bind(on_demand_used + i32::from(*mode == RequestBudgetMode::OnDemand))
-                .bind(now.saturating_add(6))
+                .bind(now_ms.saturating_add(i64::from(interval) * 1000 + 1))
                 .bind(*mode == RequestBudgetMode::Pilot).bind(now)
                 .execute(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
             tx.commit()
@@ -944,11 +1070,7 @@ impl LawClient {
             .next_request
             .lock()
             .map_err(|_| DatabaseError::StorageUnavailable)? =
-            Instant::now().checked_add(Duration::from_secs(if self.budget.is_some() {
-                5
-            } else {
-                1
-            }));
+            Instant::now().checked_add(Duration::from_secs(u64::from(self.budget.is_none())));
         self.reserve_request(&cancel).await?;
         let fetched = async {
         let host = url.host_str().ok_or(DatabaseError::InvalidInput)?;

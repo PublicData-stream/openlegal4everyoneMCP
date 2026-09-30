@@ -228,6 +228,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0011_collection_skip_reasons.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            12,
+            "provider request policy".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0012_provider_request_policy.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

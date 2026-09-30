@@ -106,8 +106,17 @@ For the Korean corpus, ordinary MCP lookup/search tools never schedule provider
 traffic. `database.request_collection` is an explicit mutation that stores one
 coalesced request for a dedicated collection Job Pod; `database.collection_status`
 only reads its state. The scheduler and request Jobs share provider spacing and
-single-call admission. Continuous and explicit collection each have an operator
-cap of 1,000 reserved attempts per UTC day, for at most 2,000 in total.
+single-call admission. Operator configuration selects independent continuous and
+explicit daily caps and a minimum request interval. Defaults are 1,000 reserved
+attempts per UTC day for each mode and a five-second minimum interval. The
+ingestion template selects 50,000 continuous and 1,000 explicit attempts with a
+one-second minimum interval and a five-minute scan-cycle wait. This is operator
+policy, not a claim about provider quotas or achieved throughput. All clients use
+the same durable policy and charged counters, including after restarts. Increasing
+an exhausted budget may advance only budget-wait leases; it must preserve existing
+Retry-After pauses, suspension and unresolved-response evidence. Lowering a cap
+retains already charged attempts and blocks further admission until allowance
+exists. The scan interval is independent of legal-data freshness and gap retries.
 The scheduler marks an explicit request failed when its Kubernetes Job reports a
 terminal failure, including failure before the request Pod can open storage.
 Transient storage admission contention is retried only during collection Pod

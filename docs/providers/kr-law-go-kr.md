@@ -161,10 +161,15 @@ These are application choices, not claimed upstream service guarantees:
   to serving. A rejected list page is handled at its provider boundary.
 - `mode = "continuous"` uses durable per-dataset page cursors and queues every
   record on one current page per dataset and one historical page for datasets
-  with provider revisions each hour. The 128-job queue applies backpressure,
+  with provider revisions per incremental scan pass. The delay between completed
+  passes is `database.ingestion.scan_interval_secs` (default 3,600 seconds,
+  accepted range 60–86,400); the active collection template uses 300 seconds.
+  A pass can take longer while provider admission or processing is busy.
+  The 128-job queue applies backpressure,
   and a current-page cursor advances only after each listed HEAD revision has
   published or has a durable, explicitly incomplete gap. Due page and detail gaps
-  are retried once in a later hourly cycle under the same request budget. It
+  keep their existing retry eligibility and are revisited in a later scan under
+  the same request budget. It
   alternates a front-page refresh with one-page overlap to reduce
   moving-offset omissions. This is incremental
   collection, not a stabilized full inventory. It never marks date-selector
@@ -173,13 +178,20 @@ These are application choices, not claimed upstream service guarantees:
   records keep the existing capture, while corrected content creates a new
   capture. A body past its 30-day public retention age must be recaptured.
   Identical observations do not advance publication fences or sequences.
-- Admission allows one fetch at a time, reserves an attempt before DNS, and spaces
-  attempts by at least five seconds across restarts. PostgreSQL caps continuous
-  collection at 1,000 attempts per UTC day and explicit on-demand collection at
-  a separate 1,000 attempts per UTC day. These are independent operator budgets;
-  the aggregate admitted maximum is 2,000 attempts per UTC day. The next admissible time is conservatively
-  rounded to a whole second. These limits are operator policy, not a provider
-  quota assertion.
+- Admission allows one fetch at a time and reserves an attempt before DNS.
+  `[database.ingestion.provider_requests]` configures independent
+  `continuous_daily_limit` and `on_demand_daily_limit` budgets and their shared
+  `min_interval_secs` spacing, persisted in PostgreSQL across restarts. Omitted
+  settings default to 1,000 attempts per UTC day for each budget and five seconds
+  between attempts. Daily limits accept 1–1,000,000 attempts and minimum spacing
+  accepts 1–3,600 seconds. The active collection template selects 50,000 automatic
+  attempts, 1,000 explicit on-demand attempts and one-second minimum spacing,
+  for an aggregate daily admission ceiling of 51,000 attempts. List, detail,
+  attachment and retry attempts all spend the selected budget. These are operator
+  policy, not a provider quota assertion or a promise of achieved throughput.
+  Applying changed settings preserves already charged daily counts, admission
+  pauses, unresolved responses and operator suspension. The next admissible time
+  is conservatively rounded to a whole second.
   HTTP 429/503 persists admission pauses from `Retry-After` across restarts,
   including HTTP dates. Guidance over seven days sets durable
   `operator_suspended=true` and blocks further attempts until the operator

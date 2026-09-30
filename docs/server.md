@@ -394,6 +394,18 @@ a later comparable date and that HEAD has not changed since the list began.
 Equal or missing dates are skipped conservatively.
 No public arbitrary URL, SQL, filesystem search, or direct corpus mutation tool is registered.
 Operator ingestion configuration is a separate startup decision.
+`[database.ingestion.provider_requests]` sets shared, durable upstream admission
+policy through `continuous_daily_limit`, `on_demand_daily_limit` and
+`min_interval_secs`; defaults are 1,000, 1,000 and 5 respectively. Daily limits
+accept 1–1,000,000 attempts and spacing accepts 1–3,600 seconds. The optional
+collector template selects 50,000 automatic attempts and 1,000 explicit attempts
+per UTC day, with one-second minimum spacing. This is an operator request budget,
+not a provider quota assertion. Changing the settings retains charged requests
+and safety pauses. `database.ingestion.scan_interval_secs` controls only the delay
+between completed continuous inventory passes (default 3,600, range 60–86,400);
+the collector template selects 300 seconds. Freshness and gap retry eligibility
+keep their existing periods. These controls are separate from public MCP tool
+calling and transport capacity limits.
 The [optional Kubernetes ingestion overlay](deployment-kubernetes.md#optional-ingestion-integration)
 uses a separate scheduler and request Job Pods with explicit kubeconfig/context
 and projected tokens. The serving Pod has no provider credential. See the

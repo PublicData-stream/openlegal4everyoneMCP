@@ -80,6 +80,13 @@ mode = "continuous"
 retain_history_bodies = false
 detail_timeout_secs = 3600
 detail_job_workers = 4
+scan_interval_secs = 300
+
+# Operator policy; these values do not assert the upstream provider's quota.
+[database.ingestion.provider_requests]
+continuous_daily_limit = 50000
+on_demand_daily_limit = 1000
+min_interval_secs = 1
 
 # Match deploy/document-sandbox/namespace.yaml ResourceQuota/document-budget.
 # Omitting this table retains these defaults.

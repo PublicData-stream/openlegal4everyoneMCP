@@ -33,6 +33,7 @@ pub struct CorpusRuntime {
     retain_history_bodies: bool,
     detail_timeout_secs: u64,
     detail_job_workers: u32,
+    scan_interval_secs: u64,
     ingestion_mode: Option<IngestionMode>,
     pilot_candidates: Vec<InventoryItem>,
     inventory_verified: Arc<std::sync::atomic::AtomicBool>,
@@ -860,10 +861,13 @@ impl CorpusRuntime {
                 IngestionMode::Pilot => RequestBudgetMode::Pilot,
                 IngestionMode::Continuous => RequestBudgetMode::Continuous,
             };
-            Some(
-                LawClient::new(secret, Arc::new(processor))?
-                    .with_request_budget(persistent.pool(), mode),
+            let client = LawClient::new(secret, Arc::new(processor))?;
+            LawClient::configure_provider_request_limits(
+                &persistent.pool(),
+                &c.provider_requests.limits()?,
             )
+            .await?;
+            Some(client.with_request_budget(persistent.pool(), mode))
         } else {
             None
         };
@@ -975,6 +979,10 @@ impl CorpusRuntime {
                 .ingestion
                 .as_ref()
                 .map_or(1, |c| c.detail_job_workers),
+            scan_interval_secs: config
+                .ingestion
+                .as_ref()
+                .map_or(3600, |c| c.scan_interval_secs),
         }))
     }
     pub async fn close(&self) -> Result<(), ServerError> {
@@ -1395,7 +1403,7 @@ impl CorpusRuntime {
             }
             // A few moving pages cannot establish an atomic, complete upstream
             // catalog. Keep exact-date selectors and completeness claims closed.
-            tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(3600))=>{}}
+            tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(self.scan_interval_secs))=>{}}
         }
     }
     /// Check publication without waiting for a slow detail job. A page remains
@@ -2234,12 +2242,14 @@ mod manual_pilot_tests {
                 collection_namespace: "openlegal-serving".into(),
                 collection_job_template_path: "/etc/openlegal/collection-job.json".into(),
                 document_worker: Default::default(),
+                provider_requests: Default::default(),
                 enabled: true,
                 mode: IngestionMode::Pilot,
                 manual_candidates_path: Some(path.clone()),
                 retain_history_bodies: false,
                 detail_timeout_secs: 3600,
                 detail_job_workers: 1,
+                scan_interval_secs: 3600,
             }),
         };
         let item = serde_json::json!({

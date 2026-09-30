@@ -252,7 +252,7 @@ impl PgCorpusStore {
             return Ok(None);
         };
         let id: Uuid = row.try_get("id").map_err(db)?;
-        sqlx::query("UPDATE openlegal.corpus_job SET status='running',attempts=attempts+1,lease_until=$2::text::numeric,expected_version=$3,started_at=$4::text::numeric,completed_at=NULL WHERE id=$1").bind(id).bind(now.saturating_add(lease_seconds).to_string()).bind(row.try_get::<i64,_>("object_version").map_err(db)?+1).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_job SET status='running',attempts=attempts+1,lease_until=$2::text::numeric,expected_version=$3,started_at=$4::text::numeric,completed_at=NULL,error_category=NULL WHERE id=$1").bind(id).bind(now.saturating_add(lease_seconds).to_string()).bind(row.try_get::<i64,_>("object_version").map_err(db)?+1).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_object SET version=version+1 WHERE object_key=$1")
             .bind(row.try_get::<String, _>("object_key").map_err(db)?)
             .execute(&mut *tx)

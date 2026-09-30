@@ -144,7 +144,7 @@ impl PgCorpusStore {
         .await
         .map_err(db)?;
         let budget = sqlx::query(
-            "SELECT utc_day,daily_used,on_demand_used,operator_suspended,unresolved_response FROM openlegal.provider_request_budget WHERE singleton",
+            "SELECT utc_day,daily_used,on_demand_used,continuous_daily_limit,on_demand_daily_limit,operator_suspended,unresolved_response FROM openlegal.provider_request_budget WHERE singleton",
         )
         .fetch_one(&self.pool)
         .await
@@ -167,7 +167,15 @@ impl PgCorpusStore {
                 "daily_used"
             })
             .map_err(db)?;
-        if budget.try_get::<i64, _>("utc_day").map_err(db)? == (now / 86_400) as i64 && used >= 1000
+        let limit: i32 = budget
+            .try_get(if origin.as_deref() == Some("explicit") {
+                "on_demand_daily_limit"
+            } else {
+                "continuous_daily_limit"
+            })
+            .map_err(db)?;
+        if budget.try_get::<i64, _>("utc_day").map_err(db)? == (now / 86_400) as i64
+            && used >= limit
         {
             return Ok(ObjectCompletionEta::Unknown {
                 reason: "provider_budget_exhausted".into(),
