@@ -46,11 +46,11 @@ bridge.oncalltool = async ({ name, arguments: args }) => {
     comparisons.set(value.comparison_id, { before, after, summary: value });
     return { content: [], structuredContent: value };
   }
-  if (name === 'delete_text_diff') {
+  if (name === 'text.diff.delete') {
     if (params.has('deletefail') && deletions++ === 0) return { isError: true, content: [] };
     comparisons.delete(String(input.comparison_id)); return { content: [], structuredContent: { schema_version: 1, deleted: true } };
   }
-  if (name === 'get_text_diff_page') {
+  if (name === 'text.diff.page') {
     if (params.has('slowpage')) await new Promise(resolve => setTimeout(resolve, 300));
     const item = comparisons.get(String(input.comparison_id));
     if (!item) return { isError: true, content: [] };

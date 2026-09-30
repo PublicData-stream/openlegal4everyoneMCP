@@ -93,9 +93,15 @@ def success(body, revision, session=None, origin=None):
 
 def text_diff_smoke(revision, session, tools):
     by_name = {tool["name"]: tool for tool in tools}
-    for name in ("compare_texts", "show_text_diff", "get_text_diff_page", "delete_text_diff"):
+    for name in ("text.diff", "text.diff.show", "text.diff.page", "text.diff.delete"):
         assert name in by_name, f"{name} missing"
-    deletion = by_name["delete_text_diff"]["annotations"]
+    for name in ("compare_texts", "show_text_diff", "get_text_diff_page", "delete_text_diff"):
+        assert name not in by_name, f"removed tool {name} remains discoverable"
+        status, _, reply = exchange(request("tools/call", revision, 19,
+            name=name, arguments={}), revision, session)
+        assert status == (400 if revision == MODERN else 200) and reply and reply.get("id") == 19, "removed-tool reply mismatch"
+        assert reply.get("error", {}).get("code") == -32602, "removed tool did not return -32602"
+    deletion = by_name["text.diff.delete"]["annotations"]
     assert deletion["readOnlyHint"] is False, deletion
     assert deletion["destructiveHint"] is True, deletion
     assert deletion["idempotentHint"] is True, deletion
@@ -108,16 +114,26 @@ def text_diff_smoke(revision, session, tools):
         assert value["schema_version"] == 1, value
         return value
 
-    blank = call("show_text_diff")
+    def compare(**arguments):
+        result = call("text.diff", **arguments)
+        summary, patch = result["comparison"], result["patch"]
+        assert summary["schema_version"] == patch["schema_version"] == 1
+        assert patch["kind"] == "patch" and patch["sealed"] is True
+        assert patch["total_bytes"] == patch["committed_bytes"]
+        assert isinstance(result["explanation"], str) and result["explanation"]
+        assert call("text.attachment.delete", attachment_id=patch["attachment_id"])["deleted"] is True
+        return summary
+
+    blank = call("text.diff.show")
     assert blank["comparison"] is None, blank
-    summary = call("compare_texts", before="first\nold\n", after="first\nnew\n",
+    summary = compare(before="first\nold\n", after="first\nnew\n",
                    before_label="Before", after_label="After")
     assert summary["equal"] is False and summary["additions"] == summary["deletions"] == 1, summary
     handle = summary["comparison_id"]
-    shown = call("show_text_diff", comparison_id=handle)
+    shown = call("text.diff.show", comparison_id=handle)
     assert shown["comparison"]["comparison_id"] == handle, shown
     for view in ("changes", "before", "after"):
-        page = call("get_text_diff_page", comparison_id=handle, view=view, page=0)
+        page = call("text.diff.page", comparison_id=handle, view=view, page=0)
         assert page["comparison_id"] == handle and page["view"] == view, page
         assert page["page"] == 0 and page["total_pages"] == 1, page
         if view == "changes":
@@ -131,8 +147,8 @@ def text_diff_smoke(revision, session, tools):
             assert page["text"] == ("first\nold\n" if view == "before" else "first\nnew\n"), page
         assert len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode()) <= 256 * 1024
     for _ in range(2):
-        assert call("delete_text_diff", comparison_id=handle)["deleted"] is True
-    _, missing = success(request("tools/call", revision, 21, name="get_text_diff_page",
+        assert call("text.diff.delete", comparison_id=handle)["deleted"] is True
+    _, missing = success(request("tools/call", revision, 21, name="text.diff.page",
                                 arguments={"comparison_id": handle, "view": "changes", "page": 0}),
                          revision, session)
     assert missing.get("isError") is True, missing
@@ -141,11 +157,11 @@ def text_diff_smoke(revision, session, tools):
     # escaping exercises nearly 12 MiB of request body without oversized lines.
     large = ("\x01" * 1023 + "\n") * 1024
     assert len(large.encode()) == 1024 * 1024
-    maximum = call("compare_texts", before=large, after=large)
+    maximum = compare(before=large, after=large)
     assert maximum["equal"] is True, maximum
     assert maximum["before"]["bytes"] == maximum["after"]["bytes"] == 1024 * 1024
     assert maximum["additions"] == maximum["deletions"] == 0, maximum
-    assert call("delete_text_diff", comparison_id=maximum["comparison_id"])["deleted"] is True
+    assert call("text.diff.delete", comparison_id=maximum["comparison_id"])["deleted"] is True
 
     _, resource = success(request("resources/read", revision, 22,
                                   uri="ui://openlegal/text-diff-v1.html"), revision, session)
@@ -210,7 +226,7 @@ def smoke():
             before_snapshot_id=capture, after_snapshot_id=capture)
         assert compared["equal"] is True
         assert compared["origin"]["before"]["snapshot_id"] == capture
-        _, removed = success(request("tools/call", revision, 25, name="delete_text_diff",
+        _, removed = success(request("tools/call", revision, 25, name="text.diff.delete",
             arguments={"comparison_id": compared["comparison_id"]}), revision, session)
         assert removed["structuredContent"]["deleted"] is True
         print(f"HTTP {revision}: exact retained history and snapshot comparison verified", flush=True)

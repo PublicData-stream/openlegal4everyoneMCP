@@ -71,18 +71,8 @@ pub struct TextDiffTools {
 impl ToolModule for TextDiffTools {
     fn register(self, registry: &mut ToolRegistry) -> Result<(), ServerError> {
         let service = self.service.clone();
-        registry.register_typed::<CompareInput, ComparisonSummary, _, _>(
-            "compare_texts",
-            "Compare two supplied UTF-8 texts exactly using Rust line and Unicode scalar character diffs. Maximum per text: 1 MiB, 100000 lines, 16 KiB per line; no NUL. Returns a bearer handle for paged results retained for ten minutes. Use show_text_diff to display the handle; anyone with it can read or delete the result. Not a legal equivalence assessment.",
-            ToolOptions::default(),
-            move |input, context| { let service = service.clone(); async move {
-                compare(&service, input, context).await.map(ToolOutput::new)
-            } },
-        )?;
-        for name in ["show_text_diff", "text.diff.show"] {
-            let service = self.service.clone();
-            registry.register_typed::<ShowInput, ShowOutput, _, _>(
-            name,
+        registry.register_typed::<ShowInput, ShowOutput, _, _>(
+            "text.diff.show",
             "Open the editable text comparison app. Supply no arguments for an empty editor, before and after to create a comparison, or comparison_id to open an existing result without recomputing. Do not mix these modes. Existing original texts load on demand for editing.",
             ToolOptions { meta: Some(MetaObject(serde_json::from_value(serde_json::json!({
                 "ui": {"resourceUri": WIDGET_URI}
@@ -101,11 +91,9 @@ impl ToolModule for TextDiffTools {
                 Ok(ToolOutput::new(ShowOutput { schema_version: 1, comparison }))
             } },
         )?;
-        }
-        for name in ["get_text_diff_page", "text.diff.page"] {
-            let service = self.service.clone();
-            registry.register_typed::<PageRequest, PageResponse, _, _>(
-            name,
+        let service = self.service.clone();
+        registry.register_typed::<PageRequest, PageResponse, _, _>(
+            "text.diff.page",
             "Read a numbered changes/before/after page using a comparison bearer handle. Pages are bounded, ordered, and do not extend the ten-minute expiry. Original text pages concatenate exactly; change fragments include original source ranges.",
             ToolOptions::default(),
             move |input, _| { let service = service.clone(); async move {
@@ -118,20 +106,6 @@ impl ToolModule for TextDiffTools {
                     meta: None,
                 })
             } },
-        )?;
-        }
-        let deletion = self.service.clone();
-        registry.register_text_diff_delete::<HandleInput, DeleteOutput, _, _>(
-            move |input, _| {
-                let service = deletion.clone();
-                async move {
-                    service.delete(&input.comparison_id).map_err(map_error)?;
-                    Ok(ToolOutput::new(DeleteOutput {
-                        schema_version: 1,
-                        deleted: true,
-                    }))
-                }
-            },
         )?;
         register_canonical(registry, self.service)
     }

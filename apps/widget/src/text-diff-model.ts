@@ -58,6 +58,23 @@ export function parseSummary(value: unknown): Comparison {
   return result;
 }
 export function parseCompare(result: unknown): Comparison { return parseSummary(data(result)); }
+export interface DiffResult { comparison: Comparison; patch: Attachment; explanation: string }
+/** Report each validated capability even if another part of the result is malformed. */
+export function parseDiff(result: unknown, retain?: { comparison: (value: Comparison) => void; patch: (value: Attachment) => void }): DiffResult {
+  const value = data(result);
+  let comparison: Comparison | undefined;
+  let patch: Attachment | undefined;
+  let failure: unknown;
+  try { comparison = parseSummary(value.comparison); retain?.comparison(comparison); } catch (error) { failure = error; }
+  try {
+    patch = parseAttachment(value.patch);
+    retain?.patch(patch);
+    if (patch.kind !== 'patch' || !patch.sealed) throw invalid();
+  } catch (error) { failure ??= error; }
+  if (failure) throw failure;
+  if (value.schema_version !== 1 || !comparison || !patch) throw invalid();
+  return { comparison, patch, explanation: string(value.explanation, 4096) };
+}
 export function parseShow(result: unknown): Comparison | null {
   const value = data(result);
   if (value.schema_version !== 1) throw invalid();

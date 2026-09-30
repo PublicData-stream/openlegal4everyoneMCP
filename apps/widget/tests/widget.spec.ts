@@ -170,7 +170,7 @@ test('compares selections across history pages with full origin and shared Rust 
   await expect(comparison.locator('.source-chunk')).toHaveText('Historical title 1\n\nSnapshot body 1. <b>Exact text</b>');
   const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
   expect(calls.find((call: { name: string }) => call.name === 'demo_compare_record_snapshots').arguments).toEqual({ source: 'layout_a', id: 'demo-1', before_snapshot_id: '1'.repeat(64), after_snapshot_id: '3'.repeat(64) });
-  expect(calls.some((call: { name: string }) => call.name === 'compare_texts')).toBe(false);
+  expect(calls.some((call: { name: string }) => call.name === 'text.diff')).toBe(false);
   await widget.getByRole('button', { name: 'Clear comparison', exact: true }).click();
   await expect(comparison).toHaveCount(0);
   await expect(widget.getByRole('button', { name: 'Use observation 1 as before' })).toBeVisible();
@@ -184,7 +184,7 @@ test('cancelled snapshot creation waits for its late handle and deletes it', asy
   await expect(widget.getByText('The cancelled comparison was deleted.')).toBeVisible();
   await expect(widget.getByRole('region', { name: 'Comparison result', exact: true })).toHaveCount(0);
   const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
-  expect(calls.filter((call: { name: string }) => call.name === 'delete_text_diff')).toHaveLength(1);
+  expect(calls.filter((call: { name: string }) => call.name === 'text.diff.delete')).toHaveLength(1);
 });
 
 test('comparison deletion failure retains its handle for Clear retry', async ({ page }) => {
@@ -224,7 +224,7 @@ test('expired historical comparisons expose no page reads and can be recreated',
   await widget.getByRole('button', { name: 'Compare snapshots' }).click();
   await expect(widget.getByText('This comparison has expired. Compare again to create a new result.')).toBeVisible();
   const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
-  expect(calls.some((call: { name: string }) => call.name === 'get_text_diff_page')).toBe(false);
+  expect(calls.some((call: { name: string }) => call.name === 'text.diff.page')).toBe(false);
   await expect(widget.getByRole('button', { name: 'Compare snapshots' })).toBeEnabled();
 });
 

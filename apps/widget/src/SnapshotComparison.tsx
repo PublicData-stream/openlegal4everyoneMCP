@@ -33,7 +33,7 @@ export function SnapshotComparison({ bridge, ready, query, before, after, cancel
     const request = ++pageSerial.current;
     const expected = { comparison_id: comparison.comparison_id, view, page: pageIndex };
     setPage(null); setPageBusy(true);
-    void bridge.callServerTool({ name: 'get_text_diff_page', arguments: expected }, { timeout: 15000 }).then(result => {
+    void bridge.callServerTool({ name: 'text.diff.page', arguments: expected }, { timeout: 15000 }).then(result => {
       if (!live.current || pageSerial.current !== request) return;
       const parsed = parsePage(result, expected);
       if (view === 'changes' && parsed.total_pages !== comparison.change_pages) throw new Error('Inconsistent pages');
@@ -42,7 +42,7 @@ export function SnapshotComparison({ bridge, ready, query, before, after, cancel
     return () => { if (request === pageSerial.current) pageSerial.current++; };
   }, [bridge, comparison, ready, expired, busy, view, pageIndex]);
   async function remove(summary: Comparison) {
-    parseDelete(await bridge.callServerTool({ name: 'delete_text_diff', arguments: { comparison_id: summary.comparison_id } }, { timeout: 15000 }));
+    parseDelete(await bridge.callServerTool({ name: 'text.diff.delete', arguments: { comparison_id: summary.comparison_id } }, { timeout: 15000 }));
     pending.current.delete(summary.comparison_id);
     if (current.current?.comparison_id === summary.comparison_id) { current.current = null; if (live.current) { setComparison(null); setPage(null); } }
   }

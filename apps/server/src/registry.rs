@@ -179,8 +179,7 @@ impl ToolRegistry {
             && !(ephemeral_delete
                 && matches!(
                     name,
-                    "delete_text_diff"
-                        | "text.diff.delete"
+                    "text.diff.delete"
                         | "text.attachment.upload"
                         | "text.attachment.delete"
                         | "database.request_collection"
@@ -258,30 +257,6 @@ impl ToolRegistry {
         Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
     {
         self.register_typed_internal(name, description, options, handler, false)
-    }
-
-    /// The sole mutation exception: deletion of a bearer-authorized transient comparison.
-    /// Kept crate-private so ordinary extension registration cannot opt into writes.
-    pub(crate) fn register_text_diff_delete<I, O, F, Fut>(
-        &mut self,
-        handler: F,
-    ) -> Result<(), ServerError>
-    where
-        I: DeserializeOwned + JsonSchema + Send + 'static,
-        O: serde::Serialize + JsonSchema + Send + 'static,
-        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
-    {
-        self.register_typed_internal(
-            "delete_text_diff",
-            "Delete a temporary comparison using its bearer handle. This also removes access for anyone sharing the handle. Repeated deletion succeeds.",
-            ToolOptions {
-                annotations: ToolAnnotations::from_raw(None, Some(false), Some(true), Some(true), Some(false)),
-                meta: None,
-            },
-            handler,
-            true,
-        )
     }
 
     /// Only the enumerated built-in transient operations may mutate anonymous state.

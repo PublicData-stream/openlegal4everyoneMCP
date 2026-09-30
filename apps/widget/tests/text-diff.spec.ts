@@ -19,8 +19,9 @@ test('compares exact pasted text through the host, renders the actual diff, and 
   await expect(widget.locator('.diff-fragment')).toContainText('<img src="https://evil.example/x">');
   await expect(widget.locator('.diff-fragment img, .diff-fragment b')).toHaveCount(0);
   const invoked = await calls(page);
-  expect(invoked[0]).toMatchObject({ name: 'compare_texts', arguments: { before: '가 <b>before</b>\n', after: '😀 <img src="https://evil.example/x">\n' } });
-  expect(invoked[1].name).toBe('get_text_diff_page');
+  expect(invoked[0]).toMatchObject({ name: 'text.diff', arguments: { before: '가 <b>before</b>\n', after: '😀 <img src="https://evil.example/x">\n' } });
+  expect(invoked[1].name).toBe('text.attachment.delete');
+  expect(invoked[2].name).toBe('text.diff.page');
   expect(external).toEqual([]);
   await expect(widget.locator('.diff-fragment button')).toHaveCount(0);
   await widget.getByText('Read the full GNU AGPLv3 license', { exact: true }).click();
@@ -39,7 +40,7 @@ test('existing handles load source chunks in order for editing, preserving CR un
   await expect(widget.getByText('Original CR bytes are preserved.', { exact: false })).toHaveCount(2);
   await widget.getByRole('button', { name: 'Compare', exact: true }).click();
   await expect(widget.getByRole('button', { name: 'Compare', exact: true })).toBeEnabled();
-  const first = (await calls(page)).find(call => call.name === 'compare_texts');
+  const first = (await calls(page)).find(call => call.name === 'text.diff');
   expect(first?.arguments.before).toBe('가\r\nOriginal before\r끝');
   expect(first?.arguments.after).toBe('😀\r\nOriginal after\n');
   await widget.getByRole('button', { name: 'Edit before as LF' }).click();
@@ -47,10 +48,10 @@ test('existing handles load source chunks in order for editing, preserving CR un
   await expect(widget.getByRole('heading', { name: 'Previous comparison' })).toBeVisible();
   await widget.getByRole('button', { name: 'Compare', exact: true }).click();
   await expect(widget.getByRole('button', { name: 'Compare', exact: true })).toBeEnabled();
-  const invoked = (await calls(page)).filter(call => call.name === 'compare_texts');
+  const invoked = (await calls(page)).filter(call => call.name === 'text.diff');
   expect(invoked[1].arguments.before).toBe('가\nOriginal before\n끝');
   const all = await calls(page);
-  for (let index = 0; index < all.length; index++) if (all[index].name === 'compare_texts') expect(all[index - 1].name).toBe('delete_text_diff');
+  for (let index = 0; index < all.length; index++) if (all[index].name === 'text.diff') expect(all[index - 1].name).toBe('text.diff.delete');
 });
 test('UTF-8 uploads keep BOM and CRLF; invalid bytes and oversized lines never call comparison', async ({ page }) => {
   const widget = await open(page);
@@ -59,13 +60,13 @@ test('UTF-8 uploads keep BOM and CRLF; invalid bytes and oversized lines never c
   await expect(widget.getByRole('button', { name: 'Edit before as LF' })).toBeVisible();
   await widget.getByRole('button', { name: 'Compare', exact: true }).click();
   await expect(widget.getByRole('button', { name: 'Compare', exact: true })).toBeEnabled();
-  expect((await calls(page)).find(call => call.name === 'compare_texts')?.arguments.before).toBe('\uFEFF가\r\n');
-  const count = (await calls(page)).filter(call => call.name === 'compare_texts').length;
+  expect((await calls(page)).find(call => call.name === 'text.diff')?.arguments.before).toBe('\uFEFF가\r\n');
+  const count = (await calls(page)).filter(call => call.name === 'text.diff').length;
   await upload.setInputFiles({ name: 'invalid.txt', mimeType: 'text/plain', buffer: Buffer.from([0xc3, 0x28]) });
   await expect(widget.getByRole('alert')).toContainText('invalid byte sequences');
   await upload.setInputFiles({ name: 'long.txt', mimeType: 'text/plain', buffer: Buffer.from('가'.repeat(5462)) });
   await expect(widget.getByRole('alert')).toContainText('16 KiB');
-  expect((await calls(page)).filter(call => call.name === 'compare_texts')).toHaveLength(count);
+  expect((await calls(page)).filter(call => call.name === 'text.diff')).toHaveLength(count);
 });
 test('bounded pages near line 100,000 retain source ranges while local gutter allocation stays small', async ({ page }) => {
   const widget = await open(page, '?pages');
@@ -95,7 +96,7 @@ test('Clear waits for deletion and a failed deletion remains retryable without c
   await widget.getByRole('button', { name: 'Clear', exact: true }).click();
   await expect(widget.getByRole('region', { name: 'Comparison result' })).toHaveCount(0);
   await expect(widget.getByLabel('Before text', { exact: true })).toHaveValue('');
-  expect((await calls(page)).filter(call => call.name === 'delete_text_diff')).toHaveLength(2);
+  expect((await calls(page)).filter(call => call.name === 'text.diff.delete')).toHaveLength(2);
 });
 test('Clear stays disabled through cancellation until a late successful handle is deleted', async ({ page }) => {
   const widget = await open(page);
@@ -108,7 +109,7 @@ test('Clear stays disabled through cancellation until a late successful handle i
   await expect(widget.getByRole('button', { name: 'Clear', exact: true })).toBeDisabled();
   await expect(widget.getByRole('alert')).toContainText('retained comparison was deleted');
   await expect(widget.getByRole('button', { name: 'Clear', exact: true })).toBeEnabled();
-  expect((await calls(page)).filter(call => call.name === 'delete_text_diff')).toHaveLength(1);
+  expect((await calls(page)).filter(call => call.name === 'text.diff.delete')).toHaveLength(1);
   await expect(widget.getByRole('region', { name: 'Comparison result' })).toHaveCount(0);
   await open(page, '?deletefail');
   await widget.getByLabel('Before text', { exact: true }).fill('slow');
@@ -119,7 +120,7 @@ test('Clear stays disabled through cancellation until a late successful handle i
   await widget.getByRole('button', { name: 'Clear', exact: true }).click();
   await expect(widget.getByRole('region', { name: 'Comparison result' })).toHaveCount(0);
   await expect(widget.getByLabel('Before text', { exact: true })).toHaveValue('');
-  expect((await calls(page)).filter(call => call.name === 'delete_text_diff')).toHaveLength(2);
+  expect((await calls(page)).filter(call => call.name === 'text.diff.delete')).toHaveLength(2);
 });
 test('initial supplied pairs and empty comparisons work; malformed data and expiry fail visibly', async ({ page }) => {
   const widget = await open(page, '?pair');
@@ -127,11 +128,11 @@ test('initial supplied pairs and empty comparisons work; malformed data and expi
   await expect(widget.locator('.diff-fragment')).toBeVisible();
   await widget.getByRole('button', { name: 'Compare', exact: true }).click();
   await expect(widget.getByRole('button', { name: 'Compare', exact: true })).toBeEnabled();
-  expect((await calls(page)).filter(call => call.name === 'compare_texts')).toHaveLength(1);
+  expect((await calls(page)).filter(call => call.name === 'text.diff')).toHaveLength(1);
   await open(page);
   await widget.getByRole('button', { name: 'Compare', exact: true }).click();
   await expect(widget.getByText('The supplied texts are identical.')).toBeVisible();
-  expect((await calls(page)).filter(call => call.name === 'get_text_diff_page')).toHaveLength(0);
+  expect((await calls(page)).filter(call => call.name === 'text.diff.page')).toHaveLength(0);
   await open(page, '?malformed');
   await expect(widget.getByRole('alert')).toContainText('unsupported comparison response');
   await open(page, '?initial&badpage');
@@ -140,7 +141,7 @@ test('initial supplied pairs and empty comparisons work; malformed data and expi
   await open(page, '?expired');
   await expect(widget.getByText('This comparison has expired.', { exact: false })).toBeVisible();
   await expect(widget.getByRole('button', { name: 'Load original texts for editing' })).toBeDisabled();
-  expect((await calls(page)).filter(call => call.name === 'get_text_diff_page')).toHaveLength(0);
+  expect((await calls(page)).filter(call => call.name === 'text.diff.page')).toHaveLength(0);
 });
 test('clear invalidates a page response still in flight', async ({ page }) => {
   const widget = await open(page, '?initial&slowpage');
@@ -187,8 +188,8 @@ test('opening a snapshot handle shows its origin and supplied-text recomparison 
   await widget.getByRole('button', { name: 'Compare', exact: true }).click();
   await expect(origin).toHaveCount(0);
   const invoked = await calls(page);
-  expect(invoked.find(call => call.name === 'compare_texts')?.arguments).not.toHaveProperty('origin');
-  expect(invoked.filter(call => call.name === 'delete_text_diff')).toHaveLength(1);
+  expect(invoked.find(call => call.name === 'text.diff')?.arguments).not.toHaveProperty('origin');
+  expect(invoked.filter(call => call.name === 'text.diff.delete')).toHaveLength(1);
 });
 
 for (const deletionFails of [false, true]) {
@@ -206,9 +207,9 @@ for (const deletionFails of [false, true]) {
       await widget.getByRole('button', { name: 'Clear', exact: true }).click();
       await expect(widget.getByRole('alert')).toHaveCount(0);
     }
-    await expect.poll(async () => (await calls(page)).filter(call => call.name === 'delete_text_diff').length).toBe(deletionFails ? 2 : 1);
+    await expect.poll(async () => (await calls(page)).filter(call => call.name === 'text.diff.delete').length).toBe(deletionFails ? 2 : 1);
     const invoked = await calls(page);
-    expect(invoked.some(call => call.name === 'get_text_diff_page')).toBe(false);
+    expect(invoked.some(call => call.name === 'text.diff.page')).toBe(false);
   });
 }
 
@@ -219,9 +220,9 @@ test('initial supplied pairs cannot claim historical origin and retain only clea
   await expect(widget.getByRole('region', { name: 'Comparison result', exact: true })).toHaveCount(0);
   await widget.getByRole('button', { name: 'Clear', exact: true }).click();
   await expect(widget.getByRole('alert')).toHaveCount(0);
-  await expect.poll(async () => (await calls(page)).filter(call => call.name === 'delete_text_diff').length).toBe(1);
+  await expect.poll(async () => (await calls(page)).filter(call => call.name === 'text.diff.delete').length).toBe(1);
   const invoked = await calls(page);
-  expect(invoked.some(call => call.name === 'get_text_diff_page')).toBe(false);
+  expect(invoked.some(call => call.name === 'text.diff.page')).toBe(false);
 });
 
 test('patch file workflow uploads exact UTF-8 and cleans all temporary handles', async ({ page }) => {
@@ -247,4 +248,108 @@ test('patch cleanup failures keep a retryable handle', async ({ page }) => {
   await widget.getByRole('button', { name: 'Clear patch', exact: true }).click();
   await expect(widget.getByRole('button', { name: 'Apply patch', exact: true })).toBeEnabled();
   expect((await calls(page)).filter(x => x.name === 'text.attachment.delete')).toHaveLength(4);
+});
+
+test('unused comparison patches are deleted promptly and failed cleanup remains retryable', async ({ page }) => {
+  const widget = await open(page, '?patchdeletefail');
+  await widget.getByLabel('Before text', { exact: true }).fill('old');
+  await widget.getByLabel('After text', { exact: true }).fill('new');
+  await widget.getByRole('button', { name: 'Compare', exact: true }).click();
+  await expect(widget.getByRole('alert')).toContainText('unused patch could not be deleted');
+  await expect(widget.locator('.diff-fragment')).toBeVisible();
+  expect((await calls(page)).filter(x => x.name === 'text.attachment.delete')).toHaveLength(1);
+  await widget.getByRole('button', { name: 'Clear', exact: true }).click();
+  await expect(widget.getByRole('alert')).toHaveCount(0);
+  await expect(widget.getByRole('region', { name: 'Comparison result' })).toHaveCount(0);
+  const invoked = await calls(page);
+  expect(invoked.filter(x => x.name === 'text.attachment.delete')).toHaveLength(2);
+  expect(invoked.filter(x => x.name === 'text.diff.delete')).toHaveLength(1);
+});
+
+test('unresolved patch cleanup prevents new comparisons and records independent deletion success', async ({ page }) => {
+  const widget = await open(page, '?patchdeletealwaysfails');
+  await widget.getByLabel('Before text', { exact: true }).fill('old');
+  await widget.getByRole('button', { name: 'Compare', exact: true }).click();
+  await expect(widget.getByRole('alert')).toContainText('unused patch could not be deleted');
+  await widget.getByRole('button', { name: 'Compare', exact: true }).click();
+  await expect(widget.getByRole('alert')).toContainText('Retry Clear before comparing again');
+  expect((await calls(page)).filter(x => x.name === 'text.diff')).toHaveLength(1);
+  await widget.getByRole('button', { name: 'Clear', exact: true }).click();
+  await expect(widget.getByRole('alert')).toContainText('Clear has not completed');
+  await expect(widget.getByRole('region', { name: 'Comparison result' })).toHaveCount(0);
+  await widget.getByRole('button', { name: 'Clear', exact: true }).click();
+  await expect.poll(async () => (await calls(page)).filter(x => x.name === 'text.attachment.delete').length).toBe(4);
+  expect((await calls(page)).filter(x => x.name === 'text.diff.delete')).toHaveLength(1);
+});
+
+for (const suffix of ['badexplanation', 'badpatch', 'wrongpatchkind']) {
+  test(`malformed ${suffix} responses clean independently validated handles`, async ({ page }) => {
+    const widget = await open(page, `?${suffix}`);
+    await widget.getByLabel('Before text', { exact: true }).fill('old');
+    await widget.getByRole('button', { name: 'Compare', exact: true }).click();
+    await expect(widget.getByRole('alert')).toContainText('unsupported comparison response');
+    await expect(widget.getByRole('region', { name: 'Comparison result' })).toHaveCount(0);
+    const invoked = await calls(page);
+    expect(invoked.filter(x => x.name === 'text.diff.delete')).toHaveLength(1);
+    expect(invoked.filter(x => x.name === 'text.attachment.delete')).toHaveLength(1);
+    expect(invoked.some(x => x.name === 'text.diff.page')).toBe(false);
+  });
+}
+
+test('cancellation during patch deletion cleans the comparison without exposing a late result', async ({ page }) => {
+  const widget = await open(page, '?slowpatchdelete');
+  await widget.getByLabel('Before text', { exact: true }).fill('old');
+  await widget.getByRole('button', { name: 'Compare', exact: true }).click();
+  await expect.poll(async () => (await calls(page)).some(x => x.name === 'text.attachment.delete')).toBe(true);
+  await page.evaluate(() => window.dispatchEvent(new Event('cancel-comparison')));
+  await expect(widget.getByRole('alert')).toContainText('retained comparison was deleted');
+  await expect(widget.getByRole('region', { name: 'Comparison result' })).toHaveCount(0);
+  expect((await calls(page)).filter(x => x.name === 'text.diff.delete')).toHaveLength(1);
+});
+
+test('a stale successful comparison cleans both handles and preserves a newer host result', async ({ page }) => {
+  const widget = await open(page);
+  await widget.getByLabel('Before text', { exact: true }).fill('slow');
+  await widget.getByRole('button', { name: 'Compare', exact: true }).click();
+  await expect(widget.getByRole('status')).toHaveText('Comparing texts…');
+  await page.evaluate(() => window.dispatchEvent(new Event('replace-comparison')));
+  await expect(widget.getByRole('button', { name: 'Clear', exact: true })).toBeEnabled();
+  await expect(widget.locator('.diff-fragment')).toContainText('Replacement before');
+  const invoked = await calls(page);
+  expect(invoked.filter(x => x.name === 'text.attachment.delete')).toHaveLength(1);
+  expect(invoked.filter(x => x.name === 'text.diff.delete')).toHaveLength(1);
+  expect(invoked.find(x => x.name === 'text.diff.delete')?.arguments.comparison_id).not.toBe('f'.repeat(64));
+});
+
+
+test('a failed previous-result deletion survives replacement by a newer host input', async ({ page }) => {
+  const widget = await open(page, '?pair&slowdeletefail');
+  await expect(widget.locator('.diff-fragment')).toBeVisible();
+  await widget.getByRole('button', { name: 'Compare', exact: true }).click();
+  await expect.poll(async () => (await calls(page)).some(x => x.name === 'text.diff.delete')).toBe(true);
+  await page.evaluate(() => window.dispatchEvent(new Event('replace-comparison')));
+  await expect(widget.getByRole('button', { name: 'Clear', exact: true })).toBeEnabled();
+  await expect(widget.locator('.diff-fragment')).toContainText('Replacement before');
+  await widget.getByRole('button', { name: 'Clear', exact: true }).click();
+  await expect(widget.getByLabel('Before text', { exact: true })).toHaveValue('');
+  const deleted = (await calls(page)).filter(x => x.name === 'text.diff.delete');
+  expect(deleted).toHaveLength(3);
+  expect(deleted[1].arguments.comparison_id).toBe(deleted[0].arguments.comparison_id);
+  expect(deleted[2].arguments.comparison_id).toBe('f'.repeat(64));
+});
+
+
+test('host replacement preserves cleanup ownership of the previously displayed comparison', async ({ page }) => {
+  const widget = await open(page);
+  await widget.getByLabel('Before text', { exact: true }).fill('old');
+  await widget.getByRole('button', { name: 'Compare', exact: true }).click();
+  await expect(widget.getByRole('button', { name: 'Compare', exact: true })).toBeEnabled();
+  await page.evaluate(() => window.dispatchEvent(new Event('replace-comparison')));
+  await expect(widget.locator('.diff-fragment')).toContainText('Replacement before');
+  await widget.getByRole('button', { name: 'Clear', exact: true }).click();
+  await expect(widget.getByLabel('Before text', { exact: true })).toHaveValue('');
+  const deleted = (await calls(page)).filter(x => x.name === 'text.diff.delete');
+  expect(deleted).toHaveLength(2);
+  expect(deleted[0].arguments.comparison_id).not.toBe('f'.repeat(64));
+  expect(deleted[1].arguments.comparison_id).toBe('f'.repeat(64));
 });

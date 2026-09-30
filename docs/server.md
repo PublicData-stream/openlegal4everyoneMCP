@@ -354,8 +354,14 @@ metadata requirements remain unchanged.
 
 `[text_diff]` registers `text.diff`, `text.apply_patch`, `text.diff.show`,
 `text.diff.page`, `text.diff.delete`, and the managed `text.attachment.*` helpers.
-Existing comparison tool names and schemas remain compatibility wrappers. See
-[text comparison](text-diff.md) for exact algorithms, patch restrictions and budgets.
+The original `compare_texts`, `show_text_diff`, `get_text_diff_page`, and
+`delete_text_diff` names are removed from discovery and dispatch. Callers migrate
+to the `text.diff` family; comparison creation now returns
+`{schema_version, comparison, patch, explanation}` and clients manage comparison
+and patch lifetimes independently. Snapshot comparisons retain their direct-summary
+result and use `text.diff.delete` for cleanup. See
+[text comparison](text-diff.md) for the migration mapping, algorithms, patch
+restrictions and budgets.
 
 `[database]` additionally registers the six database operations, `database.show`,
 `database.request_collection`, `database.collection_status`, and the read-only

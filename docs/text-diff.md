@@ -56,15 +56,15 @@ styles and license locally, with no external origins allowed by their MCP CSP.
 
 ## MCP contract
 
-All four tools share one application service across HTTP and native WebTransport.
+The `text` tools share one application service across HTTP and native WebTransport.
 Object outputs carry `schema_version: 1`.
 
 | Tool | Input and output |
 | --- | --- |
-| `compare_texts` | Required `before` and `after` strings; optional `before_label` and `after_label`. Returns a summary with `comparison_id`, expiry, byte/line/newline information, additions/deletions, equality and change-page count. |
-| `show_text_diff` | Either `{}`, a before/after pair with optional labels, or `comparison_id` alone. Returns `{schema_version, comparison}`; null comparison opens an empty editor. Only this tool advertises the UI resource. |
-| `get_text_diff_page` | `comparison_id`, zero-based `page`, and `view` (`changes`, `before`, `after`). Returns numbered changes or original text chunks, with `total_pages`. |
-| `delete_text_diff` | `comparison_id`. Returns `{schema_version: 1, deleted: true}` even when the well-formed handle is already absent. |
+| `text.diff` | Required `before` and `after` strings or text attachment references; optional `before_label` and `after_label`. Returns `{schema_version, comparison, patch, explanation}`. The nested comparison summary contains `comparison_id`, expiry, byte/line/newline information, additions/deletions, equality and change-page count; `patch` is a sealed complete-patch attachment. |
+| `text.diff.show` | Either `{}`, a before/after pair with optional labels, or `comparison_id` alone. Returns `{schema_version, comparison}`; null comparison opens an empty editor. Only this tool advertises the UI resource. |
+| `text.diff.page` | `comparison_id`, zero-based `page`, and `view` (`changes`, `before`, `after`). Returns numbered changes or original text chunks, with `total_pages`. |
+| `text.diff.delete` | `comparison_id`. Returns `{schema_version: 1, deleted: true}` even when the well-formed handle is already absent. |
 
 The resource URI is `ui://openlegal/text-diff-v1.html`, MIME
 `text/html;profile=mcp-app`. Missing/expired handles have the same sanitized read
@@ -158,16 +158,23 @@ errors. Lengths, EOF, process status, source correspondence and annotation bound
 are checked. Both pipe input/output and process completion are supervised to avoid
 pipe deadlocks. The worker does not spawn descendants.
 
-Clear is disabled while creation is unresolved. It invalidates page requests and
-deletes the current result before reporting success; deletion failure leaves a
-retry action. Recomparison deletes the previous widget result before creating its
-replacement. Deletion prevents subsequent reads but cannot retract content already
-returned to another client. Closing a widget is not a reliable deletion signal;
+The comparison widget deletes the unused patch attachment promptly after creating
+its comparison. Comparison and patch handles have independent lifetimes: deleting
+one never deletes the other. A failed patch deletion leaves the comparison usable,
+retains the attachment for **Clear** to retry, and blocks another comparison until
+cleanup succeeds. Clear is disabled while creation is unresolved. It invalidates
+page requests and deletes every outstanding comparison and patch handle before
+reporting success; partial deletion records each success and retains failed handles
+for retry. Recomparison resolves outstanding cleanup and deletes the previous
+widget result before creating its replacement. Cancelled and stale successful
+responses also clean up both returned handles. Deletion prevents subsequent reads
+but cannot retract content already returned to another client. Closing a widget is not a reliable deletion signal;
 fixed expiry remains the fallback.
 
-`delete_text_diff` and its `text.diff.delete` alias are built-in mutation exceptions
-alongside the temporary attachment upload/deletion tools described below. Their annotations declare
-read-only false, destructive true, idempotent true and open-world false. Generic
+`text.diff.delete` and `text.attachment.delete` are built-in mutation exceptions.
+Their annotations declare read-only false, destructive true, idempotent true and
+open-world false. Attachment upload is another narrow exception, with its distinct
+annotations described below. Generic
 extension registration still requires read-only behavior. This exception does not
 authorize repository changes, provider writes, or general administration.
 
@@ -193,21 +200,35 @@ With PostgreSQL + BlobStore persistence enabled, the record history tool can res
 snapshots of the same record and call the existing comparison service. The exact
 projection is title, two LF bytes, then body. See the [history contract](persistence.md#history-and-comparisons).
 The optional summary `origin` is server-derived and retained with the transient
-comparison. `compare_texts` does not accept this field. Editing creates a supplied-
-text comparison without a verified historical association. Original source payloads
+comparison. `text.diff` does not accept this field. Snapshot comparison still returns
+its summary directly, rather than the `text.diff` envelope, and has no patch
+attachment. Editing creates a supplied-text comparison without a verified
+historical association. Original source payloads
 remain governed by L2 retention; comparison text and metadata expire after ten
 minutes even if the source snapshots are already evicted.
 
 ## Canonical text tools and temporary attachments
 
-The canonical API adds `text.diff`, `text.apply_patch`, `text.diff.show`,
-`text.diff.page`, and `text.diff.delete`. The four original tool names remain
-available with their original input/output shapes; the namespaced show/page/delete
-helpers have the same contracts. `text.diff` accepts `before` and `after` as UTF-8
+The API uses `text.diff`, `text.apply_patch`, `text.diff.show`, `text.diff.page`,
+and `text.diff.delete`. The four original comparison names are removed from
+discovery and dispatch, without compatibility wrappers:
+
+| Removed name | Replacement |
+| --- | --- |
+| `compare_texts` | `text.diff` |
+| `show_text_diff` | `text.diff.show` |
+| `get_text_diff_page` | `text.diff.page` |
+| `delete_text_diff` | `text.diff.delete` |
+
+Calls to removed names return the unknown-tool JSON-RPC error `-32602` on both
+supported revisions and transports. This breaks callers using the former names;
+clients migrating `compare_texts` must also extract the nested `comparison` and
+manage the independently retained `patch`. `text.diff` accepts `before` and `after` as UTF-8
 strings, `{ "attachment_id": "<handle>" }`, or a complete returned text attachment
 object, plus optional display labels. Its
-result contains `comparison`, a sealed `patch` attachment, and a deterministic
-`explanation` of the line/scalar algorithm described above. The patch attachment
+versioned result contains `{schema_version: 1, comparison, patch, explanation}`:
+`comparison` is the summary, `patch` a sealed attachment, and `explanation` a
+deterministic description of the line/scalar algorithm described above. The patch attachment
 contains one complete unified patch; concatenating display fragments is not a
 substitute. Equal texts export an empty no-op patch. Comparison and patch handles
 are independently deletable and expire ten minutes after their publication.

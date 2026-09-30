@@ -229,7 +229,7 @@ async fn changes_reversions_exact_history_and_comparison_preserve_capture_origin
     assert_eq!(summary["origin"]["projection"], "title_lf_lf_body_v1");
     let original = call(
         &url,
-        "get_text_diff_page",
+        "text.diff.page",
         json!({"comparison_id":summary["comparison_id"],"view":"before","page":0}),
     )
     .await;
@@ -239,7 +239,7 @@ async fn changes_reversions_exact_history_and_comparison_preserve_capture_origin
     );
     let shown = call(
         &url,
-        "show_text_diff",
+        "text.diff.show",
         json!({"comparison_id":summary["comparison_id"]}),
     )
     .await;
@@ -249,8 +249,26 @@ async fn changes_reversions_exact_history_and_comparison_preserve_capture_origin
     );
     let wrong = call(&url,"demo_compare_record_snapshots",json!({"source":"layout_a","id":"002","before_snapshot_id":first,"after_snapshot_id":second})).await;
     assert_eq!(wrong["isError"], true);
-    let supplied = call(&url, "compare_texts", json!({"before":"a","after":"b"})).await;
-    assert!(supplied["structuredContent"].get("origin").is_none());
+    let supplied = call(&url, "text.diff", json!({"before":"a","after":"b"})).await;
+    assert!(
+        supplied["structuredContent"]["comparison"]
+            .get("origin")
+            .is_none()
+    );
+    let deleted_patch = call(
+        &url,
+        "text.attachment.delete",
+        supplied["structuredContent"]["patch"].clone(),
+    )
+    .await;
+    assert_eq!(deleted_patch["structuredContent"]["deleted"], true);
+    let deleted_comparison = call(
+        &url,
+        "text.diff.delete",
+        json!({"comparison_id": supplied["structuredContent"]["comparison"]["comparison_id"]}),
+    )
+    .await;
+    assert_eq!(deleted_comparison["structuredContent"]["deleted"], true);
     assert_eq!(
         calls.load(Ordering::SeqCst),
         4,

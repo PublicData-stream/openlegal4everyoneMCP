@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from '@modelcontextprotocol/ext-apps';
 import { SourceOffer } from './SourceOffer.tsx';
-import { decodeFile, DiffResponseError, editAsLf, MAX_TEXT_BYTES, parseCompare, parseDelete, parsePage, parsePair, parseShow, utf8Length, validateLabel, validateText, type Comparison, type DiffPage, type PageView, type TextPair } from './text-diff-model.ts';
+import { decodeFile, DiffResponseError, editAsLf, MAX_TEXT_BYTES, parseDiff, parseDelete, parsePage, parsePair, parseShow, utf8Length, validateLabel, validateText, type Comparison, type DiffPage, type PageView, type TextPair } from './text-diff-model.ts';
 import './style.css';
 import './text-diff.css';
 import { TextPatchPanel } from './TextPatchPanel.tsx';
@@ -41,6 +41,7 @@ function TextComparison() {
   // its response is consumed and any late handle is deleted or retained for retry.
   const creation = useRef<{ cancelled: boolean } | null>(null);
   const pendingDeletion = useRef(new Map<string, Comparison>());
+  const pendingPatches = useRef(new Set<string>());
   const expired = comparison !== null && now >= comparison.expires_at * 1000;
   useEffect(() => {
     const width = matchMedia('(min-width: 900px)');
@@ -54,6 +55,7 @@ function TextComparison() {
   useEffect(() => {
     live.current = true;
     bridge.ontoolinput = input => {
+      if (current.current) pendingDeletion.current.set(current.current.comparison_id, current.current);
       serial.current++; fileSerial.current.before++; fileSerial.current.after++;
       initialHandle.current = null;
       if (!creation.current) setBusy(null); setPageBusy(false); setPage(null); setComparison(null); setError('');
@@ -67,6 +69,7 @@ function TextComparison() {
       } catch (error) { setError(error instanceof Error ? error.message : 'The supplied texts could not be opened.'); }
     };
     bridge.ontoolresult = result => {
+      if (current.current) pendingDeletion.current.set(current.current.comparison_id, current.current);
       serial.current++;
       if (!creation.current) setBusy(null); setPageBusy(false); setPage(null); setView('changes'); setPageIndex(0); setError('');
       try {
@@ -75,6 +78,7 @@ function TextComparison() {
           pendingDeletion.current.set(summary.comparison_id, summary);
           throw new DiffResponseError('The supplied-text response contained unexpected historical metadata. Use Clear to delete its retained result.');
         }
+        if (summary) pendingDeletion.current.delete(summary.comparison_id);
         setComparison(summary); setDirty(false); setNow(Date.now());
         if (!summary) setPair(blank());
         else if (!suppliedPair.current) setPair(null);
@@ -97,7 +101,7 @@ function TextComparison() {
     const request = ++serial.current;
     const expected = { comparison_id: comparison.comparison_id, view, page: pageIndex };
     setPage(null); setPageBusy(true);
-    void bridge.callServerTool({ name: 'get_text_diff_page', arguments: expected }, { timeout: 15000 }).then(result => {
+    void bridge.callServerTool({ name: 'text.diff.page', arguments: expected }, { timeout: 15000 }).then(result => {
       if (!live.current || request !== serial.current) return;
       const parsed = parsePage(result, expected);
       if (view === 'changes' && parsed.total_pages !== comparison.change_pages) throw new DiffResponseError('The server returned inconsistent comparison pages.');
@@ -119,12 +123,30 @@ function TextComparison() {
     } catch (error) { if (live.current && request === fileSerial.current[side]) setError(error instanceof Error ? error.message : 'The file could not be read.'); }
   }
   async function remove(summary: Comparison, request: number): Promise<boolean> {
-    const result = await bridge.callServerTool({ name: 'delete_text_diff', arguments: { comparison_id: summary.comparison_id } }, { timeout: 15000 });
+    parseDelete(await bridge.callServerTool({ name: 'text.diff.delete', arguments: { comparison_id: summary.comparison_id } }, { timeout: 15000 }));
+    // Record server cleanup even when a newer host input invalidated the display.
+    pendingDeletion.current.delete(summary.comparison_id);
     if (!live.current || request !== serial.current) return false;
-    parseDelete(result);
     setComparison(previous => previous?.comparison_id === summary.comparison_id ? null : previous);
     if (current.current?.comparison_id === summary.comparison_id) setPage(null);
     return true;
+  }
+  async function removePatch(id: string) {
+    parseDelete(await bridge.callServerTool({ name: 'text.attachment.delete', arguments: { attachment_id: id } }, { timeout: 15000 }));
+    pendingPatches.current.delete(id);
+  }
+  async function cleanupCreated() {
+    // Try every capability; a failed deletion must not prevent independent cleanup.
+    let failed = false;
+    for (const id of [...pendingPatches.current]) { try { await removePatch(id); } catch { failed = true; } }
+    for (const summary of [...pendingDeletion.current.values()]) {
+      try {
+        parseDelete(await bridge.callServerTool({ name: 'text.diff.delete', arguments: { comparison_id: summary.comparison_id } }, { timeout: 15000 }));
+        pendingDeletion.current.delete(summary.comparison_id);
+        if (live.current) setComparison(previous => previous?.comparison_id === summary.comparison_id ? null : previous);
+      } catch { failed = true; }
+    }
+    return !failed;
   }
   async function compare() {
     if (!pairRef.current || !ready || busyRef.current || creation.current) return;
@@ -136,48 +158,52 @@ function TextComparison() {
     creation.current = operation;
     fileSerial.current.before++; fileSerial.current.after++;
     setBusy('compare'); setPageBusy(false); setError('');
+    let received = false;
     try {
-      for (const retained of pendingDeletion.current.values()) {
-        if (!(await remove(retained, request))) return;
-        pendingDeletion.current.delete(retained.comparison_id);
+      if (!(await cleanupCreated())) throw new DiffResponseError('Temporary text could not be deleted. Retry Clear before comparing again.');
+      if (!live.current || operation.cancelled || request !== serial.current) return;
+      if (current.current) {
+        const previous = current.current;
+        pendingDeletion.current.set(previous.comparison_id, previous);
+        if (!(await remove(previous, request))) return;
       }
-      if (current.current && !(await remove(current.current, request))) return;
       if (operation.cancelled || request !== serial.current) return;
-      const result = await bridge.callServerTool({ name: 'compare_texts', arguments: { ...input } }, { timeout: 30000 });
-      if (!live.current) return;
-      const summary = parseCompare(result);
-      // A newly supplied pair cannot acquire a server-history association. Keep
-      // the validated handle only for cleanup; never render the claimed origin.
-      if (summary.origin) {
-        pendingDeletion.current.set(summary.comparison_id, summary);
-        try {
-          const deletion = await bridge.callServerTool({ name: 'delete_text_diff', arguments: { comparison_id: summary.comparison_id } }, { timeout: 15000 });
-          parseDelete(deletion);
-          pendingDeletion.current.delete(summary.comparison_id);
-        } catch {
-          throw new DiffResponseError('The supplied-text response contained unexpected historical metadata. Retry Clear to delete its retained result.');
-        }
-        throw new DiffResponseError('The supplied-text response contained unexpected historical metadata. Its retained result was deleted.');
-      }
-      if (operation.cancelled || request !== serial.current) {
-        pendingDeletion.current.set(summary.comparison_id, summary);
-        try {
-          const deletion = await bridge.callServerTool({ name: 'delete_text_diff', arguments: { comparison_id: summary.comparison_id } }, { timeout: 15000 });
-          parseDelete(deletion);
-          pendingDeletion.current.delete(summary.comparison_id);
-          if (live.current && operation.cancelled) setError('The request was cancelled. Its retained comparison was deleted.');
-        } catch {
-          if (live.current) {
-            if (!current.current) setComparison(summary);
-            setError('The cancelled comparison could not be deleted. Retry Clear to delete the retained text.');
-          }
-        }
+      const result = await bridge.callServerTool({ name: 'text.diff', arguments: { ...input } }, { timeout: 30000 });
+      received = true;
+      const { comparison: summary, patch } = parseDiff(result, {
+        comparison: value => pendingDeletion.current.set(value.comparison_id, value),
+        patch: value => pendingPatches.current.add(value.attachment_id),
+      });
+      // A newly supplied pair cannot acquire a server-history association.
+      if (summary.origin) throw new DiffResponseError('The supplied-text response contained unexpected historical metadata.');
+      if (!live.current || operation.cancelled || request !== serial.current) {
+        const cleaned = await cleanupCreated();
+        if (live.current && operation.cancelled) setError(cleaned
+          ? 'The request was cancelled. Its retained comparison was deleted.'
+          : 'The cancelled comparison could not be deleted. Retry Clear to delete the retained text.');
         return;
       }
+      // This comparison becomes visible; its unused patch is deleted promptly.
+      pendingDeletion.current.delete(summary.comparison_id);
       setComparison(summary); setView('changes'); setPageIndex(0); setDirty(false); setNow(Date.now());
+      try { await removePatch(patch.attachment_id); }
+      catch { if (live.current && request === serial.current) setError('The unused patch could not be deleted. Retry Clear before comparing again.'); }
+      // Cancellation or a new host input may arrive while patch deletion is pending.
+      if (!live.current || operation.cancelled || request !== serial.current) {
+        pendingDeletion.current.set(summary.comparison_id, summary);
+        const cleaned = await cleanupCreated();
+        if (live.current && operation.cancelled) {
+          if (cleaned) setComparison(previous => previous?.comparison_id === summary.comparison_id ? null : previous);
+          setError(cleaned ? 'The request was cancelled. Its retained comparison was deleted.' : 'The cancelled comparison could not be deleted. Retry Clear to delete the retained text.');
+        }
+      }
     } catch (error) {
-      if (live.current && operation.cancelled) setError('The request was cancelled. If the host lost its response, any retained text expires within 10 minutes.');
-      else if (live.current && request === serial.current) setError(message(error, 'The comparison could not be completed. Try again.'));
+      // Malformed responses can still contain valid, independently owned handles.
+      const cleaned = received ? await cleanupCreated() : pendingDeletion.current.size === 0 && pendingPatches.current.size === 0;
+      if (live.current && (operation.cancelled || request === serial.current)) {
+        const detail = message(error, operation.cancelled ? 'The request was cancelled. If the host lost its response, any retained text expires within 10 minutes.' : 'The comparison could not be completed. Try again.');
+        setError(cleaned || detail.includes('Retry Clear') ? detail : `${detail} Retry Clear to delete retained text.`);
+      }
     }
     finally {
       if (creation.current === operation) { creation.current = null; if (live.current) setBusy(null); }
@@ -185,19 +211,16 @@ function TextComparison() {
   }
   async function clear() {
     if (busyRef.current || creation.current) return;
-    if ((current.current || pendingDeletion.current.size) && !ready) { setError('Reconnect the host to delete the retained comparison, or wait for its expiry.'); return; }
+    if ((current.current || pendingDeletion.current.size || pendingPatches.current.size) && !ready) { setError('Reconnect the host to delete the retained text, or wait for its expiry.'); return; }
     const request = ++serial.current;
     fileSerial.current.before++; fileSerial.current.after++;
     setBusy('delete'); setPageBusy(false); setError('');
+    if (current.current) pendingDeletion.current.set(current.current.comparison_id, current.current);
     try {
-      const retained = new Map(pendingDeletion.current);
-      if (current.current) retained.set(current.current.comparison_id, current.current);
-      for (const summary of retained.values()) {
-        if (!(await remove(summary, request))) return;
-        pendingDeletion.current.delete(summary.comparison_id);
-      }
-      setPair(blank()); setPage(null); setView('changes'); setPageIndex(0); setDirty(false);
-    } catch (error) { if (live.current && request === serial.current) setError(`${message(error, 'The retained comparison could not be deleted.')} Clear has not completed; retry Clear.`); }
+      if (!(await cleanupCreated())) throw new DiffResponseError('The retained text could not be deleted.');
+      if (!live.current || request !== serial.current) return;
+      setComparison(null); setPair(blank()); setPage(null); setView('changes'); setPageIndex(0); setDirty(false);
+    } catch (error) { if (live.current && request === serial.current) setError(`${message(error, 'The retained text could not be deleted.')} Clear has not completed; retry Clear.`); }
     finally { if (live.current && request === serial.current) setBusy(null); }
   }
   async function loadSources() {
@@ -211,7 +234,7 @@ function TextComparison() {
         let total = 1;
         for (let index = 0; index < total; index++) {
           const expected = { comparison_id: summary.comparison_id, view: side, page: index };
-          const result = await bridge.callServerTool({ name: 'get_text_diff_page', arguments: expected }, { timeout: 15000 });
+          const result = await bridge.callServerTool({ name: 'text.diff.page', arguments: expected }, { timeout: 15000 });
           if (!live.current || request !== serial.current) return;
           const chunk = parsePage(result, expected);
           if (index > 0 && chunk.total_pages !== total) throw new DiffResponseError('The server returned inconsistent source pages.');

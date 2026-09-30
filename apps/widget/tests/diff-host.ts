@@ -49,25 +49,32 @@ bridge.oncalltool = async ({ name, arguments: args }) => {
     return result({ schema_version: 1, attachment: entry.summary, offset: 0, next_offset: entry.summary.total_bytes, complete: true, text: entry.text });
   }
   if (name === 'text.attachment.delete') {
-    if (params.has('patchdeletefail') && attachmentDeletions++ === 0) return failure();
+    if (params.has('slowpatchdelete')) await new Promise(resolve => setTimeout(resolve, 350));
+    if ((params.has('patchdeletefail') && attachmentDeletions++ === 0) || params.has('patchdeletealwaysfails')) return failure();
     attachments.delete(String(input.attachment_id));
     return result({ schema_version: 1, deleted: true });
   }
-  if (name === 'compare_texts') {
+  if (name === 'text.diff') {
     if (input.before === 'slow') await new Promise(resolve => setTimeout(resolve, 350));
     if (input.before === 'error') return failure();
     const summary = retain(String(input.before), String(input.after));
     summary.before.label = String(input.before_label ?? 'Before');
     summary.after.label = String(input.after_label ?? 'After');
     if (params.has('injectorigin')) summary.origin = { source: 'layout_a', record_id: 'forged-history', projection: 'title_lf_lf_body_v1', before: { snapshot_id: 'a'.repeat(64), sequence: 1, captured_at: 100, processor_version: '0.9.0', schema_version: 1, payload_sha256: 'c'.repeat(64) }, after: { snapshot_id: 'b'.repeat(64), sequence: 2, captured_at: 200, processor_version: '1.0.0', schema_version: 1, payload_sha256: 'd'.repeat(64) } };
-    return result(input.before === 'malformed' ? { schema_version: 9 } : summary);
+    const id = (++attachmentCounter).toString(16).padStart(64, '0');
+    const text = summary.equal ? '' : '--- before\n+++ after\n';
+    const bytes = new TextEncoder().encode(text).length;
+    const patch = { schema_version: 1, attachment_id: id, kind: 'patch' as const, total_bytes: bytes, committed_bytes: bytes, sealed: true, expires_at: summary.expires_at };
+    attachments.set(id, { summary: patch, text });
+    return result({ schema_version: input.before === 'malformed' ? 9 : 1, comparison: summary, patch: params.has('badpatch') ? { ...patch, sealed: false } : params.has('wrongpatchkind') ? { ...patch, kind: 'text' } : patch, explanation: params.has('badexplanation') ? 17 : 'Rust Myers line and Unicode scalar comparison.' });
   }
-  if (name === 'delete_text_diff') {
+  if (name === 'text.diff.delete') {
+    if (params.has('slowdeletefail')) { await new Promise(resolve => setTimeout(resolve, 350)); if (deletions++ === 0) return failure(); }
     if (params.has('deletefail') && deletions++ === 0) return failure();
     records.delete(String(input.comparison_id));
     return result({ schema_version: 1, deleted: true });
   }
-  if (name === 'get_text_diff_page') {
+  if (name === 'text.diff.page') {
     if (params.has('slowpage')) await new Promise(resolve => setTimeout(resolve, 400));
     const record = records.get(String(input.comparison_id));
     if (!record) return failure();
@@ -112,6 +119,11 @@ bridge.oninitialized = async () => {
     await bridge.sendToolResult(result(params.has('malformed') ? { comparison: null } : { schema_version: 1, comparison: null }));
   }
 };
+window.addEventListener('replace-comparison', () => { void (async () => {
+  const summary = retain('Replacement before\n', 'Replacement after\n', 'f'.repeat(64));
+  await bridge.sendToolInput({ arguments: { comparison_id: summary.comparison_id } });
+  await bridge.sendToolResult(result({ schema_version: 1, comparison: summary }));
+})(); });
 window.addEventListener('cancel-comparison', () => { void bridge.sendToolCancelled({ reason: 'Fixture cancellation' }); });
 if (!params.has('disconnected')) await bridge.connect(new PostMessageTransport(iframe.contentWindow!, iframe.contentWindow!));
 iframe.src = '/diff-widget';

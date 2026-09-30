@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { decodeFile, editAsLf, fragmentRows, scalarSegments, splitRows, MAX_LINE_BYTES, MAX_TEXT_BYTES, parseCompare, parseDelete, parsePage, parsePair, parseShow, parseSummary, validateLabel, validateText } from '../src/text-diff-model.ts';
+import { decodeFile, editAsLf, fragmentRows, scalarSegments, splitRows, MAX_LINE_BYTES, MAX_TEXT_BYTES, parseCompare, parseDiff, parseDelete, parsePage, parsePair, parseShow, parseSummary, validateLabel, validateText } from '../src/text-diff-model.ts';
 import { fixtureFragment, fixtureId, fixturePage, fixtureSummary } from './text-diff-fixtures.ts';
 const response = (structuredContent: unknown) => ({ structuredContent });
 const expected = { comparison_id: fixtureId, view: 'changes' as const, page: 0 };
@@ -178,4 +178,26 @@ test('attachment response validator rejects wrong identity and false completion'
   assert.equal(parseAttachmentChunk(response, expected, 0).text, '한');
   assert.throws(() => parseAttachmentChunk({ structuredContent: { ...response.structuredContent, complete: false } }, expected, 0));
   assert.throws(() => parseAttachmentChunk(response, { ...expected, attachment_id: 'b'.repeat(64) }, 0));
+});
+
+
+test('canonical diff parses its nested summary, sealed patch and bounded explanation', () => {
+  const comparison = fixtureSummary('before\n', 'after\n');
+  const patch = { schema_version: 1, attachment_id: 'b'.repeat(64), kind: 'patch', total_bytes: 12, committed_bytes: 12, sealed: true, expires_at: comparison.expires_at };
+  const value = { schema_version: 1, comparison, patch, explanation: 'Rust Myers' };
+  assert.equal(parseDiff(response(value)).comparison.comparison_id, comparison.comparison_id);
+  assert.equal(parseDiff(response(value)).patch.attachment_id, patch.attachment_id);
+  assert.throws(() => parseDiff(response(comparison)));
+  for (const change of [{ schema_version: 2 }, { explanation: 17 }, { explanation: 'x'.repeat(4097) }, { patch: { ...patch, kind: 'text' } }, { patch: { ...patch, sealed: false } }]) assert.throws(() => parseDiff(response({ ...value, ...change })));
+  // A malformed sibling must not lose another fully validated capability.
+  const retained: string[] = [];
+  const handlers = { comparison: (item: ReturnType<typeof parseCompare>) => retained.push(item.comparison_id), patch: (item: { attachment_id: string }) => retained.push(item.attachment_id) };
+  assert.throws(() => parseDiff(response({ ...value, comparison: { schema_version: 9 } }), handlers));
+  assert.deepEqual(retained, [patch.attachment_id]);
+  retained.length = 0;
+  assert.throws(() => parseDiff(response({ ...value, explanation: 17 }), handlers));
+  assert.deepEqual(retained, [comparison.comparison_id, patch.attachment_id]);
+  retained.length = 0;
+  assert.throws(() => parseDiff({ isError: true, structuredContent: value }, handlers));
+  assert.deepEqual(retained, []);
 });

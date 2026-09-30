@@ -242,21 +242,58 @@ async fn text_diff_smoke(
     let listed = rpc(send, reader, budget, revision, "tools/list", json!({})).await?;
     let tools = listed["tools"].as_array().ok_or("tool discovery missing")?;
     for name in [
-        "compare_texts",
-        "show_text_diff",
-        "get_text_diff_page",
-        "delete_text_diff",
+        "text.diff",
+        "text.diff.show",
+        "text.diff.page",
+        "text.diff.delete",
     ] {
         let tool = tools
             .iter()
             .find(|tool| tool["name"] == name)
             .ok_or("comparison tool missing")?;
-        if name == "delete_text_diff"
+        if name == "text.diff.delete"
             && (tool["annotations"]["readOnlyHint"] != false
                 || tool["annotations"]["destructiveHint"] != true
                 || tool["annotations"]["idempotentHint"] != true)
         {
             return Err("deletion annotations disagree with behavior".into());
+        }
+    }
+    for name in [
+        "compare_texts",
+        "show_text_diff",
+        "get_text_diff_page",
+        "delete_text_diff",
+    ] {
+        if tools.iter().any(|tool| tool["name"] == name) {
+            return Err("removed comparison tool remains discoverable".into());
+        }
+        let mut params = json!({"name":name,"arguments":{}});
+        if revision == "2026-07-28" {
+            params["_meta"] = json!({
+                "io.modelcontextprotocol/protocolVersion":revision,
+                "io.modelcontextprotocol/clientInfo":{"name":"openlegal-wt-client","version":"1"},
+                "io.modelcontextprotocol/clientCapabilities":{}
+            });
+        }
+        write_json(
+            send,
+            &json!({"jsonrpc":"2.0","id":19,"method":"tools/call","params":params}),
+            MAX_MESSAGE_BYTES,
+            budget,
+            Duration::from_secs(10),
+        )
+        .await?;
+        let frame = reader
+            .read()
+            .await?
+            .ok_or("removed-tool response missing")?;
+        let response: Value = serde_json::from_slice(&frame.bytes)?;
+        if response["id"] != 19
+            || response["error"]["code"] != -32602
+            || response.get("result").is_some()
+        {
+            return Err("removed comparison tool did not return -32602".into());
         }
     }
     let blank = rpc(
@@ -265,15 +302,25 @@ async fn text_diff_smoke(
         budget,
         revision,
         "tools/call",
-        json!({"name":"show_text_diff","arguments":{}}),
+        json!({"name":"text.diff.show","arguments":{}}),
     )
     .await?;
-    if !blank["structuredContent"]["comparison"].is_null() {
+    if blank["structuredContent"]["schema_version"] != 1
+        || !blank["structuredContent"]["comparison"].is_null()
+    {
         return Err("blank comparison editor missing".into());
     }
-    let compared = rpc(send, reader, budget, revision, "tools/call",
-        json!({"name":"compare_texts","arguments":{"before":"first\nold\n","after":"first\nnew\n"}})).await?;
-    let summary = &compared["structuredContent"];
+    let compared = rpc(
+        send,
+        reader,
+        budget,
+        revision,
+        "tools/call",
+        json!({"name":"text.diff","arguments":{"before":"first\nold\n","after":"first\nnew\n"}}),
+    )
+    .await?;
+    let summary =
+        comparison_summary_and_delete_patch(send, reader, budget, revision, &compared).await?;
     if summary["schema_version"] != 1
         || summary["equal"] != false
         || summary["additions"] != 1
@@ -290,15 +337,17 @@ async fn text_diff_smoke(
         budget,
         revision,
         "tools/call",
-        json!({"name":"show_text_diff","arguments":{"comparison_id":handle}}),
+        json!({"name":"text.diff.show","arguments":{"comparison_id":handle}}),
     )
     .await?;
-    if shown["structuredContent"]["comparison"]["comparison_id"] != handle {
+    if shown["structuredContent"]["schema_version"] != 1
+        || shown["structuredContent"]["comparison"]["comparison_id"] != handle
+    {
         return Err("existing comparison editor mismatch".into());
     }
     for view in ["changes", "before", "after"] {
         let result = rpc(send, reader, budget, revision, "tools/call",
-            json!({"name":"get_text_diff_page","arguments":{"comparison_id":handle,"view":view,"page":0}})).await?;
+            json!({"name":"text.diff.page","arguments":{"comparison_id":handle,"view":view,"page":0}})).await?;
         let page = &result["structuredContent"];
         if page["schema_version"] != 1
             || page["comparison_id"] != handle
@@ -341,7 +390,7 @@ async fn text_diff_smoke(
             budget,
             revision,
             "tools/call",
-            json!({"name":"delete_text_diff","arguments":{"comparison_id":handle}}),
+            json!({"name":"text.diff.delete","arguments":{"comparison_id":handle}}),
         )
         .await?;
         if deleted["structuredContent"]["schema_version"] != 1
@@ -359,11 +408,13 @@ async fn text_diff_smoke(
         budget,
         revision,
         "tools/call",
-        json!({"name":"compare_texts","arguments":{"before":large,"after":large}}),
+        json!({"name":"text.diff","arguments":{"before":large,"after":large}}),
     )
     .await?;
-    let summary = &maximum["structuredContent"];
-    if summary["equal"] != true
+    let summary =
+        comparison_summary_and_delete_patch(send, reader, budget, revision, &maximum).await?;
+    if summary["schema_version"] != 1
+        || summary["equal"] != true
         || summary["before"]["bytes"] != 1024 * 1024
         || summary["after"]["bytes"] != 1024 * 1024
         || summary["additions"] != 0
@@ -377,10 +428,12 @@ async fn text_diff_smoke(
         budget,
         revision,
         "tools/call",
-        json!({"name":"delete_text_diff","arguments":{"comparison_id":summary["comparison_id"]}}),
+        json!({"name":"text.diff.delete","arguments":{"comparison_id":summary["comparison_id"]}}),
     )
     .await?;
-    if deleted["structuredContent"]["deleted"] != true {
+    if deleted["structuredContent"]["schema_version"] != 1
+        || deleted["structuredContent"]["deleted"] != true
+    {
         return Err("maximum input result deletion failed".into());
     }
     let server_info = rpc(
@@ -424,6 +477,48 @@ async fn text_diff_smoke(
     }
     println!("WebTransport {revision}: comparison lifecycle, maximum inputs and resource verified");
     Ok(())
+}
+
+async fn comparison_summary_and_delete_patch<'a>(
+    send: &mut wtransport::SendStream,
+    reader: &mut FrameReader<wtransport::RecvStream>,
+    budget: &Arc<Semaphore>,
+    revision: &str,
+    result: &'a Value,
+) -> Result<&'a Value, ServerError> {
+    let value = &result["structuredContent"];
+    let patch = &value["patch"];
+    if value["schema_version"] != 1
+        || value["comparison"]["schema_version"] != 1
+        || patch["schema_version"] != 1
+        || patch["kind"] != "patch"
+        || patch["sealed"] != true
+        || patch["total_bytes"].as_u64().is_none()
+        || patch["total_bytes"] != patch["committed_bytes"]
+        || !value["explanation"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    {
+        return Err("text.diff envelope mismatch".into());
+    }
+    let handle = patch["attachment_id"]
+        .as_str()
+        .ok_or("patch attachment handle missing")?;
+    let deleted = rpc(
+        send,
+        reader,
+        budget,
+        revision,
+        "tools/call",
+        json!({"name":"text.attachment.delete","arguments":{"attachment_id":handle}}),
+    )
+    .await?;
+    if deleted["structuredContent"]["schema_version"] != 1
+        || deleted["structuredContent"]["deleted"] != true
+    {
+        return Err("patch attachment cleanup failed".into());
+    }
+    Ok(&value["comparison"])
 }
 
 async fn exchange(
@@ -521,7 +616,7 @@ async fn history_smoke(
         budget,
         revision,
         "tools/call",
-        json!({"name":"delete_text_diff","arguments":{"comparison_id":summary["comparison_id"]}}),
+        json!({"name":"text.diff.delete","arguments":{"comparison_id":summary["comparison_id"]}}),
     )
     .await?;
     if deleted["structuredContent"]["deleted"] != true {

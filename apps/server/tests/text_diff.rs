@@ -6,11 +6,11 @@ use openlegal_server::{
     config::{AccessPolicy, Limits, SourceOffer},
     demo::DemoTools,
     http::HttpEndpoint,
-    registry::server_info_registry,
+    registry::{ToolOptions, ToolOutput, ToolRegistry, server_info_registry},
     resources::ResourceRegistry,
     text_diff::{TextDiffTools, WIDGET_URI},
 };
-use rmcp::model::{Resource, ResourceContents};
+use rmcp::model::{Resource, ResourceContents, ToolAnnotations};
 use serde_json::{Value, json};
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -125,7 +125,7 @@ impl Server {
                 "io.modelcontextprotocol/clientCapabilities": {}
             });
         }
-        let bounded_page = method == "tools/call" && params["name"] == "get_text_diff_page";
+        let bounded_page = method == "tools/call" && params["name"] == "text.diff.page";
         let mut request = reqwest::Client::new()
             .post(&self.url)
             .header("host", "diff.test")
@@ -183,6 +183,16 @@ impl Server {
         .await
     }
 
+    async fn compare(&self, version: &str, arguments: Value) -> Value {
+        let diff = self.successful_call(version, "text.diff", arguments).await;
+        assert!(diff["explanation"].as_str().unwrap().contains("Myers"));
+        assert_eq!(diff["patch"]["kind"], "patch");
+        assert_eq!(diff["patch"]["sealed"], true);
+        self.successful_call(version, "text.attachment.delete", diff["patch"].clone())
+            .await;
+        diff["comparison"].clone()
+    }
+
     async fn successful_call(&self, version: &str, name: &str, arguments: Value) -> Value {
         let response = self.call(version, name, arguments).await;
         assert!(response.get("error").is_none(), "{response}");
@@ -192,42 +202,116 @@ impl Server {
     }
 }
 
+#[test]
+fn extension_registration_cannot_acquire_transient_mutation_permissions() {
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct Input {
+        value: bool,
+    }
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Output {
+        value: bool,
+    }
+    for name in [
+        "delete_text_diff",
+        "text.diff.delete",
+        "text.attachment.delete",
+        "text.attachment.upload",
+    ] {
+        let mut registry = ToolRegistry::new();
+        let annotations =
+            ToolAnnotations::from_raw(None, Some(false), Some(true), Some(true), Some(false));
+        let ordinary = registry.register_with_annotations::<Input, _, _>(
+            name,
+            "Synthetic mutation fixture",
+            annotations.clone(),
+            |input, _| async move { Ok(json!({"value": input.value})) },
+        );
+        assert_eq!(
+            ordinary.unwrap_err().to_string(),
+            "anonymous extension tools must be read-only"
+        );
+        let typed = registry.register_typed::<Input, Output, _, _>(
+            name,
+            "Synthetic mutation fixture",
+            ToolOptions {
+                annotations,
+                meta: None,
+            },
+            |input, _| async move { Ok(ToolOutput::new(Output { value: input.value })) },
+        );
+        assert_eq!(
+            typed.unwrap_err().to_string(),
+            "anonymous extension tools must be read-only"
+        );
+
+        // The same object fixtures and names are accepted when accurately read-only.
+        registry
+            .register::<Input, _, _>(name, "Synthetic read-only fixture", |input, _| async move {
+                Ok(json!({"value": input.value}))
+            })
+            .unwrap();
+        let mut typed_registry = ToolRegistry::new();
+        typed_registry
+            .register_typed::<Input, Output, _, _>(
+                name,
+                "Synthetic read-only fixture",
+                ToolOptions::default(),
+                |input, _| async move { Ok(ToolOutput::new(Output { value: input.value })) },
+            )
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn independent_comparison_tools_have_typed_schemas_and_accurate_deletion_annotations() {
     let server = Server::start(false).await;
     for version in ["2025-11-25", "2026-07-28"] {
         let listed = server.rpc(version, "tools/list", json!({})).await;
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 9);
         assert!(
             tools
                 .iter()
                 .all(|tool| !tool["name"].as_str().unwrap().starts_with("demo_"))
         );
         for name in [
-            "compare_texts",
-            "show_text_diff",
-            "get_text_diff_page",
-            "delete_text_diff",
+            "text.diff",
+            "text.diff.show",
+            "text.diff.page",
+            "text.diff.delete",
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["inputSchema"]["type"], "object");
             assert_eq!(tool["outputSchema"]["type"], "object");
             assert_eq!(
                 tool["annotations"]["readOnlyHint"],
-                name != "delete_text_diff"
+                name != "text.diff.delete"
             );
-            if name == "delete_text_diff" {
+            if name == "text.diff.delete" {
                 assert_eq!(tool["annotations"]["destructiveHint"], true);
                 assert_eq!(tool["annotations"]["idempotentHint"], true);
                 assert_eq!(tool["annotations"]["openWorldHint"], false);
             }
-            if name == "show_text_diff" {
+            if name == "text.diff.show" {
                 assert_eq!(tool["_meta"]["ui"]["resourceUri"], WIDGET_URI);
             }
         }
+        for (removed, arguments) in [
+            ("compare_texts", json!({"before":"a", "after":"b"})),
+            ("show_text_diff", json!({})),
+            (
+                "get_text_diff_page",
+                json!({"comparison_id":"a".repeat(64), "page":0}),
+            ),
+            ("delete_text_diff", json!({"comparison_id":"a".repeat(64)})),
+        ] {
+            assert!(tools.iter().all(|tool| tool["name"] != removed));
+            let response = server.call(version, removed, arguments).await;
+            assert_eq!(response["error"]["code"], -32602, "{removed}: {response}");
+        }
         let blank = server
-            .successful_call(version, "show_text_diff", json!({}))
+            .successful_call(version, "text.diff.show", json!({}))
             .await;
         assert_eq!(blank["comparison"], Value::Null);
         let resources = server.rpc(version, "resources/list", json!({})).await;
@@ -246,7 +330,7 @@ async fn both_revisions_compare_page_reopen_and_delete_without_demo() {
     for version in ["2025-11-25", "2026-07-28"] {
         let before = format!("\u{feff}{}tail", "법률 😀\r\n".repeat(6000));
         let after = before.replace("tail", "updated");
-        let summary = server.successful_call(version, "compare_texts", json!({
+        let summary = server.compare(version, json!({
             "before":before, "after":after, "before_label":"../../Before", "after_label":"After"
         })).await;
         assert_eq!(summary["equal"], false);
@@ -266,7 +350,7 @@ async fn both_revisions_compare_page_reopen_and_delete_without_demo() {
                 let page = server
                     .successful_call(
                         version,
-                        "get_text_diff_page",
+                        "text.diff.page",
                         json!({"comparison_id":handle,"view":view,"page":number}),
                     )
                     .await;
@@ -289,7 +373,7 @@ async fn both_revisions_compare_page_reopen_and_delete_without_demo() {
         let changes = server
             .successful_call(
                 version,
-                "get_text_diff_page",
+                "text.diff.page",
                 json!({"comparison_id":handle,"page":0}),
             )
             .await;
@@ -298,7 +382,7 @@ async fn both_revisions_compare_page_reopen_and_delete_without_demo() {
         assert!(fragment["patch"].as_str().unwrap().contains("+updated"));
         assert!(fragment["before_start"].as_u64().unwrap() > 5990);
         let shown = server
-            .successful_call(version, "show_text_diff", json!({"comparison_id":handle}))
+            .successful_call(version, "text.diff.show", json!({"comparison_id":handle}))
             .await;
         assert_eq!(
             shown["comparison"], summary,
@@ -307,32 +391,29 @@ async fn both_revisions_compare_page_reopen_and_delete_without_demo() {
         for _ in 0..2 {
             assert_eq!(
                 server
-                    .successful_call(version, "delete_text_diff", json!({"comparison_id":handle}))
+                    .successful_call(version, "text.diff.delete", json!({"comparison_id":handle}))
                     .await["deleted"],
                 true
             );
         }
         for (name, arguments) in [
-            ("show_text_diff", json!({"comparison_id":handle})),
-            (
-                "get_text_diff_page",
-                json!({"comparison_id":handle,"page":0}),
-            ),
+            ("text.diff.show", json!({"comparison_id":handle})),
+            ("text.diff.page", json!({"comparison_id":handle,"page":0})),
         ] {
             let missing = server.call(version, name, arguments).await;
             assert_eq!(missing["result"]["isError"], true);
             assert_eq!(missing["result"]["structuredContent"]["code"], "not_found");
         }
         let pair = server
-            .successful_call(version, "show_text_diff", json!({"before":"", "after":""}))
+            .successful_call(version, "text.diff.show", json!({"before":"", "after":""}))
             .await;
         assert_eq!(pair["comparison"]["equal"], true);
         assert_eq!(pair["comparison"]["change_pages"], 0);
-        assert_eq!(server.successful_call(version, "get_text_diff_page", json!({"comparison_id":pair["comparison"]["comparison_id"], "view":"before", "page":0})).await["text"], "");
+        assert_eq!(server.successful_call(version, "text.diff.page", json!({"comparison_id":pair["comparison"]["comparison_id"], "view":"before", "page":0})).await["text"], "");
         server
             .successful_call(
                 version,
-                "delete_text_diff",
+                "text.diff.delete",
                 json!({"comparison_id":pair["comparison"]["comparison_id"]}),
             )
             .await;
@@ -345,66 +426,66 @@ async fn invalid_modes_inputs_labels_and_handles_fail_at_the_public_boundary() {
     let server = Server::start(false).await;
     for version in ["2025-11-25", "2026-07-28"] {
         for (name, arguments) in [
-            ("show_text_diff", json!({"before":"one"})),
-            ("show_text_diff", json!({"after":"two"})),
+            ("text.diff.show", json!({"before":"one"})),
+            ("text.diff.show", json!({"after":"two"})),
             (
-                "show_text_diff",
+                "text.diff.show",
                 json!({"before_label":"label without text"}),
             ),
             (
-                "show_text_diff",
+                "text.diff.show",
                 json!({"comparison_id":"a".repeat(64),"before":"one","after":"two"}),
             ),
             (
-                "show_text_diff",
+                "text.diff.show",
                 json!({"comparison_id":"a".repeat(64),"after_label":"label"}),
             ),
             (
-                "compare_texts",
+                "text.diff",
                 json!({"before":"one","after":"two","before_label":"\nPRIVATE_INPUT_MARKER"}),
             ),
             (
-                "compare_texts",
+                "text.diff",
                 json!({"before":"one","after":"two","after_label":"법".repeat(43)}),
             ),
             (
-                "compare_texts",
+                "text.diff",
                 json!({"before":"one","after":"two","before_label":""}),
             ),
             (
-                "compare_texts",
+                "text.diff",
                 json!({"before":"private\u{0}input","after":"two"}),
             ),
             (
-                "compare_texts",
+                "text.diff",
                 json!({"before":"x".repeat(16 * 1024 + 1),"after":"two"}),
             ),
             (
-                "compare_texts",
+                "text.diff",
                 json!({"before":"\n".repeat(100_001),"after":"two"}),
             ),
             (
-                "compare_texts",
+                "text.diff",
                 json!({"before":format!("{}\n", "x".repeat(1023)).repeat(1025),"after":"two"}),
             ),
-            ("compare_texts", json!({"before":5,"after":"two"})),
+            ("text.diff", json!({"before":5,"after":"two"})),
             (
-                "compare_texts",
+                "text.diff",
                 json!({"before":"one","after":"two","git_option":"--external-diff"}),
             ),
             (
-                "get_text_diff_page",
+                "text.diff.page",
                 json!({"comparison_id":"../private", "page":0}),
             ),
             (
-                "get_text_diff_page",
+                "text.diff.page",
                 json!({"comparison_id":"a".repeat(64), "view":"unknown", "page":0}),
             ),
             (
-                "get_text_diff_page",
+                "text.diff.page",
                 json!({"comparison_id":"a".repeat(64), "page":-1}),
             ),
-            ("delete_text_diff", json!({"comparison_id":"A".repeat(64)})),
+            ("text.diff.delete", json!({"comparison_id":"A".repeat(64)})),
         ] {
             let invalid = server.call(version, name, arguments).await;
             assert_eq!(invalid["error"]["code"], -32602, "{name}: {invalid}");
@@ -413,7 +494,7 @@ async fn invalid_modes_inputs_labels_and_handles_fail_at_the_public_boundary() {
         let unknown = server
             .successful_call(
                 version,
-                "delete_text_diff",
+                "text.diff.delete",
                 json!({"comparison_id":"a".repeat(64)}),
             )
             .await;
@@ -453,7 +534,7 @@ async fn comparison_and_demo_resources_coexist_with_one_source_offer() {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"compare_texts"));
+        assert!(names.contains(&"text.diff"));
         assert!(names.contains(&"demo_show_records"));
     }
     server.stop().await;
@@ -496,17 +577,13 @@ async fn heavily_escaped_source_and_change_pages_fit_complete_wire_budget() {
     let after = before.replace('\u{1}', "\u{2}");
     for version in ["2025-11-25", "2026-07-28"] {
         let summary = server
-            .successful_call(
-                version,
-                "compare_texts",
-                json!({"before":before,"after":after}),
-            )
+            .compare(version, json!({"before":before,"after":after}))
             .await;
         for view in ["changes", "before", "after"] {
             let page = server
                 .successful_call(
                     version,
-                    "get_text_diff_page",
+                    "text.diff.page",
                     json!({"comparison_id":summary["comparison_id"],"view":view,"page":0}),
                 )
                 .await;
@@ -518,7 +595,7 @@ async fn heavily_escaped_source_and_change_pages_fit_complete_wire_budget() {
         server
             .successful_call(
                 version,
-                "delete_text_diff",
+                "text.diff.delete",
                 json!({"comparison_id":summary["comparison_id"]}),
             )
             .await;
@@ -531,18 +608,12 @@ async fn unicode_scalar_highlights_are_exposed_in_both_revisions() {
     let server = Server::start(false).await;
     for revision in ["2025-11-25", "2026-07-28"] {
         let summary = server
-            .successful_call(
-                revision,
-                "compare_texts",
-                json!({
-                    "before":"A한😀Z\r\n", "after":"A韓😀Q\n"
-                }),
-            )
+            .compare(revision, json!({"before":"A한😀Z\r\n", "after":"A韓😀Q\n"}))
             .await;
         let page = server
             .successful_call(
                 revision,
-                "get_text_diff_page",
+                "text.diff.page",
                 json!({
                     "comparison_id":summary["comparison_id"], "page":0
                 }),
@@ -558,7 +629,7 @@ async fn unicode_scalar_highlights_are_exposed_in_both_revisions() {
         server
             .successful_call(
                 revision,
-                "delete_text_diff",
+                "text.diff.delete",
                 json!({"comparison_id":summary["comparison_id"]}),
             )
             .await;

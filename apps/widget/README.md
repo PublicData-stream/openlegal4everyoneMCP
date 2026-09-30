@@ -103,7 +103,7 @@ not evidence that future advisories cannot arise.
 
 `text-diff.html` is an independent MCP App and does not require the synthetic
 upstream demo. It accepts pasted text or UTF-8 files, optional before/after labels,
-and compares through the host-mediated `compare_texts` tool. Each source is bounded
+and compares through the host-mediated `text.diff` tool. Each source is bounded
 at 1 MiB UTF-8, 100,000 LF-delimited lines, and 16 KiB per line excluding LF but
 including any preceding CR. Labels require 1–128 UTF-8 bytes without controls. Files
 are decoded with fatal UTF-8 validation, preserving a leading BOM; NUL and invalid
@@ -117,15 +117,18 @@ explicitly, without an implicit newline conversion; pasting into a CR-containing
 preview requires the explicit LF edit step first. Server metadata reports byte and
 line counts, CRLF/LF/bare-CR counts, BOM, and final-newline status.
 
-`show_text_diff` opens a blank editor, a supplied pair, or an existing handle.
+`text.diff.show` opens a blank editor, a supplied pair, or an existing handle.
 Version 1 show results contain `{schema_version: 1, comparison: summary | null}`;
-`compare_texts` returns the versioned summary directly. Summaries contain the opaque
+`text.diff` returns `{schema_version: 1, comparison, patch, explanation}`. The
+widget validates this envelope and its sealed patch attachment, then reads the
+nested comparison summary. Snapshot comparison results still contain the summary
+directly. Summaries contain the opaque
 comparison handle, expiry, source metadata, added/deleted line counts, equality,
 and change-page count. Existing handles can load their exact before/after source
 chunks for editing. The widget reassembles them in order and checks source size
 before exposing the editor.
 
-`get_text_diff_page` takes `{comparison_id, view, page}`, where view is `changes`,
+`text.diff.page` takes `{comparison_id, view, page}`, where view is `changes`,
 `before`, or `after`, and pages are zero-based. Results include `schema_version: 1`,
 the same identity/view/page, `total_pages`, a `fragments` array, and source `text`
 only for source pages. Change fragments contain a standalone Git-style hunk and its
@@ -150,13 +153,19 @@ exact bounded chunks, which can divide a line. This is a text comparison, not a
 claim about legal equivalence or revisions.
 
 Comparisons are retained server-side for up to ten minutes. The visible notice
-explains that the handle grants access to the retained text. **Clear** awaits
-`delete_text_diff` and keeps a failed deletion retryable. Recomparison deletes the
-previous handle before submitting the next pair. Clear is disabled during a
+explains that the handle grants access to the retained text. The widget promptly
+deletes `text.diff`'s unused patch through `text.attachment.delete`; deleting the
+comparison does not delete its patch attachment. Failed patch cleanup keeps the
+comparison usable and retains the attachment for retry of **Clear**. **Clear**
+awaits `text.diff.delete` and outstanding attachment deletions before reporting
+success, records individual successful deletions, and keeps failed deletions
+retryable. Recomparison resolves outstanding cleanup and deletes the previous
+comparison handle before submitting the next pair. Clear is disabled during a
 comparison, including after cancellation until the actual RPC settles. A late
-successful handle is deleted before Clear is re-enabled; cleanup failure retains
-the handle for a retry of Clear. Closing the widget or losing the host response
-can prevent cleanup, leaving server expiry as the fallback. Pending page results
+successful comparison and patch handles are deleted before Clear is re-enabled;
+cleanup failure retains each failed handle for a retry of Clear. Stale successful
+responses and rejected historical association metadata also trigger cleanup.
+Closing the widget or losing the host response can prevent cleanup, leaving server expiry as the fallback. Pending page results
 cannot restore content after Clear. Input edits
 leave the last result labelled **Previous comparison** until recomparison succeeds.
 The widget does not persist sources or handles in browser storage. Host
@@ -167,7 +176,9 @@ renderer through the SDK bridge, with synthetic paginated patches, source chunks
 errors, expired handles, and deletion failures. Tests cover local gutter allocation
 near source line 100,000, exact Unicode/CR/BOM handling, original source loading,
 responsive layouts, inert HTML-like content, cancellation, and late-page rejection.
-This is not a live ChatGPT integration test.
+This is not a live ChatGPT integration test. The former `compare_texts`,
+`show_text_diff`, `get_text_diff_page`, and `delete_text_diff` names are removed;
+there are no compatibility wrappers. See the [migration mapping](../../docs/text-diff.md#canonical-text-tools-and-temporary-attachments).
 
 The comparison renderer is first-party React code. Removing
 `@git-diff-view/react` also removes its browser diff engines, highlighting graph,
