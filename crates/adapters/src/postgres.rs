@@ -214,6 +214,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0009_inventory_item_offset.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            10,
+            "revision history order".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0010_revision_history_order.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

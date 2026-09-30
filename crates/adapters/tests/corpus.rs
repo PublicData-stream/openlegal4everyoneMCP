@@ -1231,6 +1231,316 @@ async fn corpus_capture_identity_unchanged_validation_and_conflict() {
 
 #[tokio::test]
 #[ignore = "requires scripts/test-postgres.sh"]
+async fn corpus_revision_history_checkpoint_order_and_bounded_pages() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("history-order"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(base.pool(), blobs, Arc::new(FixtureClock));
+    let longest_id = format!("{}:\"Z!", "한".repeat(84));
+    assert_eq!(longest_id.len(), 256);
+    // This is the expected presentation order, independent of observation order.
+    // Publication-only and effective-date entries share one checkpoint date;
+    // C collation breaks ties, including punctuation and non-ASCII IDs.
+    let revisions = [
+        ("latest", Some("20000101"), Some("20270101")),
+        ("A", None, Some("20260101")),
+        ("a:quoted\"한", None, Some("20260101")),
+        ("publication-only", Some("20260101"), None),
+        (longest_id.as_str(), None, Some("20260101")),
+        ("old-effective", Some("20990101"), Some("20250101")),
+        ("old-publication", Some("20240101"), None),
+        ("unknown:A", None, None),
+        ("unknown:a", None, None),
+    ];
+    let expected: Vec<_> = revisions.iter().map(|r| r.0.to_owned()).collect();
+    for (case, order) in [
+        ("reverse", vec![8, 7, 6, 5, 4, 3, 2, 1, 0]),
+        ("shuffled", vec![0, 4, 2, 8, 5, 1, 7, 3, 6]),
+    ] {
+        let mut object = object();
+        object.id = case.into();
+        let mut sequences = BTreeMap::new();
+        for (position, index) in order.into_iter().enumerate() {
+            let (id, publication, effective) = revisions[index];
+            store
+                .record_revision_catalog(&object, id, publication, effective, 100)
+                .await
+                .unwrap();
+            sequences.insert(id.to_owned(), position as u64 + 1);
+        }
+        for limit in [1, 3, 100] {
+            let mut seen = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = store
+                    .history(
+                        object.clone(),
+                        HistoryKind::Revisions,
+                        cursor,
+                        limit,
+                        101,
+                        token(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!page.entries.is_empty());
+                assert!(page.entries.len() <= limit);
+                for entry in page.entries {
+                    assert_eq!(entry.sequence, sequences[&entry.revision_id]);
+                    assert!(entry.capture_id.is_none());
+                    assert!(entry.captured_at.is_none());
+                    seen.push(entry.revision_id);
+                }
+                if let Some(next) = page.next_cursor {
+                    assert!(next.len() <= 512);
+                    assert!(next.contains(":r2:"));
+                    assert!(seen.len() < expected.len());
+                    cursor = Some(next);
+                } else {
+                    break;
+                }
+            }
+            assert_eq!(seen, expected, "{case}, page size {limit}");
+        }
+    }
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn corpus_revision_history_cursors_validate_and_fence_changes() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("history-cursors"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(base.pool(), blobs, Arc::new(FixtureClock));
+    let object = object();
+    for (id, date) in [("new", "20260101"), ("old", "20250101")] {
+        store
+            .record_revision_catalog(&object, id, None, Some(date), 100)
+            .await
+            .unwrap();
+    }
+    let page = store
+        .history(
+            object.clone(),
+            HistoryKind::Revisions,
+            None,
+            1,
+            101,
+            token(),
+        )
+        .await
+        .unwrap();
+    let cursor = page.next_cursor.unwrap();
+    let fields: Vec<_> = cursor.splitn(5, ':').collect();
+    let prefix = format!("{}:r2:{}:", fields[0], fields[2]);
+    let legacy = format!("{}:r:{}:{}", fields[0], fields[2], page.entries[0].sequence);
+    for invalidated in [
+        legacy,
+        "malformed".into(),
+        cursor.replacen(":r2:", ":c:", 1),
+        cursor.replacen(fields[0], &"0".repeat(64), 1),
+    ] {
+        assert!(matches!(
+            store
+                .history(
+                    object.clone(),
+                    HistoryKind::Revisions,
+                    Some(invalidated),
+                    1,
+                    101,
+                    token()
+                )
+                .await,
+            Err(DatabaseError::SnapshotInvalidated)
+        ));
+    }
+    for invalid in [
+        format!("{prefix}20260230:new"),
+        format!("{prefix}20260101:"),
+        format!("{prefix}20260101:{}", "x".repeat(257)),
+        format!("{prefix}20260101:bad\nrevision"),
+        "x".repeat(513),
+    ] {
+        assert!(matches!(
+            store
+                .history(
+                    object.clone(),
+                    HistoryKind::Revisions,
+                    Some(invalid),
+                    1,
+                    101,
+                    token()
+                )
+                .await,
+            Err(DatabaseError::InvalidInput)
+        ));
+    }
+    assert!(matches!(
+        store
+            .history(
+                object.clone(),
+                HistoryKind::Captures,
+                Some(cursor.clone()),
+                1,
+                101,
+                token()
+            )
+            .await,
+        Err(DatabaseError::SnapshotInvalidated)
+    ));
+    // Metadata changes alter the catalog fence without a publication.
+    store
+        .record_revision_catalog(&object, "old", None, Some("20280101"), 102)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .history(
+                object.clone(),
+                HistoryKind::Revisions,
+                Some(cursor),
+                1,
+                103,
+                token()
+            )
+            .await,
+        Err(DatabaseError::SnapshotInvalidated)
+    ));
+    let page = store
+        .history(
+            object.clone(),
+            HistoryKind::Revisions,
+            None,
+            1,
+            103,
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.entries[0].revision_id, "old");
+    let cursor = page.next_cursor;
+    // Body publication alters the independent object-version fence.
+    publish(&store, "old", "corrected bytes", 104).await;
+    assert!(matches!(
+        store
+            .history(object, HistoryKind::Revisions, cursor, 1, 105, token())
+            .await,
+        Err(DatabaseError::SnapshotInvalidated)
+    ));
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn corpus_revision_history_corrections_and_eviction_keep_checkpoint_order() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("history-corrections"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(base.pool(), blobs, Arc::new(FixtureClock));
+    // A correction to old legal text is the newest observation, while its
+    // official checkpoint remains older than the current checkpoint.
+    let mut captures = Vec::new();
+    for (id, date, body, head, time) in [
+        ("old", "20200101", "old original", false, 100),
+        ("new", "20260101", "new original", true, 110),
+        ("old", "20200101", "old corrected", false, 120),
+    ] {
+        let mut record = record(id, body);
+        record.publication_date = None;
+        record.effective_date = Some(date.into());
+        let capture = store
+            .publish(
+                Publication {
+                    record,
+                    raw: body.as_bytes().to_vec(),
+                    additional_evidence: vec![],
+                    processor_version: "fixture_v1".into(),
+                    retrieved_at: time,
+                    now: time,
+                    expected_version: store.state(&object()).await.unwrap().version,
+                    install_head: head,
+                    job_id: None,
+                },
+                token(),
+            )
+            .await
+            .unwrap();
+        captures.push(capture);
+    }
+    let revision_page = store
+        .history(object(), HistoryKind::Revisions, None, 10, 130, token())
+        .await
+        .unwrap();
+    assert_eq!(revision_page.entries[0].revision_id, "new");
+    assert_eq!(revision_page.entries[0].sequence, 2);
+    assert_eq!(revision_page.entries[1].revision_id, "old");
+    assert_eq!(revision_page.entries[1].sequence, 3);
+    assert_eq!(
+        revision_page.entries[1].capture_id.as_ref(),
+        Some(&captures[2].capture_id)
+    );
+    let capture_page = store
+        .history(object(), HistoryKind::Captures, None, 1, 130, token())
+        .await
+        .unwrap();
+    assert_eq!(
+        capture_page.entries[0].capture_id.as_ref(),
+        Some(&captures[2].capture_id)
+    );
+    let next = store
+        .history(
+            object(),
+            HistoryKind::Captures,
+            capture_page.next_cursor,
+            10,
+            130,
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next.entries.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        [2, 1]
+    );
+    assert!(next.next_cursor.is_none());
+    // Real retirement and index acknowledgment evict old bodies but retain the
+    // catalog, dates and chronology. The current body remains protected.
+    store
+        .acknowledge_index(store.watermark().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(store.maintain(300, 250).await.unwrap(), 0);
+    store
+        .acknowledge_index(store.watermark().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(store.maintain(301, 250).await.unwrap(), 2);
+    let evicted = store
+        .history(object(), HistoryKind::Revisions, None, 10, 302, token())
+        .await
+        .unwrap();
+    assert_eq!(
+        evicted
+            .entries
+            .iter()
+            .map(|e| e.revision_id.as_str())
+            .collect::<Vec<_>>(),
+        ["new", "old"]
+    );
+    assert_eq!(evicted.entries[1].sequence, 3);
+    assert!(evicted.entries[1].capture_id.is_none());
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
 async fn corpus_dates_need_complete_inventory_and_unique_revision() {
     let fixture = support::TestDatabase::new().await;
     let base = fixture.open(100).await;

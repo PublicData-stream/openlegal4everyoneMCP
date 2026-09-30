@@ -569,7 +569,7 @@ impl PgCorpusStore {
         cancel: CancellationToken,
     ) -> Result<HistoryPage, DatabaseError> {
         check(&cancel)?;
-        if !(1..=100).contains(&limit) {
+        if !(1..=100).contains(&limit) || cursor.as_ref().is_some_and(|c| c.len() > 512) {
             return Err(DatabaseError::InvalidInput);
         }
         let state = self.state(&object).await?;
@@ -580,38 +580,77 @@ impl PgCorpusStore {
             return Err(DatabaseError::UnsupportedHistory);
         }
         let k = key(&object)?;
-        let tag = if matches!(kind, HistoryKind::Revisions) {
-            "r"
-        } else {
-            "c"
-        };
-        let before = if let Some(cursor) = cursor {
-            let parts: Vec<_> = cursor.split(':').collect();
-            if parts.len() != 4
+        let revisions = matches!(kind, HistoryKind::Revisions);
+        let tag = if revisions { "r2" } else { "c" };
+        let mut after_revision = None;
+        let mut after_date = String::new();
+        let mut before = i64::MAX;
+        if let Some(cursor) = cursor {
+            // The revision ID occupies the terminal field, so embedded colons
+            // remain literal UTF-8. Its 256-byte limit keeps r2 cursors below 512
+            // bytes without expanding provider IDs into escaped representations.
+            let fields = if revisions { 5 } else { 4 };
+            let parts: Vec<_> = if revisions {
+                cursor.splitn(fields, ':').collect()
+            } else {
+                cursor.split(':').collect()
+            };
+            if parts.len() != fields
                 || parts[0] != k
                 || parts[1] != tag
                 || parts[2] != format!("{}.{}", state.version, state.catalog_version)
             {
                 return Err(DatabaseError::SnapshotInvalidated);
             }
-            parts[3]
-                .parse::<i64>()
-                .map_err(|_| DatabaseError::InvalidInput)?
+            if revisions {
+                if !parts[3].is_empty() && !valid_date(parts[3]) {
+                    return Err(DatabaseError::InvalidInput);
+                }
+                RevisionSelector::Revision {
+                    id: parts[4].into(),
+                }
+                .validate()?;
+                after_date = parts[3].into();
+                after_revision = Some(parts[4].to_owned());
+            } else {
+                before = parts[3]
+                    .parse::<i64>()
+                    .map_err(|_| DatabaseError::InvalidInput)?;
+            }
+        }
+        let rows = if revisions {
+            // Observation sequences can change when old bytes are corrected;
+            // chronological presentation follows retained checkpoint dates.
+            // Empty dates sort last, and C collation gives a stable ID tie-break.
+            if let Some(after_revision) = after_revision {
+                // Separate bounded ranges let the index seek past the cursor
+                // even for large groups of revisions sharing a checkpoint date.
+                let sql = "SELECT * FROM ((SELECT revision_id,latest_capture AS capture_id,last_sequence AS sequence,captured_at::text,publication_date,effective_date,COALESCE(effective_date,publication_date,'') AS sort_date FROM openlegal.corpus_revision WHERE object_key=$1 AND COALESCE(effective_date,publication_date,'')=$2 AND revision_id COLLATE \"C\">$3 COLLATE \"C\" ORDER BY COALESCE(effective_date,publication_date,'') DESC,revision_id COLLATE \"C\" ASC LIMIT $4) UNION ALL (SELECT revision_id,latest_capture AS capture_id,last_sequence AS sequence,captured_at::text,publication_date,effective_date,COALESCE(effective_date,publication_date,'') AS sort_date FROM openlegal.corpus_revision WHERE object_key=$1 AND COALESCE(effective_date,publication_date,'')<$2 ORDER BY COALESCE(effective_date,publication_date,'') DESC,revision_id COLLATE \"C\" ASC LIMIT $4)) remaining ORDER BY sort_date DESC,revision_id COLLATE \"C\" ASC LIMIT $4";
+                sqlx::query(sql)
+                    .bind(&k)
+                    .bind(after_date)
+                    .bind(after_revision)
+                    .bind((limit + 1) as i64)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(db)?
+            } else {
+                sqlx::query("SELECT revision_id,latest_capture AS capture_id,last_sequence AS sequence,captured_at::text,publication_date,effective_date FROM openlegal.corpus_revision WHERE object_key=$1 ORDER BY COALESCE(effective_date,publication_date,'') DESC,revision_id COLLATE \"C\" ASC LIMIT $2")
+                    .bind(&k)
+                    .bind((limit + 1) as i64)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(db)?
+            }
         } else {
-            i64::MAX
+            sqlx::query("SELECT revision_id,id AS capture_id,sequence,captured_at::text,publication_date,effective_date FROM openlegal.corpus_capture_catalog WHERE object_key=$1 AND sequence<$2 ORDER BY sequence DESC LIMIT $3")
+                .bind(&k)
+                .bind(before)
+                .bind((limit + 1) as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db)?
         };
-        let sql = if matches!(kind, HistoryKind::Revisions) {
-            "SELECT revision_id,latest_capture AS capture_id,last_sequence AS sequence,captured_at::text,publication_date,effective_date FROM openlegal.corpus_revision WHERE object_key=$1 AND last_sequence<$2 ORDER BY last_sequence DESC LIMIT $3"
-        } else {
-            "SELECT revision_id,id AS capture_id,sequence,captured_at::text,publication_date,effective_date FROM openlegal.corpus_capture_catalog WHERE object_key=$1 AND sequence<$2 ORDER BY sequence DESC LIMIT $3"
-        };
-        let rows = sqlx::query(sql)
-            .bind(&k)
-            .bind(before)
-            .bind((limit + 1) as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db)?;
         let more = rows.len() > limit;
         let mut entries = Vec::new();
         for r in rows.into_iter().take(limit) {
@@ -642,10 +681,23 @@ impl PgCorpusStore {
         check(&cancel)?;
         let next_cursor = if more {
             entries.last().map(|e| {
-                format!(
-                    "{k}:{tag}:{}.{}:{}",
-                    state.version, state.catalog_version, e.sequence
-                )
+                if revisions {
+                    format!(
+                        "{k}:{tag}:{}.{}:{}:{}",
+                        state.version,
+                        state.catalog_version,
+                        e.effective_date
+                            .as_deref()
+                            .or(e.publication_date.as_deref())
+                            .unwrap_or(""),
+                        e.revision_id,
+                    )
+                } else {
+                    format!(
+                        "{k}:{tag}:{}.{}:{}",
+                        state.version, state.catalog_version, e.sequence
+                    )
+                }
             })
         } else {
             None

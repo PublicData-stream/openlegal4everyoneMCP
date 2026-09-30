@@ -245,7 +245,7 @@ impl ToolModule for DatabaseTools {
         let service = self.database.clone();
         registry.register_typed::<HistoryInput, HistoryPage, _, _>(
             "database.history",
-            "List provider revision checkpoints or separate capture observations of one object, newest first. A retained catalog entry does not promise retained body content. Treaty and decision/precedent provider revision history is unsupported; capture history remains available.",
+            "List provider revision checkpoints ordered by effective date, falling back to publication date, newest first; missing dates follow dated revisions. Capture observations are separately ordered newest capture first. A retained catalog entry does not promise retained body content. Treaty and decision/precedent provider revision history is unsupported; capture history remains available.",
             ToolOptions::default(),
             move |input, ctx| {
                 let service = service.clone();

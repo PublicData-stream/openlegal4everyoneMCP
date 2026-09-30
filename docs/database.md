@@ -42,6 +42,15 @@ becomes HEAD. Raw primary evidence and referenced attachment evidence remain lin
 by SHA-256; failures to read or verify retained evidence fail closed. SHA-256 links
 bytes and representations; it does not authenticate legal authority.
 
+`database.history(kind="revisions")` presents checkpoints by effective date,
+falling back to publication date when the effective date is absent, newest first.
+Undated checkpoints come last; equal dates use revision ID byte order as a stable
+tie-breaker. This presentation order does not establish legal applicability.
+Returned `sequence` values still identify local observations, not chronological
+revision ranks. Capture history remains newest local observation first.
+Revision cursors issued before this ordering change return `snapshot_invalidated`;
+restart traversal from its first page.
+
 ## Content and metadata
 
 `database.get` accepts object, selector, `fresh_only`, optional section, offset,
@@ -205,6 +214,13 @@ Use distinct, non-nested directories for synthetic cache blobs, corpus blobs and
 the index. Do not share a corpus index between concurrent server processes. Run
 `openlegal-server --migrate CONFIG.toml` with the migration credential before serving.
 The runtime credential does not create schema objects.
+
+The inspector corrections add a revision ordering index through a new
+migration. Run the matching binary's `--migrate` before
+starting it; there is no evidence rewrite or search-index rebuild. The schema gate
+checks the exact migration set, so an older binary cannot open an upgraded schema.
+For a behavior rollback, use a revert build retaining these additive migrations;
+do not remove migration history.
 
 Serving retained data requires neither provider credentials nor Kubernetes.
 Coverage is reported complete only after all three current datasets have matching
