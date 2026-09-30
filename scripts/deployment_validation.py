@@ -320,8 +320,11 @@ def validate_config(raw, profile="retained"):
                        "max_buffer_bytes": 256 * 1024 * 1024,
                        "shutdown_timeout_secs": 15}
     if profile == "retained":
-        expected_limits["rate_limit"] = {"verified_tunnel": {
-            "calls_per_second": 1000, "burst": 1000}}
+        expected_limits.update({"max_in_flight": 128000, "max_connections": 256000,
+                                "max_calls_per_connection": 16000})
+        expected_limits["rate_limit"] = {"calls_per_second": 200000, "burst": 200000,
+                                          "verified_tunnel": {
+                                              "calls_per_second": 200000, "burst": 200000}}
     equal(config["limits"], expected_limits, "limits")
     equal(config["text_diff"], {"widget_html": "/opt/openlegal/widgets/text-diff.html"}, "text_diff")
     if profile == "retained":

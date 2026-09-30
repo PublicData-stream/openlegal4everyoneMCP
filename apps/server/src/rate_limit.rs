@@ -88,4 +88,23 @@ mod tests {
             assert!(limiter.try_admit().await);
         }
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn expanded_rate_retains_exact_burst_and_refill() {
+        let limiter = RateLimiter::new(true, 200_000, 200_000);
+        for _ in 0..200_000 {
+            assert!(limiter.try_admit().await);
+        }
+        assert!(!limiter.try_admit().await);
+        tokio::time::advance(Duration::from_micros(4)).await;
+        assert!(!limiter.try_admit().await);
+        tokio::time::advance(Duration::from_micros(1)).await;
+        assert!(limiter.try_admit().await);
+        assert!(!limiter.try_admit().await);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..200_000 {
+            assert!(limiter.try_admit().await);
+        }
+        assert!(!limiter.try_admit().await);
+    }
 }

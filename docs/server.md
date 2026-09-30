@@ -253,6 +253,13 @@ lists tools and calls `server_info`; never disable certificate verification.
 | `idle_timeout_secs` | 60 |
 | `shutdown_timeout_secs` | 15 |
 
+Operator overrides allow `max_in_flight` up to 128,000 and `max_connections`
+up to 256,000. `max_calls_per_connection` must be positive and no greater than
+`max_in_flight`. These are admission ceilings; the shared byte budget, tool-specific
+budgets and Pod resources can limit work before those ceilings are reached.
+The Kubernetes operator templates select 128,000 calls in flight, 256,000
+connections and 16,000 concurrent calls per connection.
+
 `[limits.rate_limit]` controls valid `tools/call` requests across both transports:
 
 | Setting | Default |
@@ -261,7 +268,8 @@ lists tools and calls `server_info`; never disable certificate verification.
 | `calls_per_second` | 100 |
 | `burst` | 100 |
 
-The rate and burst must each be between 1 and 10,000, including when disabled.
+The rate and burst must each be between 1 and 200,000, including when disabled.
+The Kubernetes operator templates select 200,000 calls/s and burst 200,000.
 The bucket starts full and refills continuously. An exhausted call fails immediately
 with the structured `rate_limited` tool error. Known tool calls with valid arguments
 spend one token after concurrency admission, including calls that later fail in the
@@ -274,11 +282,11 @@ explicitly.
 Optional `[limits.rate_limit.verified_tunnel]` sets `calls_per_second` and `burst`
 for a second process-wide bucket shared across the two transports. A call selects
 it only after the connection completes required edge mTLS; it replaces the ordinary
-bucket for that call. Both values must be in 1–10,000, and startup rejects the
+bucket for that call. Both values must be in 1–200,000, and startup rejects the
 override without `[edge_mtls]` on both listeners. When the table is absent,
 authenticated calls retain the ordinary bucket. No HTTP header supplies tunnel
 identity. This authenticates the edge, so all callers forwarded by that edge
-share its bucket. The production templates set 1,000 calls/second and burst 1,000;
+share its bucket. The production templates set 200,000 calls/second and burst 200,000;
 the default configuration remains 100/100. OxiBelt's route limits count HTTP
 requests and WebTransport CONNECT handshakes, while the backend counts valid tool
 calls within sessions.

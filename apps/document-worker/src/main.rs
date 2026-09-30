@@ -117,6 +117,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn scratch_is_tmpfs(mountinfo: &str) -> bool {
+    mountinfo
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let (mount, filesystem) = line.split_once(" - ")?;
+            // mountinfo escapes whitespace and backslashes in path fields. The
+            // fixed /scratch path contains none, so its encoded form is identical.
+            if mount.split_whitespace().nth(4)? != "/scratch" {
+                return None;
+            }
+            Some(filesystem.split_whitespace().next() == Some("tmpfs"))
+        })
+        .unwrap_or(false)
+}
+
 fn probe() -> Result<(), Box<dyn std::error::Error>> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     let value = |name: &str| {
@@ -154,6 +170,7 @@ fn probe() -> Result<(), Box<dyn std::error::Error>> {
         "apparmor": std::fs::read_to_string("/proc/self/attr/current").unwrap_or_default().trim(),
         "user_namespace": namespace_isolated, "network_denied": network_denied,
         "root_readonly": root_readonly,
+        "scratch_tmpfs": scratch_is_tmpfs(&std::fs::read_to_string("/proc/self/mountinfo")?),
         "no_token": !std::path::Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token").exists(),
         "pids_max": std::fs::read_to_string("/sys/fs/cgroup/pids.max").unwrap_or_default().trim(),
         "memory_max": std::fs::read_to_string("/sys/fs/cgroup/memory.max").unwrap_or_default().trim(),
@@ -161,4 +178,34 @@ fn probe() -> Result<(), Box<dyn std::error::Error>> {
     });
     serde_json::to_writer(std::io::stdout().lock(), &report)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scratch_is_tmpfs;
+
+    #[test]
+    fn scratch_mount_requires_tmpfs_at_the_exact_path() {
+        assert!(scratch_is_tmpfs(
+            "42 1 0:1 / /scratch rw,nosuid,nodev shared:1 - tmpfs tmpfs rw,size=2097152k\n"
+        ));
+        for mountinfo in [
+            "42 1 8:1 /scratch /scratch rw - ext4 /dev/vda rw\n",
+            "42 1 0:1 / / rw - tmpfs tmpfs rw\n",
+            "42 1 0:1 / /scratch-extra rw - tmpfs tmpfs rw\n",
+            "42 1 0:1 / /scratch\\040extra rw - tmpfs tmpfs rw\n",
+            "42 1 0:1 / /scratch rw\n",
+            "",
+        ] {
+            assert!(!scratch_is_tmpfs(mountinfo), "{mountinfo}");
+        }
+    }
+
+    #[test]
+    fn disk_overmount_does_not_report_a_hidden_tmpfs() {
+        assert!(!scratch_is_tmpfs(concat!(
+            "42 1 0:1 / /scratch rw - tmpfs tmpfs rw\n",
+            "43 42 8:1 / /scratch rw - ext4 /dev/vda rw\n",
+        )));
+    }
 }

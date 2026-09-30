@@ -74,8 +74,8 @@ health listener stays plaintext and has no NodePort or public route.
 NodePorts alone do not establish privacy; the operator must restrict access to
 the intended host/private path and validate the effective network controls.
 
-The serving templates allocate a separate process-wide bucket of 1,000 tool
-calls/second with burst 1,000 for the verified tunnel. HTTP and WebTransport
+The serving templates allocate a separate process-wide bucket of 200,000 tool
+calls/second with burst 200,000 for the verified tunnel. HTTP and WebTransport
 share that bucket. All public callers behind OxiBelt share its allowance;
 the client certificate identifies the edge, not each public caller. The edge
 handoff separately limits `/mcp` to 1,000 requests/second and `/mcp-wt/v1`

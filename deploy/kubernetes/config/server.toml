@@ -30,10 +30,17 @@ bind = "0.0.0.0:9090"
 max_message_bytes = 16777216
 max_buffer_bytes = 268435456
 shutdown_timeout_secs = 15
+max_in_flight = 128000
+max_connections = 256000
+max_calls_per_connection = 16000
+
+[limits.rate_limit]
+calls_per_second = 200000
+burst = 200000
 
 [limits.rate_limit.verified_tunnel]
-calls_per_second = 1000
-burst = 1000
+calls_per_second = 200000
+burst = 200000
 
 [text_diff]
 widget_html = "/opt/openlegal/widgets/text-diff.html"

@@ -590,7 +590,7 @@ fn pod_manifest(name: &str, namespace: &str, image: &str, limits: &DocumentWorke
                 "resources": {"requests": {"cpu": limits.cpu, "memory": limits.memory, "ephemeral-storage": limits.scratch},
                     "limits": {"cpu": limits.cpu, "memory": limits.memory, "ephemeral-storage": limits.scratch}},
                 "volumeMounts": [{"name": "scratch", "mountPath": "/scratch"}]}],
-            "volumes": [{"name": "scratch", "emptyDir": {"sizeLimit": limits.scratch}}]
+            "volumes": [{"name": "scratch", "emptyDir": {"medium": "Memory", "sizeLimit": limits.scratch}}]
         }
     })
 }
@@ -670,7 +670,7 @@ elif 'create' in args:
     pod=json.load(sys.stdin)
     assert pod['spec']['hostUsers'] is False
     assert pod['spec']['automountServiceAccountToken'] is False
-    assert pod['spec']['volumes'] == [{'name':'scratch','emptyDir':{'sizeLimit':@POD_SCRATCH@}}]
+    assert pod['spec']['volumes'] == [{'name':'scratch','emptyDir':{'medium':'Memory','sizeLimit':@POD_SCRATCH@}}]
     assert pod['spec']['containers'][0]['volumeMounts'] == [{'name':'scratch','mountPath':'/scratch'}]
     assert pod['spec']['containers'][0]['env'] == [
         {'name':'TMPDIR','value':'/scratch'}, {'name':'TESSDATA_PREFIX','value':'/opt/tessdata'},

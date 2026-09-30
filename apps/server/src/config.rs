@@ -80,20 +80,20 @@ impl Limits {
             || self.max_buffer_bytes < self.max_message_bytes * 4
             || self.max_buffer_bytes > u32::MAX as usize
             || self.max_in_flight == 0
-            || self.max_in_flight > 65536
+            || self.max_in_flight > 128_000
             || self.max_connections == 0
-            || self.max_connections > 65536
+            || self.max_connections > 256_000
             || self.max_calls_per_connection == 0
             || self.max_calls_per_connection > self.max_in_flight
-            || !(1..=10_000).contains(&self.rate_limit.calls_per_second)
-            || !(1..=10_000).contains(&self.rate_limit.burst)
+            || !(1..=200_000).contains(&self.rate_limit.calls_per_second)
+            || !(1..=200_000).contains(&self.rate_limit.burst)
             || self
                 .rate_limit
                 .verified_tunnel
                 .as_ref()
                 .is_some_and(|override_config| {
-                    !(1..=10_000).contains(&override_config.calls_per_second)
-                        || !(1..=10_000).contains(&override_config.burst)
+                    !(1..=200_000).contains(&override_config.calls_per_second)
+                        || !(1..=200_000).contains(&override_config.burst)
                 })
             || [
                 self.io_timeout_secs,
@@ -146,11 +146,12 @@ mod limits_tests {
         for invalid in [
             "[rate_limit]\ncalls_per_second = 0",
             "[rate_limit]\nburst = 0",
-            "[rate_limit]\ncalls_per_second = 10001",
-            "[rate_limit]\nburst = 10001",
+            "[rate_limit]\ncalls_per_second = 200001",
+            "[rate_limit]\nburst = 200001",
             "[rate_limit]\nunknown = 1",
             "[rate_limit.verified_tunnel]\ncalls_per_second = 0\nburst = 1",
-            "[rate_limit.verified_tunnel]\ncalls_per_second = 1\nburst = 10001",
+            "[rate_limit.verified_tunnel]\ncalls_per_second = 200001\nburst = 1",
+            "[rate_limit.verified_tunnel]\ncalls_per_second = 1\nburst = 200001",
             "[rate_limit.verified_tunnel]\ncalls_per_second = 1",
         ] {
             assert!(
@@ -162,6 +163,48 @@ mod limits_tests {
             toml::from_str("[rate_limit.verified_tunnel]\ncalls_per_second = 1000\nburst = 1000")
                 .unwrap();
         assert!(tunnel.validate().is_ok());
+    }
+
+    #[test]
+    fn expanded_operator_admission_limits_remain_bounded() {
+        let selected: Limits = toml::from_str(
+            "max_in_flight = 128000\nmax_connections = 256000\nmax_calls_per_connection = 16000\n\
+             [rate_limit]\ncalls_per_second = 200000\nburst = 200000\n\
+             [rate_limit.verified_tunnel]\ncalls_per_second = 200000\nburst = 200000",
+        )
+        .unwrap();
+        assert!(selected.validate().is_ok());
+        assert_eq!(selected.max_in_flight, 128_000);
+        assert_eq!(selected.max_connections, 256_000);
+        assert_eq!(selected.max_calls_per_connection, 16_000);
+        for invalid in [
+            Limits {
+                max_in_flight: 128_001,
+                ..selected.clone()
+            },
+            Limits {
+                max_connections: 256_001,
+                ..selected.clone()
+            },
+            Limits {
+                max_in_flight: 0,
+                ..selected.clone()
+            },
+            Limits {
+                max_connections: 0,
+                ..selected.clone()
+            },
+            Limits {
+                max_calls_per_connection: 0,
+                ..selected.clone()
+            },
+            Limits {
+                max_calls_per_connection: 128_001,
+                ..selected.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 }
 

@@ -234,16 +234,20 @@ acceptance gate below before live documents are processed:
 
 Each Pod has a read-only root, non-root UID/GID 65532, no capabilities, no privilege
 escalation, explicit seccomp/AppArmor, and configurable CPU, memory and scratch
-limits. The defaults are two CPUs, 4 GiB memory and 2 GiB ephemeral storage with
-a 2 GiB `emptyDir`. Requests equal limits. Set `cpu`, `memory`, `scratch` and
+limits. The defaults are two CPUs, 4 GiB memory and a 2 GiB tmpfs scratch volume
+(`emptyDir` with `medium: Memory`). Scratch usage counts within the worker's
+4 GiB memory limit; it does not add a separate 2 GiB memory allowance. Requests
+equal limits. The retained 2 GiB ephemeral-storage requests/limits cover writable
+container layers and logs, not tmpfs capacity. Set `cpu`, `memory`, `scratch` and
 `pool_limit` under `[database.ingestion.document_worker]` in the ingestion TOML;
 the table and individual fields are optional. Resources use positive Kubernetes
 Quantity strings, and the pool limit is a positive integer. The worker's OMP and
 Rayon thread limits use the CPU limit rounded up to whole cores, clamped to 1–64.
-PID limits come from kubelet configuration, never
-an invented Pod resource field. Kubernetes ephemeral-storage enforcement is
-eviction-based unless the underlying node filesystem supplies stronger quotas;
-the configured `emptyDir` size is not a synchronous per-write disk quota.
+PID limits come from kubelet configuration, never an invented Pod resource field.
+The `scratch` setting controls the tmpfs `sizeLimit` and the retained disk
+ephemeral-storage budget. Kubernetes accounts tmpfs usage against memory rather
+than ephemeral storage. The disk budget still uses eviction-based enforcement
+unless the underlying node filesystem supplies stronger quotas.
 
 Run the real-cluster gate only with explicit configuration:
 
@@ -261,7 +265,9 @@ scripts/test-document-sandbox.sh
 
 The gate creates/deletes synthetic worker Pods and checks user mapping,
 privilege/capability restrictions, AppArmor/seccomp, network EPERM/EACCES (not mere unreachability),
-read-only root (EROFS at an image-owned writable probe path), absent tokens, actual CPU/memory/PID cgroups, XML exec framing,
+read-only root (EROFS at an image-owned writable probe path), absent tokens, actual
+CPU/memory/PID cgroups, admitted scratch `medium: Memory` and an actual tmpfs
+filesystem at `/scratch`, XML exec framing,
 absence of document logs, PID denial and deadline enforcement. The fixed 5 GiB
 probe checks memory exhaustion only when the selected limit is below 5 GiB;
 for larger limits the gate reports that exhaustion was not tested while still

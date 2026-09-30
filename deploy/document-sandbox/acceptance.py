@@ -116,9 +116,10 @@ def assert_created_pod(pod):
                                ("ephemeral-storage", worker["scratch"])):
         for bound in ("requests", "limits"):
             assert quantity(resources[bound][resource]) == quantity(selected), f"Pod {bound}.{resource}"
-    scratch = next(volume["emptyDir"]["sizeLimit"] for volume in spec["volumes"]
+    scratch = next(volume["emptyDir"] for volume in spec["volumes"]
                    if volume["name"] == "scratch")
-    assert quantity(scratch) == quantity(worker["scratch"]), "Pod scratch size"
+    assert scratch.get("medium") == "Memory", "Pod scratch must use tmpfs"
+    assert quantity(scratch["sizeLimit"]) == quantity(worker["scratch"]), "Pod scratch size"
 
 
 def call(args, data=None, timeout=90, check=True):
@@ -147,7 +148,7 @@ def manifest(deadline=300):
                 "capabilities": {"drop": ["ALL"]}, "appArmorProfile": {"type": "Localhost", "localhostProfile": "openlegal-document"}},
             "resources": {"requests": resources, "limits": resources.copy()},
             "volumeMounts": [{"name": "scratch", "mountPath": "/scratch"}]}],
-        "volumes": [{"name": "scratch", "emptyDir": {"sizeLimit": worker["scratch"]}}]}}
+        "volumes": [{"name": "scratch", "emptyDir": {"medium": "Memory", "sizeLimit": worker["scratch"]}}]}}
 
 
 def create(deadline=300):
@@ -171,7 +172,7 @@ try:
     create()
     assert_created_pod(json.loads(call(["get", "pod", name, "-o", "json"]).stdout))
     report = json.loads(execute("--probe").stdout)
-    for key in ["nonroot", "no_new_privileges", "capabilities_dropped", "seccomp_filter", "user_namespace", "network_denied", "root_readonly", "no_token"]:
+    for key in ["nonroot", "no_new_privileges", "capabilities_dropped", "seccomp_filter", "user_namespace", "network_denied", "root_readonly", "no_token", "scratch_tmpfs"]:
         assert report[key], key
     assert "openlegal-document" in report["apparmor"] and "enforce" in report["apparmor"]
     # A user-namespaced runc container can expose a wider local pids.max even
@@ -218,6 +219,6 @@ try:
         time.sleep(2)
     assert status.get("reason") == "DeadlineExceeded"
     evidence = "memory exhaustion" if memory_exhaustion else "memory.max only (exhaustion untested)"
-    print(f"PASS: real runtime isolation, cgroups, XML exec framing, no content logs, PID, {evidence}, deadline, cleanup")
+    print(f"PASS: real runtime isolation, scratch tmpfs, cgroups, XML exec framing, no content logs, PID, {evidence}, deadline, cleanup")
 finally:
     delete()
