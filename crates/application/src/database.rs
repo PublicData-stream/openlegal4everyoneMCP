@@ -345,30 +345,56 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn freshness_boundaries_and_historical_metadata() {
-        for (now, expected) in [
+    async fn head_content_and_metadata_enforce_freshness_boundaries() {
+        for (now, state) in [
             (3699, Some(FreshnessState::Fresh)),
             (3700, Some(FreshnessState::Stale)),
+            (86499, Some(FreshnessState::Stale)),
             (86500, None),
+            (86501, None),
         ] {
-            let service = DatabaseService::new(Arc::new(Mock), Arc::new(Fixed(now)));
-            let result = service
-                .get(request(RevisionSelector::Head), CancellationToken::new())
-                .await;
-            match expected {
-                Some(s) => assert_eq!(result.unwrap().freshness.unwrap().state, s),
-                None => assert!(matches!(result, Err(DatabaseError::FreshnessUnavailable))),
+            for fresh_only in [false, true] {
+                let service = DatabaseService::new(Arc::new(Mock), Arc::new(Fixed(now)));
+                let mut input = request(RevisionSelector::Head);
+                input.fresh_only = fresh_only;
+                let content = service.get(input.clone(), CancellationToken::new()).await;
+                let metadata = service.get_metadata(input, CancellationToken::new()).await;
+                let expected = state.filter(|state| !fresh_only || *state == FreshnessState::Fresh);
+                for result in [content.map(|r| r.freshness), metadata.map(|r| r.freshness)] {
+                    match expected {
+                        Some(state) => assert_eq!(result.unwrap().unwrap().state, state),
+                        None => assert!(matches!(result, Err(DatabaseError::FreshnessUnavailable))),
+                    }
+                }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn historical_content_and_metadata_ignore_current_head_freshness() {
         let service = DatabaseService::new(Arc::new(Mock), Arc::new(Fixed(999999)));
-        let result = service
-            .get_metadata(
-                request(RevisionSelector::Revision { id: "r1".into() }),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(result.freshness.is_none());
-        assert_eq!(result.title, "Title");
+        for selector in [
+            RevisionSelector::Revision { id: "r1".into() },
+            RevisionSelector::Capture { id: "a".repeat(64) },
+        ] {
+            for fresh_only in [false, true] {
+                let mut input = request(selector.clone());
+                input.fresh_only = fresh_only;
+                let content = service
+                    .get(input.clone(), CancellationToken::new())
+                    .await
+                    .unwrap();
+                let metadata = service
+                    .get_metadata(input, CancellationToken::new())
+                    .await
+                    .unwrap();
+                assert!(content.freshness.is_none());
+                assert!(metadata.freshness.is_none());
+                assert_eq!(content.capture.capture_id, "a".repeat(64));
+                assert_eq!(metadata.capture_id, "a".repeat(64));
+                assert_eq!(metadata.revision_id, "r1");
+                assert_eq!(metadata.title, "Title");
+            }
+        }
     }
 }

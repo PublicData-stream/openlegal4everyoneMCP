@@ -518,18 +518,19 @@ fn scan(
         } else if let Some(literal) = literal {
             let mut matched = None;
             for (name, source, ocr) in &sections {
-                if literal
+                if let Some(span) = literal
                     .find(source.as_bytes())
                     .map_err(|_| E::InvalidInput)?
-                    .is_some()
                 {
-                    matched = Some((name, source, ocr));
+                    matched = Some((name, source, ocr, span.start(), span.end()));
                     break;
                 }
             }
-            if let Some((name, source, ocr)) = matched {
-                let text = source.chars().take(512).collect::<String>();
-                let mut found = hit(&doc, "object", 0, 0, text.len(), text, *ocr);
+            if let Some((name, source, ocr, start, end)) = matched {
+                let (excerpt_start, excerpt_end) = literal_excerpt(source, start, end)?;
+                let text = source[excerpt_start..excerpt_end].to_string();
+                let mut found = hit(&doc, "object", 0, excerpt_start, excerpt_end, text, *ocr);
+                found.match_scope = "object".into();
                 found.title = original_title;
                 found.excerpt_section = name.clone();
                 found.includes_ocr = sections.iter().any(|(_, _, o)| *o);
@@ -604,6 +605,46 @@ fn scan(
             return Ok((hits, Some(position), scanned));
         }
     }
+}
+/// Keep a complete first match with nearby original text. Offsets describe the
+/// excerpt in its original section, rather than a line-oriented match span.
+fn literal_excerpt(source: &str, start: usize, end: usize) -> Result<(usize, usize), E> {
+    if start > end || !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+        return Err(E::InvalidInput);
+    }
+    if end - start > 32768 {
+        return Err(E::Capacity);
+    }
+    let matched_scalars = source[start..end].chars().count();
+    let context_scalars = 512usize.saturating_sub(matched_scalars);
+    let before = source[..start]
+        .chars()
+        .rev()
+        .take(context_scalars / 2)
+        .count();
+    let after = source[end..].chars().take(context_scalars - before).count();
+    // Use otherwise unused trailing context on the leading side at end of section.
+    let before = source[..start]
+        .chars()
+        .rev()
+        .take(context_scalars - after)
+        .count();
+    let excerpt_start = source[..start]
+        .char_indices()
+        .rev()
+        .take(before)
+        .last()
+        .map_or(start, |(offset, _)| offset);
+    let excerpt_end = end
+        + source[end..]
+            .chars()
+            .take(after)
+            .map(char::len_utf8)
+            .sum::<usize>();
+    if excerpt_end - excerpt_start > 32768 {
+        return Err(E::Capacity);
+    }
+    Ok((excerpt_start, excerpt_end))
 }
 fn hit(
     doc: &IndexedCapture,
@@ -812,9 +853,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
         let mut separated = capture("1");
-        separated.record.body = "119 구조".into();
+        separated.record.body = "119 구조\nFictional body".into();
         let mut contiguous = capture("2");
-        contiguous.record.body = "119구조".into();
+        contiguous.record.body = "119구조\nFictional body".into();
         index.apply_capture(separated, true, 1).unwrap();
         index.apply_capture(contiguous, true, 2).unwrap();
         for (query, ignore_case, expected) in [
@@ -847,7 +888,128 @@ mod tests {
                 assert_eq!(result.0[0].object.id, "2");
                 assert_eq!(result.0[0].excerpt_section, "body");
             }
+            for found in result.0 {
+                assert_eq!(found.match_scope, "object");
+                assert_eq!(found.section, "object");
+                assert_eq!(found.line, 0);
+                if query == "FICTIONAL" {
+                    assert!(found.text.contains("Fictional"));
+                    assert_eq!(found.excerpt_section, "title");
+                }
+            }
         }
+    }
+
+    #[test]
+    fn literal_query_excerpt_tracks_first_distant_unicode_match_across_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
+        let source = format!(
+            "{}의료지원금{}의료지원금",
+            "앞 내용\n".repeat(200),
+            "뒤 내용\n".repeat(200)
+        );
+        for (sequence, id) in [(1, "1"), (2, "2")] {
+            let mut record = capture(id);
+            record.record.body = source.clone();
+            index.apply_capture(record, true, sequence).unwrap();
+        }
+        let mut search = session(&index, SearchMode::Query, "");
+        search.query = None;
+        search.literal = Some(Arc::new(
+            RegexMatcherBuilder::new()
+                .fixed_strings(true)
+                .build("의료지원금")
+                .unwrap(),
+        ));
+        let input = request("의료지원금", &[], 1);
+        let first = scan(
+            &index,
+            &search,
+            &input,
+            Position::default(),
+            &budget(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let second = scan(
+            &index,
+            &search,
+            &input,
+            first.1.unwrap(),
+            &budget(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(first.0.len(), 1);
+        assert_eq!(second.0.len(), 1);
+        assert_ne!(first.0[0].object.id, second.0[0].object.id);
+        for found in first.0.into_iter().chain(second.0) {
+            assert_eq!(found.match_scope, "object");
+            assert_eq!(found.section, "object");
+            assert_eq!(found.line, 0);
+            assert_eq!(found.excerpt_section, "body");
+            assert_eq!(found.text.chars().count(), 512);
+            assert_eq!(found.text.matches("의료지원금").count(), 1);
+            assert_eq!(&source[found.byte_start..found.byte_end], found.text);
+            assert!(found.byte_start > 0);
+            assert!(found.byte_start <= source.find("의료지원금").unwrap());
+            assert!(found.byte_end >= source.find("의료지원금").unwrap() + "의료지원금".len());
+        }
+    }
+
+    #[test]
+    fn literal_query_excerpt_keeps_complete_long_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = CorpusIndex::open(dir.path(), KoreanAnalyzer::fixture()).unwrap();
+        let query = "법 조문 ".repeat(150);
+        assert!(query.len() <= 4096 && query.chars().count() > 512);
+        let mut record = capture("1");
+        record.record.body = format!("앞 내용 {query}뒤 내용");
+        let source = record.record.body.clone();
+        index.apply_capture(record, true, 1).unwrap();
+        let mut search = session(&index, SearchMode::Query, "");
+        search.query = None;
+        search.literal = Some(Arc::new(
+            RegexMatcherBuilder::new()
+                .fixed_strings(true)
+                .build(&query)
+                .unwrap(),
+        ));
+        let result = scan(
+            &index,
+            &search,
+            &request(&query, &[], 20),
+            Position::default(),
+            &budget(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(result.0.len(), 1);
+        let found = &result.0[0];
+        assert_eq!(found.text, query);
+        assert_eq!(&source[found.byte_start..found.byte_end], found.text);
+    }
+
+    #[test]
+    fn literal_excerpt_respects_section_edges_and_hard_byte_limit() {
+        for source in ["첫 매치 뒤", "앞 첫 매치"] {
+            let start = source.find("첫 매치").unwrap();
+            assert_eq!(
+                literal_excerpt(source, start, start + "첫 매치".len()).unwrap(),
+                (0, source.len())
+            );
+        }
+        let source = "x".repeat(32768);
+        assert_eq!(
+            literal_excerpt(&source, 0, source.len()).unwrap(),
+            (0, source.len())
+        );
+        let source = "x".repeat(32769);
+        assert!(matches!(
+            literal_excerpt(&source, 0, source.len()),
+            Err(E::Capacity)
+        ));
     }
 
     #[test]

@@ -76,6 +76,13 @@ served time, age, freshness state, expiry times and remaining TTLs. Freshness la
 one hour; stale content can be served only within 24 hours of validation.
 `fresh_only` rejects stale data. A newly observed replacement awaiting processing
 cannot make the previous HEAD fresh. Historical results do not carry current TTL.
+`fresh_only=false` allows disclosed stale HEAD only below the 24-hour limit. For
+an otherwise readable retained HEAD at 24 hours or later, both `database.get` and
+`database.get_metadata` return `freshness_unavailable`, even if
+`database.object_status` reports `indexed=true`. Object-state and evidence errors
+still apply before freshness classification.
+Use an exact retained revision or capture selector to read historical evidence;
+an index entry neither renews HEAD validation nor proves corpus completeness.
 
 Provider text, extracted attachment text, and OCR are distinct sections. OCR has
 source digest/page provenance and is excluded from search/comparison by default.
@@ -133,6 +140,9 @@ Clients that previously used a bare field prefix as ordinary text must quote or
 escape it. This search change needs no index rebuild; a server restart expires
 existing search cursors.
 
+The `database.query` input schema omits `context_lines`; supplying it, including
+zero, is invalid tool input (`-32602`). The rg input retains this option.
+
 Terms, prefixes, AND and OR are evaluated separately for each engine. At every NOT
 node, the union of its child's two engine results is negated and shared by both
 engines; the final root results are unioned. Thus `A AND B` requires one engine to
@@ -146,6 +156,11 @@ Boolean results have whole-object scope; an excerpt is not a claimed matching sp
 Excerpt section and OCR inclusion are reported separately. Combining results is not
 a claim of improved legal-search accuracy; evaluate recall and false positives on
 appropriate evidence before making that claim.
+Literal query excerpts show the first matching substring in the first matching
+section, preserving original text and surrounding context. They normally contain
+up to 512 Unicode scalars, expanding when necessary to include the full literal
+within the 32 KiB excerpt bound. Query `byte_start` and `byte_end` delimit the
+returned excerpt in `excerpt_section`; rg offsets delimit its actual match.
 
 `database.rg` uses ripgrep's Rust regex engine. Matching is line oriented and case
 sensitive unless explicitly changed with typed `literal`, `ignore_case`, or

@@ -21,6 +21,46 @@ pub enum DateKind {
     Effective,
     Judgment,
 }
+/// Public query input omits options that are exclusive to line-oriented ripgrep.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuerySearchRequest {
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub filters: Filters,
+    #[serde(default)]
+    pub include_history: bool,
+    #[serde(default)]
+    pub include_ocr: bool,
+    #[serde(default)]
+    pub sections: Vec<String>,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    pub cursor: Option<String>,
+    /// Search the entire query as an original-text substring.
+    #[serde(default)]
+    pub literal: bool,
+    /// Valid only with literal=true.
+    #[serde(default)]
+    pub ignore_case: bool,
+}
+impl From<QuerySearchRequest> for SearchRequest {
+    fn from(request: QuerySearchRequest) -> Self {
+        Self {
+            query: request.query,
+            filters: request.filters,
+            include_history: request.include_history,
+            include_ocr: request.include_ocr,
+            sections: request.sections,
+            limit: request.limit,
+            cursor: request.cursor,
+            literal: request.literal,
+            ignore_case: request.ignore_case,
+            context_lines: 0,
+        }
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchRequest {
@@ -62,6 +102,8 @@ pub struct SearchHit {
     pub section: String,
     pub line: u64,
     pub text: String,
+    /// Original-section byte offsets: excerpt bounds for object hits, matching
+    /// substring bounds for line hits (whose text may also include context).
     pub byte_start: usize,
     pub byte_end: usize,
     pub derived_ocr: bool,

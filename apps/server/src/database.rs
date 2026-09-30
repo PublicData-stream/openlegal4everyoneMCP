@@ -12,7 +12,7 @@ use openlegal_application::{
 use openlegal_domain::{
     collection::{CollectionReceipt, CollectionRequest, CollectionStatusInput},
     legal::*,
-    legal_search::{SearchPage, SearchRequest},
+    legal_search::{QuerySearchRequest, SearchPage, SearchRequest},
     text_diff::{CompareInput, ComparisonSummary},
 };
 use schemars::JsonSchema;
@@ -264,40 +264,48 @@ impl ToolModule for DatabaseTools {
                 }
             },
         )?;
-        for (name, mode, description) in [
-            (
-                "database.query",
-                SearchMode::Query,
-                "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, in:title:, in:body:, in:case_number:, analyzed words and prefixes). Bare title:, body:, and case_number: are invalid; use the in: prefix. Double quotes require an exact case-sensitive source substring. Alternatively, literal: true searches the entire query as a source substring; ignore_case applies only with literal: true. Korean Lindera and MeCab-Ko analysis uses NFC and ASCII lowercase with no stopwords. Positive expressions must match within one engine; NOT excludes a match by either engine. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit.",
-            ),
-            (
-                "database.rg",
-                SearchMode::Ripgrep,
-                "Search managed legal content and case numbers using bounded ripgrep regex matching, case sensitive and line oriented by default. Typed literal, ignore_case, context_lines and filters are supported; filesystem paths and CLI arguments are never accepted. Continuations retain a fixed corpus generation for ten minutes.",
-            ),
-        ] {
-            let search = self.search.clone();
-            registry.register_typed::<SearchRequest, SearchPage, _, _>(
-                name,
-                description,
-                ToolOptions::default(),
-                move |input, ctx| {
-                    let search = search.clone();
-                    async move {
-                        search
-                            .search(
-                                mode,
-                                input,
-                                ctx.deadline.into_std(),
-                                ctx.request.cancellation,
-                            )
-                            .await
-                            .map(output)
-                            .map_err(map_error)
-                    }
-                },
-            )?;
-        }
+        let search = self.search.clone();
+        registry.register_typed::<QuerySearchRequest, SearchPage, _, _>(
+            "database.query",
+            "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, in:title:, in:body:, in:case_number:, analyzed words and prefixes). Bare title:, body:, and case_number: are invalid; use the in: prefix. Double quotes require an exact case-sensitive source substring. Alternatively, literal: true searches the entire query as a source substring; ignore_case applies only with literal: true. Literal excerpts surround the first matching source substring. Korean Lindera and MeCab-Ko analysis uses NFC and ASCII lowercase with no stopwords. Positive expressions must match within one engine; NOT excludes a match by either engine. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit.",
+            ToolOptions::default(),
+            move |input, ctx| {
+                let search = search.clone();
+                async move {
+                    search
+                        .search(
+                            SearchMode::Query,
+                            input.into(),
+                            ctx.deadline.into_std(),
+                            ctx.request.cancellation,
+                        )
+                        .await
+                        .map(output)
+                        .map_err(map_error)
+                }
+            },
+        )?;
+        let search = self.search.clone();
+        registry.register_typed::<SearchRequest, SearchPage, _, _>(
+            "database.rg",
+            "Search managed legal content and case numbers using bounded ripgrep regex matching, case sensitive and line oriented by default. Typed literal, ignore_case, context_lines and filters are supported; filesystem paths and CLI arguments are never accepted. Continuations retain a fixed corpus generation for ten minutes.",
+            ToolOptions::default(),
+            move |input, ctx| {
+                let search = search.clone();
+                async move {
+                    search
+                        .search(
+                            SearchMode::Ripgrep,
+                            input,
+                            ctx.deadline.into_std(),
+                            ctx.request.cancellation,
+                        )
+                        .await
+                        .map(output)
+                        .map_err(map_error)
+                }
+            },
+        )?;
         let requests = self.store.clone();
         registry.register_collection_request::<CollectionRequest, CollectionReceipt, _, _>(
             move |input, _| {
@@ -435,4 +443,44 @@ pub async fn load_widget(
     source: &crate::config::SourceOffer,
 ) -> Result<crate::resources::ResourceRegistry, ServerError> {
     crate::widget::load_widget(path, source, crate::widget::WidgetKind::Database).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn query_input_excludes_ripgrep_context_but_preserves_search_options() {
+        let query_schema = serde_json::to_value(schemars::schema_for!(QuerySearchRequest)).unwrap();
+        let rg_schema = serde_json::to_value(schemars::schema_for!(SearchRequest)).unwrap();
+        assert!(query_schema["properties"].get("context_lines").is_none());
+        assert_eq!(query_schema["additionalProperties"], false);
+        assert!(rg_schema["properties"].get("context_lines").is_some());
+        for context in [0, 1] {
+            let input = json!({"query":"medical", "context_lines":context});
+            assert!(serde_json::from_value::<QuerySearchRequest>(input.clone()).is_err());
+            let rg: SearchRequest = serde_json::from_value(input).unwrap();
+            assert_eq!(rg.context_lines, context);
+        }
+        let query: QuerySearchRequest = serde_json::from_value(json!({
+            "query":"Medical", "literal":true, "ignore_case":true,
+            "sections":["body"], "include_history":true, "include_ocr":true,
+            "filters":{"object_id":"one"}, "limit":1, "cursor":"next"
+        }))
+        .unwrap();
+        let internal: SearchRequest = query.into();
+        assert_eq!(internal.context_lines, 0);
+        assert_eq!(internal.query, "Medical");
+        assert!(internal.literal && internal.ignore_case);
+        assert!(internal.include_history && internal.include_ocr);
+        assert_eq!(internal.sections, ["body"]);
+        assert_eq!(internal.filters.object_id.as_deref(), Some("one"));
+        assert_eq!(internal.cursor.as_deref(), Some("next"));
+        assert_eq!(internal.limit, 1);
+        let omitted: QuerySearchRequest =
+            serde_json::from_value(json!({"query":"medical"})).unwrap();
+        assert_eq!(omitted.limit, 20);
+        assert_eq!(SearchRequest::from(omitted).context_lines, 0);
+    }
 }

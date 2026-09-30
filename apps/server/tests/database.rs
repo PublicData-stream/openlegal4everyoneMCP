@@ -18,20 +18,33 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, panic::AssertUnwindSafe, time::Duration};
 use tokio_util::sync::CancellationToken;
 async fn call(url: &str, revision: &str, name: &str, arguments: Value) -> Result<Value, String> {
-    let context = |stage: &str, error: String| format!("{revision} {name} {stage}: {error}");
-    let mut params = json!({"name":name,"arguments":arguments});
+    rpc(
+        url,
+        revision,
+        "tools/call",
+        json!({"name":name,"arguments":arguments}),
+    )
+    .await
+}
+
+async fn rpc(url: &str, revision: &str, method: &str, mut params: Value) -> Result<Value, String> {
+    let context = |stage: &str, error: String| format!("{revision} {method} {stage}: {error}");
+    let name = params["name"].as_str().map(str::to_owned);
     if revision == "2026-07-28" {
         params["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":revision,"io.modelcontextprotocol/clientInfo":{"name":"fictional-corpus-test","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}});
     }
-    let response = reqwest::Client::new()
+    let mut request = reqwest::Client::new()
         .post(url)
         .header("host", "database.test")
         .header("accept", "application/json, text/event-stream")
         .header("mcp-protocol-version", revision)
-        .header("mcp-method", "tools/call")
-        .header("mcp-name", name)
+        .header("mcp-method", method)
         .timeout(Duration::from_secs(15))
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":params}))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}));
+    if let Some(name) = name {
+        request = request.header("mcp-name", name);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| context("send", format!("{e:?}")))?;
@@ -204,6 +217,18 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
     let mut task = tokio::spawn(server.run(shutdown.clone()));
     let scenario = async {
         for protocol in ["2025-11-25", "2026-07-28"] {
+            let listed = rpc(&url, protocol, "tools/list", json!({})).await?;
+            let tools = listed["result"]["tools"].as_array().unwrap();
+            for (name, supports_context) in [("database.query", false), ("database.rg", true)] {
+                let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+                assert_eq!(
+                    tool["inputSchema"]["properties"]
+                        .get("context_lines")
+                        .is_some(),
+                    supports_context,
+                    "{tool}"
+                );
+            }
             let get = call(&url, protocol, "database.get", json!({"object":object})).await?;
             assert!(get["error"].is_null(), "{get}");
             assert_ne!(get["result"]["isError"], true, "{get}");
@@ -371,6 +396,22 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
                 1,
                 "{insensitive}"
             );
+            let literal_hit = &insensitive["result"]["structuredContent"]["hits"][0];
+            assert_eq!(literal_hit["match_scope"], "object");
+            assert_eq!(literal_hit["section"], "object");
+            assert_eq!(literal_hit["line"], 0);
+            assert_eq!(literal_hit["excerpt_section"], "title");
+            assert!(literal_hit["text"].as_str().unwrap().contains("ABC"));
+            for context in [0, 1] {
+                let unsupported = call(
+                    &url,
+                    protocol,
+                    "database.query",
+                    json!({"query":"ABC", "context_lines":context}),
+                )
+                .await?;
+                assert_eq!(unsupported["error"]["code"], -32602, "{unsupported}");
+            }
             let invalid_mode = call(
                 &url,
                 protocol,
@@ -406,6 +447,17 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
             assert_eq!(hit["text"], "after\n");
             assert_eq!(hit["byte_start"], 0);
             assert_eq!(hit["byte_end"], 5);
+            let context = call(
+                &url,
+                protocol,
+                "database.rg",
+                json!({"query":"^after$", "context_lines":1}),
+            )
+            .await?;
+            let context_hit = &context["result"]["structuredContent"]["hits"][0];
+            assert_eq!(context_hit["text"], "after\nFictional line\n");
+            assert_eq!(context_hit["byte_start"], 0);
+            assert_eq!(context_hit["byte_end"], 5);
             // Rejected patterns must not consume the 32 retained search-session slots.
             for _ in 0..33 {
                 let invalid = call(&url, protocol, "database.rg", json!({"query":"(["})).await?;

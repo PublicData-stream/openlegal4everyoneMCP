@@ -98,6 +98,10 @@ impl Server {
     }
 
     async fn start_with_extensions(extensions: bool) -> Self {
+        Self::start_with_options(extensions, false).await
+    }
+
+    async fn start_with_options(extensions: bool, search: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
@@ -114,7 +118,7 @@ impl Server {
             .port();
         let bind = format!("127.0.0.1:{port}").parse().unwrap();
         let limits = Arc::new(Limits {
-            max_message_bytes: 4096,
+            max_message_bytes: if search { 16384 } else { 4096 },
             max_buffer_bytes: 64 * 4096,
             io_timeout_secs: 1,
             shutdown_timeout_secs: 1,
@@ -126,6 +130,30 @@ impl Server {
                 Ok(json!({"synthetic":true}))
             })
             .unwrap();
+        if search {
+            use openlegal_domain::legal_search::{QuerySearchRequest, SearchRequest};
+            // Exercise the public input types through the actual WT handler with
+            // synthetic callbacks; PostgreSQL corpus tests cover search execution.
+            registry
+                .register::<QuerySearchRequest, _, _>(
+                    "database.query",
+                    "Synthetic query input fixture",
+                    |input, _| async move {
+                        let request = SearchRequest::from(input);
+                        Ok(json!({"query":request.query,"context_lines":request.context_lines}))
+                    },
+                )
+                .unwrap();
+            registry
+                .register::<SearchRequest, _, _>(
+                    "database.rg",
+                    "Synthetic rg input fixture",
+                    |input, _| async move {
+                        Ok(json!({"query":input.query,"context_lines":input.context_lines}))
+                    },
+                )
+                .unwrap();
+        }
         let active_plugins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let plugin_counter = active_plugins.clone();
         registry
@@ -573,6 +601,92 @@ async fn typed_tool_errors_preserve_input_and_operational_categories() {
         assert_eq!(malformed["id"], 11, "{legacy}");
         assert_eq!(malformed["error"]["code"], -32602, "{legacy}");
         assert!(malformed.get("result").is_none(), "{legacy}");
+        connection.close(0_u32.into(), b"done");
+    }
+}
+
+#[tokio::test]
+async fn query_and_rg_input_contracts_hold_on_both_revisions() {
+    let server = Server::start_with_options(false, true).await;
+    for legacy in [false, true] {
+        let client = server.client(true);
+        let connection = timeout(Duration::from_secs(3), client.connect(server.url(PATH)))
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut tx, recv) = connection.open_bi().await.unwrap().await.unwrap();
+        let mut rx = FrameReader::new(
+            recv,
+            16384,
+            Arc::new(Semaphore::new(32768)),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        if legacy {
+            send(&mut tx, &json!({"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"search-input-fixture","version":"1"}}})).await;
+            assert_eq!(
+                response(&mut rx).await["result"]["protocolVersion"],
+                "2025-11-25"
+            );
+            send(
+                &mut tx,
+                &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            )
+            .await;
+        }
+        let request = |id, method: &str, params| {
+            if legacy {
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+            } else {
+                modern(id, method, params)
+            }
+        };
+        send(&mut tx, &request(1, "tools/list", json!({}))).await;
+        let listed = response(&mut rx).await;
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        for (name, supports_context) in [("database.query", false), ("database.rg", true)] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(
+                tool["inputSchema"]["properties"]
+                    .get("context_lines")
+                    .is_some(),
+                supports_context,
+                "{legacy}: {tool}"
+            );
+        }
+        for (id, context) in [(2, 0), (3, 1)] {
+            send(&mut tx, &request(id, "tools/call", json!({"name":"database.query","arguments":{"query":"의료지원금","literal":true,"context_lines":context}}))).await;
+            let result = response(&mut rx).await;
+            assert_eq!(result["error"]["code"], -32602, "{legacy}: {result}");
+            assert!(result.get("result").is_none());
+        }
+        for (id, name, args, expected_context) in [
+            (
+                4,
+                "database.query",
+                json!({"query":"의료지원금","literal":true}),
+                0,
+            ),
+            (
+                5,
+                "database.rg",
+                json!({"query":"의료지원금","literal":true,"context_lines":1}),
+                1,
+            ),
+        ] {
+            send(
+                &mut tx,
+                &request(id, "tools/call", json!({"name":name,"arguments":args})),
+            )
+            .await;
+            let result = response(&mut rx).await;
+            assert!(result.get("error").is_none(), "{legacy}: {result}");
+            assert_eq!(
+                result["result"]["structuredContent"]["context_lines"],
+                expected_context
+            );
+            assert_eq!(result["result"]["structuredContent"]["query"], "의료지원금");
+        }
         connection.close(0_u32.into(), b"done");
     }
 }
