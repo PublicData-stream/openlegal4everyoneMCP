@@ -18,7 +18,7 @@ use openlegal_application::{
     search::SearchService,
 };
 use openlegal_domain::collection::{CollectionRequest, CollectionSearchMode, CollectionTarget};
-use openlegal_domain::legal::{DatabaseError, Dataset, RevisionSelector};
+use openlegal_domain::legal::{Capture, DatabaseError, Dataset, ObjectId, RevisionSelector};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 pub struct CorpusRuntime {
@@ -118,6 +118,120 @@ fn provider_failure_reason(error: DatabaseError) -> &'static str {
         DatabaseError::SourceDownloadFailed => "download_failed",
         _ => "worker_failed",
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionSkipReason {
+    Pending,
+    AlreadyFresh,
+    AlreadyInProgress,
+    HeadObservationSuperseded,
+    PublicationSuperseded,
+}
+
+impl CollectionSkipReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Pending => "collection_pending",
+            Self::AlreadyFresh => "already_fresh",
+            Self::AlreadyInProgress => "collection_already_in_progress",
+            Self::HeadObservationSuperseded => "head_observation_superseded",
+            Self::PublicationSuperseded => "publication_superseded",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CollectionItemOutcome {
+    Published,
+    Skipped(CollectionSkipReason),
+}
+
+#[derive(Default)]
+struct ExplicitCollectionSummary {
+    published: usize,
+    provider_failure: Option<&'static str>,
+    inventory_incomplete: bool,
+    skip_reason: Option<CollectionSkipReason>,
+    multiple_skip_reasons: bool,
+}
+
+impl ExplicitCollectionSummary {
+    fn observe_page(&mut self, page: &InventoryPage) {
+        // Explicit search samples one page; `done=false` does not make that
+        // structurally valid sample an invalid inventory response.
+        self.inventory_incomplete |= page.incomplete;
+    }
+
+    fn observe_item(&mut self, outcome: CollectionItemOutcome) {
+        match outcome {
+            CollectionItemOutcome::Published => self.published += 1,
+            CollectionItemOutcome::Skipped(reason) => {
+                if let Some(previous) = self.skip_reason {
+                    self.multiple_skip_reasons |= previous != reason;
+                } else {
+                    self.skip_reason = Some(reason);
+                }
+            }
+        }
+    }
+
+    fn observe_provider_failure(&mut self, error: DatabaseError) {
+        self.provider_failure
+            .get_or_insert(provider_failure_reason(error));
+    }
+
+    fn settlement(&self) -> (&'static str, Option<&'static str>) {
+        if self.published > 0 {
+            return (
+                "done",
+                self.provider_failure.or(self
+                    .inventory_incomplete
+                    .then_some("source_inventory_incomplete")),
+            );
+        }
+        if let Some(reason) = self.provider_failure {
+            return ("skipped", Some(reason));
+        }
+        if self.inventory_incomplete {
+            return ("failed", Some("source_inventory_incomplete"));
+        }
+        let reason = if self.multiple_skip_reasons {
+            "multiple_skip_reasons"
+        } else {
+            self.skip_reason
+                .map(CollectionSkipReason::code)
+                .unwrap_or("no_matches")
+        };
+        ("skipped", Some(reason))
+    }
+}
+
+fn select_explicit_object(
+    page: InventoryPage,
+    object: &ObjectId,
+) -> Result<InventoryItem, DatabaseError> {
+    let absent = if page.incomplete {
+        DatabaseError::SourceInventoryIncomplete
+    } else {
+        DatabaseError::NotFound
+    };
+    page.items
+        .into_iter()
+        .find(|item| &item.object == object)
+        .ok_or(absent)
+}
+
+fn head_observation_superseded(item: &InventoryItem, head: &Capture, list_started_at: u64) -> bool {
+    head.record.revision_id != item.revision_id
+        && (head.captured_at >= list_started_at
+            || head.validated_at >= list_started_at
+            || !comparable_dates_advance(
+                item.effective_date.as_deref(),
+                item.publication_date.as_deref(),
+                head.record.effective_date.as_deref(),
+                head.record.publication_date.as_deref(),
+            ))
 }
 
 #[derive(serde::Deserialize)]
@@ -313,8 +427,7 @@ impl CorpusRuntime {
             .on_demand_client()?;
         let result = self.collect_explicit(&provider, request, cancel).await;
         let (status, reason) = match &result {
-            Ok((0, reason)) => ("skipped", *reason),
-            Ok((_, reason)) => ("done", *reason),
+            Ok(summary) => summary.settlement(),
             Err(DatabaseError::BudgetExhausted | DatabaseError::Capacity) => ("deferred", None),
             Err(DatabaseError::SourceUnavailable) => ("skipped", Some("source_unavailable")),
             Err(DatabaseError::SourceDataInvalid) => ("skipped", Some("source_data_invalid")),
@@ -349,9 +462,8 @@ impl CorpusRuntime {
         provider: &LawClient,
         request: CollectionRequest,
         cancel: CancellationToken,
-    ) -> Result<(usize, Option<&'static str>), DatabaseError> {
-        let mut published = 0;
-        let mut partial_reason = None;
+    ) -> Result<ExplicitCollectionSummary, DatabaseError> {
+        let mut summary = ExplicitCollectionSummary::default();
         match request.target {
             CollectionTarget::Object { object } => {
                 let list_started_at = now();
@@ -365,12 +477,9 @@ impl CorpusRuntime {
                         cancel.clone(),
                     )
                     .await?;
-                let item = page
-                    .items
-                    .into_iter()
-                    .find(|item| item.object == object)
-                    .ok_or(DatabaseError::NotFound)?;
-                published += usize::from(
+                summary.observe_page(&page);
+                let item = select_explicit_object(page, &object)?;
+                summary.observe_item(
                     self.collect_explicit_item(provider, item, list_started_at, cancel)
                         .await?,
                 );
@@ -392,7 +501,7 @@ impl CorpusRuntime {
                     }
                 }
                 let item = select_precedent_case(&pages, &case_number, expected_id.as_deref())?;
-                published += usize::from(
+                summary.observe_item(
                     self.collect_explicit_item(provider, item, list_started_at, cancel)
                         .await?,
                 );
@@ -441,11 +550,12 @@ impl CorpusRuntime {
                                 | DatabaseError::SourceDataInvalid
                                 | DatabaseError::SourceDownloadFailed),
                             ) => {
-                                partial_reason.get_or_insert(provider_failure_reason(error));
+                                summary.observe_provider_failure(error);
                                 continue;
                             }
                             Err(error) => return Err(error),
                         };
+                        summary.observe_page(&page);
                         for item in page.items.into_iter().take(20) {
                             match self
                                 .collect_explicit_item(
@@ -456,14 +566,13 @@ impl CorpusRuntime {
                                 )
                                 .await
                             {
-                                Ok(true) => published += 1,
-                                Ok(false) => {}
+                                Ok(outcome) => summary.observe_item(outcome),
                                 Err(
                                     error @ (DatabaseError::SourceUnavailable
                                     | DatabaseError::SourceDataInvalid
                                     | DatabaseError::SourceDownloadFailed),
                                 ) => {
-                                    partial_reason.get_or_insert(provider_failure_reason(error));
+                                    summary.observe_provider_failure(error);
                                 }
                                 Err(error) => return Err(error),
                             }
@@ -472,7 +581,7 @@ impl CorpusRuntime {
                 }
             }
         }
-        Ok((published, partial_reason))
+        Ok(summary)
     }
 
     async fn collect_explicit_item(
@@ -481,10 +590,12 @@ impl CorpusRuntime {
         item: InventoryItem,
         list_started_at: u64,
         cancel: CancellationToken,
-    ) -> Result<bool, DatabaseError> {
+    ) -> Result<CollectionItemOutcome, DatabaseError> {
         let observed = self.store.state(&item.object).await?;
         if observed.pending {
-            return Ok(false);
+            return Ok(CollectionItemOutcome::Skipped(
+                CollectionSkipReason::Pending,
+            ));
         }
         if observed.head_capture.is_some() {
             match self
@@ -497,18 +608,10 @@ impl CorpusRuntime {
                 )
                 .await
             {
-                Ok(head) if head.record.revision_id != item.revision_id => {
-                    let newer_observation =
-                        head.captured_at >= list_started_at || head.validated_at >= list_started_at;
-                    let newer_source_date = comparable_dates_advance(
-                        item.effective_date.as_deref(),
-                        item.publication_date.as_deref(),
-                        head.record.effective_date.as_deref(),
-                        head.record.publication_date.as_deref(),
-                    );
-                    if newer_observation || !newer_source_date {
-                        return Ok(false);
-                    }
+                Ok(head) if head_observation_superseded(&item, &head, list_started_at) => {
+                    return Ok(CollectionItemOutcome::Skipped(
+                        CollectionSkipReason::HeadObservationSuperseded,
+                    ));
                 }
                 Ok(_) => {}
                 Err(DatabaseError::NotFound | DatabaseError::RevisionUnavailable) => {}
@@ -520,7 +623,9 @@ impl CorpusRuntime {
             .head_revision_ready(&item.object, &item.revision_id, now())
             .await?
         {
-            return Ok(false);
+            return Ok(CollectionItemOutcome::Skipped(
+                CollectionSkipReason::AlreadyFresh,
+            ));
         }
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert("collection_origin".into(), "explicit".into());
@@ -553,7 +658,9 @@ impl CorpusRuntime {
             .map(String::as_str)
             != Some("explicit")
         {
-            return Ok(false);
+            return Ok(CollectionItemOutcome::Skipped(
+                CollectionSkipReason::AlreadyInProgress,
+            ));
         }
         let Some(job) = self
             .store
@@ -634,10 +741,12 @@ impl CorpusRuntime {
             )
             .await
         {
-            Ok(_) => Ok(true),
+            Ok(_) => Ok(CollectionItemOutcome::Published),
             Err(DatabaseError::Conflict) => {
                 self.store.fail_claim(&job, false).await?;
-                Ok(false)
+                Ok(CollectionItemOutcome::Skipped(
+                    CollectionSkipReason::PublicationSuperseded,
+                ))
             }
             Err(error) => {
                 self.store.fail_claim(&job, false).await?;
@@ -1814,6 +1923,182 @@ impl CorpusRuntime {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod explicit_collection_tests {
+    use super::*;
+    use openlegal_domain::legal::LegalRecord;
+    use std::collections::BTreeMap;
+
+    fn item() -> InventoryItem {
+        InventoryItem {
+            object: ObjectId {
+                jurisdiction: "kr".into(),
+                provider: "law_go_kr".into(),
+                dataset: Dataset::NationalStatute,
+                id: "001".into(),
+            },
+            revision_id: "200:20260102".into(),
+            effective_date: Some("20260102".into()),
+            publication_date: Some("20260101".into()),
+            title: "Fictional statute".into(),
+            data_source: None,
+            case_number: None,
+            treaty_class_code: None,
+        }
+    }
+
+    fn page(items: Vec<InventoryItem>, incomplete: bool) -> InventoryPage {
+        InventoryPage {
+            items,
+            total: Some(200),
+            done: false,
+            rejected_rows: usize::from(incomplete),
+            incomplete,
+        }
+    }
+
+    #[test]
+    fn explicit_object_selection_preserves_valid_rows_without_claiming_absence_from_bad_rows() {
+        let wanted = item().object;
+        for incomplete in [false, true] {
+            let selected = select_explicit_object(page(vec![item()], incomplete), &wanted).unwrap();
+            assert_eq!(selected.object, wanted);
+            let missing = select_explicit_object(page(vec![], incomplete), &wanted).unwrap_err();
+            assert_eq!(
+                missing,
+                if incomplete {
+                    DatabaseError::SourceInventoryIncomplete
+                } else {
+                    DatabaseError::NotFound
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_collection_settlement_preserves_partial_publication_and_failure_precedence() {
+        for published in [false, true] {
+            for incomplete in [false, true] {
+                for failure in [
+                    None,
+                    Some(DatabaseError::SourceUnavailable),
+                    Some(DatabaseError::SourceDataInvalid),
+                    Some(DatabaseError::SourceDownloadFailed),
+                ] {
+                    let mut summary = ExplicitCollectionSummary::default();
+                    summary.observe_page(&page(vec![item()], incomplete));
+                    summary.observe_item(CollectionItemOutcome::Skipped(
+                        CollectionSkipReason::AlreadyFresh,
+                    ));
+                    if let Some(error) = failure {
+                        summary.observe_provider_failure(error);
+                        // A later failure never replaces the first one.
+                        summary.observe_provider_failure(DatabaseError::SourceDownloadFailed);
+                    }
+                    if published {
+                        summary.observe_item(CollectionItemOutcome::Published);
+                    }
+                    let expected = match (published, failure, incomplete) {
+                        (true, Some(error), _) => ("done", Some(provider_failure_reason(error))),
+                        (false, Some(error), _) => {
+                            ("skipped", Some(provider_failure_reason(error)))
+                        }
+                        (true, None, true) => ("done", Some("source_inventory_incomplete")),
+                        (false, None, true) => ("failed", Some("source_inventory_incomplete")),
+                        (true, None, false) => ("done", None),
+                        (false, None, false) => ("skipped", Some("already_fresh")),
+                    };
+                    assert_eq!(summary.settlement(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn skipped_collection_reports_actual_distinct_causes_and_empty_samples() {
+        let causes = [
+            (CollectionSkipReason::Pending, "collection_pending"),
+            (CollectionSkipReason::AlreadyFresh, "already_fresh"),
+            (
+                CollectionSkipReason::AlreadyInProgress,
+                "collection_already_in_progress",
+            ),
+            (
+                CollectionSkipReason::HeadObservationSuperseded,
+                "head_observation_superseded",
+            ),
+            (
+                CollectionSkipReason::PublicationSuperseded,
+                "publication_superseded",
+            ),
+        ];
+        for (cause, code) in causes {
+            let mut summary = ExplicitCollectionSummary::default();
+            summary.observe_item(CollectionItemOutcome::Skipped(cause));
+            summary.observe_item(CollectionItemOutcome::Skipped(cause));
+            assert_eq!(summary.settlement(), ("skipped", Some(code)));
+            let different = if cause == CollectionSkipReason::Pending {
+                CollectionSkipReason::AlreadyFresh
+            } else {
+                CollectionSkipReason::Pending
+            };
+            summary.observe_item(CollectionItemOutcome::Skipped(different));
+            assert_eq!(
+                summary.settlement(),
+                ("skipped", Some("multiple_skip_reasons"))
+            );
+        }
+        let mut empty = ExplicitCollectionSummary::default();
+        empty.observe_page(&page(vec![], false));
+        assert_eq!(empty.settlement(), ("skipped", Some("no_matches")));
+        empty.observe_page(&page(vec![], true));
+        assert_eq!(
+            empty.settlement(),
+            ("failed", Some("source_inventory_incomplete"))
+        );
+    }
+
+    #[test]
+    fn explicit_head_guard_preserves_observation_and_date_fences() {
+        let mut candidate = item();
+        let mut head = Capture {
+            capture_id: "a".repeat(64),
+            sequence: 1,
+            record: LegalRecord {
+                object: candidate.object.clone(),
+                revision_id: "100:20260101".into(),
+                title: "Fictional statute".into(),
+                body: "Fictional body".into(),
+                sections: vec![],
+                metadata: BTreeMap::new(),
+                publication_date: Some("20260101".into()),
+                effective_date: Some("20260101".into()),
+                source_url: "https://example.invalid/fictional".into(),
+                representation: "provider_record".into(),
+            },
+            retrieved_at: 90,
+            captured_at: 90,
+            validated_at: 90,
+            processor_version: "fictional_v1".into(),
+            raw_sha256: "b".repeat(64),
+        };
+        assert!(!head_observation_superseded(&candidate, &head, 100));
+        head.captured_at = 100;
+        assert!(head_observation_superseded(&candidate, &head, 100));
+        head.captured_at = 90;
+        head.validated_at = 100;
+        assert!(head_observation_superseded(&candidate, &head, 100));
+        head.validated_at = 90;
+        candidate.effective_date = None;
+        assert!(head_observation_superseded(&candidate, &head, 100));
+        candidate.effective_date = Some("20251231".into());
+        assert!(head_observation_superseded(&candidate, &head, 100));
+        candidate.revision_id = head.record.revision_id.clone();
+        head.captured_at = 101;
+        assert!(!head_observation_superseded(&candidate, &head, 100));
     }
 }
 

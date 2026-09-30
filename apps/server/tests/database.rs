@@ -229,6 +229,63 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
                     "{tool}"
                 );
             }
+            // Settle a fictional request in storage; no scheduler/provider work
+            // runs. Then verify retained reasons through both public tools.
+            runtime
+                .store
+                .heartbeat_collection_scheduler()
+                .await
+                .unwrap();
+            let target = json!({"target":{"kind":"object","object":{"jurisdiction":"kr","provider":"law_go_kr","dataset":"national_statute","id":"123"}}});
+            let receipt = call(
+                &url,
+                protocol,
+                "database.request_collection",
+                target.clone(),
+            )
+            .await?;
+            let request_id = receipt["result"]["structuredContent"]["request_id"]
+                .as_str()
+                .unwrap();
+            if receipt["result"]["structuredContent"]["status"] == "queued" {
+                let (claimed, _) = runtime
+                    .store
+                    .claim_collection_request()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(claimed, request_id);
+                runtime
+                    .store
+                    .settle_collection_request_with_reason(
+                        request_id,
+                        "skipped",
+                        Some("already_fresh"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let status = call(
+                &url,
+                protocol,
+                "database.collection_status",
+                json!({"request_id":request_id}),
+            )
+            .await?;
+            assert_eq!(status["result"]["structuredContent"]["status"], "skipped");
+            assert_eq!(
+                status["result"]["structuredContent"]["reason"],
+                "already_fresh"
+            );
+            let deduplicated = call(&url, protocol, "database.request_collection", target).await?;
+            assert_eq!(
+                deduplicated["result"]["structuredContent"]["request_id"],
+                request_id
+            );
+            assert_eq!(
+                deduplicated["result"]["structuredContent"]["reason"],
+                "already_fresh"
+            );
             let get = call(&url, protocol, "database.get", json!({"object":object})).await?;
             assert!(get["error"].is_null(), "{get}");
             assert_ne!(get["result"]["isError"], true, "{get}");

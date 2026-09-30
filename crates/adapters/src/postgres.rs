@@ -221,6 +221,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0010_revision_history_order.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            11,
+            "collection skip reasons".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0011_collection_skip_reasons.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

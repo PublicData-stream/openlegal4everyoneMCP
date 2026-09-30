@@ -143,6 +143,13 @@ impl PgCorpusStore {
                     | "identity_conflict"
                     | "worker_failed"
                     | "worker_lost"
+                    | "collection_pending"
+                    | "already_fresh"
+                    | "collection_already_in_progress"
+                    | "head_observation_superseded"
+                    | "publication_superseded"
+                    | "no_matches"
+                    | "multiple_skip_reasons"
             )
         }) {
             return Err(DatabaseError::InvalidInput);

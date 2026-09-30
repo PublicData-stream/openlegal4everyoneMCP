@@ -191,6 +191,26 @@ explicit errors. PostgreSQL is authoritative. The index consumes an ordered dura
 outbox, commits before acknowledging events, and preserves old readers until their
 sessions expire. Referenced missing/corrupt evidence is a storage failure.
 
+## Explicit collection outcomes
+
+`database.request_collection` coalesces equivalent requests, and
+`database.collection_status` returns the same bounded receipt, including an
+optional terminal `reason`. A new skipped attempt reports its observed cause:
+`collection_pending`, `already_fresh`, `collection_already_in_progress`,
+`head_observation_superseded`, `publication_superseded`, or `no_matches`.
+`multiple_skip_reasons` means different objects were skipped for different causes.
+Old receipts with no reason retain that uncertainty.
+
+Structurally incomplete provider lists do not establish absence. Valid matching
+rows can still be collected; absent higher-priority provider failures, the receipt
+is `done` with `source_inventory_incomplete` when something publishes, or `failed`
+with that reason when nothing publishes. Existing `source_unavailable`,
+`source_data_invalid`, and `download_failed` reasons retain precedence in encounter
+order. A bounded search of one page and up to 20 valid items per dataset/class does
+not promise a complete inventory; normal page truncation is separate from invalid
+or missing source rows. Precedent-case collection retains its stricter uniqueness
+and completeness requirements.
+
 ## Operator configuration
 
 Build the widgets first. Add to a configuration that already supplies persistent
@@ -230,12 +250,12 @@ the index. Do not share a corpus index between concurrent server processes. Run
 `openlegal-server --migrate CONFIG.toml` with the migration credential before serving.
 The runtime credential does not create schema objects.
 
-The inspector corrections add a revision ordering index through a new
-migration. Run the matching binary's `--migrate` before
+The inspector corrections add an ordering index and expand the collection reason
+constraint through new migrations. Run the matching binary's `--migrate` before
 starting it; there is no evidence rewrite or search-index rebuild. The schema gate
 checks the exact migration set, so an older binary cannot open an upgraded schema.
 For a behavior rollback, use a revert build retaining these additive migrations;
-do not remove migration history.
+do not remove migration history or infer reasons for old NULL receipts.
 
 Serving retained data requires neither provider credentials nor Kubernetes.
 Coverage is reported complete only after all three current datasets have matching
