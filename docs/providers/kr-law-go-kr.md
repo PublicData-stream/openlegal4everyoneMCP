@@ -39,6 +39,24 @@ NTS HTML identity markers remain unverified; unrecognized markup fails closed.
 | [Interpretation list](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=expcListGuide) and [detail](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=expcInfoGuide) | Interpretation serial and response/reason fields |
 | [Administrative-appeal list](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=deccListGuide) and [detail](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=deccInfoGuide) | Appeal serial, order, claim and reasons |
 
+## Commercial use and application
+
+The project's operator policy permits commercial use of the configured LAW OPEN
+DATA legal-information APIs. Operators must state a commercial purpose, when
+applicable, in their API application and obtain approval for the selected data
+and actual egress IP. The application-purpose requirement is maintainer-supplied
+confirmation recorded on 2026-10-01; this repository has not inspected the
+account-specific application or approval screen.
+
+The public [service guidance](https://open.law.go.kr/LSO/information/guide.do),
+checked on 2026-10-01, expressly includes commercial use in its legal-information
+reuse policy. Its generic restriction paragraph does not enumerate noncommercial
+DRF APIs. Do not characterize the configured `eflaw`, `admrul`, `ordin`, `trty`,
+`prec`, `detc`, `expc` or `decc` routes as commercially prohibited on that basis.
+The separately licensed file-data conversion APIs on `data.go.kr` are different
+services; their licenses do not establish restrictions on these DRF routes.
+Preserve required source attribution and approved access conditions.
+
 ## Identity, views and dates
 
 Application identity is `(jurisdiction=kr, provider=law_go_kr, dataset, provider ID)`.
