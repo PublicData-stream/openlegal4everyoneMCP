@@ -53,8 +53,9 @@ When the user wants to know which of several laws changed, call `law.watch`
 with up to 100 `laws` (names or objects). Pass the `snapshot` from the user's
 last check as `previous`, and give the new `snapshot` back so they can keep it
 for next time; you cannot schedule the check yourself. Report `changed` entries
-first, then entries with `upcoming` revisions (promulgated, not yet in force),
-then `not_observed` or `ambiguous` names to fix. Without `previous`, every
+first, then entries whose `repeal_status` is `repealed` or `repeal_scheduled`,
+then entries with `upcoming` revisions (promulgated, not yet in force), then
+`not_observed` or `ambiguous` names to fix. Without `previous`, every
 found entry is `new`: report its HEAD revision and dates instead of a change.
 
 ## Renames, repeal and upcoming changes
@@ -62,9 +63,16 @@ found entry is `new`: report its HEAD revision and dates instead of a change.
 For one law, call `law.lineage`. `titles` lists title periods (`renamed` is
 true when the title changed), `upcoming` lists revisions taking effect after
 today, and `head_state` other than `published` (for example `withdrawn`) means
-the current text is not readable. `repeal_mentions` are lines in other laws that
-mention the title with `폐지`: quote them as leads and do not state that the law
-was repealed unless a returned line says so. If `law.watch` or `law.lineage` is
+the current text is not readable.
+
+`repeal_status` comes from the provider's amendment type (`제개정구분명`) on
+the latest retained revision. `repealed` or `repeal_scheduled` with a `repeal`
+record is the provider's own record: state it with the repealing revision, its
+amendment type (`폐지`, `타법폐지`, `일괄폐지`) and its effective date.
+`no_repeal_recorded` means the latest retained revision is not a repeal; say
+that a repeal not yet collected would not show. `unknown` means no amendment
+type was recorded. `repeal_mentions` are lines in other laws that mention the
+title with `폐지`: quote them as leads, never as the repeal record. If `law.watch` or `law.lineage` is
 missing, use `database.history` and `database.get_metadata` instead.
 
 ## Large documents

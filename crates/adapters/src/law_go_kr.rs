@@ -31,6 +31,9 @@ pub struct InventoryItem {
     pub data_source: Option<String>,
     pub case_number: Option<String>,
     pub treaty_class_code: Option<String>,
+    /// Provider `제개정구분명` of this revision, such as `일부개정` or `타법폐지`.
+    #[serde(default)]
+    pub amendment_type: Option<String>,
 }
 impl InventoryItem {
     /// Validate an operator-supplied identity hint before it can queue a live
@@ -49,6 +52,7 @@ impl InventoryItem {
             || self.title.len() > 512
             || self.data_source.as_deref().is_some_and(|s| s.len() > 512)
             || self.case_number.as_deref().is_some_and(|s| s.len() > 512)
+            || self.amendment_type.as_deref().is_some_and(|s| s.len() > 64)
         {
             return Err(DatabaseError::InvalidInput);
         }
@@ -1357,6 +1361,11 @@ fn parse_inventory_tree(
                 } else {
                     None
                 },
+                amendment_type: if dataset.has_provider_revisions() {
+                    first(node, "제개정구분명").filter(|v| !v.is_empty() && v.len() <= 64)
+                } else {
+                    None
+                },
             }))
         })();
         match parsed {
@@ -1838,6 +1847,9 @@ pub fn project(
     if let Some(value) = &item.data_source {
         metadata.insert("data_source".into(), value.clone());
     }
+    if let Some(value) = &item.amendment_type {
+        metadata.insert("amendment_type".into(), value.clone());
+    }
     if let Some(value) = &item.case_number {
         metadata
             .entry("case_number".into())
@@ -1956,6 +1968,9 @@ fn project_additional(
     );
     metadata.insert("provider_record_number".into(), number.clone());
     metadata.insert("section_locator_semantics".into(), "source_ordinal".into());
+    if let Some(value) = &item.amendment_type {
+        metadata.insert("amendment_type".into(), value.clone());
+    }
     for (original, key) in [
         ("행정규칙종류", "document_type"),
         ("소관부처명", "authority"),
@@ -2132,6 +2147,43 @@ mod tests {
         .unwrap();
         assert_eq!(flags, (3, true));
         store.close().await.unwrap();
+    }
+    #[test]
+    fn revisioned_inventory_rows_keep_the_provider_amendment_type() {
+        let row = |amendment: &str| {
+            branch(
+                "law",
+                vec![
+                    field("법령ID", "1"),
+                    field("법령일련번호", "100"),
+                    field("법령명한글", "Fictional statute"),
+                    field("시행일자", "20260101"),
+                    field("제개정구분명", amendment),
+                ],
+            )
+        };
+        let tree = branch(
+            "root",
+            vec![field("totalCnt", "2"), row("타법폐지"), row("")],
+        );
+        let page = parse_inventory_tree(&tree, Dataset::NationalStatute, 1).unwrap();
+        assert_eq!(page.items[0].amendment_type.as_deref(), Some("타법폐지"));
+        assert_eq!(page.items[1].amendment_type, None);
+        let precedent = branch(
+            "root",
+            vec![
+                field("totalCnt", "1"),
+                branch(
+                    "prec",
+                    vec![field("판례일련번호", "100"), field("제개정구분명", "폐지")],
+                ),
+            ],
+        );
+        let page = parse_inventory_tree(&precedent, Dataset::Precedent, 1).unwrap();
+        assert_eq!(page.items[0].amendment_type, None);
+        let mut hint = item();
+        hint.amendment_type = Some("폐".repeat(30));
+        assert!(hint.validate_for_detail().is_err());
     }
     #[test]
     fn mixed_inventory_keeps_valid_rows_and_marks_page_incomplete() {
@@ -2331,6 +2383,7 @@ mod tests {
             data_source: None,
             case_number: None,
             treaty_class_code: None,
+            amendment_type: None,
         }
     }
     fn output(tree: DocumentNode) -> DocumentOutput {
@@ -2491,6 +2544,11 @@ mod tests {
         assert_eq!(record.sections.len(), 2);
         assert!(!record.source_url.contains("OC="));
         assert_eq!(record.metadata["requested_efYd"], "20260101");
+        assert!(!record.metadata.contains_key("amendment_type"));
+        let mut repealed = item();
+        repealed.amendment_type = Some("타법폐지".into());
+        let record = project(&repealed, &data).unwrap();
+        assert_eq!(record.metadata["amendment_type"], "타법폐지");
         let mut wrong = item();
         wrong.effective_date = Some("20260102".into());
         assert!(project(&wrong, &data).is_err());

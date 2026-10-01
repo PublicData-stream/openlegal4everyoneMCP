@@ -20,7 +20,7 @@ use openlegal_domain::{
         DatabaseError, Dataset, GetRequest, HistoryEntry, ObjectId, RevisionSelector, valid_date,
     },
     legal_analysis::*,
-    legal_reference::{ArticleNumber, CaseRecordMatch, RevisionChoice},
+    legal_reference::{ArticleNumber, CaseRecordMatch},
 };
 use openlegal_normalization::kr_legal_reference::{
     self as kr, ArticleLookup, LawReference, LocatedArticle, OutlineUnit,
@@ -41,6 +41,7 @@ const REVISIONED: [Dataset; 3] = [
     Dataset::Ordinance,
 ];
 const MAX_WATCH_LAWS: usize = 100;
+const MAX_UPCOMING_DETAILS: usize = 5;
 const MAX_REPEAL_TITLES: usize = 10;
 const MAX_REPEAL_MENTIONS: usize = 20;
 const MAX_CITING: usize = 50;
@@ -198,14 +199,6 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-fn choice(entry: &HistoryEntry) -> RevisionChoice {
-    RevisionChoice {
-        revision_id: entry.revision_id.clone(),
-        effective_date: entry.effective_date.clone(),
-        publication_date: entry.publication_date.clone(),
-    }
-}
-
 fn chronological(entries: &[HistoryEntry]) -> Vec<&HistoryEntry> {
     let mut ordered: Vec<&HistoryEntry> = entries.iter().collect();
     ordered.sort_by(|a, b| {
@@ -219,13 +212,111 @@ fn chronological(entries: &[HistoryEntry]) -> Vec<&HistoryEntry> {
     ordered
 }
 
-/// Retained revisions taking effect after `today`, earliest first.
-fn upcoming(entries: &[HistoryEntry], today: &str) -> Vec<RevisionChoice> {
-    chronological(entries)
-        .into_iter()
+/// The provider amendment type recorded for one revision, if readable.
+async fn amendment_type(
+    lookup: &ReferenceLookup,
+    object: &ObjectId,
+    revision_id: &str,
+    cancel: &CancellationToken,
+) -> Result<Option<String>, ToolError> {
+    let result = lookup
+        .database()
+        .get_metadata(
+            GetRequest {
+                object: object.clone(),
+                selector: RevisionSelector::Revision {
+                    id: revision_id.to_string(),
+                },
+                fresh_only: false,
+            },
+            cancel.clone(),
+        )
+        .await;
+    match result {
+        Ok(metadata) => Ok(metadata.metadata.get("amendment_type").cloned()),
+        Err(DatabaseError::Cancelled) => Err(ToolError::Unavailable),
+        Err(_) => Ok(None),
+    }
+}
+
+struct RevisionStatus {
+    upcoming: Vec<UpcomingRevision>,
+    repeal_status: RepealStatus,
+    repeal: Option<RepealRecord>,
+    latest_amendment_type: Option<String>,
+}
+
+/// Upcoming revisions (earliest first) and the repeal state recorded on the latest
+/// retained revision. Repeal is read from the provider amendment type, never inferred.
+async fn revision_status(
+    lookup: &ReferenceLookup,
+    object: &ObjectId,
+    entries: &[HistoryEntry],
+    today: &str,
+    cancel: &CancellationToken,
+) -> Result<RevisionStatus, ToolError> {
+    let ordered = chronological(entries);
+    let mut known: HashMap<&str, Option<String>> = HashMap::new();
+    let mut upcoming = Vec::new();
+    for entry in ordered
+        .iter()
         .filter(|e| e.effective_date.as_deref().is_some_and(|d| d > today))
-        .map(choice)
-        .collect()
+    {
+        let amendment = if upcoming.len() < MAX_UPCOMING_DETAILS {
+            let amendment = amendment_type(lookup, object, &entry.revision_id, cancel).await?;
+            known.insert(entry.revision_id.as_str(), amendment.clone());
+            amendment
+        } else {
+            None
+        };
+        upcoming.push(UpcomingRevision {
+            revision_id: entry.revision_id.clone(),
+            effective_date: entry.effective_date.clone(),
+            publication_date: entry.publication_date.clone(),
+            amendment_type: amendment,
+        });
+    }
+    let mut status = RevisionStatus {
+        upcoming,
+        repeal_status: RepealStatus::Unknown,
+        repeal: None,
+        latest_amendment_type: None,
+    };
+    let Some(latest) = ordered.last() else {
+        return Ok(status);
+    };
+    status.latest_amendment_type = match known.get(latest.revision_id.as_str()) {
+        Some(amendment) => amendment.clone(),
+        None => amendment_type(lookup, object, &latest.revision_id, cancel).await?,
+    };
+    if let Some(value) = &status.latest_amendment_type {
+        match RepealKind::from_amendment_type(value) {
+            Some(kind) => {
+                let scheduled = latest.effective_date.as_deref().is_some_and(|d| d > today);
+                status.repeal_status = if scheduled {
+                    RepealStatus::RepealScheduled
+                } else {
+                    RepealStatus::Repealed
+                };
+                status.repeal = Some(RepealRecord {
+                    revision_id: latest.revision_id.clone(),
+                    amendment_type: value.clone(),
+                    kind,
+                    effective_date: latest.effective_date.clone(),
+                    publication_date: latest.publication_date.clone(),
+                });
+            }
+            None => status.repeal_status = RepealStatus::NoRepealRecorded,
+        }
+    }
+    Ok(status)
+}
+
+fn is_repeal(status: Option<RepealStatus>) -> bool {
+    matches!(
+        status,
+        Some(RepealStatus::Repealed | RepealStatus::RepealScheduled)
+    )
 }
 
 async fn head_metadata(
@@ -289,6 +380,7 @@ async fn watch(
         snapshot: BTreeMap::new(),
         changed: 0,
         with_upcoming: 0,
+        repealed: 0,
         corpus_complete: index.corpus_complete,
         collection_notices: index.notices.clone(),
     };
@@ -304,7 +396,10 @@ async fn watch(
             head_revision_id: None,
             effective_date: None,
             publication_date: None,
+            amendment_type: None,
             upcoming: Vec::new(),
+            repeal_status: None,
+            repeal: None,
         };
         let object = match (target.law_name, target.object) {
             (Some(name), None) => {
@@ -345,6 +440,7 @@ async fn watch(
                 };
                 result.snapshot.insert(key, head.revision_id.clone());
                 entry.title = Some(head.title);
+                entry.amendment_type = head.metadata.get("amendment_type").cloned();
                 entry.head_revision_id = Some(head.revision_id);
                 entry.effective_date = head.effective_date;
                 entry.publication_date = head.publication_date;
@@ -361,14 +457,27 @@ async fn watch(
                 }
             }
         }
-        if input.include_upcoming
-            && object.dataset.has_provider_revisions()
-            && entry.head_revision_id.is_some()
-        {
+        // A repealed law can leave the provider's current list, so the revision
+        // catalog is read even when HEAD is unavailable.
+        if object.dataset.has_provider_revisions() {
             match lookup.revisions(object.clone(), cancel.clone()).await {
-                Ok(inventory) => entry.upcoming = upcoming(&inventory.entries, today),
+                Ok(inventory) if !inventory.entries.is_empty() => {
+                    let status =
+                        revision_status(lookup, &object, &inventory.entries, today, &cancel)
+                            .await?;
+                    if input.include_upcoming {
+                        entry.upcoming = status.upcoming;
+                    }
+                    entry.repeal_status = Some(status.repeal_status);
+                    entry.repeal = status.repeal;
+                }
+                Ok(_) => {}
                 Err(DatabaseError::Cancelled) => return Err(ToolError::Unavailable),
-                Err(error) => entry.detail = Some(format!("upcoming_{}", code(error))),
+                Err(error) => {
+                    entry
+                        .detail
+                        .get_or_insert_with(|| format!("revisions_{}", code(error)));
+                }
             }
         }
         entry.object = Some(object);
@@ -378,9 +487,13 @@ async fn watch(
         if !entry.upcoming.is_empty() {
             result.with_upcoming += 1;
         }
+        if is_repeal(entry.repeal_status) {
+            result.repealed += 1;
+        }
         if !input.changes_only
             || entry.status != WatchStatus::Unchanged
             || !entry.upcoming.is_empty()
+            || is_repeal(entry.repeal_status)
         {
             result.entries.push(entry);
         }
@@ -462,6 +575,7 @@ async fn lineage(
             }),
         }
     }
+    let status = revision_status(lookup, &object, &inventory.entries, today, &cancel).await?;
     let distinct: BTreeSet<String> = titles.iter().map(|t| kr::name_key(&t.title)).collect();
     let mut searched: Vec<&str> = Vec::new();
     for title in current_title
@@ -527,7 +641,10 @@ async fn lineage(
         today: today.to_string(),
         renamed: distinct.len() > 1,
         titles,
-        upcoming: upcoming(&inventory.entries, today),
+        upcoming: status.upcoming,
+        repeal_status: status.repeal_status,
+        repeal: status.repeal,
+        latest_amendment_type: status.latest_amendment_type,
         repeal_mentions,
         revisions_without_title,
         inventory_complete: inventory.complete,
@@ -1233,7 +1350,7 @@ impl ToolModule for LegalAnalysisTools {
         let lookup = self.lookup.clone();
         registry.register_typed::<WatchInput, WatchResult, _, _>(
             "law.watch",
-            "Check up to 100 laws, administrative rules or ordinances at once for changes. Give each by law_name or object and pass the snapshot from the previous call as previous: each entry reports changed, unchanged or new against it, the HEAD revision and dates, and retained revisions that take effect after today in Korea (promulgated but not yet in force). Names that match no retained object report not_observed, which never means the law does not exist. Save the returned snapshot for the next check.",
+            "Check up to 100 laws, administrative rules or ordinances at once for changes. Give each by law_name or object and pass the snapshot from the previous call as previous: each entry reports changed, unchanged or new against it, the HEAD revision and dates, retained revisions that take effect after today in Korea (promulgated but not yet in force) with their provider amendment types, and repeal_status (repealed, repeal_scheduled, no_repeal_recorded or unknown) read from the provider amendment type (폐지, 타법폐지, 일괄폐지) of the latest retained revision. Names that match no retained object report not_observed, which never means the law does not exist. Save the returned snapshot for the next check.",
             ToolOptions::default(),
             move |input, ctx| {
                 let lookup = lookup.clone();
@@ -1253,7 +1370,7 @@ impl ToolModule for LegalAnalysisTools {
         let lookup = self.lookup.clone();
         registry.register_typed::<TargetInput, LineageResult, _, _>(
             "law.lineage",
-            "Trace one law's retained identity: title periods across retained revisions (renamed is true when the title changed), retained revisions taking effect after today, the HEAD state (published, or a corpus code such as withdrawn), and up to 20 lines in other retained statutes and rules that mention one of its titles together with 폐지. Repeal mentions are leads to read, not a finding that the law was repealed; the corpus does not record repeal status itself.",
+            "Trace one law's retained identity: title periods across retained revisions (renamed is true when the title changed), retained revisions taking effect after today with their amendment types, the HEAD state (published, or a corpus code such as withdrawn), and repeal_status with the repealing revision when the latest retained revision's provider amendment type is 폐지, 타법폐지 or 일괄폐지 (repeal_scheduled when it takes effect after today). Also returns up to 20 lines in other retained statutes and rules that mention one of its titles together with 폐지; those mentions are leads to read, not a repeal record.",
             ToolOptions::default(),
             move |input, ctx| {
                 let lookup = lookup.clone();
@@ -1370,7 +1487,7 @@ mod tests {
                     "불법행위의 내용",
                     "제750조(불법행위의 내용) 과실로 손해를 가한 자는 배상한다.",
                 )],
-                &[],
+                &[("amendment_type", "제정")],
                 false,
             ),
             record(
@@ -1394,7 +1511,7 @@ mod tests {
                         "제751조(재산 이외의 손해의 배상)\n① 첫째 항",
                     ),
                 ],
-                &[],
+                &[("amendment_type", "일부개정")],
                 true,
             ),
             record(
@@ -1404,7 +1521,47 @@ mod tests {
                 "민법",
                 Some("20990101"),
                 vec![],
-                &[],
+                &[("amendment_type", "일부개정")],
+                false,
+            ),
+            record(
+                object(Dataset::NationalStatute, "7"),
+                7,
+                "700:20200101",
+                "폐지예정법",
+                Some("20200101"),
+                vec![article("0001001", "목적", "제1조(목적) 목적")],
+                &[("amendment_type", "제정")],
+                true,
+            ),
+            record(
+                object(Dataset::NationalStatute, "7"),
+                31,
+                "701:20990101",
+                "폐지예정법",
+                Some("20990101"),
+                vec![article("0001001", "목적", "제1조(목적) 목적")],
+                &[("amendment_type", "폐지")],
+                false,
+            ),
+            record(
+                object(Dataset::NationalStatute, "8"),
+                32,
+                "800:20100101",
+                "옛법",
+                Some("20100101"),
+                vec![article("0001001", "목적", "제1조(목적) 목적")],
+                &[("amendment_type", "제정")],
+                false,
+            ),
+            record(
+                object(Dataset::NationalStatute, "8"),
+                33,
+                "801:20150101",
+                "옛법",
+                Some("20150101"),
+                vec![article("0001001", "목적", "제1조(목적) 목적")],
+                &[("amendment_type", "타법폐지")],
                 false,
             ),
             record(
@@ -1581,6 +1738,8 @@ mod tests {
                 target(Some("없는법"), None),
                 target(None, Some(object(Dataset::NationalStatute, "99"))),
                 target(None, Some(object(Dataset::Precedent, "9"))),
+                target(Some("폐지예정법"), None),
+                target(Some("옛법"), None),
             ],
             previous: previous.clone(),
             include_upcoming: true,
@@ -1599,14 +1758,41 @@ mod tests {
         use WatchStatus::*;
         assert_eq!(
             statuses,
-            [Changed, Unchanged, NotObserved, NotObserved, New]
+            [
+                Changed,
+                Unchanged,
+                NotObserved,
+                NotObserved,
+                New,
+                New,
+                NotObserved
+            ]
         );
         let civil = &result.entries[0];
         assert_eq!(civil.head_revision_id.as_deref(), Some("200:20230601"));
         assert_eq!(civil.previous_revision_id.as_deref(), Some("100:20200101"));
         assert_eq!(civil.upcoming.len(), 1);
         assert_eq!(civil.upcoming[0].revision_id, "300:20990101");
+        assert_eq!(
+            civil.upcoming[0].amendment_type.as_deref(),
+            Some("일부개정")
+        );
+        assert_eq!(civil.amendment_type.as_deref(), Some("일부개정"));
+        assert_eq!(civil.repeal_status, Some(RepealStatus::NoRepealRecorded));
         assert_eq!(result.entries[1].title.as_deref(), Some("새 시험법"));
+        assert_eq!(result.entries[1].repeal_status, Some(RepealStatus::Unknown));
+        assert_eq!(result.entries[4].repeal_status, None);
+        let scheduled = &result.entries[5];
+        assert_eq!(scheduled.repeal_status, Some(RepealStatus::RepealScheduled));
+        assert_eq!(
+            scheduled.upcoming[0].amendment_type.as_deref(),
+            Some("폐지")
+        );
+        let repealed = &result.entries[6];
+        assert_eq!(repealed.repeal_status, Some(RepealStatus::Repealed));
+        let record = repealed.repeal.as_ref().unwrap();
+        assert_eq!(record.kind, RepealKind::RepealedByOtherLaw);
+        assert_eq!(record.effective_date.as_deref(), Some("20150101"));
         assert_eq!(result.entries[3].detail.as_deref(), Some("not_observed"));
         assert_eq!(result.entries[4].input, "precedent:9");
         assert_eq!(
@@ -1614,10 +1800,14 @@ mod tests {
             BTreeMap::from([
                 ("national_statute:1".to_string(), "200:20230601".to_string()),
                 ("national_statute:3".to_string(), "500:20200101".to_string()),
+                ("national_statute:7".to_string(), "700:20200101".to_string()),
                 ("precedent:9".to_string(), "9".to_string()),
             ])
         );
-        assert_eq!((result.changed, result.with_upcoming), (1, 1));
+        assert_eq!(
+            (result.changed, result.with_upcoming, result.repealed),
+            (1, 2, 2)
+        );
         let changes = watch(
             &lookup,
             input(true),
@@ -1627,9 +1817,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(changes.entries.len(), 4);
+        assert_eq!(changes.entries.len(), 6);
         assert!(changes.entries.iter().all(|e| e.status != Unchanged));
-        assert_eq!(changes.snapshot.len(), 3);
+        assert_eq!(changes.snapshot.len(), 4);
         for laws in [
             vec![],
             vec![target(None, None)],
@@ -1679,6 +1869,7 @@ mod tests {
         assert_eq!(renamed.repeal_mentions.len(), 1);
         assert_eq!(renamed.repeal_mentions[0].object.id, "6");
         assert!(renamed.repeal_mentions[0].line.contains("폐지한다"));
+        assert_eq!(renamed.repeal_status, RepealStatus::Unknown);
         let civil = lineage(
             &lookup,
             TargetInput {
@@ -1697,6 +1888,39 @@ mod tests {
         assert_eq!(civil.titles[0].last_revision_id, "300:20990101");
         assert_eq!(civil.upcoming[0].revision_id, "300:20990101");
         assert!(civil.repeal_mentions.is_empty());
+        assert_eq!(civil.repeal_status, RepealStatus::NoRepealRecorded);
+        assert_eq!(civil.latest_amendment_type.as_deref(), Some("일부개정"));
+        let repealed = lineage(
+            &lookup,
+            TargetInput {
+                object: None,
+                law_name: Some("옛법".into()),
+            },
+            "20240101",
+            deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repealed.head_state, "not_observed");
+        assert_eq!(repealed.repeal_status, RepealStatus::Repealed);
+        let record = repealed.repeal.unwrap();
+        assert_eq!(record.revision_id, "801:20150101");
+        assert_eq!(record.amendment_type, "타법폐지");
+        let scheduled = lineage(
+            &lookup,
+            TargetInput {
+                object: Some(object(Dataset::NationalStatute, "7")),
+                law_name: None,
+            },
+            "20240101",
+            deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scheduled.repeal_status, RepealStatus::RepealScheduled);
+        assert_eq!(scheduled.repeal.unwrap().kind, RepealKind::Repealed);
         let precedent = TargetInput {
             object: Some(object(Dataset::Precedent, "9")),
             law_name: None,

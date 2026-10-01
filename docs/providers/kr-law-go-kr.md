@@ -103,6 +103,17 @@ only be asserted after its stabilized full-traversal checks succeed. Catalog
 changes invalidate history/date-resolution views without invalidating a running
 normalization job; job publication has its own version fence.
 
+Statute, administrative-rule and ordinance list rows keep a nonempty
+`제개정구분명` of at most 64 bytes as the capture metadata `amendment_type`,
+verbatim. The [effective-date list guide](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=lsEfYdListGuide)
+documents the field and its amendment classes, including `폐지`, `폐지제정`,
+`일괄폐지` and `타법폐지`. The value travels with the list observation through
+the job queue; manual pilot hints do not supply it. A missing field is recorded
+as absent, never inferred. The legal analysis tools derive repeal status from it
+and nothing else; the observation-time `현행연혁코드` is not retained because it
+changes as revisions take effect. Live list rows have not been checked for the
+field.
+
 ## Text, evidence and references
 
 Ordered XML fields retain article, paragraph, subparagraph, item and supplementary

@@ -4,11 +4,70 @@
 //! legal effect.
 use crate::{
     legal::{CollectionNotice, Dataset, ObjectId, SectionKind},
-    legal_reference::{InForceSelection, LawNameResolution, RevisionChoice},
+    legal_reference::{InForceSelection, LawNameResolution},
 };
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::BTreeMap;
+
+/// How a revision repealed its law, from the provider amendment type (`제개정구분명`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RepealKind {
+    /// `폐지`
+    Repealed,
+    /// `타법폐지`: repealed by another act.
+    RepealedByOtherLaw,
+    /// `일괄폐지`
+    RepealedInBatch,
+}
+impl RepealKind {
+    /// `폐지제정` (repealed and re-enacted) and every amendment type are not repeals.
+    pub fn from_amendment_type(value: &str) -> Option<Self> {
+        let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+        match compact.as_str() {
+            "폐지" => Some(Self::Repealed),
+            "타법폐지" => Some(Self::RepealedByOtherLaw),
+            "일괄폐지" => Some(Self::RepealedInBatch),
+            _ => None,
+        }
+    }
+}
+
+/// Repeal state read from the latest retained revision of an object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RepealStatus {
+    /// The latest retained revision is a repeal whose effective date is today or earlier.
+    Repealed,
+    /// The latest retained revision is a repeal taking effect after today.
+    RepealScheduled,
+    /// The latest retained revision records an amendment type that is not a repeal.
+    /// A repeal the corpus has not collected yet is not reflected.
+    NoRepealRecorded,
+    /// The latest retained revision records no amendment type, or could not be read.
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct RepealRecord {
+    pub revision_id: String,
+    /// The provider amendment type exactly as recorded, such as `타법폐지`.
+    pub amendment_type: String,
+    pub kind: RepealKind,
+    pub effective_date: Option<String>,
+    pub publication_date: Option<String>,
+}
+
+/// A retained revision whose effective date is after today.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct UpcomingRevision {
+    pub revision_id: String,
+    pub effective_date: Option<String>,
+    pub publication_date: Option<String>,
+    /// The provider amendment type, when recorded, for the first five upcoming revisions.
+    pub amendment_type: Option<String>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -38,8 +97,13 @@ pub struct WatchEntry {
     pub head_revision_id: Option<String>,
     pub effective_date: Option<String>,
     pub publication_date: Option<String>,
+    /// The provider amendment type of the HEAD revision, when recorded.
+    pub amendment_type: Option<String>,
     /// Retained revisions whose effective date is after today (promulgated, not yet effective).
-    pub upcoming: Vec<RevisionChoice>,
+    pub upcoming: Vec<UpcomingRevision>,
+    /// None for datasets without provider revisions or when no object was read.
+    pub repeal_status: Option<RepealStatus>,
+    pub repeal: Option<RepealRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -52,6 +116,8 @@ pub struct WatchResult {
     pub snapshot: BTreeMap<String, String>,
     pub changed: u32,
     pub with_upcoming: u32,
+    /// Entries whose repeal status is `repealed` or `repeal_scheduled`.
+    pub repealed: u32,
     pub corpus_complete: bool,
     pub collection_notices: Vec<CollectionNotice>,
 }
@@ -67,6 +133,7 @@ pub struct TitlePeriod {
 }
 
 /// A line in another retained text that mentions this law's title and `폐지`.
+/// It is a lead to read, unlike the provider amendment type in [`RepealRecord`].
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct RepealMention {
     pub object: ObjectId,
@@ -88,7 +155,11 @@ pub struct LineageResult {
     /// Oldest first.
     pub titles: Vec<TitlePeriod>,
     pub renamed: bool,
-    pub upcoming: Vec<RevisionChoice>,
+    pub upcoming: Vec<UpcomingRevision>,
+    /// Repeal state from the provider amendment type of the latest retained revision.
+    pub repeal_status: RepealStatus,
+    pub repeal: Option<RepealRecord>,
+    pub latest_amendment_type: Option<String>,
     pub repeal_mentions: Vec<RepealMention>,
     /// Catalog revisions with no retained capture title.
     pub revisions_without_title: u32,
@@ -235,4 +306,24 @@ pub struct ArticleReadResult {
     pub annex_index: Vec<String>,
     pub truncated: bool,
     pub warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RepealKind;
+
+    #[test]
+    fn repeal_kinds_follow_provider_amendment_types() {
+        assert_eq!(
+            RepealKind::from_amendment_type("타법 폐지"),
+            Some(RepealKind::RepealedByOtherLaw)
+        );
+        assert_eq!(
+            RepealKind::from_amendment_type("폐지"),
+            Some(RepealKind::Repealed)
+        );
+        for other in ["폐지제정", "일부개정", "타법개정", ""] {
+            assert_eq!(RepealKind::from_amendment_type(other), None);
+        }
+    }
 }

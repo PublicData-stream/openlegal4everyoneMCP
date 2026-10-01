@@ -29,6 +29,33 @@ title, a single national statute wins; otherwise the call fails as ambiguous and
 the caller should pass `object`. "Today" is the calendar date in Korea (UTC+9)
 when the call runs; a revision is upcoming when its effective date is later.
 
+## Amendment types and repeal
+
+Collection records the provider's `제개정구분명` from each statute,
+administrative-rule and ordinance list row as the capture metadata
+`amendment_type`, exactly as written (for example `제정`, `일부개정`, `타법개정`,
+`폐지`, `타법폐지`). The official effective-date list guide documents this field
+and the amendment classes `폐지`, `폐지제정`, `일괄폐지` and `타법폐지`; the
+administrative-rule and ordinance rows are read when they carry the same field.
+
+`law.watch` and `law.lineage` read the amendment type of the latest retained
+revision, the one with the latest effective date:
+
+| `repeal_status` | Meaning |
+| --- | --- |
+| `repealed` | The latest revision is `폐지`, `타법폐지` or `일괄폐지` and its effective date is today or earlier |
+| `repeal_scheduled` | The latest revision is such a repeal and takes effect after today |
+| `no_repeal_recorded` | The latest revision records another amendment type |
+| `unknown` | The latest revision records no amendment type or could not be read |
+
+`repeal` gives the repealing revision, its recorded amendment type, its kind and
+dates. `폐지제정` (repealed and re-enacted) is not reported as a repeal. A repeal
+that the corpus has not collected yet is not reflected, so `no_repeal_recorded`
+is evidence about retained revisions only. Captures made before this field was
+collected have no amendment type and report `unknown` until the revision is
+revalidated or collected again; whether revalidation records the field for an
+unchanged provider body has not been verified against a live corpus.
+
 ## Batch watching
 
 `law.watch` accepts `laws` (1 to 100 items, each a `law_name` or an `object`),
@@ -47,11 +74,15 @@ Each entry reports one status:
 | `ambiguous` | Several retained objects have the name; `detail` gives the count |
 | `unavailable` | HEAD could not be read; `detail` gives the corpus error code |
 
-Entries also carry the HEAD title and dates and, for datasets with provider
-revisions, the retained revisions whose effective date is after today. The new
+Entries also carry the HEAD title, dates and amendment type and, for datasets
+with provider revisions, the retained revisions whose effective date is after
+today (with the amendment types of the first five) and the repeal status above.
+The catalog is read even when HEAD is unavailable, because a repealed law can
+leave the provider's current list. `repealed` counts entries whose status is
+`repealed` or `repeal_scheduled`. The new
 `snapshot` keeps the previous revision for objects whose HEAD could not be read,
 so a failed read does not reset the watch. `changes_only` omits unchanged entries
-without upcoming revisions; the snapshot still covers every object.
+without upcoming revisions or a repeal; the snapshot still covers every object.
 
 Scheduling and notification belong to the client. A client can store the
 snapshot and call the tool on its own schedule.
@@ -65,16 +96,18 @@ revisions. It reports:
   same title, compared without spacing. `renamed` is true when there is more than
   one run. `revisions_without_title` counts catalog revisions with no retained
   capture.
-- `upcoming`: retained revisions whose effective date is after today.
+- `upcoming`: retained revisions whose effective date is after today, with the
+  amendment types of the first five.
+- `repeal_status`, `repeal` and `latest_amendment_type`, as described above.
 - `head_state`: `published`, or the corpus error code for HEAD, such as
   `withdrawn`.
 - `repeal_mentions`: up to 20 lines in current national statutes and
   administrative rules that contain the current title or a former title together
   with `폐지`, with the title not preceded by another Hangul syllable.
 
-The corpus does not record repeal as a status. Repeal mentions are leads to read,
-such as a supplementary provision stating that an older act is repealed, not a
-finding that the law was repealed. A title that is a prefix of a longer title
+Repeal mentions are leads to read, such as a supplementary provision stating
+that an older act is repealed. Unlike `repeal_status`, they are not a provider
+record of this object's repeal. A title that is a prefix of a longer title
 (`민법` in `민법 시행령`) can also produce a mention.
 
 ## Citing decisions

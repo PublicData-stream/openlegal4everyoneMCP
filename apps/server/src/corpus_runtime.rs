@@ -640,6 +640,9 @@ impl CorpusRuntime {
         if let Some(value) = &item.treaty_class_code {
             metadata.insert("treaty_class_code".into(), value.clone());
         }
+        if let Some(value) = &item.amendment_type {
+            metadata.insert("amendment_type".into(), value.clone());
+        }
         let queued = self
             .store
             .enqueue_job_with_metadata_fenced(
@@ -1528,6 +1531,7 @@ impl CorpusRuntime {
                 hint.data_source = None;
                 hint.case_number = None;
                 hint.treaty_class_code = None;
+                hint.amendment_type = None;
                 match tokio::time::timeout_at(
                     deadline,
                     self.refresh_with_backpressure(provider, hint, false, cancel.clone()),
@@ -1744,6 +1748,9 @@ impl CorpusRuntime {
         if let Some(v) = &item.treaty_class_code {
             metadata.insert("treaty_class_code".into(), v.clone());
         }
+        if let Some(v) = &item.amendment_type {
+            metadata.insert("amendment_type".into(), v.clone());
+        }
         self.store
             .enqueue_job_with_metadata(
                 item.object,
@@ -1814,6 +1821,7 @@ impl CorpusRuntime {
                 case_number: job.source_metadata.get("case_number").cloned(),
                 publication_date: None,
                 treaty_class_code: job.source_metadata.get("treaty_class_code").cloned(),
+                amendment_type: job.source_metadata.get("amendment_type").cloned(),
             };
             let attempt = cancel.child_token();
             let _attempt_guard = attempt.clone().drop_guard();
@@ -1959,6 +1967,7 @@ mod explicit_collection_tests {
             data_source: None,
             case_number: None,
             treaty_class_code: None,
+            amendment_type: None,
         }
     }
 
@@ -2144,6 +2153,7 @@ mod manual_pilot_tests {
                     data_source: None,
                     case_number: case_number.map(str::to_owned),
                     treaty_class_code: None,
+                    amendment_type: None,
                 })
                 .collect(),
             done,
