@@ -19,8 +19,10 @@ Keep `id` exactly as returned, including leading zeros.
 - To answer "what did the law say on day X", list revisions with
   `database.history` (`kind: "revisions"`), show the user the candidate
   revisions with their dates, and say that applicability needs legal judgment.
-- History order (effective date, then publication date) is a presentation
-  order, not a statement of legal applicability.
+- `database.history` lists revisions newest first by effective date, using the
+  publication date only when the effective date is absent; undated revisions
+  come last and equal dates are ordered by revision ID. This presentation order
+  is not a statement of legal applicability.
 - Precedents have no provider revision history; only capture history exists.
 
 ## Freshness

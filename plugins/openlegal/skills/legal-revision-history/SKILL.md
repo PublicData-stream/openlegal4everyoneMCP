@@ -16,8 +16,10 @@ compare them line by line. First identify the object with the
 
 - Report only returned text and metadata. A diff shows textual change, not
   legal equivalence, applicability or effect.
-- Revision order (effective date, then publication date) is a presentation
-  order, not a statement of which version applied when.
+- Revisions are listed newest first by effective date, using the publication
+  date only when the effective date is absent; undated revisions come last and
+  equal dates are ordered by revision ID. This is a presentation order, not a
+  statement of which version applied when.
 - Precedents have no provider revision history. For them, only `captures`
   history (local observations) exists.
 

@@ -218,6 +218,7 @@ impl ToolRegistry {
         let title = annotations
             .title
             .clone()
+            .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| tool_title(name));
         annotations.title = Some(title.clone());
         let definition = Tool::new(name.to_owned(), description.to_owned(), Arc::new(object))

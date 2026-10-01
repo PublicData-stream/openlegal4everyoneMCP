@@ -105,7 +105,12 @@ impl Server {
             .register_typed::<Empty, Output, _, _>(
                 "invalid_output",
                 "Synthetic invalid output",
-                ToolOptions::default(),
+                {
+                    // A blank supplied title falls back to the generated one.
+                    let mut options = ToolOptions::default();
+                    options.annotations.title = Some("  ".into());
+                    options
+                },
                 |_, _| async { Ok(ToolOutput::new(Output { value: 99 })) },
             )
             .unwrap();

@@ -73,8 +73,10 @@ single hyphens.
 The server serves anonymous tool calls. Its private `/metrics` endpoint records
 aggregate call, failure and rate-limit counts, not request payloads; see the
 [server contract](../../docs/server.md#configure-and-run). Text supplied to
-`text.*` tools is retained temporarily and expires ten minutes after
-publication unless deleted earlier; see [text comparison](../../docs/text-diff.md).
+`text.*` tools is retained temporarily unless deleted earlier: uploaded
+attachments expire ten minutes after the initial upload, and comparisons and
+generated attachments expire ten minutes after publication; see
+[text comparison](../../docs/text-diff.md).
 The operator's public privacy policy URL, covering collection, use, storage,
 third-party sharing, retention and contact, is still to be published.
 
