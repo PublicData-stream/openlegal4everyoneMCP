@@ -224,6 +224,12 @@ async fn typed_tools_resources_and_legacy_registration_work_in_both_revisions() 
             .unwrap();
         assert_eq!(typed["outputSchema"]["type"], "object");
         assert_eq!(typed["_meta"]["ui"]["resourceUri"], "ui://demo/widget.html");
+        let invalid_output = tools
+            .iter()
+            .find(|tool| tool["name"] == "invalid_output")
+            .unwrap();
+        assert_eq!(invalid_output["title"], "Invalid output");
+        assert_eq!(invalid_output["annotations"]["title"], "Invalid output");
         let old = result(
             server
                 .post(

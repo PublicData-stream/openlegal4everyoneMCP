@@ -213,7 +213,15 @@ impl ToolRegistry {
             .as_object()
             .ok_or("input schema must be an object")?
             .clone();
+        // Directory listings require a human-readable title on every tool.
+        let mut annotations = annotations;
+        let title = annotations
+            .title
+            .clone()
+            .unwrap_or_else(|| tool_title(name));
+        annotations.title = Some(title.clone());
         let definition = Tool::new(name.to_owned(), description.to_owned(), Arc::new(object))
+            .with_title(title)
             .with_annotations(annotations);
         let handler = Arc::new(handler);
         let invoke = Arc::new(move |value: Value, context: ToolExecutionContext| {
@@ -377,6 +385,46 @@ impl ToolRegistry {
     pub fn register_module(&mut self, module: impl ToolModule) -> Result<(), ServerError> {
         module.register(self)
     }
+}
+
+/// Human-readable title for built-in tools; other names fall back to a spaced form.
+fn tool_title(name: &str) -> String {
+    let known = match name {
+        "server_info" => "Server information",
+        "text.diff" => "Compare texts",
+        "text.apply_patch" => "Apply text patch",
+        "text.diff.show" => "Show text comparison",
+        "text.diff.page" => "Read text comparison page",
+        "text.diff.delete" => "Delete text comparison",
+        "text.attachment.upload" => "Upload text attachment",
+        "text.attachment.read" => "Read text attachment",
+        "text.attachment.delete" => "Delete text attachment",
+        "database.query" => "Search legal corpus",
+        "database.rg" => "Find exact text in legal corpus",
+        "database.get" => "Read legal document",
+        "database.get_metadata" => "Read legal document metadata",
+        "database.object_status" => "Check legal document availability",
+        "database.history" => "List legal document history",
+        "database.diff" => "Compare legal document versions",
+        "database.show" => "Show legal corpus browser",
+        "database.request_collection" => "Request legal document collection",
+        "database.collection_status" => "Check collection request status",
+        "demo_search_records" => "Search synthetic records",
+        "demo_get_record" => "Read synthetic record",
+        "demo_show_records" => "Show synthetic records",
+        "demo_list_snapshots" => "List synthetic record snapshots",
+        "demo_get_snapshot" => "Read synthetic record snapshot",
+        "demo_compare_record_snapshots" => "Compare synthetic record snapshots",
+        _ => {
+            let spaced = name.replace(['_', '.', '-'], " ");
+            let mut chars = spaced.chars();
+            return chars
+                .next()
+                .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default();
+        }
+    };
+    known.to_owned()
 }
 
 /// Count serialized bytes without allocating a second, unbounded copy of a result.

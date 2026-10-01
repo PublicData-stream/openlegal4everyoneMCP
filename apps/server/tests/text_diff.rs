@@ -275,6 +275,16 @@ async fn independent_comparison_tools_have_typed_schemas_and_accurate_deletion_a
                 .iter()
                 .all(|tool| !tool["name"].as_str().unwrap().starts_with("demo_"))
         );
+        for tool in tools {
+            let title = tool["title"].as_str().unwrap();
+            assert!(!title.is_empty());
+            assert_eq!(tool["annotations"]["title"], title);
+        }
+        let diff = tools
+            .iter()
+            .find(|tool| tool["name"] == "text.diff")
+            .unwrap();
+        assert_eq!(diff["title"], "Compare texts");
         for name in [
             "text.diff",
             "text.diff.show",
