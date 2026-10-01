@@ -1,0 +1,32 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "openlegal",
+  "version": "0.1.0",
+  "description": "Search, read, cite and compare Korean statutes, ordinances and precedents with provenance through the openlegal4everyone.stream MCP server.",
+  "author": {
+    "name": "PublicData-stream",
+    "url": "https://github.com/PublicData-stream"
+  },
+  "homepage": "https://github.com/PublicData-stream/openlegal4everyoneMCP/tree/main/plugins/openlegal",
+  "repository": "https://github.com/PublicData-stream/openlegal4everyoneMCP",
+  "license": "AGPL-3.0-only",
+  "keywords": ["legal", "korea", "law", "statute", "precedent", "mcp"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "OpenLegal 4 Everyone",
+        "shortDescription": "Korean laws and precedents with provenance",
+        "longDescription": "Search the openlegal4everyone.stream corpus of Korean national statutes, ordinances and precedents, read exact text with source and freshness metadata, compare versions, and compare supplied texts. Legal information, not legal advice.",
+        "developerName": "PublicData-stream",
+        "category": "Research",
+        "capabilities": ["Read"],
+        "websiteURL": "https://github.com/PublicData-stream/openlegal4everyoneMCP",
+        "defaultPrompt": [
+          "민법 제750조 원문을 출처와 함께 보여줘",
+          "근로기준법 최근 개정에서 바뀐 조문을 비교해줘",
+          "이 두 계약서 초안의 차이를 정리해줘"
+        ]
+      }
+    }
+  }
+}

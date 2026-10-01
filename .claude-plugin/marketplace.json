@@ -1,0 +1,15 @@
+{
+  "name": "openlegal4everyone",
+  "description": "Plugins for openlegal4everyone.stream, open Korean legal information over MCP.",
+  "owner": {
+    "name": "PublicData-stream",
+    "url": "https://github.com/PublicData-stream"
+  },
+  "plugins": [
+    {
+      "name": "openlegal",
+      "source": "./plugins/openlegal",
+      "description": "Korean statutes, ordinances and precedents with provenance through the openlegal4everyone.stream MCP server."
+    }
+  ]
+}
