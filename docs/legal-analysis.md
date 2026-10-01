@@ -26,8 +26,17 @@ Parsing lives in `openlegal_normalization::kr_legal_reference`, result contracts
 Tools that accept `law_name` look it up like `law.resolve_name`, across national
 statutes, administrative rules and ordinances. When several objects carry the
 title, a single national statute wins; otherwise the call fails as ambiguous and
-the caller should pass `object`. "Today" is the calendar date in Korea (UTC+9)
-when the call runs; a revision is upcoming when its effective date is later.
+the caller should pass `object`. These tools use the `KOR` reference profile
+(see [Jurisdictions](legal-reference.md#jurisdictions)).
+
+`law.watch` and `law.lineage` accept an optional `timezone`, an IANA time zone
+name such as `Asia/Seoul`, `America/New_York` or `UTC`. "Today" is the calendar
+date in that zone when the call runs, including daylight-saving rules; it
+defaults to `Asia/Seoul`, the `KOR` default. A revision is upcoming when its
+effective date is later than today, and a repeal is scheduled rather than in
+effect on the same basis. Results report `today` and `timezone`. An unknown or
+malformed name is rejected as invalid arguments. Zone rules come from the IANA
+database compiled into the server, not from the host.
 
 ## Amendment types and repeal
 
@@ -191,7 +200,8 @@ Text is bounded to 16 KiB per article, 32 KiB per annex and 64 KiB per call;
 
 ## Validation
 
-Parsing helpers are covered by unit tests in the normalization crate. The server
+Parsing helpers are covered by unit tests in the normalization crate; the server
+tests also check time-zone dates around midnight and daylight-saving time. The server
 tests run all five tools against an in-memory corpus of fictional records whose
 search backend evaluates the generated patterns with the same ripgrep regex
 engine as the corpus adapter. These tools have not yet been exercised against a

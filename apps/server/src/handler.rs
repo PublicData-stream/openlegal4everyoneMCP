@@ -334,6 +334,19 @@ fn map_tool_error(error: ToolError) -> Result<CallToolResult, ErrorData> {
                 None,
             ));
         }
+        ToolError::UnsupportedJurisdiction => {
+            return Ok(CallToolResult::structured_error(serde_json::json!({
+                "code": "unsupported_jurisdiction",
+                "message": "No reference profile is implemented for this ISO 3166-1 alpha-3 jurisdiction.",
+                "supported": openlegal_domain::jurisdiction::Jurisdiction::supported_codes()
+            })));
+        }
+        ToolError::InvalidTimezone => {
+            return Err(ErrorData::invalid_params(
+                "timezone must be an IANA time zone name such as Asia/Seoul or America/New_York",
+                None,
+            ));
+        }
         ToolError::InvalidUtf8Boundary { offset } => {
             return Ok(CallToolResult::structured_error(serde_json::json!({
                 "code": "invalid_utf8_boundary",

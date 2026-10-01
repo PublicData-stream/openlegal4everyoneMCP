@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 wtransport = { version = "=0.7.2", default-features = false, features = ["ring", "quinn"] }
 x509-parser = "0.18"
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

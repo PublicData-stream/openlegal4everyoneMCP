@@ -3,7 +3,7 @@ name: korean-law-research
 description: Find and quote Korean statutes, ordinances and court precedents from the OpenLegal corpus with exact provenance. Use when the user asks for a law article, 법령 조문, 판례, 사건번호, 자치법규, or wants legal source text found, read or cited.
 license: AGPL-3.0-only
 metadata:
-  version: "0.3.0"
+  version: "0.3.1"
 ---
 
 # Korean law research
@@ -29,6 +29,9 @@ the server names are used below.
 0. **Resolve names.** When the user names a law, possibly by abbreviation
    (`산안법`, `중처법 시행령`), call `law.resolve_name` to get its object. The
    `resolution` field shows any alias expansion; mention it to the user.
+   `law.resolve_name`, `citation.verify` and `law.in_force_at` take an optional
+   `jurisdiction` (ISO 3166-1 alpha-3); it defaults to `KOR`, which is what this
+   skill needs. `unsupported_jurisdiction` lists the codes the server supports.
 1. **Search.** Call `database.query` with the query DSL in
    [query-syntax.md](references/query-syntax.md). Narrow with `filters.datasets`
    (`national_statute`, `ordinance`, `precedent`, …) and typed date bounds. Use

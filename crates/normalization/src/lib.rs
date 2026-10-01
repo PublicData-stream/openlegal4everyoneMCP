@@ -1,6 +1,7 @@
 //! Pure, bounded processors for synthetic JSON and supplied search-query syntax.
 
 pub mod kr_legal_reference;
+pub mod legal_reference;
 pub mod patch;
 pub mod search_query;
 

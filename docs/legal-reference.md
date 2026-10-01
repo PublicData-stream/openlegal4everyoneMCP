@@ -5,7 +5,7 @@ three read-only tools that build on its search, history and checkpoint reads:
 
 | Tool | Purpose |
 | --- | --- |
-| `law.resolve_name` | Resolve a Korean law name or abbreviation to retained objects |
+| `law.resolve_name` | Resolve a law name or abbreviation to retained objects |
 | `citation.verify` | Check statute citations and court case numbers in supplied text |
 | `law.in_force_at` | Select the retained revision whose effective date is the latest on or before a date |
 
@@ -14,14 +14,44 @@ means the corpus has no retained observation. It never means that a law, article
 or decision does not exist. Every result carries `corpus_complete` or an
 inventory flag, and object, revision and capture identities for the evidence used.
 
-Parsing lives in `openlegal_normalization::kr_legal_reference`, corpus lookups and
-the selection policy in `openlegal_application::legal_reference`, and the MCP
-adapters in `apps/server/src/legal_reference.rs`.
+Parsing lives in per-jurisdiction reference profiles
+(`openlegal_normalization::legal_reference`, with the Korean profile in
+`kr_legal_reference`), corpus lookups and the selection policy in
+`openlegal_application::legal_reference`, and the MCP adapters in
+`apps/server/src/legal_reference.rs`.
+
+## Jurisdictions
+
+All three tools accept an optional `jurisdiction`: the ISO 3166-1 alpha-3 code of
+the legal system whose naming and citation rules apply. Codes are matched without
+regard to case. Each supported code has its own profile implementing
+`ReferenceProfile`: name normalization and aliases, title matching, article
+locators and their formatting, citation extraction, and the datasets searched for
+statutes and case numbers. The tools call only the selected profile.
+
+| Code | Profile | Corpus `jurisdiction` | Default time zone |
+| --- | --- | --- | --- |
+| `KOR` | Korean statutes and court case numbers, described below | `kr` | `Asia/Seoul` |
+
+`KOR` is the default and currently the only supported code. A well-formed code
+without a profile, such as `USA`, returns the tool error
+`unsupported_jurisdiction` with the list of supported codes; a value that is not
+three letters is rejected as invalid arguments. Name and case-number lookups only
+match corpus objects whose `jurisdiction` is the profile's corpus code, so records
+of other jurisdictions with the same title are never mixed in. Results report the
+applied `jurisdiction`.
+
+Adding a jurisdiction means adding a `Jurisdiction` variant in
+`openlegal_domain::jurisdiction` and a module implementing `ReferenceProfile`;
+the tools need no change. Corpus objects keep their provider-chosen
+`jurisdiction` value (`kr` for LAW OPEN DATA); the alpha-3 code only selects a
+profile.
 
 ## Name resolution
 
-`law.resolve_name` accepts `name` (up to 512 bytes, one line) and optional
-`datasets` (default `["national_statute"]`). The name is normalized first:
+`law.resolve_name` accepts `name` (up to 512 bytes, one line), optional
+`datasets` (default: the profile's statute datasets, `["national_statute"]` for
+`KOR`) and `jurisdiction`. The `KOR` profile normalizes the name first:
 surrounding `「」`, quotes and repeated spaces are removed and middle-dot variants
 (`·`, `‧`, `•`, `・` and others) become the provider's `ㆍ`. A built-in table then
 expands common abbreviations, including `시행령` and `시행규칙` forms: `산안법`
@@ -43,10 +73,11 @@ reject duplicate keys and non-normalized titles.
 
 ## Citation checks
 
-`citation.verify` accepts `text` up to 50,000 bytes and checks at most 50 statute
-citations and 30 distinct case numbers; `truncated` reports any excess.
+`citation.verify` accepts `text` up to 50,000 bytes and an optional
+`jurisdiction`, and checks at most 50 statute citations and 30 distinct case
+numbers; `truncated` reports any excess.
 
-Recognized statute forms include `「법령명」 제N조`, an unbracketed name before the
+The `KOR` profile recognizes statute forms including `「법령명」 제N조`, an unbracketed name before the
 article (`형법 제329조`, `중대재해 처벌 등에 관한 법률 제4조`), abbreviations,
 `제N조의M`, a following `제K항` and `제J호`, and a parenthesized article title
 such as `제750조(불법행위의 내용)`. `같은 법`, `동법` and `같은 법 시행령` inherit
@@ -88,9 +119,17 @@ records, or `not_observed`.
 
 ## Date-based selection
 
-`law.in_force_at` accepts either `object` or a national-statute `law_name`, a
-`date` (`YYYYMMDD`), an optional `article` (`제44조`, `44의2`, `제9-5조`) and an optional
-`compare_date`. Only datasets with provider revisions are supported.
+`law.in_force_at` accepts either `object` or a statute `law_name`, a `date`
+(`YYYYMMDD`), an optional `article` in the profile's locator form (for `KOR`:
+`제44조`, `44의2`, `제9-5조`), an optional `compare_date` and an optional
+`jurisdiction`. Only datasets with provider revisions are supported.
+
+Date selection does not depend on a jurisdiction. Without `jurisdiction`, the
+profile is the one whose corpus code matches `object.jurisdiction`, or `KOR` for
+`law_name`. An object of a jurisdiction without a profile can still be selected
+by date; its result has no `jurisdiction`, and asking for an `article` returns
+`unsupported_jurisdiction`. A `jurisdiction` that does not match the supplied
+object's corpus code is rejected as invalid arguments.
 
 The tool reads up to 2,000 revisions from `database.history`. It selects the
 revision with the latest effective date on or before the date; among revisions

@@ -1,23 +1,27 @@
-//! Korean law-name aliases, citation extraction and article location.
+//! Korean (KOR) reference profile: law-name aliases, citation extraction and article
+//! location. [`KOREA`] implements [`ReferenceProfile`] with these functions.
 //!
 //! These functions are pure and bounded: they read supplied text and sections and
 //! never consult a provider. Callers decide what a parsed reference resolves to.
 //! The alias table lists widely used abbreviations of official titles; it was
 //! compiled for this repository after reviewing the feature set of korean-law-mcp
 //! (MIT), without copying that project's table or code.
+use crate::legal_reference::ReferenceProfile;
+pub use crate::legal_reference::{
+    ArticleLookup, ExtractedCase, ExtractedStatute, Extraction, LawReference, LocatedArticle,
+    push_escaped,
+};
 use openlegal_domain::{
-    legal::{LegalSection, SectionKind},
+    jurisdiction::Jurisdiction,
+    legal::{Dataset, LegalSection, SectionKind},
     legal_reference::{ArticleNumber, LawNameResolution},
 };
 
-/// Largest citation-check input, in bytes.
-pub const MAX_CITATION_TEXT_BYTES: usize = 50_000;
+pub use crate::legal_reference::{MAX_CITATION_TEXT_BYTES, MAX_LAW_NAME_BYTES};
 /// Statute citations checked per call; later ones are reported as truncated.
 pub const MAX_STATUTE_CITATIONS: usize = 50;
 /// Distinct case numbers checked per call.
 pub const MAX_CASE_CITATIONS: usize = 30;
-/// Largest law name accepted for resolution, in bytes.
-pub const MAX_LAW_NAME_BYTES: usize = 512;
 
 const MIDDLE_DOTS: [char; 7] = ['·', 'ㆍ', '‧', '•', '・', '･', '∙'];
 const OFFICIAL_DOT: char = 'ㆍ';
@@ -277,14 +281,6 @@ pub fn title_pattern(name: &str) -> String {
     out
 }
 
-/// Escape a literal for the Rust regex syntax used by `database.rg`.
-pub fn push_escaped(out: &mut String, c: char) {
-    if "\\.+*?()|[]{}^$#&-~".contains(c) {
-        out.push('\\');
-    }
-    out.push(c);
-}
-
 /// The law name without a trailing `시행령` or `시행규칙`.
 pub fn base_law_name(name: &str) -> &str {
     for suffix in SUFFIXES {
@@ -434,27 +430,6 @@ fn circled_number(c: char) -> Option<u32> {
         0x32B1..=0x32BF => Some(v - 0x32B1 + 36),
         _ => None,
     }
-}
-
-/// An article found in a capture's provider article sections.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LocatedArticle<'a> {
-    pub section_id: &'a str,
-    pub number: ArticleNumber,
-    pub title: String,
-    pub text: &'a str,
-    pub deleted: bool,
-    /// Paragraph numbers in order of appearance; empty when unnumbered.
-    pub paragraphs: Vec<u32>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ArticleLookup<'a> {
-    Found(LocatedArticle<'a>),
-    NotFound {
-        first: Option<ArticleNumber>,
-        last: Option<ArticleNumber>,
-    },
 }
 
 fn parenthetical(text: &str, at: usize) -> Option<(&str, usize)> {
@@ -714,49 +689,6 @@ pub fn title_similarity(cited: &str, retained: &str) -> Option<u8> {
     }
     let shared = ga.intersection(&gb).count();
     Some(((shared * 100 + union / 2) / union) as u8)
-}
-
-/// How an extracted citation names its law.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LawReference {
-    /// Candidate names ending at the article, longest first, with their byte starts.
-    Named {
-        candidates: Vec<(String, usize)>,
-        /// The word before the article is a generic word such as `법` or `시행령`.
-        generic_tail: bool,
-    },
-    /// `같은 법`, `동법`, optionally followed by `시행령`/`시행규칙`.
-    Same {
-        suffix: Option<&'static str>,
-        start: usize,
-    },
-    /// A bare article joined to the previous citation by a connector (`및`, `,`).
-    Continued,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExtractedStatute {
-    pub law: LawReference,
-    pub article: ArticleNumber,
-    pub article_start: usize,
-    pub byte_end: usize,
-    pub paragraph: Option<u32>,
-    pub subparagraph: Option<u32>,
-    pub cited_title: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExtractedCase {
-    pub byte_start: usize,
-    pub byte_end: usize,
-    pub case_number: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Extraction {
-    pub statutes: Vec<ExtractedStatute>,
-    pub cases: Vec<ExtractedCase>,
-    pub truncated: bool,
 }
 
 fn is_boundary(c: char) -> bool {
@@ -1196,6 +1128,61 @@ pub fn parse_case_number(value: &str) -> Option<String> {
     let value = value.trim();
     let case = case_at(value, 0)?;
     (case.byte_end == value.len()).then_some(case.case_number)
+}
+
+/// The KOR reference profile.
+pub struct Korea;
+pub static KOREA: Korea = Korea;
+
+impl ReferenceProfile for Korea {
+    fn jurisdiction(&self) -> Jurisdiction {
+        Jurisdiction::Kor
+    }
+    fn resolve_law_name(&self, input: &str) -> LawNameResolution {
+        resolve_law_name(input)
+    }
+    fn name_key(&self, value: &str) -> String {
+        name_key(value)
+    }
+    fn title_pattern(&self, name: &str) -> String {
+        title_pattern(name)
+    }
+    fn base_law_name<'a>(&self, name: &'a str) -> &'a str {
+        base_law_name(name)
+    }
+    fn parse_article_number(&self, value: &str) -> Option<ArticleNumber> {
+        parse_article_number(value)
+    }
+    fn format_article(&self, article: ArticleNumber) -> String {
+        article.to_string()
+    }
+    fn locate_article<'a>(
+        &self,
+        sections: &'a [LegalSection],
+        wanted: ArticleNumber,
+    ) -> ArticleLookup<'a> {
+        locate_article(sections, wanted)
+    }
+    fn has_subparagraph(
+        &self,
+        article: &LocatedArticle<'_>,
+        paragraph: Option<u32>,
+        wanted: u32,
+    ) -> bool {
+        has_subparagraph(article, paragraph, wanted)
+    }
+    fn title_similarity(&self, cited: &str, retained: &str) -> Option<u8> {
+        title_similarity(cited, retained)
+    }
+    fn extract_citations(&self, text: &str) -> Extraction {
+        extract_citations(text)
+    }
+    fn statute_datasets(&self) -> &'static [Dataset] {
+        &[Dataset::NationalStatute]
+    }
+    fn case_datasets(&self) -> &'static [Dataset] {
+        &[Dataset::Precedent, Dataset::ConstitutionalDecision]
+    }
 }
 
 #[cfg(test)]

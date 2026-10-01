@@ -7,15 +7,13 @@ use crate::{
     database::map_error,
     legal_reference::{
         ARTICLE_TEXT_LIMIT, choose_laws, code, contains_case_number, find_titles, output,
-        pick_match, resolution_for, resolve_object, selection_for, statute_datasets, valid_text,
+        pick_match, resolution_for, resolve_object, selection_for, valid_text,
     },
     registry::{ToolError, ToolModule, ToolOptions, ToolRegistry},
 };
-use openlegal_application::{
-    Clock, SystemClock,
-    legal_reference::{ReferenceLookup, kst_date},
-};
+use openlegal_application::{Clock, SystemClock, legal_reference::ReferenceLookup};
 use openlegal_domain::{
+    jurisdiction::Jurisdiction,
     legal::{
         DatabaseError, Dataset, GetRequest, HistoryEntry, ObjectId, RevisionSelector, valid_date,
     },
@@ -23,8 +21,9 @@ use openlegal_domain::{
     legal_reference::{ArticleNumber, CaseRecordMatch},
 };
 use openlegal_normalization::kr_legal_reference::{
-    self as kr, ArticleLookup, LawReference, LocatedArticle, OutlineUnit,
+    self as kr, ArticleLookup, KOREA, LawReference, LocatedArticle, OutlineUnit,
 };
+use openlegal_normalization::legal_reference::ReferenceProfile;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{
@@ -101,6 +100,9 @@ struct WatchInput {
     /// Omit entries that are unchanged and have no upcoming revision.
     #[serde(default)]
     changes_only: bool,
+    /// IANA time zone whose calendar date is "today" for upcoming revisions, such as
+    /// `Asia/Seoul`, `America/New_York` or `UTC`. Defaults to the KOR zone `Asia/Seoul`.
+    timezone: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -110,6 +112,18 @@ struct TargetInput {
     object: Option<ObjectId>,
     /// Law, administrative rule or ordinance name; national statutes win a tie.
     law_name: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LineageInput {
+    /// Exact object; give either this or `law_name`.
+    object: Option<ObjectId>,
+    /// Law, administrative rule or ordinance name; national statutes win a tie.
+    law_name: Option<String>,
+    /// IANA time zone whose calendar date is "today" for upcoming revisions, such as
+    /// `Asia/Seoul`, `America/New_York` or `UTC`. Defaults to the KOR zone `Asia/Seoul`.
+    timezone: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -344,7 +358,7 @@ async fn head_metadata(
 async fn watch(
     lookup: &ReferenceLookup,
     input: WatchInput,
-    today: &str,
+    day: &Today,
     deadline: Instant,
     cancel: CancellationToken,
 ) -> Result<WatchResult, ToolError> {
@@ -366,16 +380,18 @@ async fn watch(
                 if !valid_text(name, kr::MAX_LAW_NAME_BYTES) || name.contains('\n') {
                     return Err(ToolError::InvalidInput);
                 }
-                names.push(resolution_for(&mut resolutions, name).resolved);
+                names.push(resolution_for(&KOREA, &mut resolutions, name).resolved);
             }
             (None, Some(object)) => object.validate().map_err(map_error)?,
             _ => return Err(ToolError::InvalidInput),
         }
     }
-    let index = find_titles(lookup, &names, &REVISIONED, deadline, &cancel).await?;
+    let index = find_titles(lookup, &KOREA, &names, &REVISIONED, deadline, &cancel).await?;
+    let today = day.date.as_str();
     let mut result = WatchResult {
         schema_version: 1,
-        today: today.to_string(),
+        today: day.date.clone(),
+        timezone: day.timezone.clone(),
         entries: Vec::new(),
         snapshot: BTreeMap::new(),
         changed: 0,
@@ -403,7 +419,7 @@ async fn watch(
         };
         let object = match (target.law_name, target.object) {
             (Some(name), None) => {
-                let resolution = resolution_for(&mut resolutions, &name);
+                let resolution = resolution_for(&KOREA, &mut resolutions, &name);
                 entry.input = name;
                 let matches = index
                     .matches
@@ -512,12 +528,14 @@ fn repeal_patterns(title: &str) -> [String; 2] {
 async fn lineage(
     lookup: &ReferenceLookup,
     input: TargetInput,
-    today: &str,
+    day: &Today,
     deadline: Instant,
     cancel: CancellationToken,
 ) -> Result<LineageResult, ToolError> {
+    let today = day.date.as_str();
     let (object, resolution) = resolve_object(
         lookup,
+        &KOREA,
         input.object,
         input.law_name,
         &REVISIONED,
@@ -638,7 +656,8 @@ async fn lineage(
         resolution,
         head_state,
         current_title,
-        today: today.to_string(),
+        today: day.date.clone(),
+        timezone: day.timezone.clone(),
         renamed: distinct.len() > 1,
         titles,
         upcoming: status.upcoming,
@@ -835,24 +854,26 @@ async fn outbound_references(
     for citation in &extraction.statutes {
         if let LawReference::Named { candidates, .. } = &citation.law {
             for (name, _) in candidates {
-                names.push(resolution_for(&mut resolutions, name).resolved);
+                names.push(resolution_for(&KOREA, &mut resolutions, name).resolved);
             }
         }
     }
-    let datasets = statute_datasets();
-    let mut index = find_titles(lookup, &names, &datasets, deadline, cancel).await?;
+    let datasets = KOREA.statute_datasets();
+    let mut index = find_titles(lookup, &KOREA, &names, datasets, deadline, cancel).await?;
     let mut looked_up: BTreeSet<String> = names.iter().map(|n| kr::name_key(n)).collect();
     let (mut chosen, pending) = choose_laws(
+        &KOREA,
         &extraction.statutes,
         &index.matches,
         &looked_up,
         &mut resolutions,
     );
     if !pending.is_empty() {
-        let more = find_titles(lookup, &pending, &datasets, deadline, cancel).await?;
+        let more = find_titles(lookup, &KOREA, &pending, datasets, deadline, cancel).await?;
         index.matches.extend(more.matches);
         looked_up.extend(pending.iter().map(|n| kr::name_key(n)));
         chosen = choose_laws(
+            &KOREA,
             &extraction.statutes,
             &index.matches,
             &looked_up,
@@ -927,6 +948,7 @@ async fn impact(
     let wanted = kr::parse_article_number(&input.article).ok_or(ToolError::InvalidInput)?;
     let (object, resolution) = resolve_object(
         lookup,
+        &KOREA,
         input.object,
         input.law_name,
         &REVISIONED,
@@ -1101,6 +1123,7 @@ async fn read_articles(
     };
     let (object, resolution) = resolve_object(
         lookup,
+        &KOREA,
         input.object,
         input.law_name,
         &REVISIONED,
@@ -1341,8 +1364,47 @@ async fn read_articles(
     })
 }
 
-fn today() -> String {
-    kst_date(SystemClock::default().now())
+/// The calendar date that counts as "today" and the time zone that defined it.
+struct Today {
+    /// `YYYYMMDD`.
+    date: String,
+    /// The IANA time zone name.
+    timezone: String,
+}
+
+const MAX_TIMEZONE_BYTES: usize = 64;
+
+impl Today {
+    /// The date of `unix_seconds` in `timezone`, or in the default jurisdiction's
+    /// zone. Zones come from the IANA database bundled into the binary, so results
+    /// do not depend on the host's zoneinfo files.
+    fn at(unix_seconds: u64, timezone: Option<&str>) -> Result<Self, ToolError> {
+        let name = timezone
+            .map(str::trim)
+            .unwrap_or(Jurisdiction::DEFAULT.default_timezone());
+        if name.is_empty()
+            || name.len() > MAX_TIMEZONE_BYTES
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/_+-".contains(&b))
+        {
+            return Err(ToolError::InvalidTimezone);
+        }
+        let zone = jiff::tz::TimeZone::get(name).map_err(|_| ToolError::InvalidTimezone)?;
+        let instant = i64::try_from(unix_seconds)
+            .ok()
+            .and_then(|seconds| jiff::Timestamp::from_second(seconds).ok())
+            .ok_or(ToolError::InvalidInput)?;
+        let date = instant.to_zoned(zone).date();
+        Ok(Self {
+            date: format!("{:04}{:02}{:02}", date.year(), date.month(), date.day()),
+            timezone: name.to_string(),
+        })
+    }
+
+    fn now(timezone: Option<&str>) -> Result<Self, ToolError> {
+        Self::at(SystemClock::default().now(), timezone)
+    }
 }
 
 impl ToolModule for LegalAnalysisTools {
@@ -1350,15 +1412,16 @@ impl ToolModule for LegalAnalysisTools {
         let lookup = self.lookup.clone();
         registry.register_typed::<WatchInput, WatchResult, _, _>(
             "law.watch",
-            "Check up to 100 laws, administrative rules or ordinances at once for changes. Give each by law_name or object and pass the snapshot from the previous call as previous: each entry reports changed, unchanged or new against it, the HEAD revision and dates, retained revisions that take effect after today in Korea (promulgated but not yet in force) with their provider amendment types, and repeal_status (repealed, repeal_scheduled, no_repeal_recorded or unknown) read from the provider amendment type (폐지, 타법폐지, 일괄폐지) of the latest retained revision. Names that match no retained object report not_observed, which never means the law does not exist. Save the returned snapshot for the next check.",
+            "Check up to 100 laws, administrative rules or ordinances at once for changes. Give each by law_name or object and pass the snapshot from the previous call as previous: each entry reports changed, unchanged or new against it, the HEAD revision and dates, retained revisions that take effect after today (promulgated but not yet in force; today is the calendar date in timezone, an IANA name defaulting to Asia/Seoul) with their provider amendment types, and repeal_status (repealed, repeal_scheduled, no_repeal_recorded or unknown) read from the provider amendment type (폐지, 타법폐지, 일괄폐지) of the latest retained revision. Names that match no retained object report not_observed, which never means the law does not exist. Save the returned snapshot for the next check.",
             ToolOptions::default(),
             move |input, ctx| {
                 let lookup = lookup.clone();
                 async move {
+                    let today = Today::now(input.timezone.as_deref())?;
                     watch(
                         &lookup,
                         input,
-                        &today(),
+                        &today,
                         ctx.deadline.into_std(),
                         ctx.request.cancellation,
                     )
@@ -1368,17 +1431,22 @@ impl ToolModule for LegalAnalysisTools {
             },
         )?;
         let lookup = self.lookup.clone();
-        registry.register_typed::<TargetInput, LineageResult, _, _>(
+        registry.register_typed::<LineageInput, LineageResult, _, _>(
             "law.lineage",
-            "Trace one law's retained identity: title periods across retained revisions (renamed is true when the title changed), retained revisions taking effect after today with their amendment types, the HEAD state (published, or a corpus code such as withdrawn), and repeal_status with the repealing revision when the latest retained revision's provider amendment type is 폐지, 타법폐지 or 일괄폐지 (repeal_scheduled when it takes effect after today). Also returns up to 20 lines in other retained statutes and rules that mention one of its titles together with 폐지; those mentions are leads to read, not a repeal record.",
+            "Trace one law's retained identity: title periods across retained revisions (renamed is true when the title changed), retained revisions taking effect after today (the calendar date in timezone, an IANA name defaulting to Asia/Seoul) with their amendment types, the HEAD state (published, or a corpus code such as withdrawn), and repeal_status with the repealing revision when the latest retained revision's provider amendment type is 폐지, 타법폐지 or 일괄폐지 (repeal_scheduled when it takes effect after today). Also returns up to 20 lines in other retained statutes and rules that mention one of its titles together with 폐지; those mentions are leads to read, not a repeal record.",
             ToolOptions::default(),
             move |input, ctx| {
                 let lookup = lookup.clone();
                 async move {
+                    let today = Today::now(input.timezone.as_deref())?;
+                    let target = TargetInput {
+                        object: input.object,
+                        law_name: input.law_name,
+                    };
                     lineage(
                         &lookup,
-                        input,
-                        &today(),
+                        target,
+                        &today,
                         ctx.deadline.into_std(),
                         ctx.request.cancellation,
                     )
@@ -1438,6 +1506,41 @@ mod tests {
     use super::*;
     use crate::test_corpus::{Record, Stored, article, deadline, lookup, object, section};
     use openlegal_domain::legal::SectionKind;
+
+    fn day(date: &str) -> Today {
+        Today {
+            date: date.to_string(),
+            timezone: "Asia/Seoul".to_string(),
+        }
+    }
+
+    #[test]
+    fn today_follows_the_requested_iana_zone_and_defaults_to_seoul() {
+        let date = |unix, zone: Option<&str>| Today::at(unix, zone).map(|t| t.date);
+        assert_eq!(date(0, None).unwrap(), "19700101");
+        assert_eq!(date(15 * 3600 - 1, None).unwrap(), "19700101");
+        assert_eq!(date(15 * 3600, None).unwrap(), "19700102");
+        assert_eq!(date(1_709_164_800, None).unwrap(), "20240229");
+        assert_eq!(date(1_790_812_800, None).unwrap(), "20261001");
+        assert_eq!(Today::at(0, None).unwrap().timezone, "Asia/Seoul");
+        // 2026-10-01T03:00:00Z is still 2026-09-30 in New York (EDT, UTC-4).
+        let early = 1_790_823_600;
+        assert_eq!(date(early, Some("America/New_York")).unwrap(), "20260930");
+        assert_eq!(date(early, Some("UTC")).unwrap(), "20261001");
+        assert_eq!(date(early, Some("Asia/Seoul")).unwrap(), "20261001");
+        // Daylight saving time: 2026-01-15T04:30:00Z is 2026-01-14 in New York (EST, UTC-5).
+        assert_eq!(
+            date(1_768_451_400, Some("America/New_York")).unwrap(),
+            "20260114"
+        );
+        for invalid in ["", "Mars/Olympus", "Asia/Seoul;", "../etc/passwd", "A b"] {
+            assert_eq!(
+                Today::at(0, Some(invalid)).err(),
+                Some(ToolError::InvalidTimezone),
+                "{invalid}"
+            );
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn record(
@@ -1744,11 +1847,12 @@ mod tests {
             previous: previous.clone(),
             include_upcoming: true,
             changes_only,
+            timezone: None,
         };
         let result = watch(
             &lookup,
             input(false),
-            "20240101",
+            &day("20240101"),
             deadline(),
             CancellationToken::new(),
         )
@@ -1811,7 +1915,7 @@ mod tests {
         let changes = watch(
             &lookup,
             input(true),
-            "20240101",
+            &day("20240101"),
             deadline(),
             CancellationToken::new(),
         )
@@ -1830,12 +1934,13 @@ mod tests {
                 previous: BTreeMap::new(),
                 include_upcoming: true,
                 changes_only: false,
+                timezone: None,
             };
             assert_eq!(
                 watch(
                     &lookup,
                     input,
-                    "20240101",
+                    &day("20240101"),
                     deadline(),
                     CancellationToken::new()
                 )
@@ -1855,7 +1960,7 @@ mod tests {
                 object: None,
                 law_name: Some("새 시험법".into()),
             },
-            "20240101",
+            &day("20240101"),
             deadline(),
             CancellationToken::new(),
         )
@@ -1876,7 +1981,7 @@ mod tests {
                 object: Some(object(Dataset::NationalStatute, "1")),
                 law_name: None,
             },
-            "20240101",
+            &day("20240101"),
             deadline(),
             CancellationToken::new(),
         )
@@ -1896,7 +2001,7 @@ mod tests {
                 object: None,
                 law_name: Some("옛법".into()),
             },
-            "20240101",
+            &day("20240101"),
             deadline(),
             CancellationToken::new(),
         )
@@ -1913,7 +2018,7 @@ mod tests {
                 object: Some(object(Dataset::NationalStatute, "7")),
                 law_name: None,
             },
-            "20240101",
+            &day("20240101"),
             deadline(),
             CancellationToken::new(),
         )
@@ -1929,7 +2034,7 @@ mod tests {
             lineage(
                 &lookup,
                 precedent,
-                "20240101",
+                &day("20240101"),
                 deadline(),
                 CancellationToken::new()
             )

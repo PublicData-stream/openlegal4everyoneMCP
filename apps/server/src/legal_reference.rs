@@ -1,7 +1,8 @@
-//! MCP tools for Korean law-name resolution, citation checks and date-based
-//! revision selection over the managed corpus. Parsing is delegated to
-//! `openlegal_normalization::kr_legal_reference`; corpus access and selection
-//! policy to `openlegal_application::legal_reference`.
+//! MCP tools for law-name resolution, citation checks and date-based revision
+//! selection over the managed corpus. Names, citations and article locators are
+//! parsed by the reference profile of the requested ISO 3166-1 alpha-3 jurisdiction
+//! (`openlegal_normalization::legal_reference`); corpus access and selection policy
+//! live in `openlegal_application::legal_reference`.
 use crate::{
     ServerError,
     database::map_error,
@@ -9,13 +10,17 @@ use crate::{
 };
 use openlegal_application::legal_reference::{ReferenceLookup, later_dates, select_in_force};
 use openlegal_domain::{
+    jurisdiction::{Jurisdiction, JurisdictionError},
     legal::{
         CollectionNotice, DatabaseError, Dataset, GetRequest, GetResult, ObjectId,
         RevisionSelector, valid_date,
     },
     legal_reference::*,
 };
-use openlegal_normalization::kr_legal_reference::{self as kr, ArticleLookup, LawReference};
+use openlegal_normalization::legal_reference::{
+    self as reference, ArticleLookup, ExtractedStatute, LawReference, MAX_CITATION_TEXT_BYTES,
+    MAX_LAW_NAME_BYTES, ReferenceProfile, push_escaped,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{
@@ -36,14 +41,32 @@ pub struct LegalReferenceTools {
     pub lookup: Arc<ReferenceLookup>,
 }
 
+/// The parsing rules of one jurisdiction.
+pub(crate) type Profile = &'static dyn ReferenceProfile;
+
+/// The jurisdiction named by an optional ISO 3166-1 alpha-3 `jurisdiction` argument.
+pub(crate) fn jurisdiction_arg(code: Option<&str>) -> Result<Jurisdiction, ToolError> {
+    match code {
+        None => Ok(Jurisdiction::DEFAULT),
+        Some(code) => Jurisdiction::parse(code).map_err(|error| match error {
+            JurisdictionError::Malformed => ToolError::InvalidInput,
+            JurisdictionError::Unsupported => ToolError::UnsupportedJurisdiction,
+        }),
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ResolveNameInput {
     /// A law name or common abbreviation, such as `산안법 시행령`.
     name: String,
-    /// Datasets to search; defaults to national statutes.
+    /// Datasets to search; defaults to the jurisdiction's statutes.
     #[serde(default)]
     datasets: Vec<Dataset>,
+    /// ISO 3166-1 alpha-3 code of the legal system whose naming and citation rules
+    /// apply, such as `KOR`. Defaults to `KOR`; codes without a profile are rejected
+    /// as unsupported_jurisdiction.
+    jurisdiction: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -51,6 +74,10 @@ struct ResolveNameInput {
 struct VerifyInput {
     /// Text containing citations such as `「민법」 제750조` or `2007다27670`.
     text: String,
+    /// ISO 3166-1 alpha-3 code of the legal system whose naming and citation rules
+    /// apply, such as `KOR`. Defaults to `KOR`; codes without a profile are rejected
+    /// as unsupported_jurisdiction.
+    jurisdiction: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -58,14 +85,18 @@ struct VerifyInput {
 struct InForceInput {
     /// Exact object; give either this or `law_name`.
     object: Option<ObjectId>,
-    /// National statute name or abbreviation; give either this or `object`.
+    /// Statute name or abbreviation; give either this or `object`.
     law_name: Option<String>,
     /// Date as YYYYMMDD.
     date: String,
-    /// Optional article such as `제44조` or `44의2`.
+    /// Optional article in the jurisdiction's locator form, such as `제44조` or `44의2`.
     article: Option<String>,
     /// Optional second date (YYYYMMDD) to select for comparison.
     compare_date: Option<String>,
+    /// ISO 3166-1 alpha-3 code whose naming and article rules apply, such as `KOR`.
+    /// Defaults to the object's jurisdiction, or `KOR` for `law_name`. Date selection
+    /// itself does not depend on it.
+    jurisdiction: Option<String>,
 }
 
 pub(crate) fn output<T>(structured: T) -> ToolOutput<T> {
@@ -94,7 +125,7 @@ pub(crate) fn valid_text(value: &str, max: usize) -> bool {
             .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
 }
 
-/// Title matches keyed by `kr::name_key`.
+/// Title matches keyed by the profile's `name_key`.
 pub(crate) struct TitleIndex {
     pub(crate) matches: BTreeMap<String, Vec<TitleMatch>>,
     pub(crate) corpus_complete: bool,
@@ -103,6 +134,7 @@ pub(crate) struct TitleIndex {
 
 pub(crate) async fn find_titles(
     lookup: &ReferenceLookup,
+    profile: Profile,
     names: &[String],
     datasets: &[Dataset],
     deadline: Instant,
@@ -110,9 +142,11 @@ pub(crate) async fn find_titles(
 ) -> Result<TitleIndex, ToolError> {
     let mut wanted: BTreeMap<String, String> = BTreeMap::new();
     for name in names {
-        let key = kr::name_key(name);
+        let key = profile.name_key(name);
         if !key.is_empty() {
-            wanted.entry(key).or_insert_with(|| kr::title_pattern(name));
+            wanted
+                .entry(key)
+                .or_insert_with(|| profile.title_pattern(name));
         }
     }
     let mut index = TitleIndex {
@@ -123,6 +157,7 @@ pub(crate) async fn find_titles(
     if wanted.is_empty() {
         return Ok(index);
     }
+    let corpus_code = profile.jurisdiction().corpus_code();
     let patterns: Vec<String> = wanted.values().cloned().collect();
     let current = lookup
         .find_lines(
@@ -139,8 +174,8 @@ pub(crate) async fn find_titles(
     index.corpus_complete &= current.corpus_complete;
     index.notices = current.collection_notices;
     for hit in current.hits {
-        let key = kr::name_key(&hit.title);
-        if !wanted.contains_key(&key) {
+        let key = profile.name_key(&hit.title);
+        if hit.object.jurisdiction != corpus_code || !wanted.contains_key(&key) {
             continue;
         }
         let list = index.matches.entry(key).or_default();
@@ -178,8 +213,9 @@ pub(crate) async fn find_titles(
     index.corpus_complete &= former.corpus_complete;
     let mut checked = 0;
     for hit in former.hits {
-        let key = kr::name_key(&hit.title);
-        if !wanted.contains_key(&key)
+        let key = profile.name_key(&hit.title);
+        if hit.object.jurisdiction != corpus_code
+            || !wanted.contains_key(&key)
             || index
                 .matches
                 .get(&key)
@@ -204,7 +240,9 @@ pub(crate) async fn find_titles(
             )
             .await
             .ok();
-        let still_current = head.as_ref().is_some_and(|h| kr::name_key(&h.title) == key);
+        let still_current = head
+            .as_ref()
+            .is_some_and(|h| profile.name_key(&h.title) == key);
         index.matches.entry(key).or_default().push(TitleMatch {
             object: hit.object,
             matched_title: hit.title,
@@ -221,27 +259,26 @@ pub(crate) async fn find_titles(
     Ok(index)
 }
 
-pub(crate) fn statute_datasets() -> Vec<Dataset> {
-    vec![Dataset::NationalStatute]
-}
-
 async fn resolve_name(
     lookup: &ReferenceLookup,
     input: ResolveNameInput,
     deadline: Instant,
     cancel: CancellationToken,
 ) -> Result<ResolveNameResult, ToolError> {
-    if !valid_text(&input.name, kr::MAX_LAW_NAME_BYTES) || input.name.contains('\n') {
+    let jurisdiction = jurisdiction_arg(input.jurisdiction.as_deref())?;
+    let profile = reference::profile(jurisdiction);
+    if !valid_text(&input.name, MAX_LAW_NAME_BYTES) || input.name.contains('\n') {
         return Err(ToolError::InvalidInput);
     }
     let datasets = if input.datasets.is_empty() {
-        statute_datasets()
+        profile.statute_datasets().to_vec()
     } else {
         input.datasets
     };
-    let resolution = kr::resolve_law_name(&input.name);
+    let resolution = profile.resolve_law_name(&input.name);
     let index = find_titles(
         lookup,
+        profile,
         std::slice::from_ref(&resolution.resolved),
         &datasets,
         deadline,
@@ -250,11 +287,12 @@ async fn resolve_name(
     .await?;
     let matches = index
         .matches
-        .get(&kr::name_key(&resolution.resolved))
+        .get(&profile.name_key(&resolution.resolved))
         .cloned()
         .unwrap_or_default();
     Ok(ResolveNameResult {
         schema_version: 1,
+        jurisdiction,
         resolution,
         matches,
         corpus_complete: index.corpus_complete,
@@ -274,19 +312,21 @@ pub(crate) struct ChosenLaw {
 }
 
 pub(crate) fn resolution_for(
+    profile: Profile,
     cache: &mut HashMap<String, LawNameResolution>,
     name: &str,
 ) -> LawNameResolution {
     cache
         .entry(name.to_string())
-        .or_insert_with(|| kr::resolve_law_name(name))
+        .or_insert_with(|| profile.resolve_law_name(name))
         .clone()
 }
 
 /// Assign a law to every extracted citation in order. Returns the names whose titles
 /// still need a lookup; the caller looks them up and runs the pass again.
 pub(crate) fn choose_laws(
-    citations: &[kr::ExtractedStatute],
+    profile: Profile,
+    citations: &[ExtractedStatute],
     index: &BTreeMap<String, Vec<TitleMatch>>,
     looked_up: &std::collections::BTreeSet<String>,
     resolutions: &mut HashMap<String, LawNameResolution>,
@@ -301,13 +341,13 @@ pub(crate) fn choose_laws(
                 generic_tail,
             } => {
                 let found = candidates.iter().find(|(name, _)| {
-                    let resolved = resolution_for(resolutions, name).resolved;
-                    index.contains_key(&kr::name_key(&resolved))
+                    let resolved = resolution_for(profile, resolutions, name).resolved;
+                    index.contains_key(&profile.name_key(&resolved))
                 });
                 match found {
                     Some((name, start)) => ChosenLaw {
                         name: name.clone(),
-                        resolution: Some(resolution_for(resolutions, name)),
+                        resolution: Some(resolution_for(profile, resolutions, name)),
                         start: *start,
                         inherited: false,
                         candidates: Vec::new(),
@@ -321,7 +361,7 @@ pub(crate) fn choose_laws(
                         let bracketed = candidates.len() == 1;
                         ChosenLaw {
                             resolution: (!*generic_tail)
-                                .then(|| resolution_for(resolutions, &name)),
+                                .then(|| resolution_for(profile, resolutions, &name)),
                             name,
                             start: if bracketed {
                                 start
@@ -342,17 +382,19 @@ pub(crate) fn choose_laws(
             LawReference::Same { suffix, start } => match &last {
                 Some(previous) if !previous.unresolved => {
                     let name = match suffix {
-                        Some(suffix) => format!("{} {suffix}", kr::base_law_name(&previous.name)),
+                        Some(suffix) => {
+                            format!("{} {suffix}", profile.base_law_name(&previous.name))
+                        }
                         None => previous.name.clone(),
                     };
                     let resolution = match suffix {
-                        Some(_) => resolution_for(resolutions, &name),
+                        Some(_) => resolution_for(profile, resolutions, &name),
                         None => previous
                             .resolution
                             .clone()
-                            .unwrap_or_else(|| resolution_for(resolutions, &name)),
+                            .unwrap_or_else(|| resolution_for(profile, resolutions, &name)),
                     };
-                    if !looked_up.contains(&kr::name_key(&resolution.resolved)) {
+                    if !looked_up.contains(&profile.name_key(&resolution.resolved)) {
                         pending.push(resolution.resolved.clone());
                     }
                     ChosenLaw {
@@ -439,15 +481,24 @@ impl CaptureCache {
     }
 }
 
-fn range(first: Option<ArticleNumber>, last: Option<ArticleNumber>) -> Option<String> {
-    Some(format!("{}~{}", first?, last?))
+fn range(
+    profile: Profile,
+    first: Option<ArticleNumber>,
+    last: Option<ArticleNumber>,
+) -> Option<String> {
+    Some(format!(
+        "{}~{}",
+        profile.format_article(first?),
+        profile.format_article(last?)
+    ))
 }
 
 async fn check_statute(
     lookup: &ReferenceLookup,
+    profile: Profile,
     cache: &mut CaptureCache,
     matches: &[TitleMatch],
-    citation: &kr::ExtractedStatute,
+    citation: &ExtractedStatute,
     result: &mut StatuteCitationResult,
     cancel: &CancellationToken,
 ) -> Result<(), ToolError> {
@@ -484,11 +535,11 @@ async fn check_statute(
     let record = &read.capture.record;
     result.revision_id = Some(record.revision_id.clone());
     result.capture_id = Some(read.capture.capture_id.clone());
-    let article = match kr::locate_article(&record.sections, citation.article) {
+    let article = match profile.locate_article(&record.sections, citation.article) {
         ArticleLookup::Found(article) => article,
         ArticleLookup::NotFound { first, last } => {
             result.status = StatuteCitationStatus::ArticleNotFound;
-            result.article_range = range(first, last);
+            result.article_range = range(profile, first, last);
             return Ok(());
         }
     };
@@ -506,14 +557,14 @@ async fn check_statute(
         StatuteCitationStatus::ParagraphNotFound
     } else if citation
         .subparagraph
-        .is_some_and(|s| !kr::has_subparagraph(&article, citation.paragraph, s))
+        .is_some_and(|s| !profile.has_subparagraph(&article, citation.paragraph, s))
     {
         StatuteCitationStatus::SubparagraphNotFound
     } else {
         result.title_similarity = citation
             .cited_title
             .as_deref()
-            .and_then(|cited| kr::title_similarity(cited, &article.title));
+            .and_then(|cited| profile.title_similarity(cited, &article.title));
         if result
             .title_similarity
             .is_some_and(|s| s < TITLE_MATCH_THRESHOLD)
@@ -532,36 +583,40 @@ async fn verify(
     deadline: Instant,
     cancel: CancellationToken,
 ) -> Result<CitationVerification, ToolError> {
-    if !valid_text(&input.text, kr::MAX_CITATION_TEXT_BYTES) {
+    let jurisdiction = jurisdiction_arg(input.jurisdiction.as_deref())?;
+    let profile = reference::profile(jurisdiction);
+    if !valid_text(&input.text, MAX_CITATION_TEXT_BYTES) {
         return Err(ToolError::InvalidInput);
     }
     let text = input.text;
-    let extraction = kr::extract_citations(&text);
+    let extraction = profile.extract_citations(&text);
     let mut resolutions = HashMap::new();
     let mut names = Vec::new();
     for citation in &extraction.statutes {
         if let LawReference::Named { candidates, .. } = &citation.law {
             for (name, _) in candidates {
-                names.push(resolution_for(&mut resolutions, name).resolved);
+                names.push(resolution_for(profile, &mut resolutions, name).resolved);
             }
         }
     }
-    let datasets = statute_datasets();
-    let mut index = find_titles(lookup, &names, &datasets, deadline, &cancel).await?;
+    let datasets = profile.statute_datasets();
+    let mut index = find_titles(lookup, profile, &names, datasets, deadline, &cancel).await?;
     let mut looked_up: std::collections::BTreeSet<String> =
-        names.iter().map(|n| kr::name_key(n)).collect();
+        names.iter().map(|n| profile.name_key(n)).collect();
     let (mut chosen, pending) = choose_laws(
+        profile,
         &extraction.statutes,
         &index.matches,
         &looked_up,
         &mut resolutions,
     );
     if !pending.is_empty() {
-        let more = find_titles(lookup, &pending, &datasets, deadline, &cancel).await?;
+        let more = find_titles(lookup, profile, &pending, datasets, deadline, &cancel).await?;
         index.corpus_complete &= more.corpus_complete;
         index.matches.extend(more.matches);
-        looked_up.extend(pending.iter().map(|n| kr::name_key(n)));
+        looked_up.extend(pending.iter().map(|n| profile.name_key(n)));
         chosen = choose_laws(
+            profile,
             &extraction.statutes,
             &index.matches,
             &looked_up,
@@ -583,7 +638,7 @@ async fn verify(
             inherited: law.inherited,
             law_name_candidates: law.candidates.clone(),
             resolution: law.resolution.clone(),
-            article: citation.article.to_string(),
+            article: profile.format_article(citation.article),
             paragraph: citation.paragraph,
             subparagraph: citation.subparagraph,
             cited_article_title: citation.cited_title.clone(),
@@ -604,10 +659,19 @@ async fn verify(
         {
             let matches = index
                 .matches
-                .get(&kr::name_key(&resolution.resolved))
+                .get(&profile.name_key(&resolution.resolved))
                 .cloned()
                 .unwrap_or_default();
-            check_statute(lookup, &mut cache, &matches, citation, &mut result, &cancel).await?;
+            check_statute(
+                lookup,
+                profile,
+                &mut cache,
+                &matches,
+                citation,
+                &mut result,
+                &cancel,
+            )
+            .await?;
         }
         match result.status {
             StatuteCitationStatus::Verified => summary.verified += 1,
@@ -626,7 +690,7 @@ async fn verify(
         .map(|case| {
             let mut literal = String::new();
             for c in case.case_number.chars() {
-                kr::push_escaped(&mut literal, c);
+                push_escaped(&mut literal, c);
             }
             format!("(?:.*[^0-9])?{literal}(?:[^0-9].*)?")
         })
@@ -634,7 +698,7 @@ async fn verify(
     let case_hits = lookup
         .find_lines(
             "case_number",
-            vec![Dataset::Precedent, Dataset::ConstitutionalDecision],
+            profile.case_datasets().to_vec(),
             &patterns,
             None,
             false,
@@ -651,7 +715,8 @@ async fn verify(
     for case in &extraction.cases {
         let mut matches: Vec<CaseRecordMatch> = Vec::new();
         for hit in &case_hits.hits {
-            if contains_case_number(&hit.text, &case.case_number)
+            if hit.object.jurisdiction == jurisdiction.corpus_code()
+                && contains_case_number(&hit.text, &case.case_number)
                 && !matches.iter().any(|m| m.object == hit.object)
             {
                 matches.push(CaseRecordMatch {
@@ -680,6 +745,7 @@ async fn verify(
     }
     Ok(CitationVerification {
         schema_version: 1,
+        jurisdiction,
         statutes,
         cases,
         summary,
@@ -697,9 +763,9 @@ pub(crate) fn contains_case_number(line: &str, number: &str) -> bool {
     })
 }
 
-fn article_text(read: &GetResult, wanted: ArticleNumber) -> Option<ArticleText> {
+fn article_text(profile: Profile, read: &GetResult, wanted: ArticleNumber) -> Option<ArticleText> {
     let record = &read.capture.record;
-    let ArticleLookup::Found(article) = kr::locate_article(&record.sections, wanted) else {
+    let ArticleLookup::Found(article) = profile.locate_article(&record.sections, wanted) else {
         return None;
     };
     let mut end = article.text.len().min(ARTICLE_TEXT_LIMIT);
@@ -767,6 +833,7 @@ pub(crate) async fn selection_for(
 /// object in `datasets` whose current (or, failing that, former) title matches a name.
 pub(crate) async fn resolve_object(
     lookup: &ReferenceLookup,
+    profile: Profile,
     object: Option<ObjectId>,
     law_name: Option<String>,
     datasets: &[Dataset],
@@ -776,12 +843,13 @@ pub(crate) async fn resolve_object(
     let (object, resolution) = match (object, law_name) {
         (Some(object), None) => (object, None),
         (None, Some(name)) => {
-            if !valid_text(&name, kr::MAX_LAW_NAME_BYTES) || name.contains('\n') {
+            if !valid_text(&name, MAX_LAW_NAME_BYTES) || name.contains('\n') {
                 return Err(ToolError::InvalidInput);
             }
-            let resolution = kr::resolve_law_name(&name);
+            let resolution = profile.resolve_law_name(&name);
             let index = find_titles(
                 lookup,
+                profile,
                 std::slice::from_ref(&resolution.resolved),
                 datasets,
                 deadline,
@@ -790,7 +858,7 @@ pub(crate) async fn resolve_object(
             .await?;
             let matches = index
                 .matches
-                .get(&kr::name_key(&resolution.resolved))
+                .get(&profile.name_key(&resolution.resolved))
                 .cloned()
                 .unwrap_or_default();
             match pick_match(&matches) {
@@ -842,19 +910,53 @@ async fn in_force_at(
     {
         return Err(ToolError::InvalidInput);
     }
-    let article = match &input.article {
-        Some(value) => Some(kr::parse_article_number(value).ok_or(ToolError::InvalidInput)?),
-        None => None,
+    // Date selection works for any jurisdiction; names and article locators need a
+    // profile, taken from the argument, the object's corpus code or the default.
+    let jurisdiction = match (&input.jurisdiction, &input.object) {
+        (Some(code), object) => {
+            let jurisdiction = jurisdiction_arg(Some(code))?;
+            if object
+                .as_ref()
+                .is_some_and(|o| o.jurisdiction != jurisdiction.corpus_code())
+            {
+                return Err(ToolError::InvalidInput);
+            }
+            Some(jurisdiction)
+        }
+        (None, Some(object)) => Jurisdiction::from_corpus_code(&object.jurisdiction),
+        (None, None) => Some(Jurisdiction::DEFAULT),
     };
-    let (object, resolution) = resolve_object(
-        lookup,
-        input.object,
-        input.law_name,
-        &statute_datasets(),
-        deadline,
-        &cancel,
-    )
-    .await?;
+    let profile = match (jurisdiction, &input.article) {
+        (Some(jurisdiction), _) => Some(reference::profile(jurisdiction)),
+        (None, Some(_)) => return Err(ToolError::UnsupportedJurisdiction),
+        (None, None) => None,
+    };
+    let article = match (&input.article, profile) {
+        (Some(value), Some(profile)) => Some(
+            profile
+                .parse_article_number(value)
+                .ok_or(ToolError::InvalidInput)?,
+        ),
+        _ => None,
+    };
+    let (object, resolution) = match profile {
+        Some(profile) => {
+            resolve_object(
+                lookup,
+                profile,
+                input.object,
+                input.law_name,
+                profile.statute_datasets(),
+                deadline,
+                &cancel,
+            )
+            .await?
+        }
+        None => match input.object {
+            Some(object) => (object, None),
+            None => return Err(ToolError::InvalidInput),
+        },
+    };
     object.validate().map_err(map_error)?;
     if !object.dataset.has_provider_revisions() {
         return Err(ToolError::UnsupportedHistory);
@@ -921,8 +1023,8 @@ async fn in_force_at(
             None => return Err(map_error(*error)),
         },
     };
-    let article = match article {
-        Some(wanted) => {
+    let article = match (article, profile) {
+        (Some(wanted), Some(profile)) => {
             let at_date = match &selection.selected {
                 Some(selected) => cache
                     .read(
@@ -935,15 +1037,15 @@ async fn in_force_at(
                     )
                     .await
                     .ok()
-                    .and_then(|read| article_text(&read, wanted)),
+                    .and_then(|read| article_text(profile, &read, wanted)),
                 None => None,
             };
             let head = head
                 .as_ref()
                 .ok()
-                .and_then(|read| article_text(read, wanted));
+                .and_then(|read| article_text(profile, read, wanted));
             Some(ArticleAtDate {
-                article: wanted.to_string(),
+                article: profile.format_article(wanted),
                 changed_since: match (&at_date, &head) {
                     (Some(a), Some(b)) => Some(!same_text(&a.text, &b.text)),
                     _ => None,
@@ -952,7 +1054,7 @@ async fn in_force_at(
                 head,
             })
         }
-        None => None,
+        _ => None,
     };
     let (diff_before, diff_after) = match (&compare, &input.compare_date) {
         (Some(other), Some(other_date)) => match (&selection.selected, &other.selected) {
@@ -977,6 +1079,7 @@ async fn in_force_at(
     };
     Ok(InForceResult {
         schema_version: 1,
+        jurisdiction,
         object,
         law_title,
         resolution,
@@ -994,7 +1097,7 @@ impl ToolModule for LegalReferenceTools {
         let lookup = self.lookup.clone();
         registry.register_typed::<ResolveNameInput, ResolveNameResult, _, _>(
             "law.resolve_name",
-            "Resolve a Korean law name or common abbreviation (for example 산안법, 중처법 시행령, 개인정보보호법) to retained corpus objects. Spacing and middle-dot variants are ignored; any alias expansion is reported in resolution. Matches carry object identity and whether the title is current or only appears in a retained historical capture. No match means the corpus has no retained object with that title, not that the law does not exist.",
+            "Resolve a law name or common abbreviation to retained corpus objects using the naming rules of jurisdiction, an ISO 3166-1 alpha-3 code (default KOR, the only supported code so far). For KOR, spacing and middle-dot variants are ignored and abbreviations such as 산안법, 중처법 시행령 or 개인정보보호법 are expanded; any alias expansion is reported in resolution. Only objects of that jurisdiction match. Matches carry object identity and whether the title is current or only appears in a retained historical capture. No match means the corpus has no retained object with that title, not that the law does not exist.",
             ToolOptions::default(),
             move |input, ctx| {
                 let lookup = lookup.clone();
@@ -1008,7 +1111,7 @@ impl ToolModule for LegalReferenceTools {
         let lookup = self.lookup.clone();
         registry.register_typed::<VerifyInput, CitationVerification, _, _>(
             "citation.verify",
-            "Check Korean statute citations (「법령명」 제N조제M항제K호, 같은 법 시행령, abbreviations) and court case numbers (2007다27670, 2016헌마123) in supplied text against the retained corpus. Each statute citation reports verified, article_not_found (with the retained article range), article_deleted, paragraph_not_found, subparagraph_not_found, title_mismatch, law_not_observed, law_ambiguous, law_name_unresolved or unavailable, with the checked capture. Current titles are checked at HEAD; a former title is checked in the capture that carried it. Case numbers report observed or not_observed. Not observed never means nonexistent. Input is limited to 50,000 bytes, 50 statute citations and 30 case numbers.",
+            "Check statute citations and court case numbers in supplied text against the retained corpus using the citation rules of jurisdiction, an ISO 3166-1 alpha-3 code (default KOR, the only supported code so far). For KOR this covers 「법령명」 제N조제M항제K호, 같은 법 시행령, abbreviations and case numbers such as 2007다27670 or 2016헌마123. Each statute citation reports verified, article_not_found (with the retained article range), article_deleted, paragraph_not_found, subparagraph_not_found, title_mismatch, law_not_observed, law_ambiguous, law_name_unresolved or unavailable, with the checked capture. Current titles are checked at HEAD; a former title is checked in the capture that carried it. Case numbers report observed or not_observed. Not observed never means nonexistent. Input is limited to 50,000 bytes, 50 statute citations and 30 case numbers.",
             ToolOptions::default(),
             move |input, ctx| {
                 let lookup = lookup.clone();
@@ -1022,7 +1125,7 @@ impl ToolModule for LegalReferenceTools {
         let lookup = self.lookup;
         registry.register_typed::<InForceInput, InForceResult, _, _>(
             "law.in_force_at",
-            "Select the retained revision of a national statute, administrative rule or ordinance whose effective date is the latest on or before a date (YYYYMMDD). Give an object or a national statute law_name. Reports determined or provisional (incomplete inventory), not_yet_effective or undetermined, the next change, same-day alternatives and provision-level dates after the date. Optionally returns one article at that revision and at HEAD, and a compare_date selection with database.diff selectors. This is not a legal-applicability ruling; supplementary provisions and transitional rules can change the applicable text.",
+            "Select the retained revision of a national statute, administrative rule or ordinance whose effective date is the latest on or before a date (YYYYMMDD). Give an object or a statute law_name; jurisdiction (ISO 3166-1 alpha-3, default KOR or the object's jurisdiction) selects the naming and article rules, while date selection works for any retained object. Reports determined or provisional (incomplete inventory), not_yet_effective or undetermined, the next change, same-day alternatives and provision-level dates after the date. Optionally returns one article at that revision and at HEAD, and a compare_date selection with database.diff selectors. This is not a legal-applicability ruling; supplementary provisions and transitional rules can change the applicable text.",
             ToolOptions::default(),
             move |input, ctx| {
                 let lookup = lookup.clone();
@@ -1169,7 +1272,25 @@ mod tests {
                 &[("case_number", "2007다27670,27687")],
                 true,
             ),
+            // A record of another jurisdiction with a KOR title; KOR lookups skip it.
+            record(
+                foreign(),
+                12,
+                "f1:20200101",
+                "민법",
+                Some("20200101"),
+                vec![article("0750001", "", "제750조 외국 조문")],
+                &[],
+                true,
+            ),
         ])
+    }
+
+    fn foreign() -> ObjectId {
+        ObjectId {
+            jurisdiction: "zz".into(),
+            ..object(Dataset::NationalStatute, "f1")
+        }
     }
 
     #[test]
@@ -1201,6 +1322,7 @@ mod tests {
             ResolveNameInput {
                 name: "산안법 시행령".into(),
                 datasets: vec![],
+                jurisdiction: None,
             },
             deadline(),
             CancellationToken::new(),
@@ -1216,6 +1338,7 @@ mod tests {
             ResolveNameInput {
                 name: "구시험법".into(),
                 datasets: vec![],
+                jurisdiction: None,
             },
             deadline(),
             CancellationToken::new(),
@@ -1232,6 +1355,7 @@ mod tests {
             ResolveNameInput {
                 name: "없는법".into(),
                 datasets: vec![],
+                jurisdiction: None,
             },
             deadline(),
             CancellationToken::new(),
@@ -1239,10 +1363,42 @@ mod tests {
         .await
         .unwrap();
         assert!(none.matches.is_empty() && none.corpus_complete);
+        let explicit = resolve_name(
+            &lookup,
+            ResolveNameInput {
+                name: "민법".into(),
+                datasets: vec![],
+                jurisdiction: Some(" kor ".into()),
+            },
+            deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(explicit.jurisdiction, Jurisdiction::Kor);
+        assert_eq!(explicit.matches.len(), 1);
+        assert_eq!(explicit.matches[0].object.jurisdiction, "kr");
+        for (code, expected) in [
+            ("USA", ToolError::UnsupportedJurisdiction),
+            ("US", ToolError::InvalidInput),
+        ] {
+            let input = ResolveNameInput {
+                name: "민법".into(),
+                datasets: vec![],
+                jurisdiction: Some(code.into()),
+            };
+            assert_eq!(
+                resolve_name(&lookup, input, deadline(), CancellationToken::new())
+                    .await
+                    .err(),
+                Some(expected)
+            );
+        }
         for bad in ["", "a\nb", &"가".repeat(200)] {
             let input = ResolveNameInput {
                 name: bad.into(),
                 datasets: vec![],
+                jurisdiction: None,
             };
             assert!(matches!(
                 resolve_name(&lookup, input, deadline(), CancellationToken::new()).await,
@@ -1260,7 +1416,10 @@ mod tests {
                     이 법 제2조. 대법원 2007다27670 판결과 2018도14262.";
         let result = verify(
             &lookup,
-            VerifyInput { text: text.into() },
+            VerifyInput {
+                text: text.into(),
+                jurisdiction: None,
+            },
             deadline(),
             CancellationToken::new(),
         )
@@ -1317,6 +1476,18 @@ mod tests {
         assert_eq!(result.cases[1].status, CaseCitationStatus::NotObserved);
         assert_eq!(result.summary.cases_observed, 1);
         assert!(result.corpus_complete && !result.truncated);
+        assert_eq!(result.jurisdiction, Jurisdiction::Kor);
+        let unsupported = verify(
+            &lookup,
+            VerifyInput {
+                text: text.into(),
+                jurisdiction: Some("usa".into()),
+            },
+            deadline(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(unsupported.err(), Some(ToolError::UnsupportedJurisdiction));
     }
 
     #[tokio::test]
@@ -1330,6 +1501,7 @@ mod tests {
                 date: "20220101".into(),
                 article: Some("750".into()),
                 compare_date: Some("20231231".into()),
+                jurisdiction: None,
             },
             deadline(),
             CancellationToken::new(),
@@ -1337,6 +1509,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.object.id, "1");
+        assert_eq!(result.jurisdiction, Some(Jurisdiction::Kor));
         assert_eq!(result.law_title, "민법");
         assert_eq!(result.selection.status, InForceStatus::Determined);
         assert_eq!(
@@ -1379,6 +1552,7 @@ mod tests {
                 date: "19991231".into(),
                 article: None,
                 compare_date: None,
+                jurisdiction: None,
             },
             deadline(),
             CancellationToken::new(),
@@ -1387,6 +1561,46 @@ mod tests {
         .unwrap();
         assert_eq!(early.selection.status, InForceStatus::NotYetEffective);
         assert!(early.selection.selected.is_none());
+        // Date selection needs no profile; article locators do.
+        let date_only = in_force_at(
+            &lookup,
+            InForceInput {
+                object: Some(foreign()),
+                law_name: None,
+                date: "20220101".into(),
+                article: None,
+                compare_date: None,
+                jurisdiction: None,
+            },
+            deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(date_only.jurisdiction, None);
+        assert_eq!(
+            date_only.selection.selected.unwrap().revision_id,
+            "f1:20200101"
+        );
+        for (article, jurisdiction, expected) in [
+            (Some("750"), None, ToolError::UnsupportedJurisdiction),
+            (None, Some("KOR"), ToolError::InvalidInput),
+        ] {
+            let input = InForceInput {
+                object: Some(foreign()),
+                law_name: None,
+                date: "20220101".into(),
+                article: article.map(Into::into),
+                compare_date: None,
+                jurisdiction: jurisdiction.map(Into::into),
+            };
+            assert_eq!(
+                in_force_at(&lookup, input, deadline(), CancellationToken::new())
+                    .await
+                    .err(),
+                Some(expected)
+            );
+        }
         for (object, name, date) in [
             (None, None, "20220101"),
             (
@@ -1406,6 +1620,7 @@ mod tests {
                 date: date.into(),
                 article: None,
                 compare_date: None,
+                jurisdiction: None,
             };
             assert!(matches!(
                 in_force_at(&lookup, input, deadline(), CancellationToken::new()).await,
@@ -1423,6 +1638,7 @@ mod tests {
                 date: "20220101".into(),
                 article: None,
                 compare_date: None,
+                jurisdiction: None,
             };
             assert_eq!(
                 in_force_at(&lookup, input, deadline(), CancellationToken::new())
@@ -1437,6 +1653,7 @@ mod tests {
             date: "20220101".into(),
             article: None,
             compare_date: None,
+            jurisdiction: None,
         };
         assert_eq!(
             in_force_at(&lookup, precedent, deadline(), CancellationToken::new())

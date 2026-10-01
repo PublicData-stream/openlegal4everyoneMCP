@@ -109,8 +109,10 @@ pub struct WatchEntry {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct WatchResult {
     pub schema_version: u32,
-    /// Korean calendar date used for `upcoming`.
+    /// Calendar date (`YYYYMMDD`) in `timezone` used for `upcoming` and repeal status.
     pub today: String,
+    /// IANA time zone that defined `today`.
+    pub timezone: String,
     pub entries: Vec<WatchEntry>,
     /// `dataset:id` to HEAD revision ID; pass it back as `previous` next time.
     pub snapshot: BTreeMap<String, String>,
@@ -151,7 +153,10 @@ pub struct LineageResult {
     /// `published`, or the corpus error code returned for HEAD (for example `withdrawn`).
     pub head_state: String,
     pub current_title: Option<String>,
+    /// Calendar date (`YYYYMMDD`) in `timezone` used for `upcoming` and repeal status.
     pub today: String,
+    /// IANA time zone that defined `today`.
+    pub timezone: String,
     /// Oldest first.
     pub titles: Vec<TitlePeriod>,
     pub renamed: bool,

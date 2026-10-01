@@ -3,7 +3,7 @@ name: legal-revision-history
 description: Trace how a Korean statute or ordinance changed over time, compare two versions and watch laws for amendments from the OpenLegal corpus. Use when the user asks about 개정 이력, 연혁, 신구조문 비교, 개정 여부 확인, 폐지·개명, 시행 예정, what changed in a law, or the text of a past version.
 license: AGPL-3.0-only
 metadata:
-  version: "0.3.0"
+  version: "0.3.1"
 ---
 
 # Legal revision history
@@ -52,7 +52,10 @@ compare them line by line. First identify the object with the
 When the user wants to know which of several laws changed, call `law.watch`
 with up to 100 `laws` (names or objects). Pass the `snapshot` from the user's
 last check as `previous`, and give the new `snapshot` back so they can keep it
-for next time; you cannot schedule the check yourself. Report `changed` entries
+for next time; you cannot schedule the check yourself. "Today" defaults to the
+date in `Asia/Seoul`; pass `timezone` (an IANA name such as `America/New_York`)
+to `law.watch` or `law.lineage` when the user asks relative to another zone, and
+report the returned `today`. Report `changed` entries
 first, then entries whose `repeal_status` is `repealed` or `repeal_scheduled`,
 then entries with `upcoming` revisions (promulgated, not yet in force), then
 `not_observed` or `ambiguous` names to fix. Without `previous`, every

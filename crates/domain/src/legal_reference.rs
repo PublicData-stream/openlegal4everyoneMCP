@@ -1,13 +1,17 @@
 //! Contracts for law-name resolution, citation checks and date-based revision selection.
 //! Results describe what the retained corpus shows; they never assert that a provider
 //! lacks an object or decide which law legally applies to particular facts.
-use crate::legal::{CollectionNotice, ObjectId};
+use crate::{
+    jurisdiction::Jurisdiction,
+    legal::{CollectionNotice, ObjectId},
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::fmt;
 
-/// A Korean article locator: `제{number}조`, the administrative-rule form
-/// `제{number}-{part}조`, either followed by `의{branch}`.
+/// An article locator. In KOR it is `제{number}조`, the administrative-rule form
+/// `제{number}-{part}조`, either followed by `의{branch}`; `Display` uses that form,
+/// and other jurisdictions format it through their reference profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 pub struct ArticleNumber {
     pub number: u32,
@@ -64,6 +68,8 @@ pub struct TitleMatch {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ResolveNameResult {
     pub schema_version: u32,
+    /// The jurisdiction whose naming rules were applied.
+    pub jurisdiction: Jurisdiction,
     pub resolution: LawNameResolution,
     pub matches: Vec<TitleMatch>,
     /// True only when every search page reported complete current corpus coverage.
@@ -168,6 +174,8 @@ pub struct CitationSummary {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct CitationVerification {
     pub schema_version: u32,
+    /// The jurisdiction whose citation rules were applied.
+    pub jurisdiction: Jurisdiction,
     pub statutes: Vec<StatuteCitationResult>,
     pub cases: Vec<CaseCitationResult>,
     pub summary: CitationSummary,
@@ -235,6 +243,9 @@ pub struct ArticleAtDate {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct InForceResult {
     pub schema_version: u32,
+    /// The jurisdiction whose naming and article rules were applied; absent when an
+    /// object of a jurisdiction without a profile was selected by date only.
+    pub jurisdiction: Option<Jurisdiction>,
     pub object: ObjectId,
     pub law_title: String,
     pub resolution: Option<LawNameResolution>,

@@ -7,6 +7,7 @@ use std::fmt;
 
 pub mod collection;
 pub mod history;
+pub mod jurisdiction;
 pub mod legal;
 pub mod legal_analysis;
 pub mod legal_reference;

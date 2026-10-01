@@ -370,6 +370,21 @@ not enabling a different first-party feature. Owner: PiQuark6046; review by
 **2026-12-19**, or on MeCab-Ko/notify changes. This is a narrow license admission,
 not a general CC0 allowlist or an advisory exception.
 
+## Time zones for legal analysis (2026-10-01)
+
+- **jiff 0.2.37** (with jiff-core 0.1.1 and jiff-tzdb 0.1.8) computes the calendar
+  date in a caller-selected IANA time zone for `law.watch` and `law.lineage`,
+  including daylight-saving rules. Default features are disabled; only `std` and
+  `tzdb-bundle-always` are enabled, so the IANA database is compiled into the
+  binary and no host zoneinfo files, system time-zone lookup or runtime download
+  are used. Updating the bundled database requires a jiff-tzdb release. Source:
+  crates.io, Unlicense OR MIT; select MIT. The archives include `LICENSE-MIT`,
+  `UNLICENSE` and `COPYING`. The lockfile also lists `defmt` crates for embedded
+  targets; they are not built for either supported server target. A fixed-offset
+  table would mis-date zones with daylight saving time, and chrono's `chrono-tz`
+  would add a second time library alongside the existing `time` crate used by
+  dependencies.
+
 ## Deployment validation tools
 
 Deployment checks and the optional ingestion image use Kubernetes `kubectl` v1.37.0 (embedded

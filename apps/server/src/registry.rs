@@ -41,6 +41,8 @@ pub enum ToolError {
     Unavailable,
     RateLimited,
     Ambiguous,
+    UnsupportedJurisdiction,
+    InvalidTimezone,
     FreshnessUnavailable,
     NormalizationFailed,
     ResourceLimit,
