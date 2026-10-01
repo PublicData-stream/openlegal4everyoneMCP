@@ -62,8 +62,13 @@ These checks establish bounded failure handling, not continuous mirror availabil
 
 The final image retains the first-party AGPL license, bundled widget notices,
 Rust dependency and standard-library notices, and embedded Korean dictionary
-notices. Notice collection follows the server's resolved non-dev graph and fails
-when a dependency has neither packaged notices nor a reviewed exact-version
+notices. Notice collection uses exact package IDs from the successful locked
+release build's Cargo artifact messages, including cached artifacts, build
+dependencies and procedural macros. Unfiltered metadata supplies package source
+information; inactive optional dependencies and unrelated workspace packages
+are not selected from its broader graph. Missing or unsuccessful build evidence
+fails collection. Collection also fails when a dependency has neither packaged
+notices nor a reviewed exact-version
 supplement. [Supplemental notice provenance](../apps/server/notices/README.md)
 records immutable upstream sources and hashes for crates whose archives omit
 license files; the image includes a per-package inventory. The embedded

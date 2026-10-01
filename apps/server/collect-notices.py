@@ -1,4 +1,4 @@
-"""Collect notices from the resolved locked graph, not unrelated cache entries.
+"""Collect notices for packages used by the successful locked server build.
 
 Build-only helper: preserves nested native-library notices and Lindera's embedded
 Korean dictionary notice. Package source and compiler caches are not distributed.
@@ -10,24 +10,58 @@ from pathlib import Path
 import shutil
 import sys
 
+if len(sys.argv) != 4:
+    raise SystemExit("usage: collect-notices.py METADATA BUILD_MESSAGES DESTINATION")
 metadata = json.loads(Path(sys.argv[1]).read_text())
-destination = Path(sys.argv[2])
+build_messages = Path(sys.argv[2])
+destination = Path(sys.argv[3])
 supplements = Path(__file__).parent / "notices"
 manifest = json.loads((supplements / "manifest.json").read_text())
 if manifest["version"] != 1:
     raise SystemExit("Unsupported supplemental notice manifest")
-nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
-pending = [p["id"] for p in metadata["packages"] if p["name"] == "openlegal-server"]
-if len(pending) != 1:
+packages = {package["id"]: package for package in metadata["packages"]}
+server_ids = [p["id"] for p in metadata["packages"] if p["name"] == "openlegal-server"]
+if len(server_ids) != 1:
     raise SystemExit("Expected exactly one server package")
 resolved = set()
-while pending:
-    package_id = pending.pop()
-    if package_id in resolved:
-        continue
-    resolved.add(package_id)
-    pending.extend(dep["pkg"] for dep in nodes[package_id]["deps"]
-                   if any(kind["kind"] != "dev" for kind in dep["dep_kinds"]))
+finished = False
+server_binary = False
+with build_messages.open() as messages:
+    for line in messages:
+        # Cargo does not control arbitrary stdout from procedural macros/tools.
+        line = line.lstrip()
+        if not line.startswith("{"):
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            raise SystemExit("Malformed Cargo build message") from None
+        reason = message.get("reason")
+        if finished:
+            raise SystemExit("Unexpected Cargo message after build completion")
+        if reason == "build-finished":
+            if message.get("success") is not True:
+                raise SystemExit("Cargo build did not succeed")
+            finished = True
+            continue
+        if reason != "compiler-artifact":
+            continue
+        package_id = message.get("package_id")
+        if not isinstance(package_id, str) or package_id not in packages:
+            raise SystemExit("Unknown Cargo artifact package ID")
+        # Include fresh cache hits, procedural macros and build dependencies.
+        resolved.add(package_id)
+        if (package_id == server_ids[0]
+                and message.get("target", {}).get("name") == "openlegal-server"
+                and "bin" in message.get("target", {}).get("kind", [])
+                and message.get("profile", {}).get("test") is False
+                and isinstance(message.get("executable"), str)
+                and message["executable"]):
+            server_binary = True
+if not finished:
+    raise SystemExit("Missing successful Cargo build completion")
+if not server_binary:
+    raise SystemExit("Missing server binary artifact")
 inventory = []
 for package in metadata["packages"]:
     if package["id"] not in resolved or package["source"] is None:

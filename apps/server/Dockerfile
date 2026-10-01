@@ -36,13 +36,15 @@ RUN --mount=type=cache,id=openlegal-server-registry,target=/usr/local/cargo/regi
         arm64) export RUSTFLAGS="-C target-feature=-crt-static"; interpreter=/lib/ld-musl-aarch64.so.1 ;; \
         *) exit 1 ;; \
     esac \
+    && mkdir -p /assets \
     && cargo build --locked --release -p openlegal-server -j "$BUILD_JOBS" \
+        --message-format=json-render-diagnostics > /assets/build-messages.jsonl \
     && readelf -l /build/release/openlegal-server | grep -F "[Requesting program interpreter: $interpreter]" \
     && ! readelf -d /build/release/openlegal-server | grep -F 'libc.so.6' \
     && mkdir -p /assets/notices \
     && cp /build/release/openlegal-server /assets/openlegal-server \
-    && cargo metadata --locked --format-version 1 --filter-platform "$(rustc -vV | sed -n 's/^host: //p')" > /assets/metadata.json \
-    && python3 apps/server/collect-notices.py /assets/metadata.json /assets/notices \
+    && cargo metadata --locked --format-version 1 > /assets/metadata.json \
+    && python3 apps/server/collect-notices.py /assets/metadata.json /assets/build-messages.jsonl /assets/notices \
     && mkdir -p /assets/notices/rust-standard-library \
     && cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" /assets/notices/rust-standard-library/ \
     && cp -r "$(rustc --print sysroot)/share/doc/rust/licenses" /assets/notices/rust-standard-library/
