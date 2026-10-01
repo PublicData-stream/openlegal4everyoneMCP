@@ -42,6 +42,7 @@ or execution permissions.
 | Korean legal data | [Korean provider profile](docs/providers/kr-law-go-kr.md) |
 | MCP/API input, outbound requests, parsers, secrets, or unsafe Rust | [Secure development](CONTRIBUTING.md#secure-development) and [review gates](CONTRIBUTING.md#review-gates) |
 | A suspected vulnerability | [Security policy](SECURITY.md), including its reporting-channel status |
+| End-user skills or Claude/ChatGPT plugin manifests | [OpenLegal plugin](plugins/openlegal/README.md); keep them separate from `.agents/skills` |
 | Work that benefits from bounded delegation | [Subagent delegation skill](.agents/skills/subagent-delegation/SKILL.md) |
 
 ## Agent handoff

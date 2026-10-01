@@ -1,0 +1,14 @@
+{
+  "name": "openlegal",
+  "displayName": "OpenLegal 4 Everyone",
+  "version": "0.1.0",
+  "description": "Search, read, cite and compare Korean statutes, ordinances and precedents with provenance through the openlegal4everyone.stream MCP server.",
+  "author": {
+    "name": "PublicData-stream",
+    "url": "https://github.com/PublicData-stream"
+  },
+  "homepage": "https://github.com/PublicData-stream/openlegal4everyoneMCP/tree/main/plugins/openlegal",
+  "repository": "https://github.com/PublicData-stream/openlegal4everyoneMCP",
+  "license": "AGPL-3.0-only",
+  "keywords": ["legal", "korea", "law", "statute", "precedent", "mcp"]
+}

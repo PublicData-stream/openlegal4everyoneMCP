@@ -95,6 +95,7 @@ backend-only upgrades remain unaccepted.
 - [Document sandbox](docs/document-sandbox.md): isolated XML/HTML/PDF/HWP/OCR processing and acceptance.
 - [Text comparison](docs/text-diff.md): Rust line/character engine, input limits, paging, retention and editable widget.
 - [Synthetic browser](docs/demo.md): local setup, tools, progress and ChatGPT manual checks.
+- [Claude and ChatGPT plugin](plugins/openlegal/README.md): shared end-user skills, plugin manifests and remaining listing work.
 - [Retrieval validation](docs/retrieval-review.md): independent reviews, checks and remaining limits.
 - [Legal-data policy](docs/legal-data-policy.md): identity, dates, normalization, and citations.
 - [Upstream policy](docs/upstream-policy.md): caching, refresh, and service protection.

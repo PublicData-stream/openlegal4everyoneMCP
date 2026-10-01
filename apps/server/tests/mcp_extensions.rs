@@ -105,7 +105,12 @@ impl Server {
             .register_typed::<Empty, Output, _, _>(
                 "invalid_output",
                 "Synthetic invalid output",
-                ToolOptions::default(),
+                {
+                    // A blank supplied title falls back to the generated one.
+                    let mut options = ToolOptions::default();
+                    options.annotations.title = Some("  ".into());
+                    options
+                },
                 |_, _| async { Ok(ToolOutput::new(Output { value: 99 })) },
             )
             .unwrap();
@@ -224,6 +229,12 @@ async fn typed_tools_resources_and_legacy_registration_work_in_both_revisions() 
             .unwrap();
         assert_eq!(typed["outputSchema"]["type"], "object");
         assert_eq!(typed["_meta"]["ui"]["resourceUri"], "ui://demo/widget.html");
+        let invalid_output = tools
+            .iter()
+            .find(|tool| tool["name"] == "invalid_output")
+            .unwrap();
+        assert_eq!(invalid_output["title"], "Invalid output");
+        assert_eq!(invalid_output["annotations"]["title"], "Invalid output");
         let old = result(
             server
                 .post(
