@@ -3,7 +3,7 @@ name: korean-law-research
 description: Find and quote Korean statutes, ordinances and court precedents from the OpenLegal corpus with exact provenance. Use when the user asks for a law article, 법령 조문, 판례, 사건번호, 자치법규, or wants legal source text found, read or cited.
 license: AGPL-3.0-only
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Korean law research
@@ -43,6 +43,12 @@ the server names are used below.
    the matched capture. To continue a long document, pass
    `{"kind":"capture","id":<metadata.capture_id>}`, the returned `session`, the
    same `section` and `next_offset`. Use `sections` to jump to an article.
+   For a long statute, administrative rule or ordinance, prefer `law.article`:
+   pass `article` (with `context` for neighbours), `chapter` (`제2장`),
+   `keyword` or `annex` (`별표 1`), or nothing to get the outline first. Add
+   `date` for the version in force on a day. An `annex_text_sparse` warning
+   means the annex table may exist only as an image; say so instead of
+   guessing its values.
 4. **Report freshness.** State `retrieved_at`, `validated_at` and `freshness`
    from `metadata`. If the result is stale, say so; set `fresh_only: true` when the
    user needs current text only.
@@ -58,8 +64,24 @@ each citation's `status` as returned. `title_mismatch`, `article_not_found`,
 checked capture; `law_not_observed` and `not_observed` only mean the corpus has
 no record. Correct or flag your own citations that do not verify.
 
-If `law.resolve_name` or `citation.verify` is not in the server's tool list,
-fall back to `database.rg` on the `title` section and `database.get`.
+## Precedent status and article impact
+
+- Before relying on a precedent, call `precedent.citing` with its case number.
+  `overruling_language_found` means a later retained decision says it changes or
+  no longer follows the cited view: quote that line and the decision's case
+  number and date. `none_found` only means no recognized phrase was found in the
+  retained decisions; never present it as confirmation that the precedent is
+  still good law.
+- When the user asks what an article affects or what cites it, call
+  `article.impact`. Report counts per dataset with a few example lines, and say
+  that abbreviated references (`법 제5조`) and references under former titles
+  are not counted. The `mermaid` field can be rendered as a diagram where the
+  host supports Mermaid.
+
+If `law.resolve_name`, `citation.verify`, `law.article`, `precedent.citing` or
+`article.impact` is not in the server's tool list, fall back to `database.rg`
+(on the `title` section for names, on `body` for a case number or
+`「법령명」 제N조`) and `database.get`.
 
 ## When the corpus does not have it
 

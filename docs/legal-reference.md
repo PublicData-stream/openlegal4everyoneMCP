@@ -71,9 +71,10 @@ Each statute citation receives one status:
 | `unavailable` | The object could not be read; `detail` gives the corpus error code |
 
 Current titles are checked against HEAD; a former title is checked against the
-capture that carried it. Articles are located in `article:` provider sections by
-their leading `제N조` or `제N조의M`; supplementary-provision (`부칙`) sections are
-not used. Paragraphs are the circled numbers ① to ㊿ at line starts; an article
+capture that carried it. Articles are located in `article:` provider sections, or
+in provider blocks that hold several articles, by their leading `제N조`, `제N조의M`
+or `제N-P조`; a missing `제N-P조` falls back to `제N조의P`. Supplementary-provision
+(`부칙`) sections are not used. Paragraphs are the circled numbers ① to ㊿ at line starts; an article
 without them accepts only `제1항`. Subparagraphs are `N.` lines inside the cited
 paragraph. Title similarity is 100 when one normalized title contains the other,
 otherwise the character-bigram Jaccard index.
@@ -88,7 +89,7 @@ records, or `not_observed`.
 ## Date-based selection
 
 `law.in_force_at` accepts either `object` or a national-statute `law_name`, a
-`date` (`YYYYMMDD`), an optional `article` (`제44조`, `44의2`, `44-2`) and an optional
+`date` (`YYYYMMDD`), an optional `article` (`제44조`, `44의2`, `제9-5조`) and an optional
 `compare_date`. Only datasets with provider revisions are supported.
 
 The tool reads up to 2,000 revisions from `database.history`. It selects the
@@ -117,6 +118,9 @@ applies to particular facts. Supplementary provisions, transitional rules,
 retroactivity and provision-level effective dates can change the applicable text;
 the `basis` field says so in every result. Exact date selectors in
 `database.get` keep their existing meaning.
+
+The [legal analysis tools](legal-analysis.md) build on the same lookups for batch
+change watching, lineage, citing decisions, article impact and article reads.
 
 ## Validation
 

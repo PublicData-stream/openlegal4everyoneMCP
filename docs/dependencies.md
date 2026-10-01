@@ -296,7 +296,9 @@ and the explicit distinction between digest integrity and source authentication.
 - **grep-regex 0.1.14 / grep-matcher 0.1.8** are ripgrep's Rust regex/matcher
   libraries, allowing typed, bounded matching without interpreting command-line
   switches or spawning shell commands. Source: crates.io, MIT OR Unlicense;
-  select MIT. Regex automata and per-call scans have independent limits.
+  select MIT. Regex automata and per-call scans have independent limits. The server's
+  unit tests use the same versions as development dependencies so generated
+  legal-reference patterns are evaluated by the production regex engine.
 - **unicode-normalization 0.1.25** implements NFC for analyzed search surfaces;
   exact quoted matching and original text use the unmodified representation.
   Source: crates.io, MIT OR Apache-2.0. Hand-written Unicode composition is not an

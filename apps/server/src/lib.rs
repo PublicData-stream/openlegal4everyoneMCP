@@ -13,11 +13,14 @@ pub mod endpoint;
 pub mod framing;
 pub mod handler;
 pub mod http;
+pub mod legal_analysis;
 pub mod legal_reference;
 pub mod progress;
 mod rate_limit;
 pub mod registry;
 pub mod resources;
+#[cfg(test)]
+mod test_corpus;
 pub mod text_diff;
 mod timed_io;
 pub mod webtransport;

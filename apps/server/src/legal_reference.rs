@@ -25,7 +25,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-const ARTICLE_TEXT_LIMIT: usize = 16 * 1024;
+pub(crate) const ARTICLE_TEXT_LIMIT: usize = 16 * 1024;
 const MAX_FORMER_TITLE_OBJECTS: usize = 20;
 const MAX_CACHED_CAPTURES: usize = 8;
 /// Cited and retained article titles below this similarity are reported as mismatches.
@@ -68,7 +68,7 @@ struct InForceInput {
     compare_date: Option<String>,
 }
 
-fn output<T>(structured: T) -> ToolOutput<T> {
+pub(crate) fn output<T>(structured: T) -> ToolOutput<T> {
     ToolOutput {
         structured,
         text: Some(
@@ -79,14 +79,14 @@ fn output<T>(structured: T) -> ToolOutput<T> {
     }
 }
 
-fn code(error: DatabaseError) -> String {
+pub(crate) fn code(error: DatabaseError) -> String {
     serde_json::to_value(error)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| "unavailable".into())
 }
 
-fn valid_text(value: &str, max: usize) -> bool {
+pub(crate) fn valid_text(value: &str, max: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= max
         && !value
@@ -95,13 +95,13 @@ fn valid_text(value: &str, max: usize) -> bool {
 }
 
 /// Title matches keyed by `kr::name_key`.
-struct TitleIndex {
-    matches: BTreeMap<String, Vec<TitleMatch>>,
-    corpus_complete: bool,
-    notices: Vec<CollectionNotice>,
+pub(crate) struct TitleIndex {
+    pub(crate) matches: BTreeMap<String, Vec<TitleMatch>>,
+    pub(crate) corpus_complete: bool,
+    pub(crate) notices: Vec<CollectionNotice>,
 }
 
-async fn find_titles(
+pub(crate) async fn find_titles(
     lookup: &ReferenceLookup,
     names: &[String],
     datasets: &[Dataset],
@@ -129,6 +129,7 @@ async fn find_titles(
             "title",
             datasets.to_vec(),
             &patterns,
+            None,
             false,
             deadline,
             cancel.clone(),
@@ -167,6 +168,7 @@ async fn find_titles(
             "title",
             datasets.to_vec(),
             &missing,
+            None,
             true,
             deadline,
             cancel.clone(),
@@ -219,7 +221,7 @@ async fn find_titles(
     Ok(index)
 }
 
-fn statute_datasets() -> Vec<Dataset> {
+pub(crate) fn statute_datasets() -> Vec<Dataset> {
     vec![Dataset::NationalStatute]
 }
 
@@ -262,16 +264,19 @@ async fn resolve_name(
 
 /// The law a citation was resolved to before reading the corpus.
 #[derive(Clone)]
-struct ChosenLaw {
-    name: String,
-    resolution: Option<LawNameResolution>,
-    start: usize,
-    inherited: bool,
-    candidates: Vec<String>,
-    unresolved: bool,
+pub(crate) struct ChosenLaw {
+    pub(crate) name: String,
+    pub(crate) resolution: Option<LawNameResolution>,
+    pub(crate) start: usize,
+    pub(crate) inherited: bool,
+    pub(crate) candidates: Vec<String>,
+    pub(crate) unresolved: bool,
 }
 
-fn resolution_for(cache: &mut HashMap<String, LawNameResolution>, name: &str) -> LawNameResolution {
+pub(crate) fn resolution_for(
+    cache: &mut HashMap<String, LawNameResolution>,
+    name: &str,
+) -> LawNameResolution {
     cache
         .entry(name.to_string())
         .or_insert_with(|| kr::resolve_law_name(name))
@@ -280,7 +285,7 @@ fn resolution_for(cache: &mut HashMap<String, LawNameResolution>, name: &str) ->
 
 /// Assign a law to every extracted citation in order. Returns the names whose titles
 /// still need a lookup; the caller looks them up and runs the pass again.
-fn choose_laws(
+pub(crate) fn choose_laws(
     citations: &[kr::ExtractedStatute],
     index: &BTreeMap<String, Vec<TitleMatch>>,
     looked_up: &std::collections::BTreeSet<String>,
@@ -446,24 +451,15 @@ async fn check_statute(
     result: &mut StatuteCitationResult,
     cancel: &CancellationToken,
 ) -> Result<(), ToolError> {
-    let current: Vec<&TitleMatch> = matches
-        .iter()
-        .filter(|m| m.title_status == TitleStatus::Current)
-        .collect();
-    let pool: Vec<&TitleMatch> = if current.is_empty() {
-        matches.iter().collect()
-    } else {
-        current
-    };
-    let target = match pool.as_slice() {
-        [] => {
+    let target = match pick_match(matches) {
+        Ok(one) => one,
+        Err(0) => {
             result.status = StatuteCitationStatus::LawNotObserved;
             return Ok(());
         }
-        [one] => *one,
-        many => {
+        Err(many) => {
             result.status = StatuteCitationStatus::LawAmbiguous;
-            result.detail = Some(format!("{}_objects", many.len()));
+            result.detail = Some(format!("{many}_objects"));
             return Ok(());
         }
     };
@@ -640,6 +636,7 @@ async fn verify(
             "case_number",
             vec![Dataset::Precedent, Dataset::ConstitutionalDecision],
             &patterns,
+            None,
             false,
             deadline,
             cancel.clone(),
@@ -692,7 +689,7 @@ async fn verify(
     })
 }
 
-fn contains_case_number(line: &str, number: &str) -> bool {
+pub(crate) fn contains_case_number(line: &str, number: &str) -> bool {
     line.match_indices(number).any(|(at, _)| {
         let before = line[..at].chars().next_back();
         let after = line[at + number.len()..].chars().next();
@@ -723,7 +720,7 @@ fn same_text(a: &str, b: &str) -> bool {
     a.split_whitespace().eq(b.split_whitespace())
 }
 
-async fn selection_for(
+pub(crate) async fn selection_for(
     lookup: &ReferenceLookup,
     object: &ObjectId,
     entries: &[openlegal_domain::legal::HistoryEntry],
@@ -766,6 +763,70 @@ async fn selection_for(
     Ok(selection)
 }
 
+/// Pick the single retained object a tool targets: the supplied object, or the one
+/// object in `datasets` whose current (or, failing that, former) title matches a name.
+pub(crate) async fn resolve_object(
+    lookup: &ReferenceLookup,
+    object: Option<ObjectId>,
+    law_name: Option<String>,
+    datasets: &[Dataset],
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<(ObjectId, Option<LawNameResolution>), ToolError> {
+    let (object, resolution) = match (object, law_name) {
+        (Some(object), None) => (object, None),
+        (None, Some(name)) => {
+            if !valid_text(&name, kr::MAX_LAW_NAME_BYTES) || name.contains('\n') {
+                return Err(ToolError::InvalidInput);
+            }
+            let resolution = kr::resolve_law_name(&name);
+            let index = find_titles(
+                lookup,
+                std::slice::from_ref(&resolution.resolved),
+                datasets,
+                deadline,
+                cancel,
+            )
+            .await?;
+            let matches = index
+                .matches
+                .get(&kr::name_key(&resolution.resolved))
+                .cloned()
+                .unwrap_or_default();
+            match pick_match(&matches) {
+                Ok(one) => (one.object.clone(), Some(resolution)),
+                Err(0) => return Err(ToolError::NotObserved),
+                Err(_) => return Err(ToolError::Ambiguous),
+            }
+        }
+        _ => return Err(ToolError::InvalidInput),
+    };
+    object.validate().map_err(map_error)?;
+    Ok((object, resolution))
+}
+
+/// The single current match, or the single former match when none is current;
+/// otherwise the number of candidates. National statutes take precedence over
+/// administrative rules and ordinances with the same title.
+pub(crate) fn pick_match(matches: &[TitleMatch]) -> Result<&TitleMatch, usize> {
+    let statute = |m: &&TitleMatch| m.object.dataset == Dataset::NationalStatute;
+    let pool: Vec<&TitleMatch> = if matches.iter().any(|m| statute(&m)) {
+        matches.iter().filter(statute).collect()
+    } else {
+        matches.iter().collect()
+    };
+    let current: Vec<&TitleMatch> = pool
+        .iter()
+        .copied()
+        .filter(|m| m.title_status == TitleStatus::Current)
+        .collect();
+    let pool = if current.is_empty() { pool } else { current };
+    match pool.as_slice() {
+        [one] => Ok(one),
+        many => Err(many.len()),
+    }
+}
+
 async fn in_force_at(
     lookup: &ReferenceLookup,
     input: InForceInput,
@@ -785,43 +846,15 @@ async fn in_force_at(
         Some(value) => Some(kr::parse_article_number(value).ok_or(ToolError::InvalidInput)?),
         None => None,
     };
-    let (object, resolution) = match (input.object, input.law_name) {
-        (Some(object), None) => (object, None),
-        (None, Some(name)) => {
-            if !valid_text(&name, kr::MAX_LAW_NAME_BYTES) || name.contains('\n') {
-                return Err(ToolError::InvalidInput);
-            }
-            let resolution = kr::resolve_law_name(&name);
-            let index = find_titles(
-                lookup,
-                std::slice::from_ref(&resolution.resolved),
-                &statute_datasets(),
-                deadline,
-                &cancel,
-            )
-            .await?;
-            let matches = index
-                .matches
-                .get(&kr::name_key(&resolution.resolved))
-                .cloned()
-                .unwrap_or_default();
-            let current: Vec<&TitleMatch> = matches
-                .iter()
-                .filter(|m| m.title_status == TitleStatus::Current)
-                .collect();
-            let pool: Vec<&TitleMatch> = if current.is_empty() {
-                matches.iter().collect()
-            } else {
-                current
-            };
-            match pool.as_slice() {
-                [] => return Err(ToolError::NotObserved),
-                [one] => (one.object.clone(), Some(resolution)),
-                _ => return Err(ToolError::Ambiguous),
-            }
-        }
-        _ => return Err(ToolError::InvalidInput),
-    };
+    let (object, resolution) = resolve_object(
+        lookup,
+        input.object,
+        input.law_name,
+        &statute_datasets(),
+        deadline,
+        &cancel,
+    )
+    .await?;
     object.validate().map_err(map_error)?;
     if !object.dataset.has_provider_revisions() {
         return Err(ToolError::UnsupportedHistory);
@@ -1007,106 +1040,34 @@ impl ToolModule for LegalReferenceTools {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future::BoxFuture;
-    use openlegal_application::{
-        Clock,
-        database::{DatabaseService, DatabaseStore},
-        search::{SearchBackend, SearchBudget, SearchMode, SearchService},
-    };
-    use openlegal_domain::{
-        legal::{
-            Capture, HistoryEntry, HistoryKind, HistoryPage, LegalRecord, LegalSection, SectionKind,
-        },
-        legal_search::{SearchHit, SearchPage, SearchRequest},
-    };
-
-    const NOW: u64 = 1_000_000;
-
-    struct Fixed;
-    impl Clock for Fixed {
-        fn now(&self) -> u64 {
-            NOW
-        }
-    }
-
-    #[derive(Clone)]
-    struct Stored {
-        capture: Capture,
-        head: bool,
-    }
-
-    struct Corpus(Vec<Stored>);
-
-    fn object(dataset: Dataset, id: &str) -> ObjectId {
-        ObjectId {
-            jurisdiction: "kr".into(),
-            provider: "law_go_kr".into(),
-            dataset,
-            id: id.into(),
-        }
-    }
-
-    fn article(key: &str, title: &str, text: &str) -> LegalSection {
-        LegalSection {
-            id: format!("article:{key}"),
-            title: title.into(),
-            text: text.into(),
-            kind: SectionKind::ProviderText,
-            source_document_sha256: None,
-            page: None,
-        }
-    }
+    use crate::test_corpus::{Record, Stored, article, deadline, object};
 
     #[allow(clippy::too_many_arguments)]
-    fn stored(
+    fn record(
         object: ObjectId,
         n: u64,
-        revision: &str,
-        title: &str,
-        effective: Option<&str>,
-        sections: Vec<LegalSection>,
-        metadata: &[(&str, &str)],
+        revision: &'static str,
+        title: &'static str,
+        effective: Option<&'static str>,
+        sections: Vec<openlegal_domain::legal::LegalSection>,
+        metadata: &'static [(&'static str, &'static str)],
         head: bool,
     ) -> Stored {
-        Stored {
-            capture: Capture {
-                capture_id: format!("{n:064x}"),
-                sequence: n,
-                record: LegalRecord {
-                    object,
-                    revision_id: revision.into(),
-                    title: title.into(),
-                    body: sections
-                        .iter()
-                        .map(|s| s.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    metadata: metadata
-                        .iter()
-                        .map(|(k, v)| ((*k).into(), (*v).into()))
-                        .collect(),
-                    publication_date: effective.map(|_| "20000101".into()),
-                    effective_date: effective.map(Into::into),
-                    source_url: "https://example.test/fictional".into(),
-                    representation: "provider_effective_original".into(),
-                    sections,
-                },
-                retrieved_at: NOW,
-                captured_at: NOW,
-                validated_at: NOW,
-                processor_version: "v1".into(),
-                raw_sha256: "b".repeat(64),
-            },
+        Record {
+            object,
+            n,
+            revision,
+            title,
+            effective,
+            sections,
+            metadata,
             head,
         }
+        .build()
     }
 
-    fn corpus() -> Arc<Corpus> {
+    fn lookup() -> ReferenceLookup {
         let civil = object(Dataset::NationalStatute, "1");
-        let decree = object(Dataset::NationalStatute, "2");
-        let renamed = object(Dataset::NationalStatute, "3");
-        let twin_a = object(Dataset::NationalStatute, "4");
-        let twin_b = object(Dataset::NationalStatute, "5");
         let civil_2023 = vec![
             article("0003001", "", "제3조 삭제 <2020. 1. 1.>"),
             article(
@@ -1122,8 +1083,9 @@ mod tests {
         ];
         let mut civil_2020 = civil_2023.clone();
         civil_2020[1].text = "제750조(불법행위의 내용) 과실로 손해를 가한 자는 배상한다.".into();
-        Arc::new(Corpus(vec![
-            stored(
+        let renamed = object(Dataset::NationalStatute, "3");
+        crate::test_corpus::lookup(vec![
+            record(
                 civil.clone(),
                 1,
                 "100:20200101",
@@ -1133,7 +1095,7 @@ mod tests {
                 &[],
                 false,
             ),
-            stored(
+            record(
                 civil,
                 2,
                 "200:20230601",
@@ -1143,8 +1105,8 @@ mod tests {
                 &[("provision_effective_dates", "20230601,20240101")],
                 true,
             ),
-            stored(
-                decree,
+            record(
+                object(Dataset::NationalStatute, "2"),
                 3,
                 "300:20240101",
                 "산업안전보건법 시행령",
@@ -1157,7 +1119,7 @@ mod tests {
                 &[],
                 true,
             ),
-            stored(
+            record(
                 renamed.clone(),
                 4,
                 "400:20100101",
@@ -1167,7 +1129,7 @@ mod tests {
                 &[],
                 false,
             ),
-            stored(
+            record(
                 renamed,
                 5,
                 "500:20200101",
@@ -1177,8 +1139,8 @@ mod tests {
                 &[],
                 true,
             ),
-            stored(
-                twin_a,
+            record(
+                object(Dataset::NationalStatute, "4"),
                 6,
                 "600:20200101",
                 "쌍둥이법",
@@ -1187,8 +1149,8 @@ mod tests {
                 &[],
                 true,
             ),
-            stored(
-                twin_b,
+            record(
+                object(Dataset::NationalStatute, "5"),
                 7,
                 "700:20200101",
                 "쌍둥이법",
@@ -1197,7 +1159,7 @@ mod tests {
                 &[],
                 true,
             ),
-            stored(
+            record(
                 object(Dataset::Precedent, "9"),
                 8,
                 "9",
@@ -1207,176 +1169,7 @@ mod tests {
                 &[("case_number", "2007다27670,27687")],
                 true,
             ),
-        ]))
-    }
-
-    impl DatabaseStore for Corpus {
-        fn resolve(
-            &self,
-            object: ObjectId,
-            selector: RevisionSelector,
-            _: u64,
-            _: CancellationToken,
-        ) -> BoxFuture<'static, Result<Capture, DatabaseError>> {
-            let found = self
-                .0
-                .iter()
-                .find(|s| {
-                    s.capture.record.object == object
-                        && match &selector {
-                            RevisionSelector::Head => s.head,
-                            RevisionSelector::Revision { id } => {
-                                s.capture.record.revision_id == *id
-                            }
-                            RevisionSelector::Capture { id } => s.capture.capture_id == *id,
-                            _ => false,
-                        }
-                })
-                .map(|s| s.capture.clone())
-                .ok_or(DatabaseError::NotObserved);
-            Box::pin(async move { found })
-        }
-        fn history(
-            &self,
-            object: ObjectId,
-            _: HistoryKind,
-            _: Option<String>,
-            _: usize,
-            _: u64,
-            _: CancellationToken,
-        ) -> BoxFuture<'static, Result<HistoryPage, DatabaseError>> {
-            let entries = self
-                .0
-                .iter()
-                .filter(|s| s.capture.record.object == object)
-                .map(|s| HistoryEntry {
-                    revision_id: s.capture.record.revision_id.clone(),
-                    capture_id: Some(s.capture.capture_id.clone()),
-                    sequence: s.capture.sequence,
-                    captured_at: Some(NOW),
-                    publication_date: s.capture.record.publication_date.clone(),
-                    effective_date: s.capture.record.effective_date.clone(),
-                })
-                .collect();
-            Box::pin(async move {
-                Ok(HistoryPage {
-                    entries,
-                    next_cursor: None,
-                    inventory_complete: true,
-                })
-            })
-        }
-    }
-
-    /// Test-only evaluation of the anchored alternatives that this module generates.
-    fn line_matches(alternative: &str, section: &str, line: &str) -> bool {
-        if section == "case_number" {
-            let number = alternative
-                .trim_start_matches("(?:.*[^0-9])?")
-                .trim_end_matches("(?:[^0-9].*)?");
-            return contains_case_number(line, number);
-        }
-        let mut literal = String::new();
-        let mut chars = alternative
-            .replace(" ?", "")
-            .chars()
-            .collect::<Vec<_>>()
-            .into_iter();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => literal.extend(chars.next()),
-                '[' => {
-                    for c in chars.by_ref() {
-                        if c == ']' {
-                            break;
-                        }
-                    }
-                }
-                c => literal.push(c),
-            }
-        }
-        kr::name_key(&literal) == kr::name_key(line)
-    }
-
-    impl SearchBackend for Corpus {
-        fn search(
-            &self,
-            mode: SearchMode,
-            request: SearchRequest,
-            _: SearchBudget,
-            _: CancellationToken,
-        ) -> BoxFuture<'static, Result<SearchPage, DatabaseError>> {
-            assert!(matches!(mode, SearchMode::Ripgrep));
-            let body = request
-                .query
-                .strip_prefix("^(?:")
-                .and_then(|q| q.strip_suffix(")$"))
-                .expect("anchored query")
-                .to_string();
-            let section = request.sections[0].clone();
-            let hits = self
-                .0
-                .iter()
-                .filter(|s| request.include_history || s.head)
-                .filter(|s| {
-                    request.filters.datasets.is_empty()
-                        || request
-                            .filters
-                            .datasets
-                            .contains(&s.capture.record.object.dataset)
-                })
-                .filter_map(|s| {
-                    let record = &s.capture.record;
-                    let line = if section == "title" {
-                        record.title.clone()
-                    } else {
-                        record.metadata.get(&section)?.clone()
-                    };
-                    body.split('|')
-                        .any(|alt| line_matches(alt, &section, &line))
-                        .then(|| SearchHit {
-                            match_scope: "line".into(),
-                            excerpt_section: section.clone(),
-                            includes_ocr: false,
-                            object: record.object.clone(),
-                            revision_id: record.revision_id.clone(),
-                            capture_id: s.capture.capture_id.clone(),
-                            title: record.title.clone(),
-                            section: section.clone(),
-                            line: 1,
-                            text: line,
-                            byte_start: 0,
-                            byte_end: 0,
-                            derived_ocr: false,
-                        })
-                })
-                .collect();
-            Box::pin(async move {
-                Ok(SearchPage {
-                    schema_version: 1,
-                    hits,
-                    next_cursor: None,
-                    generation: 1,
-                    corpus_complete: true,
-                    scanned_bytes: 0,
-                    analyzer_version: "test".into(),
-                    index_lag: 0,
-                    collection_notices: vec![],
-                })
-            })
-        }
-    }
-
-    fn lookup() -> ReferenceLookup {
-        let corpus = corpus();
-        ReferenceLookup::new(
-            Arc::new(DatabaseService::new(corpus.clone(), Arc::new(Fixed))),
-            Arc::new(SearchService::new(corpus)),
-        )
-    }
-
-    fn deadline() -> Instant {
-        Instant::now() + std::time::Duration::from_secs(5)
+        ])
     }
 
     #[test]

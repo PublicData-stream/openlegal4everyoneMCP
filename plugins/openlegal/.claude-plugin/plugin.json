@@ -1,7 +1,7 @@
 {
   "name": "openlegal",
   "displayName": "OpenLegal 4 Everyone",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Search, read, cite and compare Korean statutes, ordinances and precedents with provenance through the openlegal4everyone.stream MCP server.",
   "author": {
     "name": "PublicData-stream",

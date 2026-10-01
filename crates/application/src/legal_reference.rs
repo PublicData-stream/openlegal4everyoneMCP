@@ -51,14 +51,17 @@ impl ReferenceLookup {
         &self.database
     }
 
-    /// Find section lines that equal one of the regular-expression `alternatives`.
+    /// Find section lines that equal one of the regular-expression `alternatives`,
+    /// optionally within one provider object ID.
     /// Alternatives are combined into anchored `^(?:a|b)$` searches of bounded size and
     /// each search is paged to completion so no search session is left open.
+    #[allow(clippy::too_many_arguments)]
     pub async fn find_lines(
         &self,
         section: &str,
         datasets: Vec<Dataset>,
         alternatives: &[String],
+        object_id: Option<&str>,
         include_history: bool,
         deadline: Instant,
         cancel: CancellationToken,
@@ -79,6 +82,7 @@ impl ReferenceLookup {
                             query: query.clone(),
                             filters: Filters {
                                 datasets: datasets.clone(),
+                                object_id: object_id.map(str::to_string),
                                 ..Filters::default()
                             },
                             include_history,
@@ -268,6 +272,22 @@ pub fn select_in_force(
     }
 }
 
+/// The Korean (UTC+9) calendar date of a Unix time, as `YYYYMMDD`.
+pub fn kst_date(unix_seconds: u64) -> String {
+    let days = ((unix_seconds + 9 * 3600) / 86400) as i64;
+    // Civil-from-days (Howard Hinnant), valid for all dates after 1970.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}")
+}
+
 /// Distinct valid `YYYYMMDD` dates after `date` found in a provider date list such as
 /// `provision_effective_dates`, sorted ascending.
 pub fn later_dates(value: &str, date: &str) -> Vec<String> {
@@ -348,6 +368,15 @@ mod tests {
         assert_eq!(early.next_change.unwrap().revision_id, "a");
         let none = select_in_force(&[entry("u", None, None)], true, "20240101");
         assert_eq!(none.status, InForceStatus::Undetermined);
+    }
+
+    #[test]
+    fn korean_dates_use_utc_plus_nine() {
+        assert_eq!(kst_date(0), "19700101");
+        assert_eq!(kst_date(15 * 3600 - 1), "19700101");
+        assert_eq!(kst_date(15 * 3600), "19700102");
+        assert_eq!(kst_date(1_709_164_800), "20240229");
+        assert_eq!(kst_date(1_790_812_800), "20261001");
     }
 
     #[test]
@@ -487,6 +516,7 @@ mod tests {
                 "title",
                 vec![Dataset::NationalStatute],
                 &["민 ?법".to_string()],
+                None,
                 false,
                 Instant::now() + std::time::Duration::from_secs(5),
                 CancellationToken::new(),

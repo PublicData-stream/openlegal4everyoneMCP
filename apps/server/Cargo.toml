@@ -40,3 +40,5 @@ tokio = { version = "1", features = ["test-util"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 tempfile = "3"
+grep-regex = "=0.1.14"
+grep-matcher = "=0.1.8"

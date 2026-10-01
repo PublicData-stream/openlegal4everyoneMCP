@@ -6,18 +6,25 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::fmt;
 
-/// A Korean article locator, `제{number}조` or `제{number}조의{branch}`.
+/// A Korean article locator: `제{number}조`, the administrative-rule form
+/// `제{number}-{part}조`, either followed by `의{branch}`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 pub struct ArticleNumber {
     pub number: u32,
+    pub part: Option<u32>,
     pub branch: Option<u32>,
 }
 impl fmt::Display for ArticleNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.branch {
-            Some(branch) => write!(f, "제{}조의{}", self.number, branch),
-            None => write!(f, "제{}조", self.number),
+        write!(f, "제{}", self.number)?;
+        if let Some(part) = self.part {
+            write!(f, "-{part}")?;
         }
+        write!(f, "조")?;
+        if let Some(branch) = self.branch {
+            write!(f, "의{branch}")?;
+        }
+        Ok(())
     }
 }
 

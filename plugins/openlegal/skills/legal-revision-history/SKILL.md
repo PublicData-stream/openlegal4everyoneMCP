@@ -1,9 +1,9 @@
 ---
 name: legal-revision-history
-description: Trace how a Korean statute or ordinance changed over time and compare two versions from the OpenLegal corpus. Use when the user asks about 개정 이력, 연혁, 신구조문 비교, what changed in a law, or the text of a past version.
+description: Trace how a Korean statute or ordinance changed over time, compare two versions and watch laws for amendments from the OpenLegal corpus. Use when the user asks about 개정 이력, 연혁, 신구조문 비교, 개정 여부 확인, 폐지·개명, 시행 예정, what changed in a law, or the text of a past version.
 license: AGPL-3.0-only
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Legal revision history
@@ -46,6 +46,26 @@ compare them line by line. First identify the object with the
    comparison widget when the host renders apps.
 6. **Clean up.** Call `text.diff.delete` with the `comparison_id` when done.
    Handles expire after ten minutes anyway.
+
+## Watching many laws
+
+When the user wants to know which of several laws changed, call `law.watch`
+with up to 100 `laws` (names or objects). Pass the `snapshot` from the user's
+last check as `previous`, and give the new `snapshot` back so they can keep it
+for next time; you cannot schedule the check yourself. Report `changed` entries
+first, then entries with `upcoming` revisions (promulgated, not yet in force),
+then `not_observed` or `ambiguous` names to fix. Without `previous`, every
+found entry is `new`: report its HEAD revision and dates instead of a change.
+
+## Renames, repeal and upcoming changes
+
+For one law, call `law.lineage`. `titles` lists title periods (`renamed` is
+true when the title changed), `upcoming` lists revisions taking effect after
+today, and `head_state` other than `published` (for example `withdrawn`) means
+the current text is not readable. `repeal_mentions` are lines in other laws that
+mention the title with `폐지`: quote them as leads and do not state that the law
+was repealed unless a returned line says so. If `law.watch` or `law.lineage` is
+missing, use `database.history` and `database.get_metadata` instead.
 
 ## Large documents
 

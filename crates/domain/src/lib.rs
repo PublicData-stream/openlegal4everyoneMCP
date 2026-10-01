@@ -8,6 +8,7 @@ use std::fmt;
 pub mod collection;
 pub mod history;
 pub mod legal;
+pub mod legal_analysis;
 pub mod legal_reference;
 pub mod search_query;
 pub mod text_diff;

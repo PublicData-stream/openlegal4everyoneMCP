@@ -6,7 +6,7 @@
 //! compiled for this repository after reviewing the feature set of korean-law-mcp
 //! (MIT), without copying that project's table or code.
 use openlegal_domain::{
-    legal::LegalSection,
+    legal::{LegalSection, SectionKind},
     legal_reference::{ArticleNumber, LawNameResolution},
 };
 
@@ -333,9 +333,27 @@ fn unit_number(text: &str, at: usize, unit: char) -> Option<(u32, usize)> {
     Some((n, end + unit.len_utf8()))
 }
 
-/// Parse a leading `제{n}조` or `제{n}조의{m}` and return the byte after it.
+/// Parse a leading `제{n}조`, `제{n}-{p}조` or either form followed by `의{m}`, and
+/// return the byte after it.
 fn article_at(text: &str, at: usize) -> Option<(ArticleNumber, usize)> {
-    let (number, mut end) = unit_number(text, at, '조')?;
+    if !text.get(at..)?.starts_with('제') {
+        return None;
+    }
+    let start = skip_spaces(text, at + '제'.len_utf8(), 1);
+    let (number, mut end) = digits(text, start, 5)?;
+    let mut part = None;
+    if text[end..].starts_with('-')
+        && let Some((p, after)) = digits(text, end + 1, 3)
+        && p > 0
+    {
+        part = Some(p);
+        end = after;
+    }
+    end = skip_spaces(text, end, 1);
+    if number == 0 || !text[end..].starts_with('조') {
+        return None;
+    }
+    end += '조'.len_utf8();
     let mut branch = None;
     if text[end..].starts_with('의')
         && let Some((m, after)) = digits(text, end + '의'.len_utf8(), 3)
@@ -344,27 +362,68 @@ fn article_at(text: &str, at: usize) -> Option<(ArticleNumber, usize)> {
         branch = Some(m);
         end = after;
     }
-    Some((ArticleNumber { number, branch }, end))
+    Some((
+        ArticleNumber {
+            number,
+            part,
+            branch,
+        },
+        end,
+    ))
 }
 
-/// Accepts `제44조의2`, `44조의2`, `44의2`, `44-2` and `44`.
+/// Every article locator in `text` as `(article, byte_start, byte_end)`, in order.
+/// A locator directly preceded by a Hangul syllable (as in `동제3조`) is skipped.
+pub fn article_mentions(text: &str) -> Vec<(ArticleNumber, usize, usize)> {
+    let mut found = Vec::new();
+    for (at, _) in text.match_indices('제') {
+        if found.last().is_some_and(|(_, _, end)| at < *end)
+            || text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| ('가'..='힣').contains(&c))
+        {
+            continue;
+        }
+        if let Some((number, end)) = article_at(text, at) {
+            found.push((number, at, end));
+        }
+    }
+    found
+}
+
+/// Accepts `제44조의2`, `44조의2`, `44의2`, `제9-5조`, `9-5` and `44`. A hyphenated
+/// form is `제9-5조`; [`locate_article`] falls back to `제9조의5` when it is absent.
 pub fn parse_article_number(value: &str) -> Option<ArticleNumber> {
     let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
     let body = compact.strip_prefix('제').unwrap_or(&compact);
     let (number, end) = digits(body, 0, 5)?;
     let mut rest = &body[end..];
+    let mut part = None;
+    if let Some(tail) = rest.strip_prefix('-') {
+        let (p, end) = digits(tail, 0, 3)?;
+        if p == 0 {
+            return None;
+        }
+        part = Some(p);
+        rest = &tail[end..];
+    }
     rest = rest.strip_prefix('조').unwrap_or(rest);
     let branch = if rest.is_empty() {
         None
     } else {
-        let tail = rest.strip_prefix('의').or_else(|| rest.strip_prefix('-'))?;
+        let tail = rest.strip_prefix('의')?;
         let (m, end) = digits(tail, 0, 3)?;
         if end != tail.len() || m == 0 {
             return None;
         }
         Some(m)
     };
-    (number > 0).then_some(ArticleNumber { number, branch })
+    (number > 0).then_some(ArticleNumber {
+        number,
+        part,
+        branch,
+    })
 }
 
 fn circled_number(c: char) -> Option<u32> {
@@ -419,13 +478,14 @@ fn parenthetical(text: &str, at: usize) -> Option<(&str, usize)> {
     ))
 }
 
-fn parse_article_section(section: &LegalSection) -> Option<LocatedArticle<'_>> {
-    if !section.id.starts_with("article:") {
-        return None;
-    }
-    let text = section.text.trim_start();
+fn build_article<'a>(
+    section_id: &'a str,
+    title_hint: &str,
+    text: &'a str,
+) -> Option<LocatedArticle<'a>> {
+    let text = text.trim();
     let (number, mut end) = article_at(text, 0)?;
-    let mut title = section.title.trim().to_string();
+    let mut title = title_hint.trim().to_string();
     if let Some((inner, after)) = parenthetical(text, end) {
         if title.is_empty() {
             title = inner.trim().to_string();
@@ -433,12 +493,22 @@ fn parse_article_section(section: &LegalSection) -> Option<LocatedArticle<'_>> {
         end = after;
     }
     let deleted = text[end..].trim_start().starts_with("삭제");
-    let paragraphs = text
+    // The first paragraph may follow the heading on the same line.
+    let inline = text[end..]
         .lines()
-        .filter_map(|line| line.trim_start().chars().next().and_then(circled_number))
+        .next()
+        .and_then(|rest| rest.trim_start().chars().next())
+        .and_then(circled_number);
+    let paragraphs = inline
+        .into_iter()
+        .chain(
+            text.lines()
+                .skip(1)
+                .filter_map(|line| line.trim_start().chars().next().and_then(circled_number)),
+        )
         .collect();
     Some(LocatedArticle {
-        section_id: &section.id,
+        section_id,
         number,
         title,
         text,
@@ -447,25 +517,165 @@ fn parse_article_section(section: &LegalSection) -> Option<LocatedArticle<'_>> {
     })
 }
 
-/// Find an article among `article:` provider sections by its leading locator.
+/// A structural heading level: 편, 장, 절 or 관, outermost first.
+pub fn heading_rank(level: char) -> u8 {
+    match level {
+        '편' => 0,
+        '장' => 1,
+        '절' => 2,
+        _ => 3,
+    }
+}
+
+/// Parse a leading `제{n}편|장|절|관` heading.
+pub fn heading_at(text: &str) -> Option<(char, u32)> {
+    let text = text.trim_start();
+    let rest = text.strip_prefix('제')?;
+    let (n, end) = digits(rest, 0, 4)?;
+    let level = rest[end..].chars().next()?;
+    if !"편장절관".contains(level) || n == 0 {
+        return None;
+    }
+    let after = &rest[end + level.len_utf8()..];
+    let after = after
+        .strip_prefix('의')
+        .and_then(|t| digits(t, 0, 3).map(|(_, e)| &t[e..]))
+        .unwrap_or(after);
+    after
+        .chars()
+        .next()
+        .is_none_or(|c| c.is_whitespace() || c == '<' || c == '(')
+        .then_some((level, n))
+}
+
+/// Whether a line starts a new article when articles share one text block.
+fn starts_article(line: &str) -> bool {
+    article_at(line, 0).is_some_and(|(_, end)| {
+        let rest = &line[end..];
+        rest.starts_with('(')
+            || rest.starts_with('（')
+            || rest.trim().is_empty()
+            || rest.trim_start().starts_with("삭제")
+    })
+}
+
+/// One structural unit of a legal text, in source order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutlineUnit<'a> {
+    Heading {
+        level: char,
+        number: u32,
+        text: &'a str,
+    },
+    Article(LocatedArticle<'a>),
+}
+
+const BLOCK_SECTIONS: [&str; 3] = ["조문내용", "조내용", "전문"];
+
+fn close_block<'a>(
+    section_id: &'a str,
+    text: &'a str,
+    open: &mut Option<usize>,
+    end: usize,
+    units: &mut Vec<OutlineUnit<'a>>,
+) {
+    if let Some(start) = open.take()
+        && let Some(article) = build_article(section_id, "", &text[start..end])
+    {
+        units.push(OutlineUnit::Article(article));
+    }
+}
+
+/// Headings and articles of a capture. National statutes use `article:` sections;
+/// administrative rules and ordinances may keep several articles in one provider
+/// text block, which is split at lines that begin with an article locator.
+/// Supplementary provisions, annexes and reasons are not part of the outline.
+pub fn outline(sections: &[LegalSection]) -> Vec<OutlineUnit<'_>> {
+    let mut units = Vec::new();
+    for section in sections {
+        if section.kind != SectionKind::ProviderText {
+            continue;
+        }
+        if section.id.starts_with("article:") {
+            let text = section.text.trim();
+            if let Some((level, number)) = heading_at(text) {
+                units.push(OutlineUnit::Heading {
+                    level,
+                    number,
+                    text,
+                });
+            } else if let Some(article) = build_article(&section.id, &section.title, text) {
+                units.push(OutlineUnit::Article(article));
+            }
+            continue;
+        }
+        if !BLOCK_SECTIONS.contains(&section.title.as_str()) {
+            continue;
+        }
+        let text = section.text.as_str();
+        let mut open: Option<usize> = None;
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let trimmed = line.trim();
+            if let Some((level, number)) = heading_at(trimmed) {
+                close_block(&section.id, text, &mut open, offset, &mut units);
+                units.push(OutlineUnit::Heading {
+                    level,
+                    number,
+                    text: trimmed,
+                });
+            } else if starts_article(trimmed) {
+                close_block(&section.id, text, &mut open, offset, &mut units);
+                open = Some(offset + (line.len() - line.trim_start().len()));
+            }
+            offset += line.len();
+        }
+        close_block(&section.id, text, &mut open, text.len(), &mut units);
+    }
+    units
+}
+
+/// Find an article by its leading locator in the capture outline.
 pub fn locate_article(sections: &[LegalSection], wanted: ArticleNumber) -> ArticleLookup<'_> {
     let mut first = None;
     let mut last = None;
-    for article in sections.iter().filter_map(parse_article_section) {
+    let mut fallback = None;
+    let alternate = wanted.part.map(|p| ArticleNumber {
+        number: wanted.number,
+        part: None,
+        branch: Some(p),
+    });
+    for unit in outline(sections) {
+        let OutlineUnit::Article(article) = unit else {
+            continue;
+        };
         if article.number == wanted {
             return ArticleLookup::Found(article);
+        }
+        if wanted.branch.is_none() && Some(article.number) == alternate && fallback.is_none() {
+            fallback = Some(article.clone());
         }
         first = first.min(Some(article.number)).or(Some(article.number));
         last = last.max(Some(article.number));
     }
-    ArticleLookup::NotFound { first, last }
+    match fallback {
+        Some(article) => ArticleLookup::Found(article),
+        None => ArticleLookup::NotFound { first, last },
+    }
 }
 
 /// Whether a numbered subparagraph (`1.`, `2.`) appears in the article, inside the
 /// cited paragraph when paragraphs are numbered.
 pub fn has_subparagraph(article: &LocatedArticle<'_>, paragraph: Option<u32>, wanted: u32) -> bool {
-    let mut inside = paragraph.is_none() || article.paragraphs.is_empty();
-    for line in article.text.lines() {
+    let inline = article
+        .text
+        .lines()
+        .next()
+        .and_then(|first| first.chars().find_map(circled_number));
+    let mut inside = paragraph.is_none()
+        || article.paragraphs.is_empty()
+        || inline.is_some() && inline == paragraph;
+    for line in article.text.lines().skip(1) {
         let line = line.trim_start();
         if let Some(n) = line.chars().next().and_then(circled_number) {
             inside = paragraph.is_none_or(|p| p == n);
@@ -852,10 +1062,145 @@ pub fn extract_citations(text: &str) -> Extraction {
     out
 }
 
+/// An annex label such as `1` or `1의2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnnexLabel {
+    pub number: u32,
+    pub branch: Option<u32>,
+}
+impl std::fmt::Display for AnnexLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.branch {
+            Some(branch) => write!(f, "별표 {}의{branch}", self.number),
+            None => write!(f, "별표 {}", self.number),
+        }
+    }
+}
+
+/// Accepts `1`, `1의2`, `별표 1의2` and `[별표 1의2]`.
+pub fn parse_annex_label(value: &str) -> Option<AnnexLabel> {
+    let compact: String = value
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '[' && *c != ']')
+        .collect();
+    let body = compact.strip_prefix("별표").unwrap_or(&compact);
+    let body = body.strip_prefix('제').unwrap_or(body);
+    let (number, end) = digits(body, 0, 4)?;
+    let rest = &body[end..];
+    let branch = if rest.is_empty() {
+        None
+    } else {
+        let tail = rest.strip_prefix('의')?;
+        let (m, end) = digits(tail, 0, 3)?;
+        if end != tail.len() || m == 0 {
+            return None;
+        }
+        Some(m)
+    };
+    (number > 0).then_some(AnnexLabel { number, branch })
+}
+
+/// The first `별표 N` or `별표 N의M` marker within the first 400 bytes of `text`.
+pub fn annex_marker(text: &str) -> Option<AnnexLabel> {
+    let mut window = 400.min(text.len());
+    while !text.is_char_boundary(window) {
+        window -= 1;
+    }
+    let head = &text[..window];
+    let at = head.find("별표")?;
+    let start = skip_spaces(text, at + "별표".len(), 1);
+    let (number, end) = digits(text, start, 4)?;
+    let mut branch = None;
+    if text[end..].starts_with('의')
+        && let Some((m, _)) = digits(text, end + '의'.len_utf8(), 3)
+    {
+        branch = Some(m);
+    }
+    (number > 0).then_some(AnnexLabel { number, branch })
+}
+
+/// An annex section: provider annex text or extracted attachment text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocatedAnnex<'a> {
+    pub label: AnnexLabel,
+    pub section_id: &'a str,
+    pub title: &'a str,
+    pub text: &'a str,
+    pub kind: SectionKind,
+    /// Little Korean text or an image tag: the values may only exist as an image.
+    pub sparse: bool,
+}
+
+fn annex_section(section: &LegalSection) -> Option<LocatedAnnex<'_>> {
+    let candidate = match section.kind {
+        SectionKind::ProviderText => section.title == "별표내용",
+        SectionKind::Extracted => true,
+        SectionKind::Ocr => false,
+    };
+    if !candidate {
+        return None;
+    }
+    let label = annex_marker(&section.text)?;
+    let hangul = section
+        .text
+        .chars()
+        .filter(|c| ('가'..='힣').contains(c))
+        .count();
+    Some(LocatedAnnex {
+        label,
+        section_id: &section.id,
+        title: &section.title,
+        text: section.text.trim(),
+        kind: section.kind.clone(),
+        sparse: hangul < 20 || section.text.contains("<img"),
+    })
+}
+
+/// Annex sections in source order, provider text before extracted attachments.
+pub fn annexes(sections: &[LegalSection]) -> Vec<LocatedAnnex<'_>> {
+    let mut found: Vec<LocatedAnnex<'_>> = sections.iter().filter_map(annex_section).collect();
+    found.sort_by_key(|a| a.kind != SectionKind::ProviderText);
+    found
+}
+
+/// Exact annex lookup; `별표 1` never matches `별표 1의2`.
+pub fn locate_annex(sections: &[LegalSection], wanted: AnnexLabel) -> Vec<LocatedAnnex<'_>> {
+    annexes(sections)
+        .into_iter()
+        .filter(|a| a.label == wanted)
+        .collect()
+}
+
+/// Phrases with which a decision declares that earlier decisions are changed or no
+/// longer followed. A match is a signal for a human to read, not a determination.
+const OVERRULING_PHRASES: [&str; 6] = [
+    "변경하기로 한다",
+    "변경하기로 하며",
+    "모두 변경",
+    "견해를 변경",
+    "더 이상 유지할 수 없",
+    "폐기하기로",
+];
+
+/// The first overruling phrase in `line`, ignoring spacing differences.
+pub fn overruling_phrase(line: &str) -> Option<&'static str> {
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    OVERRULING_PHRASES.into_iter().find(|phrase| {
+        let wanted: String = phrase.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.contains(&wanted)
+    })
+}
+
+/// Validate a whole input as one court case number, such as `2007다27670`.
+pub fn parse_case_number(value: &str) -> Option<String> {
+    let value = value.trim();
+    let case = case_at(value, 0)?;
+    (case.byte_end == value.len()).then_some(case.case_number)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openlegal_domain::legal::SectionKind;
 
     fn section(id: &str, title: &str, text: &str) -> LegalSection {
         LegalSection {
@@ -868,7 +1213,11 @@ mod tests {
         }
     }
     fn art(number: u32, branch: Option<u32>) -> ArticleNumber {
-        ArticleNumber { number, branch }
+        ArticleNumber {
+            number,
+            part: None,
+            branch,
+        }
     }
 
     #[test]
@@ -923,7 +1272,15 @@ mod tests {
     fn article_numbers_accept_common_forms() {
         assert_eq!(parse_article_number("제44조의2"), Some(art(44, Some(2))));
         assert_eq!(parse_article_number("44의2"), Some(art(44, Some(2))));
-        assert_eq!(parse_article_number("44-2"), Some(art(44, Some(2))));
+        assert_eq!(
+            parse_article_number("제9-5조"),
+            Some(ArticleNumber {
+                number: 9,
+                part: Some(5),
+                branch: None
+            })
+        );
+        assert_eq!(parse_article_number("9-5").unwrap().to_string(), "제9-5조");
         assert_eq!(parse_article_number(" 제 44 조 "), Some(art(44, None)));
         for bad in ["", "제0조", "제조", "44의", "44의0", "제44항", "123456"] {
             assert_eq!(parse_article_number(bad), None, "{bad}");
@@ -1062,5 +1419,106 @@ mod tests {
         let found = extract_citations(&text);
         assert_eq!(found.statutes.len(), MAX_STATUTE_CITATIONS);
         assert!(found.truncated);
+    }
+    #[test]
+    fn article_mentions_skip_attached_prefixes() {
+        let found: Vec<String> = article_mentions("제3조 및 제5조의2, 제9-5조에 따라 동제7조")
+            .into_iter()
+            .map(|(n, _, _)| n.to_string())
+            .collect();
+        assert_eq!(found, ["제3조", "제5조의2", "제9-5조"]);
+    }
+
+    #[test]
+    fn outlines_headings_and_split_rule_blocks() {
+        let rule = vec![
+            section(
+                "source_ordinal:1",
+                "조문내용",
+                "제1장 총칙\n제1-1조(목적) 이 규정은\n시험한다.\n제1-2조 삭제\n제2장 거래\n제9-5조(해외직접투자) ① 신고한다.\n② 제9-4조에 따른\n제9-5조의2(특례) 따른다.",
+            ),
+            section("source_ordinal:2", "부칙내용", "제1조(시행일) 부칙"),
+        ];
+        let units = outline(&rule);
+        let labels: Vec<String> = units
+            .iter()
+            .map(|u| match u {
+                OutlineUnit::Heading { level, number, .. } => format!("{level}{number}"),
+                OutlineUnit::Article(a) => a.number.to_string(),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            ["장1", "제1-1조", "제1-2조", "장2", "제9-5조", "제9-5조의2"]
+        );
+        let ArticleLookup::Found(found) =
+            locate_article(&rule, parse_article_number("9-5").unwrap())
+        else {
+            panic!("9-5");
+        };
+        assert_eq!(found.title, "해외직접투자");
+        assert_eq!(found.paragraphs, [1, 2]);
+        assert!(found.text.ends_with("제9-4조에 따른"));
+        let OutlineUnit::Article(deleted) = &units[2] else {
+            panic!("deleted");
+        };
+        assert!(deleted.deleted);
+        let statute = vec![section("article:0044002", "", "제44조의2(특례) 본문")];
+        let ArticleLookup::Found(fallback) =
+            locate_article(&statute, parse_article_number("44-2").unwrap())
+        else {
+            panic!("fallback");
+        };
+        assert_eq!(fallback.number, art(44, Some(2)));
+        assert_eq!(heading_at("제3절의2 특칙"), Some(('절', 3)));
+        assert_eq!(heading_at("제3장에 따른"), None);
+    }
+
+    #[test]
+    fn annexes_match_exact_labels_and_flag_sparse_text() {
+        let mut extracted = section(
+            "attachment:1",
+            "첨부",
+            "■ 시행규칙 [별표 1의2] 과태료의 부과기준(제5조 관련) 위반행위 근거 법조문 금액 일반기준 개별기준을 정한다",
+        );
+        extracted.kind = SectionKind::Extracted;
+        let sections = vec![
+            section(
+                "source_ordinal:7",
+                "별표내용",
+                "[별표 1] 수수료(제3조 관련)\n<img src=x>",
+            ),
+            extracted,
+            section("source_ordinal:8", "조문내용", "[별표 2] 본문에 섞인 표기"),
+        ];
+        let one = parse_annex_label("별표 1").unwrap();
+        let found = locate_annex(&sections, one);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].sparse);
+        let branch = parse_annex_label("[별표 1의2]").unwrap();
+        let found = locate_annex(&sections, branch);
+        assert_eq!(found[0].section_id, "attachment:1");
+        assert!(!found[0].sparse);
+        assert!(locate_annex(&sections, parse_annex_label("2").unwrap()).is_empty());
+        assert_eq!(annexes(&sections).len(), 2);
+        assert_eq!(branch.to_string(), "별표 1의2");
+        assert_eq!(parse_annex_label("1의"), None);
+    }
+
+    #[test]
+    fn overruling_phrases_and_case_numbers() {
+        assert_eq!(
+            overruling_phrase(
+                "이와 달리 판단한 2007다27670 판결은 이 판결의 견해에 배치되는 범위에서 변경하기로 한다."
+            ),
+            Some("변경하기로 한다")
+        );
+        assert_eq!(overruling_phrase("2007다27670 판결 참조"), None);
+        assert_eq!(
+            parse_case_number(" 2016헌마123 ").as_deref(),
+            Some("2016헌마123")
+        );
+        assert_eq!(parse_case_number("2016헌마123 판결"), None);
+        assert_eq!(parse_case_number("2020년3월"), None);
     }
 }
