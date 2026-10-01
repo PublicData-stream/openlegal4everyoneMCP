@@ -68,7 +68,7 @@ class DeploymentSourceTests(unittest.TestCase):
         # Includes secretKeyRef, secret volumes, tokenFile, projected token path,
         # private-key paths, env names, and ../ / ../../ local resource references.
         validate_sources(self.repo)
-        self.assertEqual(len(self.inventory()["sources"]), 53)
+        self.assertEqual(len(self.inventory()["sources"]), 55)
 
     def test_unknown_file_cannot_escape_even_without_known_extension(self):
         self.write("deploy/kubernetes/operator-credentials", SENTINEL)
@@ -170,6 +170,8 @@ class DeploymentSourceTests(unittest.TestCase):
             "-----BEGIN PRIVATE KEY----- " + SENTINEL,
             "-----BEGIN OPENSSH PRIVATE KEY----- " + SENTINEL,
             "postgresql://operator:" + SENTINEL + "@database.invalid/db",
+            "socks5://operator:" + SENTINEL + "@proxy.invalid:1080",
+            "socks5h://operator:" + SENTINEL + "@proxy.invalid:1080",
             'password = "' + SENTINEL + '"',
             "ghp_" + "x" * 40,
         ):

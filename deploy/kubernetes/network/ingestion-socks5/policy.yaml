@@ -1,0 +1,18 @@
+# Apply separately after replacing this documentation-only proxy address and port.
+# Use instead of ingestion-provider for a proxy-only route; policies are additive.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openlegal-allow-ingestion-socks5
+spec:
+  podSelector:
+    matchLabels:
+      openlegal.ingestion/enabled: "true"
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.60/32
+      ports:
+        - protocol: TCP
+          port: 1080

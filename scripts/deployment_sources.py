@@ -33,7 +33,7 @@ RENDER_ROOTS = {
     **{f"network-{name}": f"deploy/kubernetes/network/{name}"
        for name in ("base", "edge", "postgres-in-cluster", "postgres-external",
                     "dns-cluster", "dns-fixed", "monitoring", "ingestion-api",
-                    "ingestion-provider")},
+                    "ingestion-provider", "ingestion-socks5")},
 }
 STANDALONE = {
     **{f"deploy/kubernetes/storage/{name}.example.yaml": "storage"
@@ -50,7 +50,7 @@ MAX_TOTAL_BYTES = 2 * 1024 * 1024
 MAX_ENTRIES = 512
 PATH_PATTERN = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*")
 SENSITIVE_ENV = {"OPENLEGAL_DATABASE_URL", "OPENLEGAL_MIGRATION_DATABASE_URL",
-                 "OPENLEGAL_LAW_PROVIDER_CREDENTIAL"}
+                 "OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "OPENLEGAL_LAW_PROVIDER_PROXY_URL"}
 SENSITIVE_NAMES = ("password", "passwd", "token", "access_token", "refresh_token",
                    "api_key", "credential", "credentials", "client_key_data",
                    "private_key_data", "authorization", "provider_credential")
@@ -58,11 +58,11 @@ SENSITIVE_KEYS = {name.replace("_", "") for name in SENSITIVE_NAMES}
 RAW_SENSITIVE_NAMES = "|".join(
     [name.replace("_", "[-_]?") for name in SENSITIVE_NAMES] + sorted(SENSITIVE_ENV)
 )
-URL_PATTERN = re.compile(r"\b(?:postgres(?:ql)?|https?)://[^\s<>\"']+", re.I)
+URL_PATTERN = re.compile(r"\b(?:postgres(?:ql)?|https?|socks5h?)://[^\s<>\"']+", re.I)
 RAW_RULES = (
     ("private-key-material", re.compile(
         r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")),
-    ("credential-url", re.compile(r"\b(?:postgres(?:ql)?|https?)://[^\s/@]+:[^\s/@]+@", re.I)),
+    ("credential-url", re.compile(r"\b(?:postgres(?:ql)?|https?|socks5h?)://[^\s/@]+:[^\s/@]+@", re.I)),
     ("credential-assignment", re.compile(
         r"^[ \t]*(?:#[ \t]*)?[\"']?(?:" + RAW_SENSITIVE_NAMES + r")"
         r"[\"']?[ \t]*[:=][ \t]*\S", re.I | re.M)),

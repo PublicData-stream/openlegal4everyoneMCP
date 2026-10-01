@@ -82,6 +82,11 @@ detail_timeout_secs = 3600
 detail_job_workers = 4
 scan_interval_secs = 300
 
+# Optional LAW OPEN DATA routing, including lists, details and attachments.
+# Put the SOCKS5 URL in the named Secret environment value.
+# [database.ingestion.proxy]
+# url_env = "OPENLEGAL_LAW_PROVIDER_PROXY_URL"
+
 # Operator policy; these values do not assert the upstream provider's quota.
 [database.ingestion.provider_requests]
 continuous_daily_limit = 50000

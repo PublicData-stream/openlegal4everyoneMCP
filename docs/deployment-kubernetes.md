@@ -1283,6 +1283,42 @@ Pods to finish or reconcile them explicitly. Keep the ordinary serving Deploymen
 and its PVCs. Applying the retained root alone does not prune the scheduler,
 RoleBinding or separate NetworkPolicies.
 
+### Per-upstream SOCKS5 routing
+
+For LAW OPEN DATA, uncomment this table in the collector `server.toml`:
+
+```toml
+[database.ingestion.proxy]
+url_env = "OPENLEGAL_LAW_PROVIDER_PROXY_URL"
+```
+
+Add `OPENLEGAL_LAW_PROVIDER_PROXY_URL` to the existing `openlegal-law-provider`
+Secret with a value shaped as `socks5://[username:password@]host:port`. Both the
+scheduler Deployment and explicit collection Job template reference this optional
+Secret key. If the table is enabled, a missing/invalid value fails startup;
+omitting the table preserves direct routing. Do not put the actual URL in TOML
+or print it while editing Secret data. Use percent encoding for reserved
+characters in credentials. Authentication fields are 1–255 UTF-8 bytes each.
+
+Tailor `network/ingestion-socks5` to the reachable proxy address and TCP port and
+apply it in place of `network/ingestion-provider` for proxy-only egress. Network
+policies are additive: replacing a Kustomize root does not remove the old direct
+provider policy. Retain the tailored DNS, PostgreSQL and API-server policies;
+destination DNS remains local and checked even when requests use SOCKS5. A
+private next hop is supported; protect unencrypted SOCKS5 authentication using
+the trusted network or an SSH/VPN tunnel. Document workers and serving Pods do
+not receive this proxy Secret or provider egress permission.
+Prefer a literal proxy IP: hostname next hops use OS DNS, whose already started
+lookup may continue after a request timeout/cancellation. Fetched-target DNS
+still uses the bounded asynchronous resolver and checked address pinning.
+
+Deploy the same collector configuration to the scheduler and Job template, then
+restart the scheduler and use the new template for future request Jobs. Existing
+Pods keep their previous environment/configuration until replaced. Register the
+proxy's actual upstream egress IP with the provider. Verify approved access with
+a bounded request separately; offline fixtures do not establish geographic
+filtering or acceptance of a particular proxy.
+
 ### Offline acceptance
 
 ```sh

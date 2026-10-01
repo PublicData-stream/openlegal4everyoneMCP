@@ -24,7 +24,8 @@
           "securityContext": {"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": {"drop": ["ALL"]}},
           "env": [
             {"name": "OPENLEGAL_DATABASE_URL", "valueFrom": {"secretKeyRef": {"name": "openlegal-runtime-db", "key": "OPENLEGAL_DATABASE_URL"}}},
-            {"name": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "valueFrom": {"secretKeyRef": {"name": "openlegal-law-provider", "key": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL"}}}
+            {"name": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "valueFrom": {"secretKeyRef": {"name": "openlegal-law-provider", "key": "OPENLEGAL_LAW_PROVIDER_CREDENTIAL"}}},
+            {"name": "OPENLEGAL_LAW_PROVIDER_PROXY_URL", "valueFrom": {"secretKeyRef": {"name": "openlegal-law-provider", "key": "OPENLEGAL_LAW_PROVIDER_PROXY_URL", "optional": true}}}
           ],
           "resources": {"requests": {"cpu": "250m", "memory": "1Gi", "ephemeral-storage": "128Mi"}, "limits": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "2Gi"}},
           "volumeMounts": [

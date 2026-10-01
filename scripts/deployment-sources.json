@@ -245,6 +245,20 @@
       ]
     },
     {
+      "path": "deploy/kubernetes/network/ingestion-socks5/kustomization.yaml",
+      "role": "kustomization",
+      "owners": [
+        "network-ingestion-socks5"
+      ]
+    },
+    {
+      "path": "deploy/kubernetes/network/ingestion-socks5/policy.yaml",
+      "role": "resource",
+      "owners": [
+        "network-ingestion-socks5"
+      ]
+    },
+    {
       "path": "deploy/kubernetes/network/monitoring/kustomization.yaml",
       "role": "kustomization",
       "owners": [

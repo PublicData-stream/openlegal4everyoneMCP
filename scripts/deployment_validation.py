@@ -75,7 +75,8 @@ ADMIN = {
 }
 
 NETWORK_VARIANTS = ("base", "edge", "postgres-in-cluster", "postgres-external",
-                    "dns-cluster", "dns-fixed", "monitoring", "ingestion-api", "ingestion-provider")
+                    "dns-cluster", "dns-fixed", "monitoring", "ingestion-api", "ingestion-provider",
+                    "ingestion-socks5")
 
 DOCUMENT_WORKER_DEFAULTS = {"cpu": "2", "memory": "4Gi", "scratch": "2Gi", "pool_limit": 16}
 QUANTITY_SCALE = {
@@ -188,9 +189,10 @@ def network_example(variant):
             ports = [port("TCP", 53), port("UDP", 53)]
         elif variant.startswith("ingestion-"):
             name = "openlegal-allow-" + variant
-            address = "192.0.2.40" if variant == "ingestion-api" else "192.0.2.50"
+            address = {"ingestion-api": "192.0.2.40", "ingestion-provider": "192.0.2.50",
+                       "ingestion-socks5": "192.0.2.60"}[variant]
             peer = {"ipBlock": {"cidr": address + "/32"}}
-            ports = [port("TCP", 443)]
+            ports = [port("TCP", 1080 if variant == "ingestion-socks5" else 443)]
         else:
             name = "openlegal-allow-monitoring"
             peer = selected_peer("replace-with-monitoring-namespace", "app.kubernetes.io/name",
@@ -632,9 +634,13 @@ def validate_ingestion(documents, retained_documents):
             "collector resources")
     for pod in (job_pod, scheduler_pod):
         env = {item["name"]: item for item in pod["containers"][0]["env"]}
-        equal(env, {name: {"name": name, "valueFrom": {"secretKeyRef": {"name": secret, "key": name}}}
+        expected_env = {name: {"name": name, "valueFrom": {"secretKeyRef": {"name": secret, "key": name}}}
                     for name, secret in (("OPENLEGAL_DATABASE_URL", "openlegal-runtime-db"),
-                                         ("OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "openlegal-law-provider"))},
+                                         ("OPENLEGAL_LAW_PROVIDER_CREDENTIAL", "openlegal-law-provider"))}
+        proxy_name = "OPENLEGAL_LAW_PROVIDER_PROXY_URL"
+        expected_env[proxy_name] = {"name": proxy_name, "valueFrom": {"secretKeyRef": {
+            "name": "openlegal-law-provider", "key": proxy_name, "optional": True}}}
+        equal(env, expected_env,
               "collector credential set")
     quota = added("ResourceQuota", "collection-pod-budget")
     equal(quota["spec"], {"hard": {"pods": "18"}}, "separate on-demand Pod budget")

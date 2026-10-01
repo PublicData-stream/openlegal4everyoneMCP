@@ -522,6 +522,23 @@ class IngestionValidationTests(unittest.TestCase):
             "name": "openlegal-law-provider", "namespace": "openlegal-serving"}, "stringData": {"token": "inline"}})
         self.rejected()
 
+    def test_proxy_secret_is_optional_and_confined_to_collectors(self):
+        env = next(item for item in self.container["env"] if item["name"] == "OPENLEGAL_LAW_PROVIDER_PROXY_URL")
+        original = copy.deepcopy(env)
+        for replacement in (
+            {"name": env["name"], "value": "socks5://inline:secret@proxy.invalid:1080"},
+            {"name": env["name"], "valueFrom": {"secretKeyRef": {
+                "name": "other", "key": env["name"], "optional": True}}},
+            {"name": env["name"], "valueFrom": {"secretKeyRef": {
+                "name": "openlegal-law-provider", "key": env["name"], "optional": False}}},
+        ):
+            with self.subTest(replacement=replacement):
+                env.clear()
+                env.update(replacement)
+                self.rejected()
+        env.clear()
+        env.update(original)
+
     def test_kubeconfig_rejects_ambient_or_embedded_authentication_and_tls_downgrade(self):
         data = self.controller_config["data"]
         original = data["kubeconfig"]
@@ -701,6 +718,19 @@ class NetworkValidationTests(unittest.TestCase):
                 self.assertFalse(self.permits(docs, workload, "egress", "TCP", 6443, address=address))
             for address in ("192.0.2.41", "192.0.2.51", "198.51.100.1"):
                 self.assertFalse(self.permits(docs, workload, "egress", "TCP", 443, address=address))
+
+    def test_socks5_policy_keeps_direct_provider_and_other_workloads_closed(self):
+        docs = self.combination("postgres-external", "dns-cluster", False)
+        docs.extend(self.examples["ingestion-socks5"])
+        for workload in self.workloads + [{"openlegal.ingestion/enabled": "true"},
+                                          {"app.kubernetes.io/name": "openlegal-document-worker"}]:
+            self.assertEqual(self.permits(docs, workload, "egress", "TCP", 1080, address="192.0.2.60"),
+                             workload.get("openlegal.ingestion/enabled") == "true")
+            for protocol, port, address in (("UDP", 1080, "192.0.2.60"),
+                                          ("TCP", 1080, "192.0.2.61"),
+                                          ("TCP", 443, "192.0.2.50"),
+                                          ("TCP", 443, "192.0.2.60")):
+                self.assertFalse(self.permits(docs, workload, "egress", protocol, port, address=address))
 
     def test_peer_conjunction_ports_and_destination_boundaries(self):
         docs = self.combination("postgres-in-cluster", "dns-cluster", True)

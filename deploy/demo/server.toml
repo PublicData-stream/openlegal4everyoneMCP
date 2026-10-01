@@ -26,6 +26,10 @@ max_buffer_bytes = 268435456
 upstream = "http://127.0.0.1:8081"
 widget_html = "apps/widget/dist/index.html"
 
+# Optional per-upstream SOCKS5 routing; the environment value is a secret URL.
+# [demo.proxy]
+# url_env = "OPENLEGAL_DEMO_PROXY_URL"
+
 [cache]
 mode = "persistent"
 retention_days = 30

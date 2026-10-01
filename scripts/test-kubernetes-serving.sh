@@ -52,7 +52,7 @@ render() {
 render deploy/kubernetes/serving "$scratch/retained.yaml"
 render test-support/deployment/text-only "$scratch/text-only.yaml"
 mkdir "$scratch/network"
-for variant in base edge postgres-in-cluster postgres-external dns-cluster dns-fixed monitoring ingestion-api ingestion-provider; do
+for variant in base edge postgres-in-cluster postgres-external dns-cluster dns-fixed monitoring ingestion-api ingestion-provider ingestion-socks5; do
     render "deploy/kubernetes/network/$variant" "$scratch/network/$variant.yaml"
 done
 render deploy/kubernetes/ingestion "$scratch/ingestion.yaml"

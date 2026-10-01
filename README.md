@@ -47,6 +47,13 @@ synthetic search still uses literal text.
 
 ## Run and extend
 
+Upstreams support independently configured SOCKS5 proxies. For LAW OPEN DATA,
+set `[database.ingestion.proxy].url_env` to the name of the secret environment
+variable containing `socks5://[username:password@]host:port`; the synthetic demo
+uses `[demo.proxy].url_env`. See [upstream routing policy](docs/upstream-policy.md#retry-and-outbound-behavior)
+and the [collection deployment guide](docs/deployment-kubernetes.md#per-upstream-socks5-routing)
+for DNS pinning, secret injection and egress configuration.
+
 Install the pinned Rust toolchain, prepare the configuration and TLS certificate
 paths from the [server guide](docs/server.md), then run:
 

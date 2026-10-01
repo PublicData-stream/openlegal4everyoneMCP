@@ -27,7 +27,7 @@ INPUTS = (
     "migrate.yaml", "maintain.yaml", "rebuild.yaml", "storage.yaml",
     *(f"network/{name}.yaml" for name in (
         "base", "edge", "postgres-in-cluster", "postgres-external", "dns-cluster",
-        "dns-fixed", "monitoring", "ingestion-api", "ingestion-provider")),
+        "dns-fixed", "monitoring", "ingestion-api", "ingestion-provider", "ingestion-socks5")),
 )
 DOCUMENT_INPUTS = ("namespace.yaml", "controller-role.yaml")
 KINDS = {

@@ -51,6 +51,12 @@ spec:
                 secretKeyRef:
                   name: openlegal-law-provider
                   key: OPENLEGAL_LAW_PROVIDER_CREDENTIAL
+            - name: OPENLEGAL_LAW_PROVIDER_PROXY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: openlegal-law-provider
+                  key: OPENLEGAL_LAW_PROVIDER_PROXY_URL
+                  optional: true
           resources:
             requests: {cpu: "500m", memory: 2Gi, ephemeral-storage: 128Mi}
             limits: {cpu: "2", memory: 4Gi, ephemeral-storage: 2Gi}
