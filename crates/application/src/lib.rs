@@ -6,6 +6,7 @@
 pub mod blob;
 pub mod database;
 pub mod document;
+pub mod legal_reference;
 pub mod persistence;
 mod service;
 pub mod text_diff;

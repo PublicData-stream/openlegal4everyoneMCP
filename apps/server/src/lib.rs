@@ -13,6 +13,7 @@ pub mod endpoint;
 pub mod framing;
 pub mod handler;
 pub mod http;
+pub mod legal_reference;
 pub mod progress;
 mod rate_limit;
 pub mod registry;

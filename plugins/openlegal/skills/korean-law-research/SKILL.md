@@ -3,7 +3,7 @@ name: korean-law-research
 description: Find and quote Korean statutes, ordinances and court precedents from the OpenLegal corpus with exact provenance. Use when the user asks for a law article, 법령 조문, 판례, 사건번호, 자치법규, or wants legal source text found, read or cited.
 license: AGPL-3.0-only
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # Korean law research
@@ -26,6 +26,9 @@ the server names are used below.
 
 ## Workflow
 
+0. **Resolve names.** When the user names a law, possibly by abbreviation
+   (`산안법`, `중처법 시행령`), call `law.resolve_name` to get its object. The
+   `resolution` field shows any alias expansion; mention it to the user.
 1. **Search.** Call `database.query` with the query DSL in
    [query-syntax.md](references/query-syntax.md). Narrow with `filters.datasets`
    (`national_statute`, `ordinance`, `precedent`, …) and typed date bounds. Use
@@ -45,6 +48,18 @@ the server names are used below.
    user needs current text only.
 5. **Show (optional).** Call `database.show` to open the corpus browser when the
    host renders apps and the user wants to browse.
+
+## Checking citations
+
+When the user supplies text with citations, or before you send an answer that
+cites articles or case numbers, call `citation.verify` with that text. Report
+each citation's `status` as returned. `title_mismatch`, `article_not_found`,
+`paragraph_not_found` and `article_deleted` mean the citation does not match the
+checked capture; `law_not_observed` and `not_observed` only mean the corpus has
+no record. Correct or flag your own citations that do not verify.
+
+If `law.resolve_name` or `citation.verify` is not in the server's tool list,
+fall back to `database.rg` on the `title` section and `database.get`.
 
 ## When the corpus does not have it
 

@@ -16,9 +16,13 @@ Keep `id` exactly as returned, including leading zeros.
 - A date selector matches a recorded date exactly. It is **not** "the version
   legally applicable on that day". Missing or ambiguous evidence returns an error
   rather than a guess.
-- To answer "what did the law say on day X", list revisions with
-  `database.history` (`kind: "revisions"`), show the user the candidate
-  revisions with their dates, and say that applicability needs legal judgment.
+- To answer "what did the law say on day X", call `law.in_force_at` with the
+  object or law name, the date and optionally the article. It selects the
+  revision with the latest effective date on or before that day and reports
+  `determined` or `provisional`, the next change and any later provision dates.
+  Show the selected revision with its dates and say that applicability still
+  needs legal judgment (부칙, transitional rules). If the tool is unavailable,
+  list revisions with `database.history` (`kind: "revisions"`) instead.
 - `database.history` lists revisions newest first by effective date, using the
   publication date only when the effective date is absent; undated revisions
   come last and equal dates are ordered by revision ID. This presentation order

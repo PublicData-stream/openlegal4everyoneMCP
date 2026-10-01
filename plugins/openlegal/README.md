@@ -33,11 +33,12 @@ anonymous; no account, token or OAuth flow is required.
 
 | Skill | Use |
 | --- | --- |
-| `korean-law-research` | Search and read statutes, ordinances and precedents and cite them with provenance; request collection when the corpus lacks an object |
+| `korean-law-research` | Resolve law names and abbreviations, search and read statutes, ordinances and precedents, check citations and cite them with provenance; request collection when the corpus lacks an object |
 | `legal-revision-history` | List revisions of one object and compare two versions |
 | `legal-text-comparison` | Compare and patch user-supplied texts |
 
-The skills call the server's `database.*` and `text.*` tools. The synthetic
+The skills call the server's `database.*`, `law.*`, `citation.verify` and
+`text.*` tools. The synthetic
 `demo_*` tools are not part of the public plugin.
 
 ## Install

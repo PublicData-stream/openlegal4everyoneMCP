@@ -4,6 +4,8 @@ The optional `[database]` configuration registers `database.query`, `database.rg
 `database.get`, `database.get_metadata`, `database.object_status`, `database.history`, `database.diff`, and
 `database.show` on both existing MCP transports. It requires PostgreSQL persistence
 and the text comparison service. The synthetic demo remains a separate dataset.
+The same configuration registers the [legal reference tools](legal-reference.md)
+`law.resolve_name`, `citation.verify` and `law.in_force_at`.
 
 The implementation has offline fixtures and local integration gates. An enabled
 provider adapter or a successful build does not establish a complete national

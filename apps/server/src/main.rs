@@ -304,6 +304,14 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                 comparison: diff_service.clone().ok_or("database comparison unavailable")?,
                 store: runtime.store.clone(),
             })?;
+            registry.register_module(openlegal_server::legal_reference::LegalReferenceTools {
+                lookup: std::sync::Arc::new(
+                    openlegal_application::legal_reference::ReferenceLookup::new(
+                        runtime.database.clone(),
+                        runtime.search.clone(),
+                    ),
+                ),
+            })?;
             corpus_runtime = Some(runtime);
         }
         let demo_service = config
