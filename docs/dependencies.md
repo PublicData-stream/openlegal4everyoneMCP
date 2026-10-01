@@ -98,12 +98,21 @@ dependency requires renewed relevant review and transport tests, not only a buil
 
 ## Retrieval and widget additions
 
-- **reqwest 0.13** is now also a production adapter dependency with only `rustls`
-  and `stream`. It supplies bounded streamed HTTP bodies instead of a second
-  handwritten HTTP client. Automatic retries, redirects, environment proxies and
-  compression are disabled. Configured HTTPS hosts are pinned to previously checked
+- **reqwest 0.13** is now also a production adapter dependency with `rustls`,
+  `stream` and `socks`. It supplies bounded streamed HTTP bodies and SOCKS5
+  transport instead of handwritten production HTTP or SOCKS clients. Automatic
+  retries, redirects, environment proxies and compression are disabled. A
+  provider may explicitly configure its own SOCKS5 next hop; remote proxy DNS is
+  disabled. The existing maintained crates.io implementation handles handshake
+  and optional authentication, with no new transitive package for this feature.
+  Configured HTTPS hosts are pinned to previously checked
   addresses, retaining TLS hostname/certificate verification. Source: crates.io;
   MIT OR Apache-2.0. Existing native tests retain their development client features.
+- **percent-encoding 2** validates decoded SOCKS5 authentication lengths and UTF-8
+  without duplicating URL-decoding rules. It was already in the locked reqwest/URL
+  graph; this adds a direct adapter dependency with no new package or build script.
+  Credentials remain private and are never included in diagnostic output.
+  Source: crates.io; MIT OR Apache-2.0.
 - **Hickory resolver 0.26.2**, with locked net/proto 0.26.3, replaces blocking
   libc DNS work that would outlive an aborted lookup. Only Tokio and system-config
   features are enabled; encrypted DNS, DNSSEC and mDNS are not requested. The async

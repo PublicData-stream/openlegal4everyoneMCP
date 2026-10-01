@@ -862,6 +862,10 @@ impl CorpusRuntime {
                 IngestionMode::Continuous => RequestBudgetMode::Continuous,
             };
             let client = LawClient::new(secret, Arc::new(processor))?;
+            let client = match &c.proxy {
+                Some(proxy) => client.with_socks5_proxy(proxy.load()?),
+                None => client,
+            };
             LawClient::configure_provider_request_limits(
                 &persistent.pool(),
                 &c.provider_requests.limits()?,
@@ -2234,6 +2238,7 @@ mod manual_pilot_tests {
             widget_html: "widget".into(),
             ingestion: Some(IngestionConfig {
                 credential_env: "PROVIDER_CREDENTIAL".into(),
+                proxy: None,
                 kubectl: "/usr/local/bin/kubectl".into(),
                 kubeconfig: "/run/kubeconfig".into(),
                 context: "test".into(),

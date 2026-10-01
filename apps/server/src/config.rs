@@ -543,6 +543,9 @@ impl Config {
     }
 
     pub fn validate_storage(&self) -> Result<(), ServerError> {
+        if let Some(proxy) = self.demo.as_ref().and_then(|demo| demo.proxy.as_ref()) {
+            proxy.validate()?;
+        }
         if (self.demo.is_some() || self.database.is_some()) && self.cache.is_none() {
             return Err("retrieval requires an explicit [cache] mode: memory or persistent".into());
         }
@@ -608,8 +611,83 @@ impl TextDiffConfig {
 pub struct DemoConfig {
     /// Loopback HTTP mock only; never an arbitrary caller-provided URL.
     pub upstream: String,
+    /// Optional routing for this synthetic upstream only.
+    pub proxy: Option<UpstreamProxyConfig>,
     /// Locally built, trusted HTML loaded once before serving.
     pub widget_html: PathBuf,
+}
+
+/// Reference a secret environment variable instead of storing proxy credentials
+/// in TOML. Every provider owns its own optional setting; no global proxy fallback.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamProxyConfig {
+    pub url_env: String,
+}
+
+impl UpstreamProxyConfig {
+    pub fn validate(&self) -> Result<(), ServerError> {
+        let name = self.url_env.as_bytes();
+        if name.is_empty()
+            || name.len() > 128
+            || !(name[0].is_ascii_alphabetic() || name[0] == b'_')
+            || !name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            return Err("upstream proxy requires a valid environment variable name".into());
+        }
+        Ok(())
+    }
+
+    pub fn load(&self) -> Result<openlegal_adapters::upstream_proxy::Socks5Proxy, ServerError> {
+        self.load_with(|name| std::env::var(name).ok())
+    }
+
+    fn load_with(
+        &self,
+        read: impl FnOnce(&str) -> Option<String>,
+    ) -> Result<openlegal_adapters::upstream_proxy::Socks5Proxy, ServerError> {
+        self.validate()?;
+        let value =
+            read(&self.url_env).ok_or("upstream proxy environment is missing or not UTF-8")?;
+        openlegal_adapters::upstream_proxy::Socks5Proxy::new(&value)
+            .map_err(|_| "invalid upstream SOCKS5 proxy configuration".into())
+    }
+}
+
+#[cfg(test)]
+mod upstream_proxy_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_secrets_are_loaded_explicitly_and_errors_do_not_echo_values() {
+        let config: UpstreamProxyConfig = toml::from_str("url_env='LAW_PROXY'").unwrap();
+        config.validate().unwrap();
+        assert!(
+            config
+                .load_with(|_| Some("socks5://user:pass@127.0.0.1:1080".into()))
+                .is_ok()
+        );
+        assert!(config.load_with(|_| None).is_err());
+        let error = config
+            .load_with(|_| Some("http://secret-user:secret-pass@proxy:1080".into()))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid upstream SOCKS5 proxy configuration"
+        );
+        for name in ["", "9PROXY", "PROXY-URL", "PROXY URL", "PROXY\n"] {
+            assert!(
+                UpstreamProxyConfig {
+                    url_env: name.into()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            toml::from_str::<UpstreamProxyConfig>("url='socks5://secret:pass@proxy:1080'").is_err()
+        );
+    }
 }
 
 /// Operator-advertised corresponding source; validation never fetches the URL.
@@ -893,6 +971,8 @@ pub struct DatabaseConfig {
 #[serde(deny_unknown_fields)]
 pub struct IngestionConfig {
     pub credential_env: String,
+    /// Optional routing for LAW OPEN DATA inventory, details and attachments.
+    pub proxy: Option<UpstreamProxyConfig>,
     pub kubectl: PathBuf,
     pub kubeconfig: PathBuf,
     pub context: String,
@@ -1052,6 +1132,9 @@ impl DatabaseConfig {
             return Err("ingestion requires explicit executable, kubeconfig and credential environment name".into());
         }
         if let Some(i) = &self.ingestion {
+            if let Some(proxy) = &i.proxy {
+                proxy.validate()?;
+            }
             i.document_worker.limits()?;
             i.provider_requests.limits()?;
             if !(60..=86400).contains(&i.scan_interval_secs) {

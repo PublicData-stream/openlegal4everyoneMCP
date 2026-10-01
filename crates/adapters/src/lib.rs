@@ -12,6 +12,7 @@ pub mod corpus;
 pub mod document_jobs;
 pub mod postgres;
 pub mod text_diff;
+pub mod upstream_proxy;
 pub use cache::MemoryCache;
 
 use futures::{FutureExt, future::BoxFuture};
@@ -40,6 +41,7 @@ pub struct HttpUpstream {
     mode: DestinationMode,
     processor: Arc<dyn PayloadProcessor>,
     resolver: Option<hickory_resolver::TokioResolver>,
+    proxy: Option<upstream_proxy::Socks5Proxy>,
 }
 
 impl HttpUpstream {
@@ -99,7 +101,14 @@ impl HttpUpstream {
             mode,
             processor,
             resolver,
+            proxy: None,
         })
+    }
+
+    /// Route only this upstream's requests through an explicit trusted next hop.
+    pub fn with_socks5_proxy(mut self, proxy: upstream_proxy::Socks5Proxy) -> Self {
+        self.proxy = Some(proxy);
+        self
     }
 
     async fn fetch_once(
@@ -162,15 +171,18 @@ impl HttpUpstream {
         }) {
             return Err(RetrievalError::InvalidPayload);
         }
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(5))
-            .resolve_to_addrs(host, &addresses)
-            .build()
-            .map_err(|_| RetrievalError::Internal)?;
+            .resolve_to_addrs(host, &addresses);
+        let builder = match &self.proxy {
+            Some(proxy) => proxy.apply(builder),
+            None => builder,
+        };
+        let client = builder.build().map_err(|_| RetrievalError::Internal)?;
         let mut response = client
             .get(url)
             .header("accept", "application/json")

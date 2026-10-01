@@ -168,6 +168,32 @@ handler, application, HTTP client, and scheduler. Outbound destination, TLS,
 redirect, parser, and resource controls are defined in
 [secure development](../CONTRIBUTING.md#secure-development).
 
+An upstream may use its own explicit operator-selected SOCKS5 next hop. Configure
+`[database.ingestion.proxy].url_env` for LAW OPEN DATA and `[demo.proxy].url_env`
+for the synthetic upstream; the referenced environment variable contains the
+proxy URL, including optional credentials. Omission selects direct access;
+configuration with a missing, empty or invalid value fails startup. Ambient
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` do not select or override
+these routes. A failed proxy request must never fall back to a direct request.
+Proxy routing applies to every request under that provider, including linked
+attachments and on-demand collection, without resetting or splitting its ledger.
+
+Only `socks5://[username:password@]host:port` is supported, with an explicit
+nonzero port; proxy DNS names must use ASCII/Punycode form. Destination DNS remains
+local: validate all returned addresses and
+pin them before CONNECT, retaining HTTPS hostname and certificate verification.
+`socks5h` is deliberately unsupported because remote DNS would bypass that address
+validation. A proxy is a trusted operator-controlled next hop and may be on a
+private network; this exception applies only to the proxy, not fetched URLs.
+Unlike fetched-target DNS, a proxy hostname uses the HTTP client's OS resolver;
+an already started blocking lookup may continue after timeout or cancellation.
+Prefer a literal proxy IP when strict next-hop cancellation/resource accounting
+is needed. Request deadlines still bound how long the caller waits.
+SOCKS5 does not encrypt its own handshake or authentication. Protect that hop
+using a private network or an SSH/VPN tunnel when necessary. Keep proxy URLs out
+of committed TOML, diagnostics and source evidence. Proxy selection alone does
+not prove a provider accepts the egress IP, and does not alter cache identity.
+
 ## Operational evidence
 
 Implement bounded, redacted metrics for cache hits/misses, upstream requests,

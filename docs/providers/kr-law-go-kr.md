@@ -142,8 +142,17 @@ subsequent availability remain unverified outside that diagnostic response.
 Source references preserve dataset, selected identifier, `efYd`, character view
 and the actual `type=XML` or `type=HTML`. The real `OC` value never appears in
 references, fixtures, logs or returned errors. Requests use HTTPS with certificate
-verification, bounded DNS resolution, no proxy or redirect following, and an
-explicit destination allowlist. These code-established restrictions have not
+verification, bounded DNS resolution, no redirect following, and an explicit
+destination allowlist. An optional operator-configured SOCKS5 next hop covers
+lists, details, NTS HTML and attachments; its credentials are loaded only from
+the environment variable named by `[database.ingestion.proxy].url_env`.
+Destination DNS remains local, with every address checked and pinned before
+SOCKS5 CONNECT; `socks5h` is unsupported. A proxy failure never triggers direct
+fallback. Register the proxy's actual upstream-facing egress IP for approved
+access, rather than assuming the collector host's IP is still used. The reported
+European-host rejection, including after IP registration, is an operator
+observation; geographic filtering has not been established as its cause.
+These code-established restrictions have not
 been validated against live provider responses.
 
 ## Local freshness and resource policy

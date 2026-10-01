@@ -2514,6 +2514,7 @@ dependencies = [
  "openlegal-application",
  "openlegal-domain",
  "openlegal-normalization",
+ "percent-encoding",
  "reqwest",
  "rustix",
  "serde",

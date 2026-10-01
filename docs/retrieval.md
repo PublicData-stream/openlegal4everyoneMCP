@@ -87,9 +87,18 @@ must pass public-address policy and remain pinned to the validated connection.
 Hickory performs asynchronous DNS using startup-loaded system configuration, with
 two-second requests, one attempt, one parallel query per lookup, two active requests
 per multiplexed connection, and 16 cached responses. Hosts-file lookup is disabled
-and names are absolute. No blocking libc resolver job survives caller cancellation.
+and names are absolute. Fetched-target DNS does not leave a blocking libc resolver
+job after caller cancellation.
 TLS certificate verification remains enabled. Redirects, implicit environment
-proxies, compression, caller URLs, and source-supplied link following are disabled.
+proxies, compression, caller URLs, and source-supplied link following
+are disabled. Each upstream may explicitly select its own SOCKS5 next hop through
+`HttpUpstream::with_socks5_proxy`; the demo composition uses `[demo.proxy].url_env`.
+Checked destination addresses remain pinned, TLS verification remains enabled,
+and a failed proxy never falls back to direct access. See the
+[upstream routing policy](upstream-policy.md#retry-and-outbound-behavior).
+An operator-configured proxy hostname uses the HTTP client's OS resolver; an
+already started lookup may continue after timeout or cancellation. Use a literal
+proxy IP address when strict next-hop DNS cancellation is required.
 The isolated demonstration exception permits only a configured loopback HTTP
 address and port; it does not enable arbitrary private-network access.
 

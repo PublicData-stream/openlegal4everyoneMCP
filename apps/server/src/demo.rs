@@ -9,7 +9,7 @@ use crate::{
     },
     resources::ResourceRegistry,
 };
-use openlegal_adapters::{DestinationMode, HttpUpstream};
+use openlegal_adapters::{DestinationMode, HttpUpstream, upstream_proxy::Socks5Proxy};
 use openlegal_application::{RetrievalService, Source};
 use openlegal_domain::{
     FreshnessRequirement, ProgressStage as RetrievalStage, Query, RetrievalData, RetrievalEnvelope,
@@ -26,7 +26,7 @@ pub const WIDGET_URI: &str = "ui://openlegal-demo/records-v1.html";
 pub const WIDGET_MIME: &str = "text/html;profile=mcp-app";
 
 /// Both layouts share provider budgets while retaining distinct source/cache identity.
-fn sources(upstream: &str) -> Result<Vec<Source>, RetrievalError> {
+fn sources(upstream: &str, proxy: Option<Socks5Proxy>) -> Result<Vec<Source>, RetrievalError> {
     let mut sources = Vec::new();
     for (id, processor) in [
         (
@@ -38,24 +38,32 @@ fn sources(upstream: &str) -> Result<Vec<Source>, RetrievalError> {
             Arc::new(LayoutBProcessor) as Arc<dyn PayloadProcessor>,
         ),
     ] {
+        let client = HttpUpstream::new(upstream, DestinationMode::MockLoopback, processor.clone())?;
+        let client = match &proxy {
+            Some(proxy) => client.with_socks5_proxy(proxy.clone()),
+            None => client,
+        };
         sources.push(Source {
             id: id.into(),
             provider: "synthetic".into(),
             dataset: "records".into(),
             processor_version: processor.version().into(),
-            upstream: Arc::new(HttpUpstream::new(
-                upstream,
-                DestinationMode::MockLoopback,
-                processor,
-            )?),
+            upstream: Arc::new(client),
         });
     }
     Ok(sources)
 }
 
 pub fn service(upstream: &str) -> Result<Arc<RetrievalService>, RetrievalError> {
+    service_with_proxy(upstream, None)
+}
+
+pub fn service_with_proxy(
+    upstream: &str,
+    proxy: Option<Socks5Proxy>,
+) -> Result<Arc<RetrievalService>, RetrievalError> {
     RetrievalService::new(
-        sources(upstream)?,
+        sources(upstream, proxy)?,
         Box::new(openlegal_adapters::MemoryCache::default()),
     )
 }
@@ -65,8 +73,16 @@ pub fn service_with_store(
     upstream: &str,
     store: Arc<dyn openlegal_application::persistence::PersistentStore>,
 ) -> Result<Arc<RetrievalService>, RetrievalError> {
+    service_with_store_and_proxy(upstream, store, None)
+}
+
+pub fn service_with_store_and_proxy(
+    upstream: &str,
+    store: Arc<dyn openlegal_application::persistence::PersistentStore>,
+    proxy: Option<Socks5Proxy>,
+) -> Result<Arc<RetrievalService>, RetrievalError> {
     use sha2::{Digest, Sha256};
-    let sources = sources(upstream)?;
+    let sources = sources(upstream, proxy)?;
     let origin = url::Url::parse(upstream).map_err(|_| RetrievalError::InvalidInput)?;
     let namespace = Sha256::digest(origin.as_str().as_bytes())
         .iter()

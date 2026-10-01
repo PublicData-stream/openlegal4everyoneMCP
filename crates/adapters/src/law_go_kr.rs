@@ -98,6 +98,7 @@ pub struct LawClient {
     clock: Arc<dyn openlegal_application::Clock>,
     budget: Option<(PgPool, RequestBudgetMode)>,
     local_cap: Option<Arc<AtomicU32>>,
+    proxy: Option<crate::upstream_proxy::Socks5Proxy>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestBudgetMode {
@@ -237,7 +238,14 @@ impl LawClient {
             operator_suspended: Arc::new(AtomicBool::new(false)),
             budget: None,
             local_cap: None,
+            proxy: None,
         })
+    }
+    /// Covers inventory, details, NTS HTML and linked attachments, including clones
+    /// used by explicit collection. Provider admission and destination checks remain.
+    pub fn with_socks5_proxy(mut self, proxy: crate::upstream_proxy::Socks5Proxy) -> Self {
+        self.proxy = Some(proxy);
+        self
     }
     /// The database migration must be applied before an enabled client starts.
     /// Every outbound attempt reserves its allowance before DNS resolution.
@@ -1085,13 +1093,18 @@ impl LawClient {
         if addresses.is_empty() {
             return Err(download_failed("dns_empty"));
         }
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(30))
-            .resolve_to_addrs(host, &addresses)
+            .resolve_to_addrs(host, &addresses);
+        let builder = match &self.proxy {
+            Some(proxy) => proxy.apply(builder),
+            None => builder,
+        };
+        let client = builder
             .build()
             .map_err(|_| DatabaseError::StorageUnavailable)?;
         let fetch = async {

@@ -309,11 +309,12 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         let demo_service = config
             .demo
             .as_ref()
-            .map(|demo| {
+            .map(|demo| -> Result<_, openlegal_server::ServerError> {
+                let proxy = demo.proxy.as_ref().map(|proxy| proxy.load()).transpose()?;
                 if let Some(store) = &persistent {
-                    openlegal_server::demo::service_with_store(&demo.upstream, store.clone())
+                    Ok(openlegal_server::demo::service_with_store_and_proxy(&demo.upstream, store.clone(), proxy)?)
                 } else {
-                    openlegal_server::demo::service(&demo.upstream)
+                    Ok(openlegal_server::demo::service_with_proxy(&demo.upstream, proxy)?)
                 }
             })
             .transpose()?;

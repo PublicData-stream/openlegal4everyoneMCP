@@ -123,6 +123,9 @@ async fn offline_rebuild_preserves_ack_retirement_withdrawal_and_previous_index(
     // even when normal serving would enable them with this configuration.
     rebuilt_config.ingestion = Some(IngestionConfig {
         credential_env: "OPENLEGAL_UNUSED_REBUILD_FIXTURE_CREDENTIAL".into(),
+        proxy: Some(openlegal_server::config::UpstreamProxyConfig {
+            url_env: "OPENLEGAL_UNUSED_REBUILD_FIXTURE_PROXY".into(),
+        }),
         kubectl: "/nonexistent-rebuild-fixture/kubectl".into(),
         kubeconfig: "/nonexistent-rebuild-fixture/kubeconfig".into(),
         context: "fixture".into(),
