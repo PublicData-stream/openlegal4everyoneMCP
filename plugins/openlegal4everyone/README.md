@@ -1,4 +1,4 @@
-# OpenLegal plugin for Claude and ChatGPT
+# OpenLegal4everyone plugin for Claude and ChatGPT
 
 This folder packages the public openlegal4everyone.stream MCP server with
 end-user skills, for Claude (Claude Code, Cowork and claude.ai) and for
@@ -50,7 +50,7 @@ Claude Code:
 
 ```text
 /plugin marketplace add PublicData-stream/openlegal4everyoneMCP
-/plugin install openlegal@openlegal4everyone
+/plugin install openlegal4everyone@openlegal4everyone
 ```
 
 claude.ai or Cowork without the plugin: add
@@ -69,7 +69,7 @@ literal citation tokens do not establish native citation rendering. See the
 ## Validate
 
 ```sh
-claude plugin validate ./plugins/openlegal --strict
+claude plugin validate ./plugins/openlegal4everyone --strict
 claude plugin validate . --strict
 ```
 

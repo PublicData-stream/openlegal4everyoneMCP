@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "openlegal": {
+    "openlegal4everyone": {
       "type": "http",
       "url": "https://openlegal4everyone.mcp.publicdata.stream/mcp"
     }

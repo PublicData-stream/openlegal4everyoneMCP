@@ -1,20 +1,20 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
-  "name": "openlegal",
+  "name": "openlegal4everyone",
   "version": "0.3.1",
   "description": "Search, read, cite and compare Korean statutes, ordinances and precedents with provenance through the openlegal4everyone.stream MCP server.",
   "author": {
     "name": "PublicData-stream",
     "url": "https://github.com/PublicData-stream"
   },
-  "homepage": "https://github.com/PublicData-stream/openlegal4everyoneMCP/tree/main/plugins/openlegal",
+  "homepage": "https://github.com/PublicData-stream/openlegal4everyoneMCP/tree/main/plugins/openlegal4everyone",
   "repository": "https://github.com/PublicData-stream/openlegal4everyoneMCP",
   "license": "AGPL-3.0-only",
   "keywords": ["legal", "korea", "law", "statute", "precedent", "mcp"],
   "extensions": {
     "com.openai": {
       "interface": {
-        "displayName": "OpenLegal 4 Everyone",
+        "displayName": "openlegal4everyone",
         "shortDescription": "Korean laws and precedents with provenance",
         "longDescription": "Search the openlegal4everyone.stream corpus of Korean national statutes, ordinances and precedents, read exact text with source and freshness metadata, compare versions, and compare supplied texts. Legal information, not legal advice.",
         "developerName": "PublicData-stream",
