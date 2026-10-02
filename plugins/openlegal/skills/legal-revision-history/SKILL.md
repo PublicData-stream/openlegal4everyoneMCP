@@ -88,3 +88,8 @@ sections with `text.diff` (see the `legal-text-comparison` skill).
 
 Summarize the changed articles first, quote the changed lines exactly, and end
 with both versions' citations (revision ID, capture ID and dates).
+Use each version's returned capture reference beside the corresponding claim,
+following the research skill's
+[citation guidance](../korean-law-research/references/citation-and-provenance.md).
+Do not use current-capture `search` to recreate a historical citation. Missing
+body evidence stays explicit; a metadata-only link does not prove changed text.

@@ -34,6 +34,14 @@ These shapes follow [OpenAI MCP compatibility](https://developers.openai.com/api
 and its [user-openable URL guidance](https://developers.openai.com/plugins/build/mcp-server#company-knowledge-compatibility).
 Protocol tests do not establish actual ChatGPT citation rendering.
 
+For an inline citation request, use `search` followed by `fetch` on a returned ID
+before citing its text. Native `database.*` results remain useful for richer
+queries, historical selection and provenance; their `references` and resource
+links alone do not establish ChatGPT citation metadata. The bundled research
+skill describes this choice. Never replace selected historical evidence with
+current search results, invent citation tokens or treat a Markdown source link
+as a successful native citation UI test.
+
 ## MCP references and evidence
 
 Canonical `v1` IDs preserve jurisdiction, provider, dataset, provider object ID,
@@ -94,7 +102,9 @@ Verify release digests, source identity, reference routing and TLS.
 After public smoke succeeds, connect the public `/mcp` endpoint in ChatGPT
 developer mode and check:
 
-1. Search a retained law, fetch an item and ask for a citation. Confirm citation
+1. Refresh the connection's advertised tools and use the updated research skill
+   in a new conversation. Explicitly call `search`, fetch one returned item and
+   ask for a source citation beside the supported claim. Confirm citation
    rendering and that its click opens the same capture and text unit.
 2. Read a long article/passage. Confirm explicit passage labels and navigation
    within the same capture.

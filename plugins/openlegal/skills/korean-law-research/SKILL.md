@@ -26,6 +26,20 @@ the server names are used below.
 
 ## Workflow
 
+For a source search or a request for inline citations, prefer `search` then
+`fetch` when both tools are advertised. Pass the same query DSL described below
+as `search({"query":"..."})`, then pass a returned `results[].id` verbatim to
+`fetch({"id":"..."})` before relying on its text. Keep the returned `id`, `url`
+and capture metadata together. Search covers current retained non-OCR text;
+it does not select historical versions or establish complete coverage. Read
+the additional qualification text as well as the JSON result.
+
+Use the native workflow below for typed filters, pagination, regex, historical
+selection, article navigation or freshness controls. A native result's
+`references` may identify the exact evidence; use the returned ID and URL
+according to [citation-and-provenance.md](references/citation-and-provenance.md).
+Do not replace a selected historical capture with a new `search` result.
+
 0. **Resolve names.** When the user names a law, possibly by abbreviation
    (`산안법`, `중처법 시행령`), call `law.resolve_name` to get its object. The
    `resolution` field shows any alias expansion; mention it to the user.
@@ -104,5 +118,9 @@ If `law.resolve_name`, `citation.verify`, `law.article`, `precedent.citing` or
 ## Answer shape
 
 Lead with the quoted text or the list of matching instruments, then the
-citation block, then any freshness or coverage caveat. Keep the user's language
-(Korean or English) and keep official names in their original Korean.
+source citation beside each supported claim, then any freshness or coverage
+caveat. Use the host's citation metadata when available; otherwise use the
+returned source URL as a clearly labeled link. Keep compact provenance nearby
+when needed to distinguish versions. A separate source list is not proof of
+native citation rendering. Keep the user's language (Korean or English) and
+keep official names in their original Korean.

@@ -37,7 +37,10 @@ anonymous; no account, token or OAuth flow is required.
 | `legal-revision-history` | List revisions of one object, compare two versions, watch many laws for changes and trace renames, repeal mentions and upcoming revisions |
 | `legal-text-comparison` | Compare and patch user-supplied texts |
 
-The skills call the server's `database.*`, `law.*`, `citation.verify`,
+For source searches and inline citation requests, the research skill prefers
+the server's ChatGPT-compatible `search` and `fetch` tools when advertised.
+Native legal workflows retain their richer controls and exact capture references.
+The skills also call `database.*`, `law.*`, `citation.verify`,
 `precedent.citing`, `article.impact` and `text.*` tools. The synthetic
 `demo_*` tools are not part of the public plugin.
 
@@ -55,6 +58,13 @@ claude.ai or Cowork without the plugin: add
 
 ChatGPT: in developer mode, create a connection to the same URL, as described
 in the [ChatGPT connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt).
+
+After updating the connection's advertised tools and installing the updated
+skill source, start a new conversation and explicitly test `search` followed
+by `fetch`. Verify the host's inline source citation and click the source to
+check the same capture and text unit. Ordinary Markdown links, a source list or
+literal citation tokens do not establish native citation rendering. See the
+[citation contract and acceptance checklist](../../docs/citations.md).
 
 ## Validate
 
