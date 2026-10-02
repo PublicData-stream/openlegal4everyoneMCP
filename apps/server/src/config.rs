@@ -543,6 +543,9 @@ impl Config {
     }
 
     pub fn validate_storage(&self) -> Result<(), ServerError> {
+        if let Some(demo) = &self.demo {
+            demo.provider_requests.policy()?;
+        }
         if let Some(proxy) = self.demo.as_ref().and_then(|demo| demo.proxy.as_ref()) {
             proxy.validate()?;
         }
@@ -609,12 +612,53 @@ impl TextDiffConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DemoConfig {
+    #[serde(default)]
+    pub provider_requests: DemoRequestConfig,
     /// Loopback HTTP mock only; never an arbitrary caller-provided URL.
     pub upstream: String,
     /// Optional routing for this synthetic upstream only.
     pub proxy: Option<UpstreamProxyConfig>,
     /// Locally built, trusted HTML loaded once before serving.
     pub widget_html: PathBuf,
+}
+
+/// Independent request policy for the synthetic provider; burst and concurrency stay two.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DemoRequestConfig {
+    pub daily_limit: openlegal_application::upstream_policy::RequestLimit,
+    pub requests_per_second: u32,
+    pub max_attempts: u32,
+    pub attempt_timeout_secs: u64,
+    pub refresh_timeout_secs: u64,
+}
+impl Default for DemoRequestConfig {
+    fn default() -> Self {
+        Self {
+            daily_limit: openlegal_application::upstream_policy::RequestLimit::Unlimited,
+            requests_per_second: 2,
+            max_attempts: 2,
+            attempt_timeout_secs: 5,
+            refresh_timeout_secs: 10,
+        }
+    }
+}
+impl DemoRequestConfig {
+    pub fn policy(
+        &self,
+    ) -> Result<openlegal_application::upstream_policy::DemoRequestPolicy, ServerError> {
+        let policy = openlegal_application::upstream_policy::DemoRequestPolicy {
+            daily_limit: self.daily_limit,
+            requests_per_second: self.requests_per_second,
+            max_attempts: self.max_attempts,
+            attempt_timeout_secs: self.attempt_timeout_secs,
+            refresh_timeout_secs: self.refresh_timeout_secs,
+        };
+        policy
+            .validate()
+            .map_err(|_| "invalid demo provider request policy")?;
+        Ok(policy)
+    }
 }
 
 /// Reference a secret environment variable instead of storing proxy credentials
@@ -1027,17 +1071,31 @@ fn default_collection_job_template_path() -> PathBuf {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderRequestConfig {
-    pub continuous_daily_limit: u32,
-    pub on_demand_daily_limit: u32,
-    pub min_interval_secs: u32,
+    pub continuous_daily_limit: openlegal_application::upstream_policy::RequestLimit,
+    pub on_demand_daily_limit: openlegal_application::upstream_policy::RequestLimit,
+    /// Mutually exclusive with explicit legacy min_interval_secs.
+    pub requests_per_second: Option<u32>,
+    pub min_interval_secs: Option<u32>,
+    pub pilot_attempt_limit: openlegal_application::upstream_policy::RequestLimit,
+    pub on_demand_attempt_limit: openlegal_application::upstream_policy::RequestLimit,
+    pub pilot_timeout_secs: u64,
+    pub on_demand_timeout_secs: u64,
+    pub max_job_attempts: u32,
 }
 
 impl Default for ProviderRequestConfig {
     fn default() -> Self {
+        use openlegal_application::upstream_policy::RequestLimit::Limited;
         Self {
-            continuous_daily_limit: 1000,
-            on_demand_daily_limit: 1000,
-            min_interval_secs: 5,
+            continuous_daily_limit: Limited(1000),
+            on_demand_daily_limit: Limited(1000),
+            requests_per_second: None,
+            min_interval_secs: None,
+            pilot_attempt_limit: Limited(100),
+            on_demand_attempt_limit: Limited(32),
+            pilot_timeout_secs: 1800,
+            on_demand_timeout_secs: 7200,
+            max_job_attempts: 3,
         }
     }
 }
@@ -1046,11 +1104,27 @@ impl ProviderRequestConfig {
     pub fn limits(
         &self,
     ) -> Result<openlegal_adapters::law_go_kr::ProviderRequestLimits, ServerError> {
-        openlegal_adapters::law_go_kr::ProviderRequestLimits::new(
-            self.continuous_daily_limit,
-            self.on_demand_daily_limit,
-            self.min_interval_secs,
-        )
+        let interval_ms = match (self.requests_per_second, self.min_interval_secs) {
+            (Some(_), Some(_)) => {
+                return Err("requests_per_second conflicts with min_interval_secs".into());
+            }
+            (Some(rate), None) if (1..=1000).contains(&rate) => 1000u32.div_ceil(rate),
+            (Some(_), None) => return Err("requests_per_second must be between 1 and 1000".into()),
+            (None, Some(interval)) if (1..=3600).contains(&interval) => interval * 1000 + 1,
+            (None, Some(_)) => return Err("min_interval_secs must be between 1 and 3600".into()),
+            (None, None) => 5001,
+        };
+        openlegal_adapters::law_go_kr::ProviderRequestLimits {
+            continuous_daily_limit: self.continuous_daily_limit,
+            on_demand_daily_limit: self.on_demand_daily_limit,
+            interval_ms,
+            pilot_attempt_limit: self.pilot_attempt_limit,
+            on_demand_attempt_limit: self.on_demand_attempt_limit,
+            pilot_timeout_secs: self.pilot_timeout_secs,
+            on_demand_timeout_secs: self.on_demand_timeout_secs,
+            max_job_attempts: self.max_job_attempts,
+        }
+        .validated()
         .map_err(|_| "invalid provider request limits".into())
     }
 }
@@ -1153,7 +1227,7 @@ impl DatabaseConfig {
 
 #[cfg(test)]
 mod database_config_tests {
-    use super::{DatabaseConfig, DocumentWorkerConfig, ProviderRequestConfig};
+    use super::{DatabaseConfig, DemoRequestConfig, DocumentWorkerConfig, ProviderRequestConfig};
 
     #[test]
     fn corpus_requires_an_explicit_dictionary_without_loading_it() {
@@ -1199,14 +1273,14 @@ mod database_config_tests {
     #[test]
     fn provider_budget_defaults_partial_settings_and_validation() {
         let defaults: ProviderRequestConfig = toml::from_str("").unwrap();
-        assert_eq!(defaults.continuous_daily_limit, 1000);
-        assert_eq!(defaults.on_demand_daily_limit, 1000);
-        assert_eq!(defaults.min_interval_secs, 5);
+        assert_eq!(defaults.continuous_daily_limit.as_option(), Some(1000));
+        assert_eq!(defaults.on_demand_daily_limit.as_option(), Some(1000));
+        assert_eq!(defaults.limits().unwrap().interval_ms, 5001);
         defaults.limits().unwrap();
 
         let selected: ProviderRequestConfig =
             toml::from_str("continuous_daily_limit = 50000\nmin_interval_secs = 1").unwrap();
-        assert_eq!(selected.on_demand_daily_limit, 1000);
+        assert_eq!(selected.on_demand_daily_limit.as_option(), Some(1000));
         selected.limits().unwrap();
         for raw in [
             "continuous_daily_limit = 0",
@@ -1216,8 +1290,9 @@ mod database_config_tests {
             "on_demand_daily_limit = 1000001",
             "min_interval_secs = 3601",
         ] {
-            let invalid: ProviderRequestConfig = toml::from_str(raw).unwrap();
-            assert!(invalid.limits().is_err(), "{raw}");
+            if let Ok(invalid) = toml::from_str::<ProviderRequestConfig>(raw) {
+                assert!(invalid.limits().is_err(), "{raw}");
+            }
         }
         for raw in [
             "unknown = 1",
@@ -1228,6 +1303,66 @@ mod database_config_tests {
                 toml::from_str::<ProviderRequestConfig>(raw).is_err(),
                 "{raw}"
             );
+        }
+    }
+
+    #[test]
+    fn upstream_request_options_are_independent_and_explicit() {
+        use openlegal_application::upstream_policy::RequestLimit;
+        let law: ProviderRequestConfig = toml::from_str(
+            "continuous_daily_limit='unlimited'\non_demand_daily_limit=77\nrequests_per_second=3\npilot_attempt_limit='unlimited'\non_demand_attempt_limit='unlimited'\npilot_timeout_secs=86400\non_demand_timeout_secs=60\nmax_job_attempts=10",
+        ).unwrap();
+        let policy = law.limits().unwrap();
+        assert_eq!(policy.continuous_daily_limit, RequestLimit::Unlimited);
+        assert_eq!(policy.on_demand_daily_limit, RequestLimit::Limited(77));
+        assert_eq!(policy.interval_ms, 334);
+        assert_eq!(policy.pilot_attempt_limit, RequestLimit::Unlimited);
+        assert_eq!(policy.on_demand_attempt_limit, RequestLimit::Unlimited);
+        assert_eq!(policy.pilot_timeout_secs, 86400);
+        assert_eq!(policy.on_demand_timeout_secs, 60);
+        assert_eq!(policy.max_job_attempts, 10);
+        let fastest: ProviderRequestConfig = toml::from_str("requests_per_second=1000").unwrap();
+        assert_eq!(fastest.limits().unwrap().interval_ms, 1);
+        for raw in [
+            "requests_per_second=0",
+            "requests_per_second=1001",
+            "requests_per_second=2\nmin_interval_secs=1",
+            "pilot_timeout_secs=59",
+            "on_demand_timeout_secs=86401",
+            "max_job_attempts=0",
+            "max_job_attempts=11",
+        ] {
+            let invalid: ProviderRequestConfig = toml::from_str(raw).unwrap();
+            assert!(invalid.limits().is_err(), "{raw}");
+        }
+        for raw in [
+            "pilot_attempt_limit=0",
+            "on_demand_attempt_limit=1000001",
+            "continuous_daily_limit='Unlimited'",
+        ] {
+            assert!(
+                toml::from_str::<ProviderRequestConfig>(raw).is_err(),
+                "{raw}"
+            );
+        }
+        let demo: DemoRequestConfig = toml::from_str("").unwrap();
+        assert_eq!(demo.daily_limit, RequestLimit::Unlimited);
+        assert_eq!(demo.policy().unwrap().requests_per_second, 2);
+        assert_eq!(demo.max_attempts, 2);
+        assert_eq!(demo.attempt_timeout_secs, 5);
+        assert_eq!(demo.refresh_timeout_secs, 10);
+        let finite: DemoRequestConfig = toml::from_str("daily_limit=17\nrequests_per_second=1000\nmax_attempts=10\nattempt_timeout_secs=60\nrefresh_timeout_secs=300").unwrap();
+        finite.policy().unwrap();
+        for raw in [
+            "requests_per_second=0",
+            "requests_per_second=1001",
+            "max_attempts=11",
+            "attempt_timeout_secs=61",
+            "refresh_timeout_secs=301",
+            "attempt_timeout_secs=6\nrefresh_timeout_secs=5",
+        ] {
+            let invalid: DemoRequestConfig = toml::from_str(raw).unwrap();
+            assert!(invalid.policy().is_err(), "{raw}");
         }
     }
 
@@ -1247,7 +1382,10 @@ mod database_config_tests {
         assert_eq!(ingestion.scan_interval_secs, 3600);
         assert_eq!(ingestion.detail_timeout_secs, 3600);
         assert_eq!(ingestion.detail_job_workers, 1);
-        assert_eq!(ingestion.provider_requests.min_interval_secs, 5);
+        assert_eq!(
+            ingestion.provider_requests.limits().unwrap().interval_ms,
+            5001
+        );
         for seconds in [60, 300, 86400] {
             let configured: DatabaseConfig =
                 toml::from_str(&format!("{base}scan_interval_secs={seconds}\n")).unwrap();
@@ -1263,10 +1401,11 @@ mod database_config_tests {
             "on_demand_daily_limit=0",
             "min_interval_secs=0",
         ] {
-            let configured: DatabaseConfig =
-                toml::from_str(&format!("{base}[ingestion.provider_requests]\n{setting}\n"))
-                    .unwrap();
-            assert!(configured.validate().is_err(), "{setting}");
+            if let Ok(configured) = toml::from_str::<DatabaseConfig>(&format!(
+                "{base}[ingestion.provider_requests]\n{setting}\n"
+            )) {
+                assert!(configured.validate().is_err(), "{setting}");
+            }
         }
     }
 }

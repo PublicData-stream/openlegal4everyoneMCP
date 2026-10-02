@@ -10,6 +10,7 @@ use crate::{
     resources::ResourceRegistry,
 };
 use openlegal_adapters::{DestinationMode, HttpUpstream, upstream_proxy::Socks5Proxy};
+use openlegal_application::upstream_policy::{DailyBudgetStore, DemoRequestPolicy};
 use openlegal_application::{RetrievalService, Source};
 use openlegal_domain::{
     FreshnessRequirement, ProgressStage as RetrievalStage, Query, RetrievalData, RetrievalEnvelope,
@@ -26,7 +27,12 @@ pub const WIDGET_URI: &str = "ui://openlegal-demo/records-v1.html";
 pub const WIDGET_MIME: &str = "text/html;profile=mcp-app";
 
 /// Both layouts share provider budgets while retaining distinct source/cache identity.
-fn sources(upstream: &str, proxy: Option<Socks5Proxy>) -> Result<Vec<Source>, RetrievalError> {
+fn sources(
+    upstream: &str,
+    proxy: Option<Socks5Proxy>,
+    policy: DemoRequestPolicy,
+) -> Result<Vec<Source>, RetrievalError> {
+    policy.validate()?;
     let mut sources = Vec::new();
     for (id, processor) in [
         (
@@ -38,7 +44,8 @@ fn sources(upstream: &str, proxy: Option<Socks5Proxy>) -> Result<Vec<Source>, Re
             Arc::new(LayoutBProcessor) as Arc<dyn PayloadProcessor>,
         ),
     ] {
-        let client = HttpUpstream::new(upstream, DestinationMode::MockLoopback, processor.clone())?;
+        let client = HttpUpstream::new(upstream, DestinationMode::MockLoopback, processor.clone())?
+            .with_attempt_timeout(std::time::Duration::from_secs(policy.attempt_timeout_secs))?;
         let client = match &proxy {
             Some(proxy) => client.with_socks5_proxy(proxy.clone()),
             None => client,
@@ -62,9 +69,18 @@ pub fn service_with_proxy(
     upstream: &str,
     proxy: Option<Socks5Proxy>,
 ) -> Result<Arc<RetrievalService>, RetrievalError> {
-    RetrievalService::new(
-        sources(upstream, proxy)?,
+    service_with_proxy_and_policy(upstream, proxy, DemoRequestPolicy::default())
+}
+
+pub fn service_with_proxy_and_policy(
+    upstream: &str,
+    proxy: Option<Socks5Proxy>,
+    policy: DemoRequestPolicy,
+) -> Result<Arc<RetrievalService>, RetrievalError> {
+    RetrievalService::with_policies(
+        sources(upstream, proxy, policy)?,
         Box::new(openlegal_adapters::MemoryCache::default()),
+        std::collections::HashMap::from([("synthetic".into(), policy)]),
     )
 }
 
@@ -82,7 +98,7 @@ pub fn service_with_store_and_proxy(
     proxy: Option<Socks5Proxy>,
 ) -> Result<Arc<RetrievalService>, RetrievalError> {
     use sha2::{Digest, Sha256};
-    let sources = sources(upstream, proxy)?;
+    let sources = sources(upstream, proxy, DemoRequestPolicy::default())?;
     let origin = url::Url::parse(upstream).map_err(|_| RetrievalError::InvalidInput)?;
     let namespace = Sha256::digest(origin.as_str().as_bytes())
         .iter()
@@ -95,6 +111,33 @@ pub fn service_with_store_and_proxy(
         store,
         namespace,
     )
+}
+
+/// Configured persistent mode always charges a durable daily ledger before I/O.
+pub async fn service_with_store_proxy_and_policy(
+    upstream: &str,
+    store: Arc<dyn openlegal_application::persistence::PersistentStore>,
+    proxy: Option<Socks5Proxy>,
+    policy: DemoRequestPolicy,
+    daily_store: Arc<dyn DailyBudgetStore>,
+) -> Result<Arc<RetrievalService>, RetrievalError> {
+    use sha2::{Digest, Sha256};
+    let sources = sources(upstream, proxy, policy)?;
+    let origin = url::Url::parse(upstream).map_err(|_| RetrievalError::InvalidInput)?;
+    let namespace = Sha256::digest(origin.as_str().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    RetrievalService::with_persistence_and_policies(
+        sources,
+        Arc::new(openlegal_application::SystemClock::default()),
+        Box::new(openlegal_adapters::MemoryCache::default()),
+        store,
+        namespace,
+        std::collections::HashMap::from([("synthetic".into(), policy)]),
+        daily_store,
+    )
+    .await
 }
 
 #[derive(Clone, Copy, Deserialize, JsonSchema)]

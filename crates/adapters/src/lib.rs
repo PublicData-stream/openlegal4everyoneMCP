@@ -42,6 +42,7 @@ pub struct HttpUpstream {
     processor: Arc<dyn PayloadProcessor>,
     resolver: Option<hickory_resolver::TokioResolver>,
     proxy: Option<upstream_proxy::Socks5Proxy>,
+    attempt_timeout: Duration,
 }
 
 impl HttpUpstream {
@@ -102,7 +103,17 @@ impl HttpUpstream {
             processor,
             resolver,
             proxy: None,
+            attempt_timeout: Duration::from_secs(5),
         })
+    }
+
+    /// Bound this single attempt, including DNS, connection and processing.
+    pub fn with_attempt_timeout(mut self, timeout: Duration) -> Result<Self, RetrievalError> {
+        if timeout < Duration::from_secs(1) || timeout > Duration::from_secs(60) {
+            return Err(RetrievalError::InvalidInput);
+        }
+        self.attempt_timeout = timeout;
+        Ok(self)
     }
 
     /// Route only this upstream's requests through an explicit trusted next hop.
@@ -175,8 +186,8 @@ impl HttpUpstream {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(5))
+            .connect_timeout(self.attempt_timeout)
+            .timeout(self.attempt_timeout)
             .resolve_to_addrs(host, &addresses);
         let builder = match &self.proxy {
             Some(proxy) => proxy.apply(builder),
@@ -276,7 +287,7 @@ impl Upstream for HttpUpstream {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => Err(RetrievalError::Cancelled),
-                result = tokio::time::timeout(Duration::from_secs(5), this.fetch_once(query, cancellation.clone())) =>
+                result = tokio::time::timeout(this.attempt_timeout, this.fetch_once(query, cancellation.clone())) =>
                     result.unwrap_or(Err(RetrievalError::Unavailable)),
             }
         }.boxed()
@@ -334,6 +345,52 @@ fn retry_after(value: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use openlegal_normalization::LayoutAProcessor;
+
+    #[tokio::test]
+    async fn configured_attempt_timeout_bounds_an_unresponsive_mock() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let upstream = HttpUpstream::new(
+            &format!("http://{address}/"),
+            DestinationMode::MockLoopback,
+            Arc::new(LayoutAProcessor),
+        )
+        .unwrap();
+        assert!(
+            upstream
+                .clone()
+                .with_attempt_timeout(Duration::ZERO)
+                .is_err()
+        );
+        assert!(
+            upstream
+                .clone()
+                .with_attempt_timeout(Duration::from_secs(61))
+                .is_err()
+        );
+        let upstream = upstream
+            .with_attempt_timeout(Duration::from_secs(1))
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            upstream.fetch(
+                Query::Get {
+                    source: "layout_a".into(),
+                    id: "001".into(),
+                },
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.err(), Some(RetrievalError::Unavailable));
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test]
     async fn dns_wait_is_async_cancellable_and_bounded() {

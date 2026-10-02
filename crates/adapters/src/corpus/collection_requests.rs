@@ -1,5 +1,54 @@
 use super::*;
+use openlegal_application::upstream_policy::RequestLimit;
 use openlegal_domain::collection::{CollectionReceipt, CollectionRequest};
+
+/// Private launch policy: never included in public request identity or payload.
+#[derive(Clone, Debug)]
+pub struct CollectionLaunch {
+    pub id: String,
+    pub request: CollectionRequest,
+    pub timeout_secs: u64,
+    pub attempt_limit: RequestLimit,
+    pub launched_at: u64,
+    pub observed_at: u64,
+}
+impl CollectionLaunch {
+    pub fn job_deadline_secs(&self) -> u64 {
+        self.timeout_secs + 300
+    }
+    pub fn recovery_at(&self) -> u64 {
+        self.launched_at + self.timeout_secs + 900
+    }
+    pub fn remaining_secs(&self, now: u64) -> u64 {
+        self.launched_at
+            .saturating_add(self.timeout_secs)
+            .saturating_sub(now)
+    }
+}
+fn launch_from_row(row: &PgRow) -> Result<CollectionLaunch, DatabaseError> {
+    let request: CollectionRequest =
+        serde_json::from_value(row.try_get("payload").map_err(db)?).map_err(corrupt)?;
+    request.validate()?;
+    let limit: Option<i64> = row.try_get("operation_attempt_limit").map_err(db)?;
+    let attempt_limit = match limit {
+        Some(value) => RequestLimit::Limited(u32::try_from(value).map_err(corrupt)?),
+        None => RequestLimit::Unlimited,
+    };
+    Ok(CollectionLaunch {
+        id: row.try_get::<Uuid, _>("id").map_err(db)?.to_string(),
+        request,
+        timeout_secs: u64::try_from(
+            row.try_get::<i64, _>("operation_timeout_secs")
+                .map_err(db)?,
+        )
+        .map_err(corrupt)?,
+        attempt_limit,
+        observed_at: u64::try_from(row.try_get::<i64, _>("observed_at").map_err(db)?)
+            .map_err(corrupt)?,
+        launched_at: u64::try_from(row.try_get::<i64, _>("launched_at").map_err(db)?)
+            .map_err(corrupt)?,
+    })
+}
 
 impl PgCorpusStore {
     /// Return unsettled request Jobs. A launched Job can remain `launching`
@@ -42,6 +91,23 @@ impl PgCorpusStore {
     pub async fn claim_collection_request(
         &self,
     ) -> Result<Option<(String, CollectionRequest)>, DatabaseError> {
+        Ok(self
+            .claim_collection_request_with_policy(7200, RequestLimit::Limited(32))
+            .await?
+            .map(|launch| (launch.id, launch.request)))
+    }
+    /// Snapshot policy atomically with launch; later ConfigMap changes cannot shorten it.
+    pub async fn claim_collection_request_with_policy(
+        &self,
+        timeout_secs: u64,
+        attempt_limit: RequestLimit,
+    ) -> Result<Option<CollectionLaunch>, DatabaseError> {
+        if !(60..=86400).contains(&timeout_secs) {
+            return Err(DatabaseError::InvalidInput);
+        }
+        attempt_limit
+            .validate()
+            .map_err(|_| DatabaseError::InvalidInput)?;
         self.gate().await?;
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
@@ -62,10 +128,12 @@ impl PgCorpusStore {
         let request: CollectionRequest =
             serde_json::from_value(row.try_get("payload").map_err(db)?).map_err(corrupt)?;
         request.validate()?;
-        sqlx::query("UPDATE openlegal.collection_request SET status='launching',lease_until=floor(extract(epoch from clock_timestamp()))::bigint+8100 WHERE id=$1")
-            .bind(id).execute(&mut *tx).await.map_err(db)?;
+        let row = sqlx::query("UPDATE openlegal.collection_request SET status='launching',launched_at=floor(extract(epoch from clock_timestamp()))::bigint,operation_timeout_secs=$2,operation_attempt_limit=$3,lease_until=floor(extract(epoch from clock_timestamp()))::bigint+$2+900 WHERE id=$1 RETURNING id,payload,launched_at,operation_timeout_secs,operation_attempt_limit,floor(extract(epoch from clock_timestamp()))::bigint AS observed_at")
+            .bind(id).bind(timeout_secs as i64).bind(attempt_limit.as_option().map(i64::from))
+            .fetch_one(&mut *tx).await.map_err(db)?;
+        let launch = launch_from_row(&row)?;
         tx.commit().await.map_err(db)?;
-        Ok(Some((id.to_string(), request)))
+        Ok(Some(launch))
     }
 
     pub async fn mark_collection_running(
@@ -81,7 +149,7 @@ impl PgCorpusStore {
         {
             return Err(DatabaseError::InvalidInput);
         }
-        let changed = sqlx::query("UPDATE openlegal.collection_request SET status='running',job_name=$2,lease_until=floor(extract(epoch from clock_timestamp()))::bigint+8100 WHERE id=$1 AND status='launching'")
+        let changed = sqlx::query("UPDATE openlegal.collection_request SET status='running',job_name=$2 WHERE id=$1 AND status='launching'")
             .bind(id).bind(job_name).execute(&self.pool).await.map_err(db)?.rows_affected();
         if changed != 1 {
             let status: Option<String> =
@@ -111,6 +179,17 @@ impl PgCorpusStore {
         let request: CollectionRequest = serde_json::from_value(payload).map_err(corrupt)?;
         request.validate()?;
         Ok(request)
+    }
+
+    pub async fn load_collection_launch(
+        &self,
+        id: &str,
+    ) -> Result<CollectionLaunch, DatabaseError> {
+        self.gate().await?;
+        let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
+        let row = sqlx::query("SELECT id,payload,launched_at,operation_timeout_secs,operation_attempt_limit,floor(extract(epoch from clock_timestamp()))::bigint AS observed_at FROM openlegal.collection_request WHERE id=$1 AND status IN ('launching','running') AND lease_until>floor(extract(epoch from clock_timestamp()))::bigint")
+            .bind(id).fetch_optional(&self.pool).await.map_err(db)?.ok_or(DatabaseError::NotFound)?;
+        launch_from_row(&row)
     }
 
     pub async fn settle_collection_request(

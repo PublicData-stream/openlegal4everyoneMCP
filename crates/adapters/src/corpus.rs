@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 mod collection_gaps;
 mod collection_requests;
+pub use collection_requests::CollectionLaunch;
 mod object_status;
 pub use collection_gaps::PageGapObservation;
 mod lifecycle;

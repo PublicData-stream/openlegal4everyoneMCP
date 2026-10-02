@@ -5,7 +5,7 @@ use crate::{
 };
 use openlegal_adapters::{
     blob::FsBlobStore,
-    corpus::{CorpusRuntimeLease, PageGapObservation, PgCorpusStore},
+    corpus::{CollectionLaunch, CorpusRuntimeLease, PageGapObservation, PgCorpusStore},
     corpus_search::CorpusSearch,
     korean_analysis::KoreanAnalyzer,
     law_go_kr::{InventoryItem, InventoryPage, LawClient, RequestBudgetMode},
@@ -38,6 +38,13 @@ pub struct CorpusRuntime {
     pilot_candidates: Vec<InventoryItem>,
     inventory_verified: Arc<std::sync::atomic::AtomicBool>,
 }
+async fn pilot_watchdog(duration: Duration, cancel: CancellationToken) {
+    tokio::select! {
+        _ = cancel.cancelled() => {},
+        _ = tokio::time::sleep(duration) => cancel.cancel(),
+    }
+}
+
 fn now() -> u64 {
     SystemClock::default().now()
 }
@@ -420,13 +427,15 @@ impl CorpusRuntime {
         id: &str,
         cancel: CancellationToken,
     ) -> Result<(), DatabaseError> {
-        let request = self.store.load_collection_request(id).await?;
+        let launch = self.store.load_collection_launch(id).await?;
         let provider = self
             .provider
             .as_ref()
             .ok_or(DatabaseError::InvalidInput)?
-            .on_demand_client()?;
-        let result = self.collect_explicit(&provider, request, cancel).await;
+            .on_demand_client_with_limit(launch.attempt_limit)?;
+        let result = self
+            .collect_explicit(&provider, &launch, launch.request.clone(), cancel)
+            .await;
         let (status, reason) = match &result {
             Ok(summary) => summary.settlement(),
             Err(DatabaseError::BudgetExhausted | DatabaseError::Capacity) => ("deferred", None),
@@ -461,6 +470,7 @@ impl CorpusRuntime {
     async fn collect_explicit(
         &self,
         provider: &LawClient,
+        launch: &CollectionLaunch,
         request: CollectionRequest,
         cancel: CancellationToken,
     ) -> Result<ExplicitCollectionSummary, DatabaseError> {
@@ -481,7 +491,7 @@ impl CorpusRuntime {
                 summary.observe_page(&page);
                 let item = select_explicit_object(page, &object)?;
                 summary.observe_item(
-                    self.collect_explicit_item(provider, item, list_started_at, cancel)
+                    self.collect_explicit_item(provider, launch, item, list_started_at, cancel)
                         .await?,
                 );
             }
@@ -503,7 +513,7 @@ impl CorpusRuntime {
                 }
                 let item = select_precedent_case(&pages, &case_number, expected_id.as_deref())?;
                 summary.observe_item(
-                    self.collect_explicit_item(provider, item, list_started_at, cancel)
+                    self.collect_explicit_item(provider, launch, item, list_started_at, cancel)
                         .await?,
                 );
             }
@@ -561,6 +571,7 @@ impl CorpusRuntime {
                             match self
                                 .collect_explicit_item(
                                     provider,
+                                    launch,
                                     item,
                                     list_started_at,
                                     cancel.clone(),
@@ -588,6 +599,7 @@ impl CorpusRuntime {
     async fn collect_explicit_item(
         &self,
         provider: &LawClient,
+        launch: &CollectionLaunch,
         item: InventoryItem,
         list_started_at: u64,
         cancel: CancellationToken,
@@ -645,7 +657,7 @@ impl CorpusRuntime {
         }
         let queued = self
             .store
-            .enqueue_job_with_metadata_fenced(
+            .enqueue_job_for_collection_request(
                 item.object.clone(),
                 item.revision_id.clone(),
                 item.effective_date.clone(),
@@ -654,6 +666,7 @@ impl CorpusRuntime {
                 now(),
                 metadata,
                 Some(observed.version),
+                launch,
             )
             .await?;
         if queued
@@ -666,17 +679,27 @@ impl CorpusRuntime {
                 CollectionSkipReason::AlreadyInProgress,
             ));
         }
+        if !self
+            .store
+            .adopt_explicit_job(&queued.id, &launch.id, launch.recovery_at(), now())
+            .await?
+        {
+            return Ok(CollectionItemOutcome::Skipped(
+                CollectionSkipReason::AlreadyInProgress,
+            ));
+        }
         let Some(job) = self
             .store
-            .claim_explicit_job(
+            .claim_explicit_job_for_request(
                 &queued.id,
+                &launch.id,
                 now(),
                 self.detail_timeout_secs.saturating_add(120).max(600),
             )
             .await?
         else {
             self.store
-                .release_unclaimed_explicit_job(&queued.id)
+                .release_unclaimed_explicit_job_for_request(&queued.id, &launch.id)
                 .await?;
             return Err(DatabaseError::Capacity);
         };
@@ -1008,6 +1031,19 @@ impl CorpusRuntime {
         let mut tasks = tokio::task::JoinSet::new();
         if self.provider.is_some() {
             let ingestion = child.child_token();
+            if self.ingestion_mode == Some(IngestionMode::Pilot) {
+                let duration = self
+                    .provider
+                    .as_ref()
+                    .ok_or(DatabaseError::InvalidInput)?
+                    .begin_pilot()
+                    .await?;
+                let watchdog = ingestion.clone();
+                tasks.spawn(async move {
+                    pilot_watchdog(duration, watchdog).await;
+                    Ok::<(), DatabaseError>(())
+                });
+            }
             let runtime = self.clone();
             let token = ingestion.clone();
             tasks.spawn(async move {
@@ -1492,13 +1528,13 @@ impl CorpusRuntime {
     }
     /// Select a few identities from each documented list family. The pilot
     /// never certifies inventory completeness or walks historical catalogs.
-    /// The shared PostgreSQL request ledger enforces 100 attempts in 30 minutes.
+    /// The durable ledger returns the remaining operator-selected pilot window.
     async fn ingest_pilot(
         &self,
         provider: &LawClient,
         cancel: CancellationToken,
     ) -> Result<(), DatabaseError> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1800);
+        let deadline = tokio::time::Instant::now() + provider.begin_pilot().await?;
         self.inventory_verified
             .store(false, std::sync::atomic::Ordering::Release);
         let mut list_failures = 0usize;
@@ -2161,6 +2197,25 @@ mod manual_pilot_tests {
             rejected_rows: usize::from(incomplete),
             incomplete,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pilot_window_cancels_inventory_and_detail_workers_together() {
+        let shared = tokio_util::sync::CancellationToken::new();
+        let inventory = shared.child_token();
+        let detail = shared.child_token();
+        let watchdog = tokio::spawn(super::pilot_watchdog(
+            std::time::Duration::from_secs(60),
+            shared,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        assert!(!inventory.is_cancelled());
+        assert!(!detail.is_cancelled());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        watchdog.await.unwrap();
+        assert!(inventory.is_cancelled());
+        assert!(detail.is_cancelled());
     }
 
     #[test]

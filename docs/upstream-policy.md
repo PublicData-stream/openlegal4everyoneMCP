@@ -107,7 +107,8 @@ traffic. `database.request_collection` is an explicit mutation that stores one
 coalesced request for a dedicated collection Job Pod; `database.collection_status`
 only reads its state. The scheduler and request Jobs share provider spacing and
 single-call admission. Operator configuration selects independent continuous and
-explicit daily caps and a minimum request interval. Defaults are 1,000 reserved
+explicit daily caps, each accepting a positive limit or `"unlimited"`, and shared
+request pacing. These are UTC calendar-day caps, not rolling 24-hour windows. Defaults are 1,000 reserved
 attempts per UTC day for each mode and a five-second minimum interval. The
 ingestion template selects 50,000 continuous and 1,000 explicit attempts with a
 one-second minimum interval and a five-minute scan-cycle wait. This is operator
@@ -116,12 +117,38 @@ the same durable policy and charged counters, including after restarts. Increasi
 an exhausted budget may advance only budget-wait leases; it must preserve existing
 Retry-After pauses, suspension and unresolved-response evidence. Lowering a cap
 retains already charged attempts and blocks further admission until allowance
-exists. The scan interval is independent of legal-data freshness and gap retries.
+exists. Unlimited admission continues recording attempts, so returning to a finite
+cap cannot discard prior usage. The scan interval is independent of legal-data freshness and gap retries.
 The scheduler marks an explicit request failed when its Kubernetes Job reports a
 terminal failure, including failure before the request Pod can open storage.
 Transient storage admission contention is retried only during collection Pod
 startup, before any provider request is made. An uncertain Job creation outcome
 remains fenced until it can be reconciled or its lease expires.
+
+LAW accepts `requests_per_second = 1..1000` instead of an explicitly selected
+`min_interval_secs`; specifying both is invalid. Requests remain single-flight,
+with start spacing rounded up to milliseconds. This is an upper bound, not a
+throughput guarantee. Daily exhaustion never clears a provider pause.
+
+Synthetic retrieval has its own `[demo.provider_requests]` policy. Its daily cap
+defaults to `"unlimited"` and its rate defaults to two starts per second with burst
+two and concurrency two. Layouts belonging to the same provider share this policy;
+unrelated providers and origins do not. Persistent mode reserves daily attempts
+in a PostgreSQL ledger keyed by provider and origin namespace, including attempts
+under an unlimited cap. Memory mode counts only within the process and resets on
+reconstruction. A cache hit does not reserve an attempt; every fetch and retry
+reserves before DNS. Admission storage failure prevents the fetch and never falls
+back to memory accounting. Quota exhaustion returns a non-retryable local admission
+error through the existing MCP `rate_limited` contract.
+
+Optional attempt caps do not disable finite deadlines or retry budgets. LAW pilot
+and explicit-operation caps default to 100 and 32 respectively; each also accepts
+`"unlimited"`. Pilot and explicit timeouts default to 1800 and 7200 seconds, with
+60..86400 supported. LAW `max_job_attempts` defaults to three total processing
+executions, including the first; its HTTP transport does not add retries. Demo
+`max_attempts` defaults to two total fetches. Both maxima accept 1..10. Scheduled
+collection-gap cycles remain distinct future work, not inline retry loops.
+
 
 Negative-cache confirmed absence or valid empty searches only when the provider's
 meaning is understood and a bounded lifetime is defined. Never turn authentication

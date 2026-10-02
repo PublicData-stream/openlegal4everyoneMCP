@@ -5,7 +5,7 @@ use crate::persistence::{
 };
 use openlegal_domain::history::{SnapshotEnvelope, SnapshotPage, valid_snapshot_id};
 
-const RESOLUTION_DEADLINE: Duration = Duration::from_secs(20);
+const STORAGE_RESOLUTION_MARGIN_SECS: u64 = 10;
 
 impl RetrievalService {
     pub fn history_enabled(&self) -> bool {
@@ -216,7 +216,7 @@ impl RetrievalService {
                 Err(RetrievalError::Cancelled)
             },
             result = &mut work => result,
-            _ = tokio::time::sleep(RESOLUTION_DEADLINE) => {
+            _ = tokio::time::sleep(Duration::from_secs(provider.policy.refresh_timeout_secs + STORAGE_RESOLUTION_MARGIN_SECS)) => {
                 cancellation.cancel();
                 let _ = work.await;
                 Err(RetrievalError::StorageUnavailable)
@@ -276,7 +276,7 @@ impl RetrievalService {
         let candidate = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(RetrievalError::Cancelled),
-            result = tokio::time::timeout(REFRESH_DEADLINE, self.refresh(source, provider, query, cancellation, generation)) => {
+            result = tokio::time::timeout(Duration::from_secs(provider.policy.refresh_timeout_secs), self.refresh(source, provider, query, cancellation, generation)) => {
                 result.unwrap_or(Err(RetrievalError::Unavailable))?
             }
         };

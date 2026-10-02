@@ -394,18 +394,65 @@ a later comparable date and that HEAD has not changed since the list began.
 Equal or missing dates are skipped conservatively.
 No public arbitrary URL, SQL, filesystem search, or direct corpus mutation tool is registered.
 Operator ingestion configuration is a separate startup decision.
-`[database.ingestion.provider_requests]` sets shared, durable upstream admission
-policy through `continuous_daily_limit`, `on_demand_daily_limit` and
-`min_interval_secs`; defaults are 1,000, 1,000 and 5 respectively. Daily limits
-accept 1–1,000,000 attempts and spacing accepts 1–3,600 seconds. The optional
-collector template selects 50,000 automatic attempts and 1,000 explicit attempts
-per UTC day, with one-second minimum spacing. This is an operator request budget,
-not a provider quota assertion. Changing the settings retains charged requests
-and safety pauses. `database.ingestion.scan_interval_secs` controls only the delay
-between completed continuous inventory passes (default 3,600, range 60–86,400);
-the collector template selects 300 seconds. Freshness and gap retry eligibility
-keep their existing periods. These controls are separate from public MCP tool
-calling and transport capacity limits.
+`[database.ingestion.provider_requests]` selects shared durable LAW admission.
+`continuous_daily_limit` and `on_demand_daily_limit` each accept 1..1,000,000 or
+`"unlimited"`, defaulting to 1,000. Usage resets at UTC midnight. Unlimited usage
+is still charged; configuration changes preserve counts and safety pauses.
+
+Use `requests_per_second` (1..1,000) for evenly paced starts, or the existing
+`min_interval_secs` (1..3,600). Explicitly specifying both fails validation.
+Omitting both keeps five-second spacing. LAW permits one outstanding request;
+rate configuration does not increase concurrency. The committed collector example
+keeps 50,000/1,000 daily attempts, one-second spacing and 300-second scan waits.
+
+| LAW policy field | Default | Accepted values |
+| --- | --- | --- |
+| `pilot_attempt_limit` | 100 | 1..1,000,000 or `"unlimited"` |
+| `on_demand_attempt_limit` | 32 | 1..1,000,000 or `"unlimited"` |
+| `pilot_timeout_secs` | 1800 | 60..86400 |
+| `on_demand_timeout_secs` | 7200 | 60..86400 |
+| `max_job_attempts` | 3 | 1..10 total Job executions |
+
+Pilot start/window evidence survives restarts. Explicit operations snapshot their
+limits when launched, so configuration changes do not shorten an active deadline.
+Shared provider admission still honors current daily/rate policy and safety pauses.
+The existing `detail_timeout_secs`, network and document-worker bounds are separate.
+`scan_interval_secs` controls the delay after a completed inventory pass, not
+freshness or collection-gap retry eligibility.
+
+`[demo.provider_requests]` configures the synthetic upstream independently:
+
+| Demo policy field | Default | Accepted values |
+| --- | --- | --- |
+| `daily_limit` | `"unlimited"` | 1..1,000,000 or `"unlimited"` |
+| `requests_per_second` | 2 | 1..1000, burst 2 |
+| `max_attempts` | 2 | 1..10 total fetches |
+| `attempt_timeout_secs` | 5 | 1..60 |
+| `refresh_timeout_secs` | 10 | 1..300, at least the attempt timeout |
+
+Demo concurrency remains two. Persistent daily usage survives restart in a
+provider/origin ledger; memory daily usage is process-local. Both layouts share
+one synthetic provider budget. All retries are charged; cache hits are free.
+
+For admission governed only by request rate and finite execution deadlines:
+
+```toml
+[database.ingestion.provider_requests]
+continuous_daily_limit = "unlimited"
+on_demand_daily_limit = "unlimited"
+requests_per_second = 10
+pilot_attempt_limit = "unlimited"
+on_demand_attempt_limit = "unlimited"
+
+[demo.provider_requests]
+daily_limit = "unlimited"
+requests_per_second = 20
+```
+
+Remove an explicit `min_interval_secs` before using the new LAW rate field. Zero,
+negative, out-of-range and unknown values are invalid. These provider policies
+are separate from public MCP calling and transport limits.
+
 The [optional Kubernetes ingestion overlay](deployment-kubernetes.md#optional-ingestion-integration)
 uses a separate scheduler and request Job Pods with explicit kubeconfig/context
 and projected tokens. The serving Pod has no provider credential. See the

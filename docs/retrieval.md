@@ -40,12 +40,23 @@ quotas. A real source must choose and review its own policy before onboarding.
 | Memory cache | 256 entries or 32 MiB, including retained source bodies |
 | L1 evidence retention | Evict source and processed data together after 300 seconds or LRU pressure; optional L2 retention is separate |
 | Provider concurrency | Two requests |
-| Request starts | Two per second, burst two; all retries included |
-| Refresh deadline | Ten seconds total; five seconds per attempt; at most two attempts |
+| Request starts | Two per second by default, burst two; all retries included |
+| Refresh deadline | Defaults: ten seconds total, five per attempt, two total attempts |
 | Shared work | 32 distinct refreshes, 16 waiters per key, 64 waiters overall |
 | Upstream body | 1 MiB; compression and redirects unsupported |
 | Processed output | 64 KiB, with construction-time parser/work bounds |
 | Search | Zero-based pages, page size 1–20 (default five), query at most 256 UTF-8 bytes |
+
+`[demo.provider_requests]` can select an independent `daily_limit` (positive
+1..1,000,000 or `"unlimited"`, the default), `requests_per_second` (1..1000),
+`max_attempts` (1..10 including the first), `attempt_timeout_secs` (1..60), and
+`refresh_timeout_secs` (1..300 and no shorter than one attempt). See the
+[server contract](server.md) for the complete configuration. Rate keeps burst two
+and concurrency two. Persistent daily accounting is shared by provider/origin and
+survives restarts; memory accounting resets with the service. Token buckets,
+cooldowns and coalescing retain their existing single-backend coordination scope.
+Quota exhaustion does not trigger retries. Storage admission failure cannot send
+an uncharged request or fall back to an in-memory ledger.
 
 Admission overflow fails promptly. An admitted refresh may wait for its provider
 rate token only within its deadline. A bounded provider cooldown honors

@@ -2,6 +2,7 @@
 mod data;
 mod maintenance;
 mod publication;
+mod request_budget;
 #[cfg(test)]
 mod tests;
 
@@ -233,6 +234,13 @@ fn migrator() -> Migrator {
             "provider request policy".into(),
             MigrationType::Simple,
             include_str!("../migrations/0012_provider_request_policy.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            13,
+            "provider request options".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0013_provider_request_options.sql").into_sql_str(),
             false,
         ),
     ]);

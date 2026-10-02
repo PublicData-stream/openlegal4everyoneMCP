@@ -58,6 +58,11 @@ uses `[demo.proxy].url_env`. See [upstream routing policy](docs/upstream-policy.
 and the [collection deployment guide](docs/deployment-kubernetes.md#per-upstream-socks5-routing)
 for DNS pinning, secret injection and egress configuration.
 
+Each upstream has independent request settings. LAW daily and per-operation caps
+can explicitly select `"unlimited"`; its shared rate supports `requests_per_second`.
+Synthetic demo has its own daily/rate/time/retry settings. Existing defaults remain
+unchanged; see [provider request configuration](docs/server.md).
+
 Install the pinned Rust toolchain, prepare the configuration and TLS certificate
 paths from the [server guide](docs/server.md), then run:
 

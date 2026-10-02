@@ -10,6 +10,7 @@ pub mod legal_reference;
 pub mod persistence;
 mod service;
 pub mod text_diff;
+pub mod upstream_policy;
 pub use service::{CacheKey, CacheStore, MetricsSnapshot, RetrievalService, StoredPayload};
 
 use futures::future::BoxFuture;

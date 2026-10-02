@@ -103,6 +103,7 @@ configuration. Do not point the blob adapter at an old cache directory.
 | `cache_head` | Current compatible snapshot and mutable successful validation state, separated by query/processor/schema |
 | `cache_storage` | Bounded global snapshot/query/reference-byte accounting |
 | `blob_deletion` | Durable queue of retired physical blob generations awaiting idempotent deletion |
+| `upstream_daily_budget` | Provider/origin daily reservations, optional finite caps and retained charged counts |
 
 Relational entity primary keys default to PostgreSQL 18's native `uuidv7()`.
 Snapshot UUIDs identify occurrences; source SHA-256 identifies content. The public
@@ -309,3 +310,17 @@ revisions, exact history and comparison origins. Widget unit/browser tests prese
 client contract validation. See [contributor checks](../CONTRIBUTING.md#testing-and-ci)
 and [review evidence](persistence-review.md). No legal provider or live ChatGPT
 acceptance is implied by these synthetic checks.
+
+
+## Request-policy schema upgrade
+
+Migration 0013 adds nullable unlimited LAW caps, bigint charged usage, millisecond
+pacing, operation snapshots and configurable finite Job attempts, plus the
+synthetic provider/origin daily ledger. Migrations 0001..0012 remain immutable.
+Apply the matching binary's migration with ingestion stopped, then upgrade serving,
+scheduler and request Jobs together. Mixed old/new binaries are unsupported.
+Preserve usage, pilot start, pauses, unresolved responses and active claim evidence;
+changing policy never resets them. Rollback requires the coordinated pre-migration
+snapshot and its matching binaries, not running an older executable against the
+new schema. This migration does not alter retained legal identity or rebuild the
+search index.

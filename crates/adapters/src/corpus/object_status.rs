@@ -160,14 +160,14 @@ impl PgCorpusStore {
                 reason: "provider_paused".into(),
             });
         }
-        let used: i32 = budget
+        let used: i64 = budget
             .try_get(if origin.as_deref() == Some("explicit") {
                 "on_demand_used"
             } else {
                 "daily_used"
             })
             .map_err(db)?;
-        let limit: i32 = budget
+        let limit: Option<i32> = budget
             .try_get(if origin.as_deref() == Some("explicit") {
                 "on_demand_daily_limit"
             } else {
@@ -175,7 +175,7 @@ impl PgCorpusStore {
             })
             .map_err(db)?;
         if budget.try_get::<i64, _>("utc_day").map_err(db)? == (now / 86_400) as i64
-            && used >= limit
+            && limit.is_some_and(|limit| used >= i64::from(limit))
         {
             return Ok(ObjectCompletionEta::Unknown {
                 reason: "provider_budget_exhausted".into(),

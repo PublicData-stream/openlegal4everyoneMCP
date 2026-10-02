@@ -179,8 +179,11 @@ These are application choices, not claimed upstream service guarantees:
 - `mode = "pilot"` queues up to two revision-only manual candidates and two
   live current-list HEAD candidates for each of the nine public categories,
   scanning at most five live list pages per category. It stops upstream work
-  after 30 minutes. The durable PostgreSQL ledger admits at most 100 attempts
-  in this pilot, including list, detail and attachment requests. Pilot state
+  after 30 minutes by default. The durable PostgreSQL ledger defaults to at most
+  100 attempts in this pilot, including list, detail and attachment requests.
+  `pilot_attempt_limit` accepts a positive number or `"unlimited"`, and
+  `pilot_timeout_secs` accepts 60..86400 seconds. The pilot start/window snapshot
+  is retained, and expiration cancels inventory and detail work together. Pilot state
   is intentionally not reset on restart.
   Manual candidates contribute identity hints only; descriptive metadata for
   a public HEAD must come from a fresh live current-list observation.
@@ -219,9 +222,13 @@ These are application choices, not claimed upstream service guarantees:
 - Admission allows one fetch at a time and reserves an attempt before DNS.
   `[database.ingestion.provider_requests]` configures independent
   `continuous_daily_limit` and `on_demand_daily_limit` budgets and their shared
-  `min_interval_secs` spacing, persisted in PostgreSQL across restarts. Omitted
+  spacing, persisted in PostgreSQL across restarts. Select `requests_per_second`
+  (1..1000, evenly paced and rounded up to milliseconds) or the legacy
+  `min_interval_secs`; specifying both is invalid. Omitted
   settings default to 1,000 attempts per UTC day for each budget and five seconds
-  between attempts. Daily limits accept 1–1,000,000 attempts and minimum spacing
+  between attempts. Daily limits accept 1–1,000,000 attempts or `"unlimited"`;
+  unlimited attempts remain charged. These are UTC calendar-day limits, not
+  rolling 24-hour windows. Minimum spacing
   accepts 1–3,600 seconds. The active collection template selects 50,000 automatic
   attempts, 1,000 explicit on-demand attempts and one-second minimum spacing,
   for an aggregate daily admission ceiling of 51,000 attempts. List, detail,
@@ -250,10 +257,20 @@ These are application choices, not claimed upstream service guarantees:
   provider requests. HTTP 429/503 retain their durable pause. Cancellation
   remains cancellation. Transient sandbox
   unavailability and timeouts remain retryable processing states.
-- The queue holds at most 128 active jobs, with at most three attempts and fenced
+- The queue holds at most 128 active jobs, with three total attempts by default
+  (`max_job_attempts` accepts 1..10, including the first execution) and fenced
   claims. A publication accepts at most 100 MiB combined source bytes and 64
   attachments; extracted/OCR text is limited to 16 MiB. Raw corpus, historical
   and staging accounting have separate limits of 480 GiB, 64 GiB and 16 GiB.
+
+On-demand operations default to 32 admission attempts and 7200 seconds.
+`on_demand_attempt_limit` accepts 1..1,000,000 or `"unlimited"` and
+`on_demand_timeout_secs` accepts 60..86400. Limits are snapshotted at launch;
+client clones share the finite local counter, while unrelated operations do not.
+A finite local debit retains the existing conservative ordering before durable
+reservation. Uncertain reservation or cancellation does not automatically refund
+it. Increasing a processing retry limit never silently revives terminal failures;
+scheduled collection-gap cycles remain distinct from inline HTTP retries.
 
 Manual list XML exports can select pilot candidates, but are not provider
 detail evidence or proof of complete inventories. The September 2026 appeal

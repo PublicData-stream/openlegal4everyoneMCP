@@ -188,8 +188,9 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
             }
             Command::CollectionJob(id) => {
                 let id = id.clone();
+                let launch = runtime.store.load_collection_launch(&id).await?;
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(7200),
+                    std::time::Duration::from_secs(launch.remaining_secs(launch.observed_at)),
                     runtime.execute_collection_request(&id, cancel.clone()),
                 )
                 .await
@@ -201,7 +202,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                             .store
                             .settle_collection_request(&id, "failed")
                             .await?;
-                        Err("collection request exceeded two hours".into())
+                        Err("collection request exceeded its operation deadline".into())
                     }
                 }
             }
@@ -316,18 +317,23 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
             registry.register_module(openlegal_server::legal_analysis::LegalAnalysisTools { lookup })?;
             corpus_runtime = Some(runtime);
         }
-        let demo_service = config
+        let demo_options = config
             .demo
             .as_ref()
             .map(|demo| -> Result<_, openlegal_server::ServerError> {
                 let proxy = demo.proxy.as_ref().map(|proxy| proxy.load()).transpose()?;
-                if let Some(store) = &persistent {
-                    Ok(openlegal_server::demo::service_with_store_and_proxy(&demo.upstream, store.clone(), proxy)?)
-                } else {
-                    Ok(openlegal_server::demo::service_with_proxy(&demo.upstream, proxy)?)
-                }
+                let policy = demo.provider_requests.policy()?;
+                Ok((proxy, policy))
             })
             .transpose()?;
+        let demo_service = if let Some((proxy, policy)) = demo_options {
+            let demo = config.demo.as_ref().ok_or("missing demo configuration")?;
+            Some(if let Some(store) = &persistent {
+                openlegal_server::demo::service_with_store_proxy_and_policy(&demo.upstream, store.clone(), proxy, policy, store.clone()).await?
+            } else {
+                openlegal_server::demo::service_with_proxy_and_policy(&demo.upstream, proxy, policy)?
+            })
+        } else { None };
         if let Some(service) = &demo_service {
             registry.register_module(openlegal_server::demo::DemoTools {
                 service: service.clone(),
@@ -505,16 +511,20 @@ async fn run_collection_scheduler(
             }
             store.reap_stale_collection_requests().await?;
             reconcile_failed_collection_jobs(&store, ingestion).await?;
-            let Some((id, _request)) = store.claim_collection_request().await? else {
+            let policy = ingestion.provider_requests.limits()?;
+            let Some(launch) = store
+                .claim_collection_request_with_policy(
+                    policy.on_demand_timeout_secs,
+                    policy.on_demand_attempt_limit,
+                )
+                .await?
+            else {
                 tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
                 continue;
             };
+            let id = launch.id.clone();
             let name = format!("openlegal-request-{}", id.replace('-', ""));
-            let mut job = template.clone();
-            job["metadata"]["name"] = name.clone().into();
-            job["metadata"]["namespace"] = ingestion.collection_namespace.clone().into();
-            job["spec"]["template"]["spec"]["containers"][0]["args"] =
-                serde_json::json!(["--collection-job", id, "/etc/openlegal/server.toml"]);
+            let job = render_collection_job(&template, &launch, &ingestion.collection_namespace)?;
             let bytes = serde_json::to_vec(&job)?;
             let mut child = tokio::process::Command::new(&ingestion.kubectl)
                 .args([
@@ -561,6 +571,43 @@ async fn run_collection_scheduler(
         }
     };
     tokio::select! { result = heartbeat => result, result = dispatch => result }
+}
+
+fn render_collection_job(
+    template: &serde_json::Value,
+    launch: &openlegal_adapters::corpus::CollectionLaunch,
+    namespace: &str,
+) -> Result<serde_json::Value, ServerError> {
+    if template
+        .pointer("/spec/activeDeadlineSeconds")
+        .and_then(serde_json::Value::as_u64)
+        != Some(7500)
+        || template
+            .pointer("/spec/template/spec/containers")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|items| items.len() != 1)
+        || !(60..=86400).contains(&launch.timeout_secs)
+    {
+        return Err("invalid collection Job template or operation deadline".into());
+    }
+    if launch.id.len() != 36
+        || !launch.id.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err("invalid collection request identifier".into());
+    }
+    let mut job = template.clone();
+    job["spec"]["activeDeadlineSeconds"] = launch.job_deadline_secs().into();
+    job["metadata"]["name"] = format!("openlegal-request-{}", launch.id.replace('-', "")).into();
+    job["metadata"]["namespace"] = namespace.into();
+    job["spec"]["template"]["spec"]["containers"][0]["args"] =
+        serde_json::json!(["--collection-job", launch.id, "/etc/openlegal/server.toml"]);
+    Ok(job)
 }
 
 fn collection_job_failed(job: &serde_json::Value, name: &str) -> bool {
@@ -664,6 +711,58 @@ mod tests {
         pending["status"]["conditions"][0]["type"] = "Complete".into();
         pending["status"]["conditions"][0]["status"] = "True".into();
         assert!(!collection_job_failed(&pending, "openlegal-request-test"));
+    }
+    #[test]
+    fn collection_job_rendering_uses_captured_operation_deadline_with_default_template() {
+        use openlegal_domain::{
+            collection::{CollectionRequest, CollectionTarget},
+            legal::{Dataset, ObjectId},
+        };
+        let template: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../deploy/kubernetes/ingestion/collection-job.json"
+        ))
+        .unwrap();
+        let mut launch = openlegal_adapters::corpus::CollectionLaunch {
+            id: "00000000-0000-4000-8000-000000000001".into(),
+            request: CollectionRequest {
+                target: CollectionTarget::Object {
+                    object: ObjectId {
+                        jurisdiction: "kr".into(),
+                        provider: "law_go_kr".into(),
+                        dataset: Dataset::NationalStatute,
+                        id: "001".into(),
+                    },
+                },
+            },
+            timeout_secs: 7200,
+            attempt_limit: openlegal_application::upstream_policy::RequestLimit::Limited(32),
+            launched_at: 100,
+            observed_at: 100,
+        };
+        for (seconds, deadline) in [(60, 360), (7200, 7500), (86400, 86700)] {
+            launch.timeout_secs = seconds;
+            let rendered = render_collection_job(&template, &launch, "openlegal-serving").unwrap();
+            assert_eq!(rendered["spec"]["activeDeadlineSeconds"], deadline);
+            assert_eq!(
+                rendered["metadata"]["name"],
+                "openlegal-request-00000000000040008000000000000001"
+            );
+            assert_eq!(
+                rendered["spec"]["template"]["spec"]["securityContext"],
+                template["spec"]["template"]["spec"]["securityContext"]
+            );
+            assert_eq!(
+                rendered["spec"]["template"]["spec"]["volumes"],
+                template["spec"]["template"]["spec"]["volumes"]
+            );
+        }
+        assert_eq!(template["spec"]["activeDeadlineSeconds"], 7500);
+        launch.timeout_secs = 86401;
+        assert!(render_collection_job(&template, &launch, "openlegal-serving").is_err());
+        launch.timeout_secs = 60;
+        let mut unsafe_template = template.clone();
+        unsafe_template["spec"]["activeDeadlineSeconds"] = 0.into();
+        assert!(render_collection_job(&unsafe_template, &launch, "openlegal-serving").is_err());
     }
     #[derive(Clone)]
     struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

@@ -169,11 +169,18 @@ impl PgCorpusStore {
             .bind(detail_key(&object_key, revision)).fetch_one(&self.pool).await.map_err(db)
     }
     pub async fn requeue_due_details(&self, now: u64) -> Result<u64, DatabaseError> {
+        self.gate().await?;
         let mut tx = self.pool.begin().await.map_err(db)?;
+        // Match enqueue/adoption/claim lock order before touching any job or gap.
+        // This also keeps queue-capacity accounting serialized with new work.
+        sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
         // An isolated request Pod may disappear after enqueue or claim. After
         // its deadline (or the claim lease) the continuous worker may safely
         // adopt the stranded job without issuing a duplicate provider call.
-        sqlx::query("UPDATE openlegal.corpus_job SET source_metadata=source_metadata - 'collection_origin' WHERE source_metadata->>'collection_origin'='explicit' AND ((status='pending' AND created_at<=$1::text::numeric-8100) OR (status='running' AND lease_until<=$1::text::numeric))")
+        sqlx::query("UPDATE openlegal.corpus_job j SET source_metadata=source_metadata - 'collection_origin',explicit_request_id=NULL,explicit_recovery_at=NULL WHERE source_metadata->>'collection_origin'='explicit' AND (j.status='pending' OR (j.status='running' AND j.lease_until<=$1::text::numeric)) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>$1::text::numeric) AND ((j.explicit_request_id IS NULL AND COALESCE(j.explicit_recovery_at,j.created_at::bigint+8100)<=$1::bigint) OR (j.explicit_request_id IS NOT NULL AND j.explicit_recovery_at<=$1::bigint AND NOT EXISTS(SELECT 1 FROM openlegal.collection_request owner WHERE owner.id=j.explicit_request_id AND owner.status IN ('launching','running') AND owner.lease_until>$1::bigint)))")
             .bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("DELETE FROM openlegal.provider_collection_gap WHERE resolved_at IS NOT NULL AND resolved_at<$1")
             .bind(now.saturating_sub(30*86400) as i64).execute(&mut *tx).await.map_err(db)?;
@@ -184,12 +191,12 @@ impl PgCorpusStore {
         .await
         .map_err(db)?;
         let available = (128i64 - queued).clamp(0, 16);
-        let rows = sqlx::query("SELECT g.gap_key,j.id FROM openlegal.provider_collection_gap g JOIN openlegal.corpus_job j ON j.object_key=g.object_key AND j.revision_id=g.revision_id JOIN openlegal.corpus_object o ON o.object_key=j.object_key WHERE g.scope='detail' AND g.resolved_at IS NULL AND g.retry_at<=$1 AND j.status IN ('failed','done') AND (NOT j.install_head OR o.desired_head_revision=j.revision_id) ORDER BY g.retry_at LIMIT $2 FOR UPDATE OF g SKIP LOCKED")
+        let rows = sqlx::query("SELECT g.gap_key,j.id FROM openlegal.provider_collection_gap g JOIN openlegal.corpus_job j ON j.object_key=g.object_key AND j.revision_id=g.revision_id JOIN openlegal.corpus_object o ON o.object_key=j.object_key WHERE g.scope='detail' AND g.resolved_at IS NULL AND g.retry_at<=$1 AND j.status IN ('failed','done') AND (NOT j.install_head OR o.desired_head_revision=j.revision_id) AND (COALESCE(j.source_metadata->>'collection_origin','')<>'explicit' OR COALESCE(j.explicit_recovery_at,j.created_at::bigint+8100)<=$1) AND (j.explicit_request_id IS NULL OR (j.explicit_recovery_at<=$1 AND NOT EXISTS(SELECT 1 FROM openlegal.collection_request owner WHERE owner.id=j.explicit_request_id AND owner.status IN ('launching','running') AND owner.lease_until>$1))) ORDER BY g.retry_at LIMIT $2 FOR UPDATE OF g,j SKIP LOCKED")
             .bind(now as i64).bind(available).fetch_all(&mut *tx).await.map_err(db)?;
         for row in &rows {
             let id: uuid::Uuid = row.try_get("id").map_err(db)?;
             let gap: String = row.try_get("gap_key").map_err(db)?;
-            sqlx::query("UPDATE openlegal.corpus_job SET status='pending',attempts=0,lease_until=NULL,error_category=NULL,started_at=NULL,completed_at=NULL,source_metadata=source_metadata - 'collection_origin' WHERE id=$1")
+            sqlx::query("UPDATE openlegal.corpus_job SET status='pending',attempts=0,lease_until=NULL,error_category=NULL,started_at=NULL,completed_at=NULL,source_metadata=source_metadata - 'collection_origin',explicit_request_id=NULL,explicit_recovery_at=NULL WHERE id=$1")
                 .bind(id).execute(&mut *tx).await.map_err(db)?;
             sqlx::query(
                 "UPDATE openlegal.provider_collection_gap SET retry_at=$2 WHERE gap_key=$1",

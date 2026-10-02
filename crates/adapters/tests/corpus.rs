@@ -263,8 +263,9 @@ async fn explicit_detail_job_is_fenced_and_incomplete_capture_retries_without_fr
         .await
         .unwrap();
     assert!(store.detail_gap_active(&object(), "r1").await.unwrap());
-    assert_eq!(store.requeue_due_details(3702).await.unwrap(), 1);
-    let retry = store.claim_job(3703).await.unwrap().unwrap();
+    assert_eq!(store.requeue_due_details(3702).await.unwrap(), 0);
+    assert_eq!(store.requeue_due_details(8200).await.unwrap(), 1);
+    let retry = store.claim_job(8201).await.unwrap().unwrap();
     let same = store
         .publish(
             Publication {
@@ -272,8 +273,8 @@ async fn explicit_detail_job_is_fenced_and_incomplete_capture_retries_without_fr
                 raw: b"partial body".to_vec(),
                 additional_evidence: vec![],
                 processor_version: "fixture_v1".into(),
-                retrieved_at: 3703,
-                now: 3703,
+                retrieved_at: 8201,
+                now: 8201,
                 expected_version: retry.expected_version,
                 install_head: true,
                 job_id: Some(retry.id),
@@ -463,7 +464,7 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
     LawClient::reserve_provider_request_budget(&pool, &mode, &token())
         .await
         .unwrap();
-    let counts: (i32, i32) = sqlx::query_as(
+    let counts: (i64, i64) = sqlx::query_as(
         "SELECT daily_used,pilot_used FROM openlegal.provider_request_budget WHERE singleton",
     )
     .fetch_one(&pool)
@@ -480,7 +481,7 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
         LawClient::reserve_provider_request_budget(&pool, &mode, &token()).await,
         Err(DatabaseError::BudgetExhausted)
     );
-    let paused: (i32, i32) = sqlx::query_as(
+    let paused: (i64, i64) = sqlx::query_as(
         "SELECT daily_used,pilot_used FROM openlegal.provider_request_budget WHERE singleton",
     )
     .fetch_one(&pool)
@@ -510,7 +511,7 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
         LawClient::reserve_provider_request_budget(&pool, &mode, &token()).await,
         Err(DatabaseError::BudgetExhausted)
     );
-    let counts: (i32, i32) = sqlx::query_as(
+    let counts: (i64, i64) = sqlx::query_as(
         "SELECT daily_used,pilot_used FROM openlegal.provider_request_budget WHERE singleton",
     )
     .fetch_one(&pool)
@@ -522,7 +523,7 @@ async fn provider_budget_and_inventory_cursor_are_durable() {
     LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::OnDemand, &token())
         .await
         .unwrap();
-    let counts: (i32, i32) = sqlx::query_as(
+    let counts: (i64, i64) = sqlx::query_as(
         "SELECT daily_used,on_demand_used FROM openlegal.provider_request_budget WHERE singleton",
     )
     .fetch_one(&pool)
@@ -700,7 +701,7 @@ async fn provider_policy_migration_preserves_legacy_attempts_and_extreme_pauses(
     let fixture = support::TestDatabase::new().await;
     let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
     // Recreate the version-11 budget shape in this disposable migrated database.
-    sqlx::raw_sql("ALTER TABLE openlegal.provider_request_budget DROP CONSTRAINT provider_request_budget_daily_used_check, DROP CONSTRAINT provider_request_budget_on_demand_used_check, DROP COLUMN continuous_daily_limit, DROP COLUMN on_demand_daily_limit, DROP COLUMN min_interval_secs, DROP COLUMN next_request_at_ms, ADD CONSTRAINT provider_request_budget_daily_used_check CHECK(daily_used BETWEEN 0 AND 1000), ADD CONSTRAINT provider_request_budget_on_demand_used_check CHECK(on_demand_used BETWEEN 0 AND 1000); UPDATE openlegal.provider_request_budget SET daily_used=1000,on_demand_used=9,pilot_used=78,operator_suspended=true,unresolved_response=true,next_allowed_at=922337203685477580; DELETE FROM public._sqlx_migrations WHERE version=12;")
+    sqlx::raw_sql("DROP TABLE openlegal.upstream_daily_budget; ALTER TABLE openlegal.collection_request DROP COLUMN operation_timeout_secs,DROP COLUMN operation_attempt_limit,DROP COLUMN launched_at; ALTER TABLE openlegal.corpus_job DROP COLUMN explicit_request_id,DROP COLUMN explicit_recovery_at,DROP CONSTRAINT corpus_job_attempts_check,ADD CONSTRAINT corpus_job_attempts_check CHECK(attempts BETWEEN 0 AND 3); ALTER TABLE openlegal.provider_request_budget DROP COLUMN pilot_attempt_limit,DROP COLUMN on_demand_attempt_limit,DROP COLUMN interval_ms,DROP COLUMN pilot_timeout_secs,DROP COLUMN on_demand_timeout_secs,DROP COLUMN pilot_duration_secs,DROP COLUMN max_job_attempts,DROP CONSTRAINT provider_request_budget_pilot_used_check,ALTER COLUMN daily_used TYPE integer,ALTER COLUMN on_demand_used TYPE integer,ALTER COLUMN pilot_used TYPE integer,ADD CONSTRAINT provider_request_budget_pilot_used_check CHECK(pilot_used BETWEEN 0 AND 100); ALTER TABLE openlegal.provider_request_budget DROP CONSTRAINT provider_request_budget_daily_used_check, DROP CONSTRAINT provider_request_budget_on_demand_used_check, DROP COLUMN continuous_daily_limit, DROP COLUMN on_demand_daily_limit, DROP COLUMN min_interval_secs, DROP COLUMN next_request_at_ms, ADD CONSTRAINT provider_request_budget_daily_used_check CHECK(daily_used BETWEEN 0 AND 1000), ADD CONSTRAINT provider_request_budget_on_demand_used_check CHECK(on_demand_used BETWEEN 0 AND 1000); UPDATE openlegal.provider_request_budget SET daily_used=1000,on_demand_used=9,pilot_used=78,operator_suspended=true,unresolved_response=true,next_allowed_at=922337203685477580; DELETE FROM public._sqlx_migrations WHERE version IN (12,13);")
         .execute(&pool).await.unwrap();
     let checksums: Vec<(i64, Vec<u8>)> =
         sqlx::query_as("SELECT version,checksum FROM public._sqlx_migrations ORDER BY version")
@@ -717,7 +718,7 @@ async fn provider_policy_migration_preserves_legacy_attempts_and_extreme_pauses(
     .await
     .unwrap();
     assert_eq!(checksums, after);
-    let ledger: (i32,i32,i32,bool,bool,i64,i64,i32,i32,i32) = sqlx::query_as("SELECT daily_used,on_demand_used,pilot_used,operator_suspended,unresolved_response,next_allowed_at,next_request_at_ms,continuous_daily_limit,on_demand_daily_limit,min_interval_secs FROM openlegal.provider_request_budget WHERE singleton").fetch_one(&pool).await.unwrap();
+    let ledger: (i64,i64,i64,bool,bool,i64,i64,i32,i32,i32) = sqlx::query_as("SELECT daily_used,on_demand_used,pilot_used,operator_suspended,unresolved_response,next_allowed_at,next_request_at_ms,continuous_daily_limit,on_demand_daily_limit,min_interval_secs FROM openlegal.provider_request_budget WHERE singleton").fetch_one(&pool).await.unwrap();
     assert_eq!(
         ledger,
         (
@@ -792,7 +793,7 @@ async fn provider_policy_preserves_counters_spacing_and_independent_caps() {
         second - first >= 1001,
         "durable one-second spacing must survive separate reservations"
     );
-    let counts: (i32, i32) = sqlx::query_as(
+    let counts: (i64, i64) = sqlx::query_as(
         "SELECT daily_used,on_demand_used FROM openlegal.provider_request_budget WHERE singleton",
     )
     .fetch_one(&pool)
@@ -821,7 +822,7 @@ async fn provider_policy_preserves_counters_spacing_and_independent_caps() {
             .await,
         Err(DatabaseError::BudgetExhausted)
     );
-    let counts: (i32, i32) = sqlx::query_as(
+    let counts: (i64, i64) = sqlx::query_as(
         "SELECT daily_used,on_demand_used FROM openlegal.provider_request_budget WHERE singleton",
     )
     .fetch_one(&pool)
@@ -924,7 +925,7 @@ async fn provider_policy_wakes_only_budget_waits_and_preserves_pauses_and_claim_
         0,
         "a reclaimed job must not be woken again"
     );
-    let counts: (i32, i32, bool, bool) = sqlx::query_as("SELECT daily_used,on_demand_used,operator_suspended,unresolved_response FROM openlegal.provider_request_budget WHERE singleton").fetch_one(&pool).await.unwrap();
+    let counts: (i64, i64, bool, bool) = sqlx::query_as("SELECT daily_used,on_demand_used,operator_suspended,unresolved_response FROM openlegal.provider_request_budget WHERE singleton").fetch_one(&pool).await.unwrap();
     assert_eq!(counts, (1000, 1, false, false));
     store.fail_claim(&resumed, false).await.unwrap();
     base.close().await.unwrap();
@@ -1121,7 +1122,9 @@ async fn expired_explicit_jobs_become_claimable_by_continuous_workers() {
         running.id
     );
     store.requeue_due_details(702).await.unwrap();
-    assert_eq!(store.claim_job(703).await.unwrap().unwrap().id, running.id);
+    assert!(store.claim_job(703).await.unwrap().is_none());
+    store.requeue_due_details(8201).await.unwrap();
+    assert_eq!(store.claim_job(8202).await.unwrap().unwrap().id, running.id);
     base.close().await.unwrap();
 }
 

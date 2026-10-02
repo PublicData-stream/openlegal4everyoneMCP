@@ -221,7 +221,9 @@ values, raw workload dumps and private host details out of shared evidence.
    sandbox acceptance and independent review, prepare identity/RBAC/networking,
    then use `mode = "pilot"` for the bounded first live pass. Enabling the overlay
    immediately initiates provider traffic. The durable pilot ledger allows 100
-   attempts over 30 minutes and never resets automatically. After operator review,
+   attempts over 30 minutes by default and never resets automatically. Operator
+   request policy can select another finite duration and a finite or unlimited
+   attempt cap. After operator review,
    a new pilot may reset only its pilot counter while preserving the daily cap and
    next-request timestamp. Before selecting `mode = "continuous"`, verify an actual
    provider detail, source and search result in at least one category without a
@@ -1255,17 +1257,35 @@ old daily budget. The scan interval is a delay after a completed pass; it does
 not shorten freshness periods or gap retry eligibility. Deploy scheduler and
 request Jobs with the same ConfigMap policy.
 
+Each daily cap also accepts `"unlimited"`. A new LAW `requests_per_second` field
+supports 1..1000 starts per second with no burst and one outstanding request;
+remove an explicit legacy interval when selecting it. The committed values above
+remain unchanged. See the [server contract](server.md) for pilot/on-demand attempt
+caps, finite operation timeouts up to 24 hours, and finite processing retry counts.
+
+At request launch, the scheduler snapshots the operation limits privately and
+renders Kubernetes `activeDeadlineSeconds = on_demand_timeout_secs + 300`.
+The recovery lease uses the original launch epoch plus the snapshotted timeout
+plus 900 seconds. A late Pod uses only its remaining operation time. Configuration
+changes do not shorten active operation deadlines. Stranded explicit detail work
+is adopted only after its owner's protection and active claim fences permit it;
+legacy ownerless jobs retain their original protection. The default source Job
+still records 7500 seconds; runtime rendering validates and supplies each claim's
+computed deadline. Upgrade all ingestion binaries/configuration together after
+the matching schema migration; an older binary is not a rollback for the new schema.
+
 The overlay keeps the scheduler and request Jobs in `openlegal-serving` so they
 can mount the existing corpus and cache PVCs. `ResourceQuota/collection-pod-budget`
 allows 18 Pods in that namespace: one serving Pod, one scheduler Pod, and up to
 16 request Job Pods. The document namespace has its separate 16 Pod quota, with
 CPU, memory and scratch totals matching its worker settings. Physical node
-capacity may permit fewer simultaneous Pods. Request Jobs use a 7,500 second
+capacity may permit fewer simultaneous Pods. Request Jobs default to a 7,500 second
 Kubernetes deadline and no automatic retry; an uncertain Job creation outcome
 stops the scheduler for reconciliation rather than creating a possible duplicate.
-An explicit detail job left pending by a lost request Pod becomes eligible for
-continuous workers after 8,100 seconds; a running job becomes eligible after
-its claim lease expires. Both paths retain the provider request ledger.
+Explicit detail work left by a lost request Pod becomes eligible for continuous
+workers after the captured operation recovery window and all active claim fences
+expire. Legacy ownerless work retains its 8,100 second protection. Both paths
+retain the provider request ledger.
 
 The scheduler ServiceAccount can create Jobs in `openlegal-serving` and is bound
 to the existing document-controller Role in `openlegal-documents`. Automatic

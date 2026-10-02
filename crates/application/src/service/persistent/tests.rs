@@ -53,6 +53,9 @@ impl Upstream for UpstreamMock {
                 storage.upstream_started.notify_one();
                 storage.upstream_release.notified().await;
             }
+            if storage.mode.load(Ordering::SeqCst) == 15 {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
             if unavailable.load(Ordering::SeqCst) {
                 return Err(RetrievalError::Unavailable);
             }
@@ -323,7 +326,22 @@ fn build(
     calls: Arc<AtomicUsize>,
     unavailable: Arc<AtomicBool>,
 ) -> Arc<RetrievalService> {
-    RetrievalService::with_persistence(
+    build_with_policy(
+        storage,
+        clock,
+        calls,
+        unavailable,
+        DemoRequestPolicy::default(),
+    )
+}
+fn build_with_policy(
+    storage: Arc<StorageState>,
+    clock: Arc<ClockValue>,
+    calls: Arc<AtomicUsize>,
+    unavailable: Arc<AtomicBool>,
+    policy: DemoRequestPolicy,
+) -> Arc<RetrievalService> {
+    RetrievalService::build(
         vec![Source {
             id: "mock".into(),
             provider: "test".into(),
@@ -337,21 +355,27 @@ fn build(
         }],
         clock,
         Box::<Cache>::default(),
-        Arc::new(Storage(storage)),
+        Some(Arc::new(Storage(storage))),
         "namespace".into(),
+        HashMap::from([("test".into(), policy)]),
+        None,
     )
     .unwrap()
 }
 fn fixture() -> Fixture {
+    fixture_with_policy(DemoRequestPolicy::default())
+}
+fn fixture_with_policy(policy: DemoRequestPolicy) -> Fixture {
     let storage = Arc::new(StorageState::default());
     let clock = Arc::new(ClockValue(AtomicU64::new(1000)));
     let calls = Arc::new(AtomicUsize::new(0));
     let unavailable = Arc::new(AtomicBool::new(false));
-    let service = build(
+    let service = build_with_policy(
         storage.clone(),
         clock.clone(),
         calls.clone(),
         unavailable.clone(),
+        policy,
     );
     Fixture {
         service,
@@ -557,6 +581,41 @@ async fn capture_retention_prevents_recently_validated_old_l1_head() {
     let fresh = get(&f.service).await.unwrap();
     assert_eq!(fresh.snapshot.unwrap().captured_at, now);
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    f.service.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn configured_persistent_refresh_can_finish_after_twenty_seconds() {
+    let f = fixture_with_policy(DemoRequestPolicy {
+        attempt_timeout_secs: 60,
+        refresh_timeout_secs: 60,
+        ..Default::default()
+    });
+    f.storage.mode.store(15, Ordering::SeqCst);
+    let started = Instant::now();
+    get(&f.service).await.unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(30));
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.storage.writes.load(Ordering::SeqCst), 1);
+    f.service.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn configured_persistent_resolution_deadline_drains_storage_and_fails_closed() {
+    let f = fixture_with_policy(DemoRequestPolicy {
+        refresh_timeout_secs: 30,
+        ..Default::default()
+    });
+    f.storage.mode.store(4, Ordering::SeqCst);
+    let started = Instant::now();
+    assert_eq!(
+        get(&f.service).await,
+        Err(RetrievalError::StorageUnavailable)
+    );
+    assert_eq!(started.elapsed(), Duration::from_millis(40_100));
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.storage.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(f.service.metrics().cache_entries, 0);
     f.service.shutdown().await.unwrap();
 }
 

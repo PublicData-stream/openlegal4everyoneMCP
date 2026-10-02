@@ -1,4 +1,5 @@
 use crate::persistence::{PersistentStore, StorageMetrics};
+use crate::upstream_policy::{DailyBudgetStore, DemoRequestPolicy};
 use crate::{
     Clock, FRESH_SECONDS, FetchedPayload, MAX_PROCESSED_BYTES, MAX_RAW_BYTES, RETENTION_SECONDS,
     Source, SystemClock,
@@ -29,8 +30,6 @@ mod persistent;
 const MAX_IN_FLIGHT: usize = 32;
 const MAX_WAITERS_PER_KEY: usize = 16;
 const MAX_WAITERS: usize = 64;
-const REFRESH_DEADLINE: Duration = Duration::from_secs(10);
-const ATTEMPT_DEADLINE: Duration = Duration::from_secs(5);
 const PERSISTENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const PERSISTENT_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -107,6 +106,8 @@ struct Rate {
 struct Provider {
     active: Arc<Semaphore>,
     rate: Mutex<Rate>,
+    policy: DemoRequestPolicy,
+    daily: Mutex<(u64, u64)>,
 }
 
 #[derive(Default)]
@@ -152,6 +153,7 @@ pub struct RetrievalService {
     counters: Counters,
     persistence: Option<Arc<dyn PersistentStore>>,
     namespace: String,
+    daily_budget: Option<Arc<dyn DailyBudgetStore>>,
 }
 
 impl RetrievalService {
@@ -175,7 +177,7 @@ impl RetrievalService {
         clock: Arc<dyn Clock>,
         cache: Box<dyn CacheStore>,
     ) -> Result<Arc<Self>, RetrievalError> {
-        Self::build(sources, clock, cache, None, String::new())
+        Self::with_clock_and_policies(sources, clock, cache, HashMap::new())
     }
 
     pub fn with_persistence(
@@ -189,7 +191,100 @@ impl RetrievalService {
             return Err(RetrievalError::InvalidInput);
         }
         store.policy().validate()?;
-        Self::build(sources, clock, cache, Some(store), namespace)
+        Self::build(
+            sources,
+            clock,
+            cache,
+            Some(store),
+            namespace,
+            HashMap::new(),
+            None,
+        )
+    }
+
+    /// Configure independent policies by provider; omitted providers use defaults.
+    pub fn with_policies(
+        sources: Vec<Source>,
+        cache: Box<dyn CacheStore>,
+        policies: HashMap<String, DemoRequestPolicy>,
+    ) -> Result<Arc<Self>, RetrievalError> {
+        Self::with_clock_and_policies(sources, Arc::new(SystemClock::default()), cache, policies)
+    }
+
+    pub fn with_clock_and_policies(
+        sources: Vec<Source>,
+        clock: Arc<dyn Clock>,
+        cache: Box<dyn CacheStore>,
+        policies: HashMap<String, DemoRequestPolicy>,
+    ) -> Result<Arc<Self>, RetrievalError> {
+        Self::build(sources, clock, cache, None, String::new(), policies, None)
+    }
+
+    /// Durable policy configuration completes before any owned workers are started.
+    pub async fn with_persistence_and_policies(
+        sources: Vec<Source>,
+        clock: Arc<dyn Clock>,
+        cache: Box<dyn CacheStore>,
+        store: Arc<dyn PersistentStore>,
+        namespace: String,
+        policies: HashMap<String, DemoRequestPolicy>,
+        daily_budget: Arc<dyn DailyBudgetStore>,
+    ) -> Result<Arc<Self>, RetrievalError> {
+        if !valid_identifier(&namespace, 128) || !store.healthy() {
+            return Err(RetrievalError::InvalidInput);
+        }
+        store.policy().validate()?;
+        Self::validate_policies(&sources, &policies)?;
+        let mut configured = std::collections::HashSet::new();
+        for source in &sources {
+            if configured.insert(source.provider.clone()) {
+                let policy = policies.get(&source.provider).copied().unwrap_or_default();
+                daily_budget
+                    .configure(
+                        namespace.clone(),
+                        source.provider.clone(),
+                        policy.daily_limit,
+                    )
+                    .await?;
+            }
+        }
+        Self::build(
+            sources,
+            clock,
+            cache,
+            Some(store),
+            namespace,
+            policies,
+            Some(daily_budget),
+        )
+    }
+
+    fn validate_policies(
+        sources: &[Source],
+        policies: &HashMap<String, DemoRequestPolicy>,
+    ) -> Result<(), RetrievalError> {
+        if sources.is_empty() || sources.len() > 32 {
+            return Err(RetrievalError::InvalidInput);
+        }
+        let mut registered = std::collections::HashSet::new();
+        for source in sources {
+            if !valid_identifier(&source.id, 64)
+                || !valid_identifier(&source.provider, 64)
+                || !valid_identifier(&source.dataset, 64)
+                || source.processor_version.is_empty()
+                || source.processor_version.len() > 128
+                || !registered.insert(&source.id)
+            {
+                return Err(RetrievalError::InvalidInput);
+            }
+        }
+        for (provider, policy) in policies {
+            policy.validate()?;
+            if !sources.iter().any(|source| &source.provider == provider) {
+                return Err(RetrievalError::InvalidInput);
+            }
+        }
+        Ok(())
     }
 
     fn build(
@@ -198,26 +293,19 @@ impl RetrievalService {
         cache: Box<dyn CacheStore>,
         persistence: Option<Arc<dyn PersistentStore>>,
         namespace: String,
+        policies: HashMap<String, DemoRequestPolicy>,
+        daily_budget: Option<Arc<dyn DailyBudgetStore>>,
     ) -> Result<Arc<Self>, RetrievalError> {
-        if sources.is_empty() || sources.len() > 32 {
-            return Err(RetrievalError::InvalidInput);
-        }
+        Self::validate_policies(&sources, &policies)?;
         tokio::runtime::Handle::try_current().map_err(|_| RetrievalError::Internal)?;
         let mut registered = HashMap::new();
         let mut providers = HashMap::new();
         for source in sources {
-            if !valid_identifier(&source.id, 64)
-                || !valid_identifier(&source.provider, 64)
-                || !valid_identifier(&source.dataset, 64)
-                || source.processor_version.is_empty()
-                || source.processor_version.len() > 128
-                || registered.contains_key(&source.id)
-            {
-                return Err(RetrievalError::InvalidInput);
-            }
             providers.entry(source.provider.clone()).or_insert_with(|| {
                 Arc::new(Provider {
                     active: Arc::new(Semaphore::new(2)),
+                    policy: policies.get(&source.provider).copied().unwrap_or_default(),
+                    daily: Mutex::new((clock.now() / 86_400, 0)),
                     rate: Mutex::new(Rate {
                         tokens: 2.0,
                         at: Instant::now(),
@@ -249,6 +337,7 @@ impl RetrievalService {
             counters: Counters::default(),
             persistence,
             namespace,
+            daily_budget,
         });
         let weak = Arc::downgrade(&service);
         let token = service.shutdown.clone();
@@ -449,7 +538,7 @@ impl RetrievalService {
                     let result = tokio::select! {
                         biased;
                         _ = token.cancelled() => Err(RetrievalError::Cancelled),
-                        result = tokio::time::timeout(REFRESH_DEADLINE,
+                        result = tokio::time::timeout(Duration::from_secs(provider.policy.refresh_timeout_secs),
                             service.refresh(&source, &provider, query, &token, generation)) => {
                             result.unwrap_or(Err(RetrievalError::Unavailable))
                         }
@@ -585,14 +674,22 @@ impl RetrievalService {
         cancellation: &CancellationToken,
         generation: u64,
     ) -> Outcome {
-        for attempt in 0..2 {
+        for attempt in 0..provider.policy.max_attempts {
+            // Storage admission may wait long enough for rate tokens to refill.
+            // Consume the token only after the durable reservation completes, at
+            // the actual fetch boundary. A committed reservation is conservative
+            // accounting even if cancellation or the refresh deadline follows.
+            self.reserve_daily(source, provider, cancellation).await?;
             self.acquire_rate(provider, cancellation).await?;
+            if cancellation.is_cancelled() {
+                return Err(RetrievalError::Cancelled);
+            }
             if attempt != 0 {
                 self.counters.retries.fetch_add(1, Ordering::Relaxed);
             }
             self.counters.requests.fetch_add(1, Ordering::Relaxed);
             let result = tokio::time::timeout(
-                ATTEMPT_DEADLINE,
+                Duration::from_secs(provider.policy.attempt_timeout_secs),
                 source
                     .upstream
                     .fetch(query.clone(), cancellation.child_token()),
@@ -615,13 +712,23 @@ impl RetrievalService {
                     let seconds = match error {
                         RetrievalError::Throttled {
                             retry_after_secs: Some(seconds),
-                        } => seconds,
-                        _ => 1,
+                        } => seconds.max((1_u64 << attempt).min(30)),
+                        _ => (1_u64 << attempt).min(30),
                     };
                     // Keep the full provider delay; overflow is conservatively unavailable.
                     // Jitter extends the floor, never retries before Retry-After.
                     let jitter = Duration::from_millis(100 + (generation.wrapping_mul(73) % 151));
-                    let delay = Duration::from_secs(seconds).saturating_add(jitter);
+                    let backoff = Duration::from_secs((1_u64 << attempt).min(30))
+                        .saturating_add(jitter)
+                        .min(Duration::from_secs(30));
+                    let delay = match error {
+                        RetrievalError::Throttled {
+                            retry_after_secs: Some(_),
+                        } => Duration::from_secs(seconds)
+                            .saturating_add(jitter)
+                            .max(backoff),
+                        _ => backoff,
+                    };
                     let Some(until) = Instant::now().checked_add(delay) else {
                         provider
                             .rate
@@ -636,7 +743,7 @@ impl RetrievalService {
                         rate.cooldown =
                             Some(rate.cooldown.map_or(until, |existing| existing.max(until)));
                     }
-                    if attempt == 1 {
+                    if attempt + 1 == provider.policy.max_attempts {
                         return Err(error);
                     }
                 }
@@ -644,6 +751,39 @@ impl RetrievalService {
             }
         }
         Err(RetrievalError::Unavailable)
+    }
+
+    async fn reserve_daily(
+        &self,
+        source: &Source,
+        provider: &Provider,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RetrievalError> {
+        if cancellation.is_cancelled() {
+            return Err(RetrievalError::Cancelled);
+        }
+        if let Some(store) = &self.daily_budget {
+            return store
+                .reserve(
+                    self.namespace.clone(),
+                    source.provider.clone(),
+                    cancellation.clone(),
+                )
+                .await;
+        }
+        let mut usage = provider
+            .daily
+            .lock()
+            .map_err(|_| RetrievalError::Internal)?;
+        let day = self.clock.now() / 86_400;
+        if usage.0 != day {
+            *usage = (day, 0);
+        }
+        if !provider.policy.daily_limit.allows(usage.1) {
+            return Err(RetrievalError::Busy);
+        }
+        usage.1 = usage.1.checked_add(1).ok_or(RetrievalError::Busy)?;
+        Ok(())
     }
 
     async fn acquire_rate(
@@ -658,8 +798,10 @@ impl RetrievalService {
                     return Err(error);
                 }
                 let now = Instant::now();
-                rate.tokens =
-                    (rate.tokens + now.duration_since(rate.at).as_secs_f64() * 2.0).min(2.0);
+                rate.tokens = (rate.tokens
+                    + now.duration_since(rate.at).as_secs_f64()
+                        * f64::from(provider.policy.requests_per_second))
+                .min(2.0);
                 rate.at = now;
                 if let Some(until) = rate.cooldown
                     && until > now
@@ -670,7 +812,9 @@ impl RetrievalService {
                     rate.tokens -= 1.0;
                     return Ok(());
                 } else {
-                    Duration::from_secs_f64((1.0 - rate.tokens) / 2.0)
+                    Duration::from_secs_f64(
+                        (1.0 - rate.tokens) / f64::from(provider.policy.requests_per_second),
+                    )
                 }
             };
             tokio::select! {
@@ -1153,6 +1297,345 @@ mod tests {
                 .unwrap();
         (service, clock, calls, behavior)
     }
+    fn policy_fixture(
+        policy: DemoRequestPolicy,
+        daily_budget: Option<Arc<dyn DailyBudgetStore>>,
+    ) -> (
+        Arc<RetrievalService>,
+        Arc<TestClock>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        policy_fixture_with_delay(policy, daily_budget, Duration::from_millis(100))
+    }
+
+    fn policy_fixture_with_delay(
+        policy: DemoRequestPolicy,
+        daily_budget: Option<Arc<dyn DailyBudgetStore>>,
+        delay: Duration,
+    ) -> (
+        Arc<RetrievalService>,
+        Arc<TestClock>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let behavior = Arc::new(AtomicUsize::new(0));
+        let clock = Arc::new(TestClock::default());
+        let mut sources = Vec::new();
+        for (id, provider) in [
+            ("layout_a", "synthetic"),
+            ("layout_b", "synthetic"),
+            ("other", "other_provider"),
+        ] {
+            sources.push(Source {
+                id: id.into(),
+                provider: provider.into(),
+                dataset: "records".into(),
+                processor_version: "v1".into(),
+                upstream: Arc::new(Mock {
+                    calls: calls.clone(),
+                    behavior: behavior.clone(),
+                    delay,
+                }),
+            });
+        }
+        let service = RetrievalService::build(
+            sources,
+            clock.clone(),
+            Box::<TestCache>::default(),
+            None,
+            "test_budget".into(),
+            HashMap::from([("synthetic".into(), policy)]),
+            daily_budget,
+        )
+        .unwrap();
+        (service, clock, calls, behavior)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daily_budget_is_shared_by_layouts_independent_by_provider_and_rolls_at_utc_midnight() {
+        use crate::upstream_policy::RequestLimit;
+        let (service, clock, calls, _) = policy_fixture(
+            DemoRequestPolicy {
+                daily_limit: RequestLimit::Limited(1),
+                ..Default::default()
+            },
+            None,
+        );
+        retrieve(&service, "001").await.unwrap();
+        retrieve(&service, "001").await.unwrap(); // Fresh cache does not reserve again.
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let fetch = |source: &str, id: &str| {
+            service.retrieve(
+                Query::Get {
+                    source: source.into(),
+                    id: id.into(),
+                },
+                FreshnessRequirement::FreshOnly,
+                CancellationToken::new(),
+                None,
+            )
+        };
+        assert_eq!(fetch("layout_b", "002").await, Err(RetrievalError::Busy));
+        fetch("other", "002").await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        clock.0.store(86_400, Ordering::Relaxed);
+        fetch("layout_b", "003").await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_charge_daily_budget_and_obey_configured_total_attempts() {
+        use crate::upstream_policy::RequestLimit;
+        let (service, _, calls, behavior) = policy_fixture(
+            DemoRequestPolicy {
+                daily_limit: RequestLimit::Limited(1),
+                max_attempts: 3,
+                ..Default::default()
+            },
+            None,
+        );
+        behavior.store(1, Ordering::Relaxed);
+        assert_eq!(retrieve(&service, "001").await, Err(RetrievalError::Busy));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        service.shutdown().await.unwrap();
+        let (service, _, calls, behavior) = policy_fixture(
+            DemoRequestPolicy {
+                max_attempts: 3,
+                ..Default::default()
+            },
+            None,
+        );
+        behavior.store(1, Ordering::Relaxed);
+        assert_eq!(
+            retrieve(&service, "001").await,
+            Err(RetrievalError::Unavailable)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        service.shutdown().await.unwrap();
+        let (service, _, calls, behavior) = policy_fixture(
+            DemoRequestPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            None,
+        );
+        behavior.store(1, Ordering::Relaxed);
+        assert_eq!(
+            retrieve(&service, "001").await,
+            Err(RetrievalError::Unavailable)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        service.shutdown().await.unwrap();
+    }
+
+    struct FailedDailyStore;
+    impl DailyBudgetStore for FailedDailyStore {
+        fn configure(
+            &self,
+            _: String,
+            _: String,
+            _: crate::upstream_policy::RequestLimit,
+        ) -> BoxFuture<'static, Result<(), RetrievalError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn reserve(
+            &self,
+            _: String,
+            _: String,
+            _: CancellationToken,
+        ) -> BoxFuture<'static, Result<(), RetrievalError>> {
+            Box::pin(async { Err(RetrievalError::StorageUnavailable) })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daily_storage_failure_fails_closed_before_fetch() {
+        let (service, _, calls, _) = policy_fixture(
+            DemoRequestPolicy::default(),
+            Some(Arc::new(FailedDailyStore)),
+        );
+        assert_eq!(
+            retrieve(&service, "001").await,
+            Err(RetrievalError::StorageUnavailable)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        service.shutdown().await.unwrap();
+    }
+
+    #[derive(Default)]
+    struct DelayedDailyStore(Arc<AtomicUsize>);
+    impl DailyBudgetStore for DelayedDailyStore {
+        fn configure(
+            &self,
+            _: String,
+            _: String,
+            _: crate::upstream_policy::RequestLimit,
+        ) -> BoxFuture<'static, Result<(), RetrievalError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn reserve(
+            &self,
+            _: String,
+            _: String,
+            _: CancellationToken,
+        ) -> BoxFuture<'static, Result<(), RetrievalError>> {
+            let calls = self.0.clone();
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::Relaxed) < 2 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    struct TimedMock {
+        inner: Mock,
+        starts: Arc<Mutex<Vec<Instant>>>,
+    }
+    impl Upstream for TimedMock {
+        fn fetch(
+            &self,
+            query: Query,
+            cancellation: CancellationToken,
+        ) -> BoxFuture<'static, Result<FetchedPayload, RetrievalError>> {
+            self.starts.lock().unwrap().push(Instant::now());
+            self.inner.fetch(query, cancellation)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_daily_reservation_cannot_double_the_fetch_boundary_burst() {
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let source = Source {
+            id: "layout_a".into(),
+            provider: "synthetic".into(),
+            dataset: "records".into(),
+            processor_version: "v1".into(),
+            upstream: Arc::new(TimedMock {
+                inner: Mock {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    behavior: Arc::new(AtomicUsize::new(0)),
+                    delay: Duration::ZERO,
+                },
+                starts: starts.clone(),
+            }),
+        };
+        let service = RetrievalService::build(
+            vec![source],
+            Arc::new(TestClock::default()),
+            Box::<TestCache>::default(),
+            None,
+            "delayed_budget".into(),
+            HashMap::new(),
+            Some(Arc::new(DelayedDailyStore::default())),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let (a, b) = tokio::join!(retrieve(&service, "001"), retrieve(&service, "002"));
+        a.unwrap();
+        b.unwrap();
+        let (c, d) = tokio::join!(retrieve(&service, "003"), retrieve(&service, "004"));
+        c.unwrap();
+        d.unwrap();
+        let offsets: Vec<_> = starts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|at| at.duration_since(started))
+            .collect();
+        assert_eq!(offsets.len(), 4);
+        assert_eq!(offsets[0], Duration::from_secs(1));
+        assert_eq!(offsets[1], Duration::from_secs(1));
+        assert!(offsets[2] >= Duration::from_millis(1500));
+        assert!(offsets[3] >= Duration::from_secs(2));
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_refill_keeps_two_token_burst_and_configured_rate() {
+        let (service, _, _, _) = policy_fixture(
+            DemoRequestPolicy {
+                requests_per_second: 10,
+                ..Default::default()
+            },
+            None,
+        );
+        let provider = service.providers.get("synthetic").unwrap();
+        let cancellation = CancellationToken::new();
+        service.acquire_rate(provider, &cancellation).await.unwrap();
+        service.acquire_rate(provider, &cancellation).await.unwrap();
+        let started = Instant::now();
+        service.acquire_rate(provider, &cancellation).await.unwrap();
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_attempt_and_refresh_deadlines_bound_fetch() {
+        let (service, _, _, _) = policy_fixture(
+            DemoRequestPolicy {
+                attempt_timeout_secs: 1,
+                refresh_timeout_secs: 1,
+                ..Default::default()
+            },
+            None,
+        );
+        let provider = service.providers.get("synthetic").unwrap();
+        provider.rate.lock().unwrap().cooldown = Some(Instant::now() + Duration::from_secs(2));
+        let started = Instant::now();
+        assert_eq!(
+            retrieve(&service, "001").await,
+            Err(RetrievalError::Unavailable)
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        service.shutdown().await.unwrap();
+        let (service, _, calls, _) = policy_fixture_with_delay(
+            DemoRequestPolicy {
+                attempt_timeout_secs: 1,
+                max_attempts: 1,
+                refresh_timeout_secs: 5,
+                ..Default::default()
+            },
+            None,
+            Duration::from_secs(10),
+        );
+        let started = Instant::now();
+        assert_eq!(
+            retrieve(&service, "001").await,
+            Err(RetrievalError::Unavailable)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_provider_policy_is_rejected() {
+        let source = Source {
+            id: "layout_a".into(),
+            provider: "synthetic".into(),
+            dataset: "records".into(),
+            processor_version: "v1".into(),
+            upstream: Arc::new(Mock {
+                calls: Arc::new(AtomicUsize::new(0)),
+                behavior: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::ZERO,
+            }),
+        };
+        assert!(matches!(
+            RetrievalService::with_policies(
+                vec![source],
+                Box::<TestCache>::default(),
+                HashMap::from([("unknown".into(), DemoRequestPolicy::default())])
+            ),
+            Err(RetrievalError::InvalidInput)
+        ));
+    }
+
     async fn retrieve(
         service: &Arc<RetrievalService>,
         id: &str,
