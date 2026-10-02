@@ -7,6 +7,7 @@ use openlegal_adapters::{
     law_go_kr::{LawClient, ProviderRequestLimits, RequestBudgetMode},
 };
 use openlegal_application::{
+    citation::CitationLease,
     database::{DatabaseStore, Publication},
     document::{DocumentError, DocumentInput, DocumentOutput, DocumentProcessor},
     persistence::PersistentStore,
@@ -703,11 +704,14 @@ async fn provider_policy_migration_preserves_legacy_attempts_and_extreme_pauses(
     // Recreate the version-11 budget shape in this disposable migrated database.
     sqlx::raw_sql("DROP TABLE openlegal.upstream_daily_budget; ALTER TABLE openlegal.collection_request DROP COLUMN operation_timeout_secs,DROP COLUMN operation_attempt_limit,DROP COLUMN launched_at; ALTER TABLE openlegal.corpus_job DROP COLUMN explicit_request_id,DROP COLUMN explicit_recovery_at,DROP CONSTRAINT corpus_job_attempts_check,ADD CONSTRAINT corpus_job_attempts_check CHECK(attempts BETWEEN 0 AND 3); ALTER TABLE openlegal.provider_request_budget DROP COLUMN pilot_attempt_limit,DROP COLUMN on_demand_attempt_limit,DROP COLUMN interval_ms,DROP COLUMN pilot_timeout_secs,DROP COLUMN on_demand_timeout_secs,DROP COLUMN pilot_duration_secs,DROP COLUMN max_job_attempts,DROP CONSTRAINT provider_request_budget_pilot_used_check,ALTER COLUMN daily_used TYPE integer,ALTER COLUMN on_demand_used TYPE integer,ALTER COLUMN pilot_used TYPE integer,ADD CONSTRAINT provider_request_budget_pilot_used_check CHECK(pilot_used BETWEEN 0 AND 100); ALTER TABLE openlegal.provider_request_budget DROP CONSTRAINT provider_request_budget_daily_used_check, DROP CONSTRAINT provider_request_budget_on_demand_used_check, DROP COLUMN continuous_daily_limit, DROP COLUMN on_demand_daily_limit, DROP COLUMN min_interval_secs, DROP COLUMN next_request_at_ms, ADD CONSTRAINT provider_request_budget_daily_used_check CHECK(daily_used BETWEEN 0 AND 1000), ADD CONSTRAINT provider_request_budget_on_demand_used_check CHECK(on_demand_used BETWEEN 0 AND 1000); UPDATE openlegal.provider_request_budget SET daily_used=1000,on_demand_used=9,pilot_used=78,operator_suspended=true,unresolved_response=true,next_allowed_at=922337203685477580; DELETE FROM public._sqlx_migrations WHERE version IN (12,13);")
         .execute(&pool).await.unwrap();
-    let checksums: Vec<(i64, Vec<u8>)> =
-        sqlx::query_as("SELECT version,checksum FROM public._sqlx_migrations ORDER BY version")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+    // Unrelated later migrations remain installed; compare the same legacy
+    // versions on both sides of the provider-budget upgrade.
+    let checksums: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT version,checksum FROM public._sqlx_migrations WHERE version<=11 ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
     openlegal_adapters::postgres::PostgresStore::migrate(&fixture.url, support::options())
         .await
         .unwrap();
@@ -1002,6 +1006,377 @@ async fn publish(store: &PgCorpusStore, revision: &str, body: &str, now: u64) ->
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn citation_lease_handoff_renews_retention_without_reviving_expired_history() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("citation-retention"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(base.pool(), blobs, Arc::new(FixtureClock));
+    let old = publish(&store, "old", "old retained evidence", 100).await;
+    publish(&store, "new", "new retained evidence", 200).await;
+    let now = 3_000_000;
+    let selected = vec![(object(), old.capture_id.clone())];
+    assert_eq!(
+        store.renew(selected.clone(), now, token()).await,
+        Err(DatabaseError::RevisionUnavailable)
+    );
+    let watermark = store.watermark().await.unwrap();
+    store.acknowledge_index(watermark).await.unwrap();
+    let session = "a".repeat(64);
+    store
+        .pin_session(session.clone(), watermark, vec![], now)
+        .await
+        .unwrap();
+    store.renew(selected.clone(), now, token()).await.unwrap();
+    store.release_session(&session).await.unwrap();
+    assert_eq!(store.maintain(now + 599, 250).await.unwrap(), 0);
+    assert!(store.outbox(watermark, 10).await.unwrap().is_empty());
+    assert_eq!(
+        store
+            .resolve(
+                object(),
+                RevisionSelector::Capture {
+                    id: old.capture_id.clone()
+                },
+                now + 599,
+                token()
+            )
+            .await
+            .unwrap()
+            .record
+            .body,
+        "old retained evidence"
+    );
+    store
+        .renew(selected.clone(), now + 590, token())
+        .await
+        .unwrap();
+    // A second request using an older clock cannot shorten shared retention.
+    store
+        .renew(selected.clone(), now + 580, token())
+        .await
+        .unwrap();
+    let expiry: String = sqlx::query_scalar(
+        "SELECT expires_at::text FROM openlegal.corpus_citation_lease WHERE capture_id=$1",
+    )
+    .bind(&old.capture_id)
+    .fetch_one(&base.pool())
+    .await
+    .unwrap();
+    assert_eq!(expiry.parse::<u64>().unwrap(), now + 1190);
+    assert_eq!(store.maintain(now + 1189, 250).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .resolve(
+                object(),
+                RevisionSelector::Capture {
+                    id: old.capture_id.clone()
+                },
+                now + 1190,
+                token()
+            )
+            .await
+            .err(),
+        Some(DatabaseError::RevisionUnavailable)
+    );
+    assert_eq!(
+        store.renew(selected, now + 1190, token()).await,
+        Err(DatabaseError::RevisionUnavailable)
+    );
+    assert_eq!(store.maintain(now + 1190, 250).await.unwrap(), 0);
+    let retirement = store.outbox(watermark, 10).await.unwrap().remove(0);
+    assert_eq!(retirement.capture_id.as_ref(), Some(&old.capture_id));
+    store.acknowledge_index(retirement.sequence).await.unwrap();
+    assert_eq!(store.maintain(now + 1191, 250).await.unwrap(), 1);
+    assert_eq!(
+        store
+            .resolve(object(), RevisionSelector::Head, now + 1191, token())
+            .await
+            .unwrap()
+            .record
+            .revision_id,
+        "new"
+    );
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn citation_lease_identity_cancellation_and_withdrawal_are_atomic() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("citation-identity"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(base.pool(), blobs, Arc::new(FixtureClock));
+    let capture = publish(&store, "r1", "retained fixture", 100).await;
+    let mut other = object();
+    other.id = "002".into();
+    assert_eq!(
+        store
+            .renew(vec![(other, capture.capture_id.clone())], 110, token())
+            .await,
+        Err(DatabaseError::RevisionUnavailable)
+    );
+    assert_eq!(
+        store
+            .renew(
+                vec![
+                    (object(), capture.capture_id.clone()),
+                    (object(), "f".repeat(64))
+                ],
+                110,
+                token()
+            )
+            .await,
+        Err(DatabaseError::RevisionUnavailable)
+    );
+    let cancelled = token();
+    cancelled.cancel();
+    assert_eq!(
+        store
+            .renew(vec![(object(), capture.capture_id.clone())], 110, cancelled)
+            .await,
+        Err(DatabaseError::Cancelled)
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_citation_lease")
+        .fetch_one(&base.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    store
+        .renew(
+            vec![
+                (object(), capture.capture_id.clone()),
+                (object(), capture.capture_id.clone()),
+            ],
+            110,
+            token(),
+        )
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_citation_lease")
+        .fetch_one(&base.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let version = store.state(&object()).await.unwrap().version;
+    store.withdraw(&object(), version, 111).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_citation_lease")
+        .fetch_one(&base.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(
+        store
+            .renew(vec![(object(), capture.capture_id.clone())], 112, token())
+            .await,
+        Err(DatabaseError::Withdrawn)
+    );
+    assert_eq!(
+        store
+            .resolve(
+                object(),
+                RevisionSelector::Capture {
+                    id: capture.capture_id
+                },
+                112,
+                token()
+            )
+            .await
+            .err(),
+        Some(DatabaseError::Withdrawn)
+    );
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn citation_capacity_is_separate_from_sessions_and_batch_renewal_is_atomic() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("citation-capacity"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(base.pool(), blobs, Arc::new(FixtureClock));
+    let first = publish(&store, "r1", "first fixture", 100).await;
+    let second = publish(&store, "r2", "second fixture", 200).await;
+    let third = publish(&store, "r3", "third fixture", 220).await;
+    store
+        .renew(vec![(object(), first.capture_id.clone())], 250, token())
+        .await
+        .unwrap();
+    // Capacity-only rows are isolated synthetic bookkeeping fixtures. Their
+    // bodies are never resolved as evidence or added to an index.
+    sqlx::query("INSERT INTO openlegal.corpus_capture(id,object_key,revision_id,sequence,captured_at,event_sequence,payload,payload_sha256,raw_sha256,raw_size,storage_key) SELECT repeat('d',56)||lpad(to_hex(n),8,'0'),c.object_key,'capacity-'||n,c.sequence+n+100,c.captured_at,c.event_sequence,c.payload,c.payload_sha256,c.raw_sha256,c.raw_size,'citation-capacity-'||n FROM openlegal.corpus_capture c CROSS JOIN generate_series(1,2047) n WHERE c.id=$1")
+        .bind(&first.capture_id).execute(&base.pool()).await.unwrap();
+    sqlx::query("INSERT INTO openlegal.corpus_citation_lease SELECT id,1000 FROM openlegal.corpus_capture WHERE storage_key LIKE 'citation-capacity-%'")
+        .execute(&base.pool()).await.unwrap();
+    // Existing captures can renew at capacity; duplicate hits consume one slot.
+    store
+        .renew(
+            vec![
+                (object(), first.capture_id.clone()),
+                (object(), first.capture_id.clone()),
+            ],
+            260,
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .renew(
+                vec![
+                    (object(), first.capture_id.clone()),
+                    (object(), second.capture_id.clone())
+                ],
+                270,
+                token()
+            )
+            .await,
+        Err(DatabaseError::Capacity)
+    );
+    let expiry: String = sqlx::query_scalar(
+        "SELECT expires_at::text FROM openlegal.corpus_citation_lease WHERE capture_id=$1",
+    )
+    .bind(&first.capture_id)
+    .fetch_one(&base.pool())
+    .await
+    .unwrap();
+    assert_eq!(expiry, "860");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openlegal.corpus_citation_lease WHERE capture_id=$1",
+    )
+    .bind(&second.capture_id)
+    .fetch_one(&base.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+    sqlx::query("UPDATE openlegal.corpus_citation_lease SET expires_at=270 WHERE capture_id=$1")
+        .bind(format!("{}00000001", "d".repeat(56)))
+        .execute(&base.pool())
+        .await
+        .unwrap();
+    store
+        .renew(vec![(object(), third.capture_id)], 270, token())
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_citation_lease")
+        .fetch_one(&base.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 2048);
+    let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_session")
+        .fetch_one(&base.pool())
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0);
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh and the provisioned Korean dictionary"]
+async fn citable_search_transfers_historical_hits_and_releases_partial_generation() {
+    use openlegal_adapters::{
+        corpus_search::CorpusSearch, korean_analysis::KoreanAnalyzer, search_index::CorpusIndex,
+    };
+    use openlegal_application::search::{SearchMode, SearchService};
+    use openlegal_domain::legal_search::{Filters, SearchRequest};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("citation-search"))
+        .await
+        .unwrap();
+    let store = Arc::new(PgCorpusStore::with_publication_clock(
+        base.pool(),
+        blobs,
+        Arc::new(FixtureClock),
+    ));
+    let first = publish(&store, "r1", "historical citation fixture one", 100).await;
+    let second = publish(&store, "r2", "historical citation fixture two", 150).await;
+    let head = publish(&store, "r3", "unrelated fixture", 200).await;
+    let dictionary =
+        std::env::var_os("OPENLEGAL_TEST_MECAB_DICTIONARY").expect("run scripts/test-postgres.sh");
+    let index = CorpusIndex::open(
+        &fixture.directory.path().join("citation-index"),
+        KoreanAnalyzer::open(std::path::Path::new(&dictionary)).unwrap(),
+    )
+    .unwrap();
+    index.apply_capture(first, false, 1).unwrap();
+    index.apply_capture(second, false, 2).unwrap();
+    index.apply_capture(head, true, 3).unwrap();
+    store.acknowledge_index(3).await.unwrap();
+    let search = SearchService::new(Arc::new(CorpusSearch::new(index, store.clone())));
+    let request = SearchRequest {
+        query: "citation".into(),
+        filters: Filters::default(),
+        include_history: true,
+        include_ocr: false,
+        sections: vec!["body".into()],
+        limit: 1,
+        cursor: None,
+        literal: true,
+        ignore_case: false,
+        context_lines: 0,
+    };
+    let page = search
+        .search_citable(
+            request.clone(),
+            Instant::now() + Duration::from_secs(10),
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.hits.len(), 1);
+    assert!(page.next_cursor.is_some());
+    let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_session")
+        .fetch_one(&base.pool())
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0);
+    let leases: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_citation_lease")
+        .fetch_one(&base.pool())
+        .await
+        .unwrap();
+    assert_eq!(leases, 1);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let capture = store
+        .resolve(
+            object(),
+            RevisionSelector::Capture {
+                id: page.hits[0].capture_id.clone(),
+            },
+            now,
+            token(),
+        )
+        .await
+        .unwrap();
+    assert!(capture.record.body.contains("historical citation"));
+    let mut continuation = request;
+    continuation.cursor = page.next_cursor;
+    assert_eq!(
+        search
+            .search(
+                SearchMode::Query,
+                continuation,
+                Instant::now() + Duration::from_secs(10),
+                token()
+            )
+            .await
+            .err(),
+        Some(DatabaseError::SessionExpired)
+    );
+    base.close().await.unwrap();
 }
 
 #[tokio::test]

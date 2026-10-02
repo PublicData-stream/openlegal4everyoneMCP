@@ -243,6 +243,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0013_provider_request_options.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            14,
+            "citation leases".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0014_citation_leases.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

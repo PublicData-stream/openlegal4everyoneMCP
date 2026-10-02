@@ -15,6 +15,7 @@ use std::sync::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod citation;
 mod collection_gaps;
 mod collection_requests;
 pub use collection_requests::CollectionLaunch;
@@ -322,7 +323,7 @@ impl PgCorpusStore {
     ) -> Result<Capture, DatabaseError> {
         self.gate().await?;
         check(&cancel)?;
-        let row=sqlx::query("SELECT c.*,c.captured_at::text AS time_text,o.withdrawn FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.id=$1 AND ($3 OR o.head_capture=c.id OR c.captured_at>$2::text::numeric-2592000 OR EXISTS(SELECT 1 FROM openlegal.corpus_session s WHERE s.generation>=c.event_sequence AND s.expires_at>$2::text::numeric AND NOT s.invalidated))").bind(id).bind(now.to_string()).bind(index_read).fetch_optional(&self.pool).await.map_err(db)?.ok_or(DatabaseError::RevisionUnavailable)?;
+        let row=sqlx::query("SELECT c.*,c.captured_at::text AS time_text,o.withdrawn FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.id=$1 AND ($3 OR o.head_capture=c.id OR c.captured_at>$2::text::numeric-2592000 OR EXISTS(SELECT 1 FROM openlegal.corpus_session s WHERE s.generation>=c.event_sequence AND s.expires_at>$2::text::numeric AND NOT s.invalidated) OR EXISTS(SELECT 1 FROM openlegal.corpus_citation_lease l WHERE l.capture_id=c.id AND l.expires_at>$2::text::numeric))").bind(id).bind(now.to_string()).bind(index_read).fetch_optional(&self.pool).await.map_err(db)?.ok_or(DatabaseError::RevisionUnavailable)?;
         if !index_read && row.try_get::<bool, _>("withdrawn").map_err(db)? {
             return Err(DatabaseError::Withdrawn);
         }

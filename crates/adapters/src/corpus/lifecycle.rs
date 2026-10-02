@@ -572,12 +572,17 @@ impl PgCorpusStore {
             .map_err(db)?;
         let changed=sqlx::query("UPDATE openlegal.corpus_object SET withdrawn=true,pending=false,version=version+1 WHERE object_key=$1 AND version=$2 RETURNING version").bind(&k).bind(i64::try_from(expected_version).map_err(|_|DatabaseError::InvalidInput)?).fetch_optional(&mut *tx).await.map_err(db)?.ok_or(DatabaseError::Conflict)?;
         let version: i64 = changed.try_get("version").map_err(db)?;
-        sqlx::query("INSERT INTO openlegal.corpus_outbox SELECT next_event,$1,$2,NULL,true,true,false FROM openlegal.corpus_control").bind(k).bind(version).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("INSERT INTO openlegal.corpus_outbox SELECT next_event,$1,$2,NULL,true,true,false FROM openlegal.corpus_control").bind(&k).bind(version).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_control SET next_event=next_event+1")
             .execute(&mut *tx)
             .await
             .map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_session SET invalidated=true WHERE NOT invalidated")
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        sqlx::query("DELETE FROM openlegal.corpus_citation_lease l USING openlegal.corpus_capture c WHERE l.capture_id=c.id AND c.object_key=$1")
+            .bind(k)
             .execute(&mut *tx)
             .await
             .map_err(db)?;
@@ -926,7 +931,7 @@ impl PgCorpusStore {
             .map_err(db)?;
         Ok(())
     }
-    /// One bounded pass. Current HEADs and live index/session pins are protected.
+    /// One bounded pass. Current HEADs, live index/session pins and citation leases are protected.
     /// Metadata removal is committed before physical blob deletion.
     pub async fn maintain(&self, now: u64, historical_before: u64) -> Result<usize, DatabaseError> {
         self.gate().await?;
@@ -936,7 +941,12 @@ impl PgCorpusStore {
             .await
             .map_err(db)?;
         sqlx::query("DELETE FROM openlegal.corpus_session WHERE expires_at<=$1::text::numeric OR invalidated").bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
-        let candidates=sqlx::query("SELECT c.id,c.object_key,o.version FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.captured_at<$1::text::numeric AND c.id IS DISTINCT FROM o.head_capture AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_retirement t WHERE t.capture_id=c.id) ORDER BY c.captured_at,c.id LIMIT 128").bind(historical_before.to_string()).fetch_all(&mut *tx).await.map_err(db)?;
+        sqlx::query("DELETE FROM openlegal.corpus_citation_lease l WHERE l.expires_at<=$1::text::numeric OR EXISTS(SELECT 1 FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.id=l.capture_id AND o.withdrawn)")
+            .bind(now.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        let candidates=sqlx::query("SELECT c.id,c.object_key,o.version FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.captured_at<$1::text::numeric AND c.id IS DISTINCT FROM o.head_capture AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_retirement t WHERE t.capture_id=c.id) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_citation_lease l WHERE l.capture_id=c.id AND l.expires_at>$2::text::numeric) ORDER BY c.captured_at,c.id LIMIT 128").bind(historical_before.to_string()).bind(now.to_string()).fetch_all(&mut *tx).await.map_err(db)?;
         for row in candidates {
             let id: String = row.try_get("id").map_err(db)?;
             let event:i64=sqlx::query_scalar("UPDATE openlegal.corpus_control SET next_event=next_event+1 RETURNING next_event-1").fetch_one(&mut *tx).await.map_err(db)?;
@@ -955,7 +965,7 @@ impl PgCorpusStore {
                 .await
                 .map_err(db)?;
         }
-        let rows=sqlx::query("SELECT c.id,c.object_key,c.storage_key,c.raw_sha256,c.raw_size FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.captured_at<$1::text::numeric AND EXISTS(SELECT 1 FROM openlegal.corpus_retirement t JOIN openlegal.corpus_control x ON true WHERE t.capture_id=c.id AND t.event_sequence<=x.index_ack) AND c.id IS DISTINCT FROM o.head_capture AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_pin p WHERE p.capture_id=c.id) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_session s WHERE s.generation>=c.event_sequence AND s.expires_at>$2::text::numeric AND NOT s.invalidated) ORDER BY c.captured_at,c.id LIMIT 128 FOR UPDATE OF c").bind(historical_before.to_string()).bind(now.to_string()).fetch_all(&mut *tx).await.map_err(db)?;
+        let rows=sqlx::query("SELECT c.id,c.object_key,c.storage_key,c.raw_sha256,c.raw_size FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.captured_at<$1::text::numeric AND EXISTS(SELECT 1 FROM openlegal.corpus_retirement t JOIN openlegal.corpus_control x ON true WHERE t.capture_id=c.id AND t.event_sequence<=x.index_ack) AND c.id IS DISTINCT FROM o.head_capture AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_pin p WHERE p.capture_id=c.id) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_session s WHERE s.generation>=c.event_sequence AND s.expires_at>$2::text::numeric AND NOT s.invalidated) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_citation_lease l WHERE l.capture_id=c.id AND l.expires_at>$2::text::numeric) ORDER BY c.captured_at,c.id LIMIT 128 FOR UPDATE OF c").bind(historical_before.to_string()).bind(now.to_string()).fetch_all(&mut *tx).await.map_err(db)?;
         let count = rows.len();
         for row in rows {
             let id: String = row.try_get("id").map_err(db)?;

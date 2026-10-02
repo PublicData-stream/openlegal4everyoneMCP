@@ -28,6 +28,16 @@ pub trait SearchBackend: Send + Sync + 'static {
         budget: SearchBudget,
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<SearchPage, DatabaseError>>;
+    /// Query results must transfer capture retention before their generation
+    /// pin is released. Backends without that guarantee fail closed.
+    fn search_citable(
+        &self,
+        _request: SearchRequest,
+        _budget: SearchBudget,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<SearchPage, DatabaseError>> {
+        Box::pin(async { Err(DatabaseError::StorageUnavailable) })
+    }
 }
 pub struct SearchService {
     backend: Arc<dyn SearchBackend>,
@@ -47,6 +57,32 @@ impl SearchService {
         deadline: Instant,
         cancel: CancellationToken,
     ) -> Result<SearchPage, DatabaseError> {
+        self.search_inner(mode, request, deadline, cancel, false)
+            .await
+    }
+    /// One bounded query page with durable citation retention and no cursor
+    /// continuation. The backend may return a marker to report partial results.
+    pub async fn search_citable(
+        &self,
+        request: SearchRequest,
+        deadline: Instant,
+        cancel: CancellationToken,
+    ) -> Result<SearchPage, DatabaseError> {
+        if request.limit > crate::citation::MAX_CITATION_SEARCH_RESULTS || request.cursor.is_some()
+        {
+            return Err(DatabaseError::InvalidInput);
+        }
+        self.search_inner(SearchMode::Query, request, deadline, cancel, true)
+            .await
+    }
+    async fn search_inner(
+        &self,
+        mode: SearchMode,
+        request: SearchRequest,
+        deadline: Instant,
+        cancel: CancellationToken,
+        citable: bool,
+    ) -> Result<SearchPage, DatabaseError> {
         validate(&request)?;
         if matches!(mode, SearchMode::Query)
             && (request.context_lines != 0
@@ -63,16 +99,16 @@ impl SearchService {
             .try_acquire_owned()
             .map_err(|_| DatabaseError::Capacity)?;
         let deadline = deadline.min(Instant::now() + Duration::from_secs(10));
-        let work = self.backend.search(
-            mode,
-            request,
-            SearchBudget {
-                bytes: 64 * 1024 * 1024,
-                deadline,
-                lease: permit,
-            },
-            cancel.clone(),
-        );
+        let budget = SearchBudget {
+            bytes: 64 * 1024 * 1024,
+            deadline,
+            lease: permit,
+        };
+        let work = if citable {
+            self.backend.search_citable(request, budget, cancel.clone())
+        } else {
+            self.backend.search(mode, request, budget, cancel.clone())
+        };
         tokio::select! {
             _ = cancel.cancelled() => Err(DatabaseError::Cancelled),
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {

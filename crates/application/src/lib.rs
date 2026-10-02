@@ -4,6 +4,7 @@
 //! deployment-wide coordination design. Adapters never add their own retry loops.
 
 pub mod blob;
+pub mod citation;
 pub mod database;
 pub mod document;
 pub mod legal_reference;
