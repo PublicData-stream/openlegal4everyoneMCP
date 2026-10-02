@@ -86,6 +86,15 @@ burst = 1000
 max_buckets = 1
 status = 429
 
+[[rate_limits]]
+name = "reference-http-edge-budget"
+key = "route"
+routes = ["legal-reference"]
+rate = "100r/s"
+burst = 100
+max_buckets = 1
+status = 429
+
 # Backend HTTP allowed_hosts must contain NODE_DNS:30080.
 [[upstreams]]
 name = "mcp-http"
@@ -142,3 +151,14 @@ methods = ["CONNECT"]
 protocols = ["webtransport"]
 [routes.match.path]
 exact = "/mcp-wt/v1"
+
+[[routes]]
+name = "legal-reference"
+hosts = ["openlegal4everyone.reference.publicdata.stream"]
+upstream = "mcp-http"
+compression = "off"
+[routes.match]
+methods = ["GET", "HEAD"]
+[routes.match.path]
+# OxiBelt matches prefixes on path-segment boundaries.
+prefix = "/source"

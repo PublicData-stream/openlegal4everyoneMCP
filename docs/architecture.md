@@ -64,6 +64,10 @@ MCP/HTTP serving. Fetching referenced resources is an explicit application actio
 never a parser side effect. Keep provider-specific mapping modules distinct.
 
 Application services define narrow interfaces for upstream and storage operations.
+The [citation service](citations.md) shares exact-capture projection and retention
+policy between ChatGPT compatibility tools, native MCP references and HTML source
+pages. Domain IDs preserve namespace and projection; PostgreSQL implements atomic
+lease admission and the server emits protocol and browser representations.
 Concrete adapters implement those interfaces; application code does not import the
 adapters crate. Put operation policy in application services and mechanics in
 adapters. In particular, storage does not decide legal freshness, and transport

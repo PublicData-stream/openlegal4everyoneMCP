@@ -280,7 +280,7 @@ def validate_config(raw, profile="retained"):
     config = tomllib.loads(raw)
     sections = ("source", "http", "webtransport", "health", "limits", "text_diff")
     if profile == "retained":
-        sections += ("edge_mtls", "cache", "database")
+        sections += ("edge_mtls", "cache", "database", "citations")
     keys(config, sections, f"{profile} server configuration")
     keys(config["source"], ("url",), "source")
     url = config["source"]["url"]
@@ -318,6 +318,10 @@ def validate_config(raw, profile="retained"):
             "required_client_dns_san": "oxibelt.openlegal.internal",
         }, "edge mTLS")
     equal(config["health"], {"bind": "0.0.0.0:9090"}, "health")
+    if profile == "retained":
+        equal(config["citations"], {
+            "base_url": "https://openlegal4everyone.reference.publicdata.stream",
+        }, "citation reference origin")
     expected_limits = {"max_message_bytes": 16 * 1024 * 1024,
                        "max_buffer_bytes": 256 * 1024 * 1024,
                        "shutdown_timeout_secs": 15}
@@ -813,6 +817,8 @@ def validate_oxibelt(raw, service):
     equal(config["rate_limits"], [
         {"name": "mcp-http-edge-budget", "key": "route", "routes": ["mcp-http"],
          "rate": "1000r/s", "burst": 1000, "max_buckets": 1, "status": 429},
+        {"name": "reference-http-edge-budget", "key": "route", "routes": ["legal-reference"],
+         "rate": "100r/s", "burst": 100, "max_buckets": 1, "status": 429},
     ], "HTTP edge route rate limit")
     upstreams = []
     for port in service["spec"]["ports"]:
@@ -845,6 +851,9 @@ def validate_oxibelt(raw, service):
          "upstream": "mcp-webtransport",
          "match": {"methods": ["CONNECT"], "protocols": ["webtransport"],
                    "path": {"exact": "/mcp-wt/v1"}}},
+        {"name": "legal-reference", "hosts": ["openlegal4everyone.reference.publicdata.stream"],
+         "upstream": "mcp-http", "compression": "off",
+         "match": {"methods": ["GET", "HEAD"], "path": {"prefix": "/source"}}},
     ], "public MCP routes")
 
 

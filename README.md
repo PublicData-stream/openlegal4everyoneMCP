@@ -102,6 +102,7 @@ backend-only upgrades remain unaccepted.
 - [Search-query syntax](docs/search-query.md): standalone parser, operators, diagnostics, and bounds.
 - [Legal corpus](docs/database.md): search, checkpoint retrieval, history, freshness and ingestion.
 - [Legal reference tools](docs/legal-reference.md): law-name resolution, citation checks and date-based revision selection.
+- [Retained-source citations](docs/citations.md): ChatGPT search/fetch, exact MCP references and browser evidence pages.
 - [Legal analysis tools](docs/legal-analysis.md): batch change watching, lineage and repeal mentions, citing decisions, article impact and article or annex reads.
 - [Document sandbox](docs/document-sandbox.md): isolated XML/HTML/PDF/HWP/OCR processing and acceptance.
 - [Text comparison](docs/text-diff.md): Rust line/character engine, input limits, paging, retention and editable widget.

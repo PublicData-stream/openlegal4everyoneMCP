@@ -26,6 +26,9 @@ required_client_dns_san = "oxibelt.openlegal.internal"
 [health]
 bind = "0.0.0.0:9090"
 
+[citations]
+base_url = "https://openlegal4everyone.reference.publicdata.stream"
+
 [limits]
 max_message_bytes = 16777216
 max_buffer_bytes = 268435456

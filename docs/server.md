@@ -191,6 +191,12 @@ matches, dangling tool UI references, and excessive discovery/results fail start
 causes filesystem or network I/O. Registered resources use modern public cache scope
 with zero TTL so clients revalidate rather than reuse a stale UI template.
 
+Optional `[citations]` adds retained legal resources, ChatGPT-compatible
+`search`/`fetch`, native source references and browser pages through shared
+application services. Dynamic reads and pages share bounded admission;
+static widget reads retain their behavior. See [citations](citations.md) for
+source identity, output formats, retention and platform acceptance.
+
 `register_worker` adds a required application worker to the endpoint supervisor.
 The server starts registered worker futures after successful listener binding;
 unexpected completion fails readiness and triggers shared shutdown/drain. The
@@ -275,7 +281,7 @@ with the structured `rate_limited` tool error. Known tool calls with valid argum
 spend one token after concurrency admission, including calls that later fail in the
 application. Unknown tool names and schema-invalid arguments retain their protocol
 errors without spending tokens. A later deserialization failure retains its
-protocol error but may spend a token. Initialization, discovery, resource reads,
+protocol error but may spend a token. Initialization, discovery, static resource reads,
 and health requests do not use this bucket. Operators can set `enabled = false`
 explicitly.
 

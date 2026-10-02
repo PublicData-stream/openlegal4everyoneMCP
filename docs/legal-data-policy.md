@@ -95,6 +95,13 @@ semantics and qualification that support them.
 
 ## Retained evidence and fixtures
 
+The optional [retained-source citation interface](citations.md) pins links to an
+exact capture and text projection. Renewable short leases protect access within
+bounded storage; they do not promise a permanent archive. Body expiry leaves a
+qualified metadata reference, and withdrawal overrides retention. Extracted and
+OCR text must remain visibly distinguished from provider text across tool,
+resource and browser representations.
+
 Retain source payloads alongside cached normalized records within a documented,
 bounded provider retention policy. Keep the linkage between payload, digest,
 normalization version, and record explicit. Store only permitted evidence; apply

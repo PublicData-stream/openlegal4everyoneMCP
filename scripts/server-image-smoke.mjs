@@ -16,7 +16,7 @@ const tunnelTls = retained ? {
 } : undefined;
 const maxBody = 16 * 1024 * 1024;
 
-function exchange(path, body, protocol = legacy, session, overrides = {}) {
+function exchange(path, body, protocol = legacy, session, overrides = {}, serving = false) {
   return new Promise((resolve, reject) => {
     const headers = {};
     if (body) {
@@ -32,10 +32,11 @@ function exchange(path, body, protocol = legacy, session, overrides = {}) {
       }
     }
     Object.assign(headers, overrides);
-    const request = (body && retained ? https : http).request({
-      hostname: 'server', port: body ? 8080 : 9090, path,
+    if (serving) headers.Host = authority;
+    const request = ((body || serving) && retained ? https : http).request({
+      hostname: 'server', port: body || serving ? 8080 : 9090, path,
       method: body ? 'POST' : 'GET', headers,
-      ...(body && retained ? tunnelTls : {}),
+      ...((body || serving) && retained ? tunnelTls : {}),
     });
     // An absolute deadline also bounds peers which continually trickle bytes.
     const timer = setTimeout(() => request.destroy(new Error('request deadline exceeded')), 10000);
@@ -159,7 +160,7 @@ for (const protocol of [legacy, modern]) {
   const packaged = await readFile('/fixture/text-diff.html', 'utf8');
   assert.equal(resource.contents[0].text, packaged.replace('__OPENLEGAL_SOURCE_URL__', source));
   if (retained) {
-    for (const name of ['database.query', 'database.get', 'database.history']) {
+    for (const name of ['database.query', 'database.get', 'database.history', 'search', 'fetch']) {
       assert.ok(listed.tools.some((tool) => tool.name === name), `missing ${name}`);
     }
     const page = await call('database.get', { object: expected.object });
@@ -181,6 +182,28 @@ for (const protocol of [legacy, modern]) {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
     assert.ok(caughtUp, 'retained corpus index did not converge in 60 seconds');
+    const citationQuery = `in:body:"${expected.body.trim()}"`;
+    const searchResult = await rpc('tools/call', { name: 'search', arguments: { query: citationQuery } });
+    assert.ok(!searchResult.isError, JSON.stringify(searchResult));
+    assert.deepEqual(JSON.parse(searchResult.content[0].text), searchResult.structuredContent);
+    const [item] = searchResult.structuredContent.results;
+    assert.ok(item?.url.startsWith('https://openlegal4everyone.reference.publicdata.stream/source/'));
+    const fetched = await rpc('tools/call', { name: 'fetch', arguments: { id: item.id } });
+    assert.ok(!fetched.isError, JSON.stringify(fetched));
+    assert.deepEqual(JSON.parse(fetched.content[0].text), fetched.structuredContent);
+    assert.equal(fetched.structuredContent.metadata.capture_id, expected.head_capture_id);
+    assert.ok(fetched.structuredContent.text.includes(expected.body));
+    const uri = `openlegal://source/${item.id}`;
+    const evidence = await rpc('resources/read', { uri });
+    assert.equal(evidence.contents[0].text, fetched.structuredContent.text);
+    assert.equal(evidence.contents[0]._meta['openlegal/provenance'].capture_id, expected.head_capture_id);
+    assert.ok(page.references.some((reference) => reference.id.includes(expected.head_capture_id)));
+    const sourcePage = await exchange(`/source/${item.id}`, undefined, protocol, undefined, {}, true);
+    assert.equal(sourcePage.status, 200);
+    assert.equal(sourcePage.headers['cache-control'], 'no-store');
+    assert.ok(sourcePage.headers['content-security-policy'].includes("default-src 'none'"));
+    assert.ok(sourcePage.value.includes(expected.head_capture_id));
+    console.log(`HTTP ${protocol}: exact citation search/fetch, native references, resource provenance and source page passed`);
     const databaseWidget = await rpc('resources/read', { uri: 'ui://openlegal/database-v1.html' });
     assert.equal(databaseWidget.contents[0].text,
       (await readFile('/fixture/database.html', 'utf8')).replace('__OPENLEGAL_SOURCE_URL__', source));

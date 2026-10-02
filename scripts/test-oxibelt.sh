@@ -159,6 +159,7 @@ source = pathlib.Path("deploy/oxibelt/kubernetes-upstream.example.toml").read_te
 for before, after in (
     ("replace-with-private-node.invalid", "backend"),
     ("openlegal4everyone.mcp.publicdata.stream", "edge"),
+    ("openlegal4everyone.reference.publicdata.stream", "reference-edge"),
     ('["backend-ca.pem"]', '["ca.pem"]'),
 ):
     assert before in source, f"missing handoff substitution: {before}"
@@ -189,7 +190,9 @@ for name in edge backend wrong-backend; do
     openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
         -subj "/CN=$name" -keyout "$scratch/fixture/cert/$name-key.pem" \
         -out "$scratch/$name.csr" >/dev/null 2>&1
-    printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n' "$name" > "$scratch/$name.ext"
+    certificate_names="DNS:$name"
+    if [[ $name == edge ]]; then certificate_names+=",DNS:reference-edge"; fi
+    printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n' "$certificate_names" > "$scratch/$name.ext"
     openssl x509 -req -in "$scratch/$name.csr" -CA "$scratch/fixture/cert/ca.pem" \
         -CAkey "$scratch/ca-key.pem" -CAcreateserial -days 2 \
         -extfile "$scratch/$name.ext" -out "$scratch/fixture/cert/$name.pem" >/dev/null 2>&1
@@ -232,9 +235,11 @@ assert config.count(client_identity) == 2, "both upstreams must present the edge
 assert config.count('rate = "1000r/s"\nburst = 1000') == 1
 (source.parent / "oxibelt-http-throttled.toml").write_text(config.replace(
     'rate = "1000r/s"\nburst = 1000', 'rate = "1r/s"\nburst = 1'))
-assert config.count('rate = "100r/s"\nburst = 100') == 1
+# The first 100r/s policy is the CONNECT handshake bucket; the reference
+# route has a later independent bucket with the same rate.
+assert config.count('rate = "100r/s"\nburst = 100') in (1, 2)
 (source.parent / "oxibelt-wt-throttled.toml").write_text(config.replace(
-    'rate = "100r/s"\nburst = 100', 'rate = "1r/s"\nburst = 1'))
+    'rate = "100r/s"\nburst = 100', 'rate = "1r/s"\nburst = 1', 1))
 backend = pathlib.Path(sys.argv[2])
 (backend.parent / "backend-wrong-san.toml").write_text(backend.read_text().replace(
     '/cert/backend.pem', '/cert/wrong-backend.pem').replace(
@@ -278,7 +283,7 @@ start_backend() {
 }
 start_backend /fixture/backend.toml
 start_edge() {
-    docker run -d --name "$edge" --network-alias edge "${hardening[@]}" --memory 1g --ulimit stack=67108864:67108864 \
+    docker run -d --name "$edge" --network-alias edge --network-alias reference-edge "${hardening[@]}" --memory 1g --ulimit stack=67108864:67108864 \
         --entrypoint /usr/local/bin/oxibelt "$image" --config "$1" >/dev/null
     if [[ ${2:-ready} == ready ]]; then
         docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/http_smoke.py /fixture/cert/ca.pem --ready
@@ -318,6 +323,22 @@ docker run --rm "${hardening[@]}" --entrypoint python3 "$image" /fixture/serving
     --http-url https://edge:8443/mcp --webtransport-url https://edge:8443/mcp-wt/v1 \
     --origin https://example.test --ca-file /fixture/cert/ca.pem --wt-client /usr/local/bin/wt_client
 if [[ $profile == kubernetes ]]; then
+    docker run --rm "${hardening[@]}" --entrypoint python3 "$image" -c '
+import http.client, ssl
+context = ssl.create_default_context(cafile="/fixture/cert/ca.pem")
+for method, path in (("GET", "/source/unknown"), ("HEAD", "/source/unknown"), ("POST", "/source/unknown"), ("GET", "/ready"), ("POST", "/mcp")):
+    connection = http.client.HTTPSConnection("reference-edge", 8443, context=context, timeout=10)
+    connection.request(method, path, headers={"Host": "reference-edge"})
+    response = connection.getresponse()
+    body = response.read()
+    assert response.status in (404, 405), (method, path, response.status)
+    if method in ("GET", "HEAD") and path.startswith("/source/"):
+        assert response.getheader("x-accel-buffering") == "no", (method, path, response.status, "GET/HEAD did not reach the bounded backend")
+        assert response.getheader("cache-control") == "no-store"
+    if method == "HEAD": assert not body
+    connection.close()
+print("Reference host: GET/HEAD reach bounded backend; other methods and operational paths excluded")
+'
     # The edge stays up while the backend is replaced. Repeated fresh MCP
     # sessions exercise the stale-H1-connection failure seen in acceptance.
     docker rm -f "$backend" >/dev/null
