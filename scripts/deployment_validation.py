@@ -587,6 +587,7 @@ def validate_ingestion(documents, retained_documents):
                 "collector node placement")
         equal(pod["securityContext"], {"runAsNonRoot": True, "runAsUser": 10004,
               "runAsGroup": 10004, "fsGroup": 10004,
+              "fsGroupChangePolicy": "OnRootMismatch",
               "seccompProfile": {"type": "RuntimeDefault"}}, "collector Pod security")
         container = pod["containers"][0]
         require(set(container) == {"name", "image", "imagePullPolicy", "args", "env",

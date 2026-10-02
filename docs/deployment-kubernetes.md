@@ -1275,7 +1275,11 @@ computed deadline. Upgrade all ingestion binaries/configuration together after
 the matching schema migration; an older binary is not a rollback for the new schema.
 
 The overlay keeps the scheduler and request Jobs in `openlegal-serving` so they
-can mount the existing corpus and cache PVCs. `ResourceQuota/collection-pod-budget`
+can mount the existing corpus and cache PVCs. Both use `fsGroupChangePolicy:
+OnRootMismatch`, like retained serving and administrative Jobs, to preserve private
+blob permissions beneath the prepared volume root. Verify that each root remains
+group `10004`, mode `2770`, before admitting any PVC user; Kubernetes may otherwise
+change private child permissions recursively. `ResourceQuota/collection-pod-budget`
 allows 18 Pods in that namespace: one serving Pod, one scheduler Pod, and up to
 16 request Job Pods. The document namespace has its separate 16 Pod quota, with
 CPU, memory and scratch totals matching its worker settings. Physical node

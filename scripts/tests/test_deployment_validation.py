@@ -3,6 +3,7 @@
 import copy
 import ipaddress
 import itertools
+import json
 import os
 import subprocess
 import sys
@@ -443,6 +444,22 @@ class IngestionValidationTests(unittest.TestCase):
     def rejected(self):
         with self.assertRaises(ValidationError):
             validate_ingestion(self.docs, self.retained)
+
+    def test_all_collectors_preserve_private_blob_permissions(self):
+        template = json.loads(self.config["data"]["collection-job.json"])
+        contexts = (self.pod["securityContext"],
+                    template["spec"]["template"]["spec"]["securityContext"])
+        for index, context in enumerate(contexts):
+            for policy in ("Always", None):
+                with self.subTest(collector=index, policy=policy):
+                    if policy is None:
+                        del context["fsGroupChangePolicy"]
+                    else:
+                        context["fsGroupChangePolicy"] = policy
+                    self.config["data"]["collection-job.json"] = json.dumps(template)
+                    self.rejected()
+                    context["fsGroupChangePolicy"] = "OnRootMismatch"
+                    self.config["data"]["collection-job.json"] = json.dumps(template)
 
     def test_opt_in_template_and_distinct_admin_configuration(self):
         validate_ingestion(self.docs, self.retained)

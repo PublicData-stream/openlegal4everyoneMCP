@@ -15,7 +15,7 @@
         "serviceAccountName": "openlegal-collection-controller",
         "terminationGracePeriodSeconds": 30,
         "nodeSelector": {"kubernetes.io/os": "linux", "openlegal.server/ready": "true"},
-        "securityContext": {"runAsNonRoot": true, "runAsUser": 10004, "runAsGroup": 10004, "fsGroup": 10004, "seccompProfile": {"type": "RuntimeDefault"}},
+        "securityContext": {"runAsNonRoot": true, "runAsUser": 10004, "runAsGroup": 10004, "fsGroup": 10004, "fsGroupChangePolicy": "OnRootMismatch", "seccompProfile": {"type": "RuntimeDefault"}},
         "containers": [{
           "name": "collector",
           "image": "registry.example/openlegal-server-ingestion@sha256:0000000000000000000000000000000000000000000000000000000000000000",
