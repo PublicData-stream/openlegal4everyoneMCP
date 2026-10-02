@@ -4,7 +4,7 @@ use openlegal_server::{
     config::{AccessPolicy, Limits},
     http::HttpEndpoint,
     progress::ProgressStage,
-    registry::{ToolOptions, ToolOutput, ToolRegistry},
+    registry::{RichToolOutput, ToolOptions, ToolOutput, ToolRegistry},
     resources::ResourceRegistry,
 };
 use rmcp::model::{MetaObject, Resource, ResourceContents};
@@ -119,6 +119,30 @@ impl Server {
                 Ok(json!({"old":true}))
             })
             .unwrap();
+        if max_message_bytes > 4096 {
+            registry
+                .register_rich::<Empty, Output, _, _>(
+                    "references",
+                    "Synthetic resource references",
+                    ToolOptions::default(),
+                    |_, _| async {
+                        let mut output = RichToolOutput::new(Output { value: 3 });
+                        output
+                            .additional_content
+                            .push(rmcp::model::ContentBlock::text(
+                                "Synthetic coverage qualification.",
+                            ));
+                        output
+                            .additional_content
+                            .push(rmcp::model::ContentBlock::resource_link(
+                                Resource::new("openlegal://source/fictional", "fictional-source")
+                                    .with_mime_type("text/plain"),
+                            ));
+                        Ok(output)
+                    },
+                )
+                .unwrap();
+        }
         let mut builder = ServerBuilder::new(
             registry,
             Limits {
@@ -299,6 +323,32 @@ async fn typed_tools_resources_and_legacy_registration_work_in_both_revisions() 
         )
         .await;
         assert!(unknown.get("error").is_some());
+    }
+}
+
+#[tokio::test]
+async fn rich_content_keeps_identical_json_first_and_emits_standard_links() {
+    let server = Server::start().await;
+    for version in ["2025-11-25", "2026-07-28"] {
+        let response = result(
+            server
+                .post(
+                    version,
+                    20,
+                    "tools/call",
+                    json!({"name":"references","arguments":{}}),
+                )
+                .await,
+        )
+        .await;
+        let result = &response["result"];
+        let text: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, result["structuredContent"]);
+        assert_eq!(result["content"][1]["type"], "text");
+        assert_eq!(result["content"][2]["type"], "resource_link");
+        assert_eq!(result["content"][2]["uri"], "openlegal://source/fictional");
+        assert_eq!(result.get("resultType").is_some(), version == "2026-07-28");
     }
 }
 

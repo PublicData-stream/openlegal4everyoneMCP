@@ -189,6 +189,8 @@ pub struct CitationVerification {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct RevisionChoice {
     pub revision_id: String,
+    /// The exact retained capture associated with this catalog choice, if known.
+    pub capture_id: Option<String>,
     pub effective_date: Option<String>,
     pub publication_date: Option<String>,
 }

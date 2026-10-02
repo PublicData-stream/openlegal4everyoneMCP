@@ -4,7 +4,7 @@ use openlegal_server::{
     framing::{FrameReader, write_json},
     handler::McpHandler,
     progress::ProgressStage,
-    registry::{ToolError, ToolOptions, ToolOutput, ToolRegistry},
+    registry::{RichToolOutput, ToolError, ToolOptions, ToolOutput, ToolRegistry},
     resources::ResourceRegistry,
     webtransport::{PATH, WebTransportEndpoint},
 };
@@ -118,7 +118,15 @@ impl Server {
             .port();
         let bind = format!("127.0.0.1:{port}").parse().unwrap();
         let limits = Arc::new(Limits {
-            max_message_bytes: if search { 16384 } else { 4096 },
+            // Extension discovery includes a typed rich-content tool; framing
+            // rejection fixtures keep their original 4 KiB allowance.
+            max_message_bytes: if search {
+                16384
+            } else if extensions {
+                8192
+            } else {
+                4096
+            },
             max_buffer_bytes: 64 * 4096,
             io_timeout_secs: 1,
             shutdown_timeout_secs: 1,
@@ -195,6 +203,23 @@ impl Server {
         let mut resources = ResourceRegistry::new();
         if extensions {
             use rmcp::model::{MetaObject, Resource, ResourceContents};
+            registry
+                .register_rich::<ProgressInput, ProgressOutput, _, _>(
+                    "references",
+                    "Synthetic references",
+                    ToolOptions::default(),
+                    |_, _| async {
+                        let mut output = RichToolOutput::new(ProgressOutput { synthetic: true });
+                        output
+                            .additional_content
+                            .push(rmcp::model::ContentBlock::resource_link(Resource::new(
+                                "openlegal://source/fictional",
+                                "fictional",
+                            )));
+                        Ok(output)
+                    },
+                )
+                .unwrap();
             resources
                 .register(
                     Resource::new("ui://demo/widget.html", "demo")
@@ -1005,6 +1030,21 @@ async fn typed_results_progress_and_static_resources_share_both_wt_lifecycles() 
             result["result"]["contents"][0]["text"],
             "<p>Synthetic widget</p>"
         );
+        let mut rich = modern(
+            4,
+            "tools/call",
+            json!({"name":"references","arguments":{"wait":false}}),
+        );
+        if legacy {
+            rich["params"].as_object_mut().unwrap().remove("_meta");
+        }
+        send(&mut tx, &rich).await;
+        let result = response(&mut rx).await;
+        let first: Value =
+            serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(first, result["result"]["structuredContent"]);
+        assert_eq!(result["result"]["content"][1]["type"], "resource_link");
+        assert_eq!(result["result"].get("resultType").is_some(), !legacy);
         connection.close(0_u32.into(), b"done");
     }
 }

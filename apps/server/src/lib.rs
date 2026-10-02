@@ -4,6 +4,7 @@
 //! Register trusted Rust tool modules and endpoint adapters before binding listeners.
 //! Legal retrieval policy belongs in application services, not transport adapters.
 
+pub mod citation;
 pub mod config;
 pub mod corpus_runtime;
 pub mod database;
@@ -17,6 +18,7 @@ pub mod legal_analysis;
 pub mod legal_reference;
 pub mod progress;
 mod rate_limit;
+mod reference_http;
 pub mod registry;
 pub mod resources;
 #[cfg(test)]

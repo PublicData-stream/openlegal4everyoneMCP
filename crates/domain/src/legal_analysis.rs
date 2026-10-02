@@ -95,6 +95,8 @@ pub struct WatchEntry {
     pub detail: Option<String>,
     pub previous_revision_id: Option<String>,
     pub head_revision_id: Option<String>,
+    /// Exact retained HEAD capture already read by this operation.
+    pub capture_id: Option<String>,
     pub effective_date: Option<String>,
     pub publication_date: Option<String>,
     /// The provider amendment type of the HEAD revision, when recorded.
@@ -153,6 +155,8 @@ pub struct LineageResult {
     /// `published`, or the corpus error code returned for HEAD (for example `withdrawn`).
     pub head_state: String,
     pub current_title: Option<String>,
+    /// Exact retained HEAD capture, when HEAD metadata was available.
+    pub capture_id: Option<String>,
     /// Calendar date (`YYYYMMDD`) in `timezone` used for `upcoming` and repeal status.
     pub today: String,
     /// IANA time zone that defined `today`.

@@ -811,6 +811,9 @@ pub(crate) async fn selection_for(
             .await
         {
             Ok(metadata) => {
+                if let Some(selected) = selection.selected.as_mut() {
+                    selected.capture_id = Some(metadata.capture_id.clone());
+                }
                 if let Some(dates) = metadata.metadata.get("provision_effective_dates") {
                     selection.later_provision_dates = later_dates(dates, date);
                     if !selection.later_provision_dates.is_empty() {

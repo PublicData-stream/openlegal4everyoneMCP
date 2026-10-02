@@ -350,6 +350,38 @@ pub struct Config {
     pub cache: Option<CacheConfig>,
     #[serde(default)]
     pub database: Option<DatabaseConfig>,
+    /// Public, capture-fixed reference pages and citation-compatible tools.
+    #[serde(default)]
+    pub citations: Option<CitationConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CitationConfig {
+    pub base_url: String,
+}
+
+impl CitationConfig {
+    pub fn validate(&self) -> Result<(), ServerError> {
+        let url = url::Url::parse(&self.base_url)?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+            || self.base_url.len() > 2048
+            || self.base_url.contains('\\')
+            || self
+                .base_url
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err("citations.base_url must be a public HTTPS origin".into());
+        }
+        Ok(())
+    }
 }
 
 /// Persistence is an explicit operator decision whenever retrieval is enabled.
@@ -543,6 +575,12 @@ impl Config {
     }
 
     pub fn validate_storage(&self) -> Result<(), ServerError> {
+        if let Some(citations) = &self.citations {
+            citations.validate()?;
+            if self.database.is_none() {
+                return Err("citations require the retained database".into());
+            }
+        }
         if let Some(demo) = &self.demo {
             demo.provider_requests.policy()?;
         }
@@ -1227,7 +1265,47 @@ impl DatabaseConfig {
 
 #[cfg(test)]
 mod database_config_tests {
-    use super::{DatabaseConfig, DemoRequestConfig, DocumentWorkerConfig, ProviderRequestConfig};
+    use super::{
+        CitationConfig, Config, DatabaseConfig, DemoRequestConfig, DocumentWorkerConfig,
+        ProviderRequestConfig,
+    };
+
+    #[test]
+    fn citation_origin_is_explicit_and_requires_a_database() {
+        CitationConfig {
+            base_url: "https://openlegal4everyone.reference.publicdata.stream".into(),
+        }
+        .validate()
+        .unwrap();
+        for base in [
+            "http://example.test",
+            "https://user:secret@example.test",
+            "https://example.test/path",
+            "https://example.test/?token=secret",
+            "https://example.test/#fragment",
+            "https://example.test\\path",
+            " https://example.test",
+            "https://example.test\n",
+        ] {
+            assert!(
+                CitationConfig {
+                    base_url: base.into()
+                }
+                .validate()
+                .is_err(),
+                "{base:?}"
+            );
+        }
+        let mut config: Config =
+            toml::from_str(include_str!("../../../deploy/demo/server.toml")).unwrap();
+        config.citations = Some(CitationConfig {
+            base_url: "https://example.test".into(),
+        });
+        assert!(config.validate_storage().is_err());
+        assert!(
+            toml::from_str::<CitationConfig>("base_url='https://example.test'\nunknown=1").is_err()
+        );
+    }
 
     #[test]
     fn corpus_requires_an_explicit_dictionary_without_loading_it() {

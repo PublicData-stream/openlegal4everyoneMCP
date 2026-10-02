@@ -2,7 +2,7 @@
 
 use crate::{ServerError, progress::ProgressReporter};
 use futures::{FutureExt, future::BoxFuture};
-use rmcp::model::{MetaObject, Tool, ToolAnnotations};
+use rmcp::model::{ContentBlock, MetaObject, Tool, ToolAnnotations};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -71,6 +71,20 @@ impl<T> ToolOutput<T> {
     }
 }
 
+/// Additive content support; existing `ToolOutput` struct literals remain valid.
+pub struct RichToolOutput<T> {
+    pub output: ToolOutput<T>,
+    pub additional_content: Vec<ContentBlock>,
+}
+impl<T> RichToolOutput<T> {
+    pub fn new(structured: T) -> Self {
+        Self {
+            output: ToolOutput::new(structured),
+            additional_content: Vec::new(),
+        }
+    }
+}
+
 /// Descriptor annotations and static client metadata for a typed read-only tool.
 pub struct ToolOptions {
     pub annotations: ToolAnnotations,
@@ -104,6 +118,8 @@ pub(crate) struct InvocationOutput {
     pub structured: Value,
     pub text: Option<String>,
     pub meta: Option<MetaObject>,
+    pub additional_content: Vec<ContentBlock>,
+    pub strict_result_limit: bool,
 }
 
 type Invoke = dyn Fn(Value, ToolExecutionContext) -> BoxFuture<'static, Result<InvocationOutput, ToolError>>
@@ -237,6 +253,8 @@ impl ToolRegistry {
                         structured,
                         text: None,
                         meta: None,
+                        additional_content: Vec::new(),
+                        strict_result_limit: false,
                     })
             }
             .boxed()
@@ -268,6 +286,48 @@ impl ToolRegistry {
         Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
     {
         self.register_typed_internal(name, description, options, handler, false)
+    }
+
+    /// Register typed structured output and additional MCP content blocks.
+    /// The shared handler bounds the complete result, including duplicated JSON.
+    pub fn register_rich<I, O, F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        options: ToolOptions,
+        handler: F,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: serde::Serialize + JsonSchema + Send + 'static,
+        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RichToolOutput<O>, ToolError>> + Send + 'static,
+    {
+        self.register_typed::<I, O, _, _>(name, description, options, |_, _| async {
+            Err(ToolError::Internal)
+        })?;
+        let handler = Arc::new(handler);
+        let tool = self
+            .tools
+            .get_mut(name)
+            .ok_or("registered tool disappeared")?;
+        tool.invoke = Arc::new(move |value, context| {
+            let handler = handler.clone();
+            async move {
+                let input = serde_json::from_value(value).map_err(|_| ToolError::InvalidInput)?;
+                let result = handler(input, context).await?;
+                Ok(InvocationOutput {
+                    structured: serde_json::to_value(result.output.structured)
+                        .map_err(|_| ToolError::Internal)?,
+                    text: result.output.text,
+                    meta: result.output.meta,
+                    additional_content: result.additional_content,
+                    strict_result_limit: true,
+                })
+            }
+            .boxed()
+        });
+        Ok(())
     }
 
     /// Only the enumerated built-in transient operations may mutate anonymous state.
@@ -358,6 +418,8 @@ impl ToolRegistry {
                         .map_err(|_| ToolError::Internal)?,
                     text: output.text,
                     meta: output.meta,
+                    additional_content: Vec::new(),
+                    strict_result_limit: false,
                 })
             }
             .boxed()
@@ -387,6 +449,40 @@ impl ToolRegistry {
 
     pub fn register_module(&mut self, module: impl ToolModule) -> Result<(), ServerError> {
         module.register(self)
+    }
+
+    pub(crate) fn enable_citation_references(&mut self) -> Result<(), ServerError> {
+        let descriptor = serde_json::to_value(schemars::schema_for!(
+            openlegal_domain::citation::CitationDescriptor
+        ))?;
+        for (name, tool) in &mut self.tools {
+            if !crate::citation::is_native_citation_tool(name) {
+                continue;
+            }
+            let Some(schema) = &tool.definition.output_schema else {
+                continue;
+            };
+            let mut schema = Value::Object(schema.as_ref().clone());
+            let properties = schema
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+                .ok_or("citation tool output schema must expose object properties")?;
+            properties.insert(
+                "references".into(),
+                serde_json::json!({"type":"array","maxItems":20,"items":descriptor}),
+            );
+            tool.output_validator = Some(
+                jsonschema::validator_for(&schema)
+                    .map_err(|_| "invalid citation reference output schema")?,
+            );
+            tool.definition = tool.definition.clone().with_raw_output_schema(Arc::new(
+                schema
+                    .as_object()
+                    .ok_or("invalid citation output schema")?
+                    .clone(),
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -147,6 +147,7 @@ impl Endpoint for HttpEndpoint {
         } else {
             context.handler.clone()
         };
+        let source_handler = handler.clone();
         // Legacy initialize remains supported; the read-only registry needs no persistent sessions.
         let config = StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
@@ -160,13 +161,18 @@ impl Endpoint for HttpEndpoint {
             Arc::new(LocalSessionManager::default()),
             config,
         );
-        let app =
-            Router::new()
-                .nest_service("/mcp", service)
-                .layer(middleware::from_fn_with_state(
-                    (context.clone(), self.access),
-                    guard,
-                ));
+        let mut app = Router::new().nest_service("/mcp", service);
+        if source_handler.citation_service().is_some() {
+            app = app.merge(
+                Router::new()
+                    .route("/source/{*id}", get(crate::reference_http::source_page))
+                    .with_state(source_handler),
+            );
+        }
+        let app = app.layer(middleware::from_fn_with_state(
+            (context.clone(), self.access),
+            guard,
+        ));
         let run = async move { serve_bounded(listener, app, context, tls_acceptor).await }.boxed();
         Ok(BoundEndpoint {
             id: "http".into(),

@@ -72,6 +72,7 @@ pub struct ServerBuilder {
     registry: ToolRegistry,
     source: SourceOffer,
     resources: ResourceRegistry,
+    citations: Option<Arc<openlegal_application::citation::CitationService>>,
     workers: Vec<WorkerFactory>,
     limits: Limits,
     ids: HashSet<String>,
@@ -85,6 +86,7 @@ impl ServerBuilder {
             registry,
             source,
             resources: ResourceRegistry::new(),
+            citations: None,
             workers: Vec::new(),
             limits,
             ids: HashSet::new(),
@@ -96,6 +98,15 @@ impl ServerBuilder {
     /// Add immutable resources before listener binding. An empty registry is the default.
     pub fn with_resources(mut self, resources: ResourceRegistry) -> Self {
         self.resources = resources;
+        self
+    }
+
+    /// Enable retained-corpus source resources and source-page application access.
+    pub fn with_citations(
+        mut self,
+        citations: Arc<openlegal_application::citation::CitationService>,
+    ) -> Self {
+        self.citations = Some(citations);
         self
     }
 
@@ -148,7 +159,8 @@ impl ServerBuilder {
                 self.resources,
                 limits.clone(),
                 self.source,
-            )?,
+            )?
+            .with_citations(self.citations)?,
             buffers: Arc::new(Semaphore::new(limits.max_buffer_bytes)),
             requests: Arc::new(Semaphore::new(limits.max_in_flight)),
             connections: Arc::new(Semaphore::new(limits.max_connections)),

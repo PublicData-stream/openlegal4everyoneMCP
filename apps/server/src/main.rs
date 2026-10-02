@@ -291,6 +291,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         _ => None,
     };
     let mut corpus_runtime = None;
+    let mut citations = None;
     let result: Result<(), ServerError> = async {
         if let Some(database) = &config.database {
             let runtime = openlegal_server::corpus_runtime::CorpusRuntime::open(
@@ -315,6 +316,21 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                 lookup: lookup.clone(),
             })?;
             registry.register_module(openlegal_server::legal_analysis::LegalAnalysisTools { lookup })?;
+            if let Some(options) = &config.citations {
+                let service = std::sync::Arc::new(
+                    openlegal_application::citation::CitationService::new(
+                        runtime.database.clone(),
+                        runtime.search.clone(),
+                        runtime.store.clone(),
+                        std::sync::Arc::new(openlegal_application::SystemClock::default()),
+                        options.base_url.clone(),
+                    )?,
+                );
+                registry.register_module(openlegal_server::citation::CitationTools {
+                    service: service.clone(),
+                })?;
+                citations = Some(service);
+            }
             corpus_runtime = Some(runtime);
         }
         let demo_options = config
@@ -359,6 +375,9 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         }
         let mut builder = ServerBuilder::new(registry, config.limits, config.source.url.clone())
             .with_resources(resources);
+        if let Some(service) = citations {
+            builder = builder.with_citations(service);
+        }
         if let Some(service) = &diff_service {
             let service = service.clone();
             builder.register_worker("text_diff", move |shutdown| async move {

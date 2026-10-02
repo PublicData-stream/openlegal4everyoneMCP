@@ -179,6 +179,7 @@ fn anchored_queries(alternatives: &[String]) -> Result<Vec<String>, DatabaseErro
 fn choice(entry: &HistoryEntry) -> RevisionChoice {
     RevisionChoice {
         revision_id: entry.revision_id.clone(),
+        capture_id: entry.capture_id.clone(),
         effective_date: entry.effective_date.clone(),
         publication_date: entry.publication_date.clone(),
     }

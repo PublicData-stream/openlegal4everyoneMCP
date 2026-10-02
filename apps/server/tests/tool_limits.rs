@@ -4,7 +4,7 @@ use openlegal_server::{
     config::{AccessPolicy, EdgeMtlsConfig, HttpTlsConfig, Limits, RateLimitConfig, SourceOffer},
     framing::{FrameReader, write_json},
     http::{HealthEndpoint, HttpEndpoint},
-    registry::{ToolError, ToolOptions, ToolOutput, ToolRegistry},
+    registry::{RichToolOutput, ToolError, ToolOptions, ToolOutput, ToolRegistry},
     webtransport::WebTransportEndpoint,
 };
 use serde_json::{Value, json};
@@ -53,38 +53,54 @@ impl Server {
     async fn start_with_mtls(limits: Limits, mtls: bool) -> Self {
         let source = SourceOffer::new("https://source.test/running").unwrap();
         let mut registry = ToolRegistry::new();
-        registry
-            .register::<Empty, _, _>("small", "Small output", |_, _| async {
-                Ok(json!({"ok":true}))
-            })
-            .unwrap();
-        registry
-            .register::<Empty, _, _>("missing_data", "Application failure", |_, _| async {
-                Err(ToolError::NotFound)
-            })
-            .unwrap();
-        registry
-            .register::<Empty, _, _>("fits", "Result at byte boundary", |_, _| async {
-                Ok(json!({"data":"x".repeat(339)}))
-            })
-            .unwrap();
-        registry
-            .register::<Empty, _, _>("exceeds", "Result beyond byte boundary", |_, _| async {
-                Ok(json!({"data":"x".repeat(340)}))
-            })
-            .unwrap();
-        registry
-            .register_typed::<Empty, LargeOutput, _, _>(
-                "typed_exceeds",
-                "Typed result beyond byte boundary",
-                ToolOptions::default(),
-                |_, _| async {
-                    Ok(ToolOutput::new(LargeOutput {
-                        data: "x".repeat(400),
-                    }))
-                },
-            )
-            .unwrap();
+        if limits.max_tool_result_bytes != Some(350) {
+            registry
+                .register::<Empty, _, _>("small", "Small output", |_, _| async {
+                    Ok(json!({"ok":true}))
+                })
+                .unwrap();
+            registry
+                .register::<Empty, _, _>("missing_data", "Application failure", |_, _| async {
+                    Err(ToolError::NotFound)
+                })
+                .unwrap();
+        }
+        if limits.max_tool_result_bytes == Some(350) {
+            registry
+                .register::<Empty, _, _>("fits", "Result at byte boundary", |_, _| async {
+                    Ok(json!({"data":"x".repeat(339)}))
+                })
+                .unwrap();
+            registry
+                .register::<Empty, _, _>("exceeds", "Result beyond byte boundary", |_, _| async {
+                    Ok(json!({"data":"x".repeat(340)}))
+                })
+                .unwrap();
+            registry
+                .register_typed::<Empty, LargeOutput, _, _>(
+                    "typed_exceeds",
+                    "Typed result beyond byte boundary",
+                    ToolOptions::default(),
+                    |_, _| async {
+                        Ok(ToolOutput::new(LargeOutput {
+                            data: "x".repeat(400),
+                        }))
+                    },
+                )
+                .unwrap();
+            registry
+                .register_rich::<Empty, LargeOutput, _, _>(
+                    "rich_exceeds",
+                    "Combined duplicated result exceeds budget",
+                    ToolOptions::default(),
+                    |_, _| async {
+                        Ok(RichToolOutput::new(LargeOutput {
+                            data: "x".repeat(180),
+                        }))
+                    },
+                )
+                .unwrap();
+        }
         let directory = tempfile::tempdir().unwrap();
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
@@ -567,7 +583,7 @@ async fn configured_result_boundary_is_a_tool_error_on_both_transports() {
         .await;
         let (_client, _connection, mut tx, mut rx) = server.wt().await;
         wt_ready(&mut tx, &mut rx, version).await;
-        for name in ["fits", "exceeds", "typed_exceeds"] {
+        for name in ["fits", "exceeds", "typed_exceeds", "rich_exceeds"] {
             let http = server.http(version, "tools/call", call(name)).await;
             let wt = wt_call(&mut tx, &mut rx, version, 5, "tools/call", call(name)).await;
             if name == "fits" {

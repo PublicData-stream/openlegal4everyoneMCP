@@ -410,6 +410,7 @@ async fn watch(
             detail: None,
             previous_revision_id: None,
             head_revision_id: None,
+            capture_id: None,
             effective_date: None,
             publication_date: None,
             amendment_type: None,
@@ -458,6 +459,7 @@ async fn watch(
                 entry.title = Some(head.title);
                 entry.amendment_type = head.metadata.get("amendment_type").cloned();
                 entry.head_revision_id = Some(head.revision_id);
+                entry.capture_id = Some(head.capture_id);
                 entry.effective_date = head.effective_date;
                 entry.publication_date = head.publication_date;
             }
@@ -546,10 +548,15 @@ async fn lineage(
     if !object.dataset.has_provider_revisions() {
         return Err(ToolError::UnsupportedHistory);
     }
-    let (head_state, current_title) = match head_metadata(lookup, &object, &cancel).await? {
-        Ok(head) => ("published".to_string(), Some(head.title)),
-        Err(error) => (code(error), None),
-    };
+    let (head_state, current_title, capture_id) =
+        match head_metadata(lookup, &object, &cancel).await? {
+            Ok(head) => (
+                "published".to_string(),
+                Some(head.title),
+                Some(head.capture_id),
+            ),
+            Err(error) => (code(error), None, None),
+        };
     let inventory = lookup
         .revisions(object.clone(), cancel.clone())
         .await
@@ -656,6 +663,7 @@ async fn lineage(
         resolution,
         head_state,
         current_title,
+        capture_id,
         today: day.date.clone(),
         timezone: day.timezone.clone(),
         renamed: distinct.len() > 1,
