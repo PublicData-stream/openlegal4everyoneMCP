@@ -183,6 +183,8 @@ class HttpClient:
                     headers["Mcp-Method"] = body["method"]
                     if "name" in body.get("params", {}):
                         headers["Mcp-Name"] = body["params"]["name"]
+                    elif "uri" in body.get("params", {}):
+                        headers["Mcp-Name"] = body["params"]["uri"]
             try:
                 connection.request("POST" if body else "GET", target.path,
                                    json.dumps(body) if body else None, headers)

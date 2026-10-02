@@ -295,7 +295,24 @@ class TlsTests(unittest.TestCase):
                 pass
 
             def do_POST(self):
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if mode in ("resource", "resource_mismatch", "resource_legacy", "tool_name"):
+                    body = json.loads(raw)
+                    params = body["params"]
+                    expected_name = params.get("name", params.get("uri"))
+                    if mode == "resource_mismatch":
+                        expected_name += "/different"
+                    valid = (self.headers.get("Mcp-Method") == body["method"]
+                             and self.headers.get("Mcp-Name") == expected_name)
+                    if mode == "resource_legacy":
+                        valid = (self.headers.get("Mcp-Method") is None
+                                 and self.headers.get("Mcp-Name") is None)
+                    self.send_response(200 if valid else 400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"jsonrpc": "2.0", "id": body["id"],
+                                                "result": {"contents": [{"uri": params.get("uri"), "text": "fixture"}]}}).encode())
+                    return
                 self.do_GET()
 
             def do_GET(self):
@@ -345,6 +362,29 @@ class TlsTests(unittest.TestCase):
             result = self.client(url).exchange(REQUEST, smoke.REVISIONS[0])
             self.assertEqual(result, {"ok": True})
             self.assertLess(time.monotonic() - start, .25)
+
+    def test_modern_resource_uri_matches_name_header(self):
+        uri = "openlegal://source/v1/fixture/capture/section/s-%ED%95%9C%EA%B8%80"
+        with self.server("resource") as url:
+            result = self.client(url).rpc(smoke.REVISIONS[1], "resources/read", {"uri": uri})
+            self.assertEqual(result["contents"], [{"uri": uri, "text": "fixture"}])
+
+    def test_resource_header_mismatch_remains_http_failure(self):
+        with self.server("resource_mismatch") as url:
+            with self.assertRaises(smoke.Failure) as caught:
+                self.client(url).rpc(smoke.REVISIONS[1], "resources/read", {"uri": "openlegal://fixture"})
+            self.assertEqual(caught.exception.reason, "unexpected_status")
+
+    def test_legacy_resource_read_has_no_modern_headers(self):
+        with self.server("resource_legacy") as url:
+            result = self.client(url).rpc(smoke.REVISIONS[0], "resources/read", {"uri": "openlegal://fixture"})
+            self.assertEqual(result["contents"][0]["text"], "fixture")
+
+    def test_tool_name_takes_priority_over_uri(self):
+        with self.server("tool_name") as url:
+            result = self.client(url).rpc(smoke.REVISIONS[1], "tools/call",
+                                          {"name": "fixture.tool", "uri": "openlegal://fixture", "arguments": {}})
+            self.assertEqual(result["contents"][0]["text"], "fixture")
 
     def test_ca_bundle_requires_only_valid_certificates(self):
         cert = self.cert.read_bytes()
