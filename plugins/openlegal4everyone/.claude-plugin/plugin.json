@@ -7,10 +7,12 @@
     "name": "PublicData-stream",
     "url": "https://github.com/PublicData-stream"
   },
-  "homepage": "https://github.com/PublicData-stream/openlegal4everyoneMCP/tree/main/plugins/openlegal4everyone",
+  "homepage": "https://publicdata.stream/",
   "repository": "https://github.com/PublicData-stream/openlegal4everyoneMCP",
   "icon": "./logo.svg",
   "license": "AGPL-3.0-only",
   "keywords": ["legal", "korea", "law", "statute", "precedent", "mcp"],
-  "privacyPolicyUrl": "https://publicdata.stream/servers/openlegal4everyonemcp/privacy"
+  "privacyPolicyUrl": "https://publicdata.stream/servers/openlegal4everyonemcp/privacy",
+  "supportUrl": "https://publicdata.stream/servers/openlegal4everyonemcp/",
+  "termsOfServiceUrl": "https://publicdata.stream/servers/openlegal4everyonemcp/terms"
 }
