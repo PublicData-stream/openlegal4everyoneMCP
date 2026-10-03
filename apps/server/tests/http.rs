@@ -140,21 +140,33 @@ impl Server {
             active,
         }
     }
+    fn raw_request(&self, body: &Value) -> reqwest::RequestBuilder {
+        reqwest::Client::new()
+            .post(&self.url)
+            .header("host", "backend.test")
+            .header("accept", "application/json, text/event-stream")
+            .json(body)
+    }
     fn request(&self, version: &str, method: &str, mut params: Value) -> reqwest::RequestBuilder {
         if version == "2026-07-28" {
             params["_meta"] = meta();
         }
-        let mut request = reqwest::Client::new()
-            .post(&self.url)
-            .header("host", "backend.test")
-            .header("accept", "application/json, text/event-stream")
+        let mut request = self
+            .raw_request(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
             .header("mcp-protocol-version", version)
             .header("mcp-method", method);
         if let Some(name) = params.get("name").and_then(Value::as_str) {
             request = request.header("mcp-name", name);
         }
-        request.json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+        request
     }
+}
+fn codex_initialize(version: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{
+        "protocolVersion":version,
+        "capabilities":{"elicitation":{"form":{},"url":{}}},
+        "clientInfo":{"name":"codex-mcp-client","title":"Codex","version":"0.159.0-alpha.12.1"}
+    }})
 }
 fn meta() -> Value {
     json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28",
@@ -164,6 +176,9 @@ async fn reply(response: reqwest::Response) -> Value {
     decode(response, 200).await
 }
 async fn decode(response: reqwest::Response, expected: u16) -> Value {
+    decode_id(response, expected, 1).await
+}
+async fn decode_id(response: reqwest::Response, expected: u16, id: u64) -> Value {
     let status = response.status();
     let text = response.text().await.unwrap();
     assert_eq!(status, expected, "{text}");
@@ -173,8 +188,239 @@ async fn decode(response: reqwest::Response, expected: u16) -> Value {
     text.lines()
         .filter_map(|line| line.strip_prefix("data:"))
         .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
-        .find(|value| value.get("id") == Some(&json!(1)))
+        .find(|value| value.get("id") == Some(&json!(id)))
         .unwrap_or_else(|| panic!("no RPC response: {text}"))
+}
+
+#[tokio::test]
+async fn captured_codex_initialize_negotiates_before_tool_discovery() {
+    let server = Server::start().await;
+    let response = server
+        .raw_request(&codex_initialize("2025-06-18"))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.headers().get("mcp-session-id").is_none());
+    let initialized = decode_id(response, 200, 0).await;
+    assert_eq!(initialized["id"], 0);
+    let negotiated = initialized["result"]["protocolVersion"].as_str().unwrap();
+    assert_eq!(negotiated, "2025-11-25");
+    let response = server
+        .raw_request(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+        .header("mcp-protocol-version", negotiated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    assert!(response.bytes().await.unwrap().is_empty());
+    let listed = reply(
+        server
+            .raw_request(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+            .header("mcp-protocol-version", negotiated)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(listed["result"].get("resultType").is_none());
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "synthetic")
+    );
+}
+
+#[tokio::test]
+async fn initialize_negotiates_proposals_with_consistent_supported_headers() {
+    let server = Server::start().await;
+    for (proposal, header) in [
+        ("2025-11-25", None),
+        ("2099-01-01", None),
+        ("2026-07-28", None),
+        ("2025-11-25", Some("2025-11-25")),
+        ("2026-07-28", Some("2026-07-28")),
+    ] {
+        let mut request = server.raw_request(&codex_initialize(proposal));
+        if let Some(header) = header {
+            request = request.header("mcp-protocol-version", header);
+        }
+        let response = request.send().await.unwrap();
+        assert!(response.headers().get("mcp-session-id").is_none());
+        let result = decode_id(response, 200, 0).await;
+        assert_eq!(
+            result["result"]["protocolVersion"], "2025-11-25",
+            "{proposal} {header:?}"
+        );
+    }
+    for (proposal, header, code) in [
+        ("2025-06-18", "2025-06-18", -32022),
+        ("2099-01-01", "2099-01-01", -32022),
+        ("2025-06-18", "2025-11-25", -32020),
+        ("2025-11-25", "2026-07-28", -32020),
+        ("2026-07-28", "2025-11-25", -32020),
+    ] {
+        let result = decode_id(
+            server
+                .raw_request(&codex_initialize(proposal))
+                .header("mcp-protocol-version", header)
+                .send()
+                .await
+                .unwrap(),
+            400,
+            0,
+        )
+        .await;
+        assert_eq!(result["id"], 0);
+        assert_eq!(
+            result["error"]["code"], code,
+            "{proposal} {header}: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn initialize_rejects_malformed_versions_and_ambiguous_headers() {
+    let server = Server::start().await;
+    for version in [None, Some(Value::Null), Some(json!(123)), Some(json!({}))] {
+        let mut body = codex_initialize("2025-06-18");
+        match version {
+            Some(version) => body["params"]["protocolVersion"] = version,
+            None => {
+                body["params"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("protocolVersion");
+            }
+        }
+        let result = decode_id(server.raw_request(&body).send().await.unwrap(), 400, 0).await;
+        assert_eq!(result["error"]["code"], -32022);
+    }
+    for (name, value) in [
+        ("mcp-protocol-version", "2025-11-25"),
+        ("mcp-method", "initialize"),
+        ("mcp-name", "fixture"),
+    ] {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap();
+        headers.append(name.clone(), value.parse().unwrap());
+        headers.append(name, value.parse().unwrap());
+        let result = decode_id(
+            server
+                .raw_request(&codex_initialize("2025-11-25"))
+                .headers(headers)
+                .send()
+                .await
+                .unwrap(),
+            400,
+            0,
+        )
+        .await;
+        assert_eq!(result["error"]["code"], -32020);
+    }
+    let result = decode_id(
+        server
+            .raw_request(&codex_initialize("2025-11-25"))
+            .header(
+                "mcp-protocol-version",
+                reqwest::header::HeaderValue::from_bytes(&[0x80]).unwrap(),
+            )
+            .send()
+            .await
+            .unwrap(),
+        400,
+        0,
+    )
+    .await;
+    assert_eq!(result["error"]["code"], -32020);
+    let mut body = codex_initialize("2025-11-25");
+    body["params"]["_meta"] = meta();
+    let result = decode_id(
+        server
+            .raw_request(&body)
+            .header("mcp-protocol-version", "2025-11-25")
+            .send()
+            .await
+            .unwrap(),
+        400,
+        0,
+    )
+    .await;
+    assert_eq!(result["error"]["code"], -32020);
+    assert_eq!(
+        server
+            .context
+            .handler
+            .counters
+            .calls
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn subsequent_requests_require_supported_protocol_headers() {
+    let server = Server::start().await;
+    for method in ["notifications/initialized", "tools/list"] {
+        for header in [None, Some("2025-06-18")] {
+            let mut body = json!({"jsonrpc":"2.0","method":method,"params":{}});
+            if method == "tools/list" {
+                body["id"] = json!(1);
+            }
+            let mut request = server.raw_request(&body);
+            if let Some(header) = header {
+                request = request.header("mcp-protocol-version", header);
+            }
+            let result = decode(request.send().await.unwrap(), 400).await;
+            assert_eq!(
+                result["error"]["code"], -32022,
+                "{method} {header:?}: {result}"
+            );
+            assert_eq!(
+                result["error"]["data"]["supported"],
+                json!(["2026-07-28", "2025-11-25"])
+            );
+        }
+    }
+    let mut params = json!({"_meta":meta()});
+    params["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");
+    let result = decode(
+        server
+            .raw_request(
+                &json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":params}),
+            )
+            .header("mcp-protocol-version", "2099-01-01")
+            .header("mcp-method", "server/discover")
+            .send()
+            .await
+            .unwrap(),
+        400,
+    )
+    .await;
+    assert_eq!(result["error"]["code"], -32022);
+    let discovery = reply(
+        server
+            .request("2026-07-28", "server/discover", json!({}))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(discovery["result"]["resultType"], "complete");
+    assert_eq!(
+        discovery["result"]["supportedVersions"],
+        json!(["2026-07-28", "2025-11-25"])
+    );
+    assert_eq!(
+        server
+            .context
+            .handler
+            .counters
+            .calls
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 #[tokio::test]
@@ -203,6 +449,10 @@ async fn both_revisions_share_registered_tools_and_validation() {
                 .unwrap(),
         )
         .await;
+        assert_eq!(
+            list["result"].get("resultType").is_some(),
+            version == "2026-07-28"
+        );
         assert!(
             list["result"]["tools"]
                 .as_array()

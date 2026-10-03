@@ -17,8 +17,9 @@ SOURCE_URL = "https://example.org/openlegal/source"
 
 def exchange(body, revision=MODERN, session=None, origin=None, path="/mcp", host=None, timeout=10):
     connection = http.client.HTTPSConnection("edge", 8443, context=CONTEXT, timeout=timeout)
-    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
-               "MCP-Protocol-Version": revision}
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    if revision is not None:
+        headers["MCP-Protocol-Version"] = revision
     if revision == MODERN:
         headers["Mcp-Method"] = body["method"]
         name = body.get("params", {}).get("name") or body.get("params", {}).get("uri")
@@ -172,7 +173,27 @@ def text_diff_smoke(revision, session, tools):
     print(f"HTTP {revision}: text comparison lifecycle, 1 MiB inputs, resource read", flush=True)
 
 
+def initialization_negotiation_smoke():
+    # Reproduce the bundled Codex client's headerless proposal; discovery is
+    # sufficient for this compatibility check and does not execute a tool.
+    body = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {"elicitation": {"form": {}, "url": {}}},
+        "clientInfo": {"name": "codex-mcp-client", "title": "Codex",
+                       "version": "0.159.0-alpha.12.1"}}}
+    headers, result = success(body, None)
+    negotiated = result["protocolVersion"]
+    assert negotiated == LEGACY, result
+    assert "mcp-session-id" not in headers, headers
+    status, _, _ = exchange({"jsonrpc": "2.0", "method": "notifications/initialized"}, negotiated)
+    assert status == 202, status
+    _, listed = success(request("tools/list", negotiated, 1), negotiated)
+    assert any(tool["name"] == "server_info" for tool in listed["tools"]), listed
+    print(f"HTTP initialize: 2025-06-18 proposal negotiated to {negotiated}, tools discovered", flush=True)
+
+
 def smoke():
+    initialization_negotiation_smoke()
     for revision in (MODERN, LEGACY):
         session = None
         if revision == LEGACY:

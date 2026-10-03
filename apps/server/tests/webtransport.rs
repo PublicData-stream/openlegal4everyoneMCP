@@ -401,6 +401,65 @@ async fn response(reader: &mut FrameReader<wtransport::RecvStream>) -> Value {
 }
 
 #[tokio::test]
+async fn legacy_initialize_negotiates_before_tool_discovery() {
+    let server = Server::start().await;
+    let client = server.client(true);
+    for proposal in ["2025-06-18", "2025-11-25", "2099-01-01", "2026-07-28"] {
+        let connection = client.connect(server.url(PATH)).await.unwrap();
+        let (mut tx, rx) = connection.open_bi().await.unwrap().await.unwrap();
+        let mut rx = reader(rx);
+        send(
+            &mut tx,
+            &json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{
+                "protocolVersion":proposal,
+                "capabilities":{"elicitation":{"form":{},"url":{}}},
+                "clientInfo":{"name":"codex-mcp-client","title":"Codex","version":"0.159.0-alpha.12.1"}
+            }}),
+        )
+        .await;
+        let initialized = response(&mut rx).await;
+        assert_eq!(initialized["id"], 0);
+        assert_eq!(
+            initialized["result"]["protocolVersion"], "2025-11-25",
+            "{proposal}: {initialized}"
+        );
+        send(
+            &mut tx,
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        )
+        .await;
+        send(
+            &mut tx,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+        )
+        .await;
+        let listed = response(&mut rx).await;
+        assert_eq!(listed["id"], 1);
+        assert!(
+            listed["result"].get("resultType").is_none(),
+            "{proposal}: {listed}"
+        );
+        assert!(
+            listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "server_info"),
+            "{proposal}: {listed}"
+        );
+        timeout(Duration::from_secs(2), async {
+            while server.context.requests.available_permits() != server.context.limits.max_in_flight
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        connection.close(0_u32.into(), b"done");
+    }
+}
+
+#[tokio::test]
 async fn unsupported_modern_versions_negotiate_without_legacy_fallback() {
     let server = Server::start().await;
     let client = server.client(true);

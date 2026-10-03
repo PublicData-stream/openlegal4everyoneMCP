@@ -211,7 +211,19 @@ Streamable HTTP routing and JSON/SSE error/result translation. HTTP legacy mode
 is stateless: initialization works without issuing a persistent session ID. No
 standalone legacy HTTP+SSE listener, persistent event store or GET event stream is
 provided. HTTP protocol headers must be consistent with the body; missing or
-unsupported version headers are rejected except for legacy initialization.
+unsupported version headers are rejected. The initial `initialize` request may
+omit `MCP-Protocol-Version`; when supplied, it must name a supported version and
+match `params.protocolVersion`.
+
+The initialization body's version is a proposal, not a requirement that it already
+be supported. The SDK negotiates unsupported proposals to the supported handshake
+revision `2025-11-25`. For example, a headerless `2025-06-18` proposal receives
+`result.protocolVersion: "2025-11-25"`; the client then sends its initialized
+notification and subsequent requests with that response version in the HTTP header.
+This does not add `2025-06-18` support. An `initialize` proposal naming
+`2026-07-28` also negotiates to `2025-11-25`: modern clients use `server/discover`
+and per-request metadata instead of the handshake. Modern unsupported-version
+errors continue to expose the supported versions for clients that implement retry.
 
 WebTransport binding v1 uses exactly one client-opened reliable bidirectional
 application stream per connection, UTF-8 JSON-RPC messages separated by LF (CRLF

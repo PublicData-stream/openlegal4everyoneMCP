@@ -344,14 +344,19 @@ fn validate_version(headers: &http::HeaderMap, bytes: &[u8]) -> Option<Response>
     }
     let supported = json!({"supported":["2026-07-28","2025-11-25"]});
     if initialize {
-        if value
+        let Some(proposed) = value
             .pointer("/params/protocolVersion")
             .and_then(Value::as_str)
-            != Some("2025-11-25")
-        {
+        else {
             return reject(-32022, "unsupported initialization protocol", supported);
+        };
+        // The body proposes a version; the SDK negotiates a supported legacy
+        // revision. A supplied HTTP header still names an actual supported
+        // version and must agree with that proposal.
+        if version.is_some_and(|v| !matches!(v, "2025-11-25" | "2026-07-28")) {
+            return reject(-32022, "unsupported protocol version", supported);
         }
-        if version.is_some_and(|v| v != "2025-11-25") {
+        if version.is_some_and(|v| v != proposed) {
             return reject(
                 -32020,
                 "initialization protocol header mismatch",
