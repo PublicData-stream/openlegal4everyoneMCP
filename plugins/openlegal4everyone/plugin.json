@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "openlegal4everyone",
-  "version": "0.3.1",
-  "description": "Search, read, cite and compare Korean statutes, ordinances and precedents with provenance through the openlegal4everyone.stream MCP server.",
+  "version": "1.0.1",
+  "description": "Search, read, cite and compare governments' statutes, ordinances and precedents with provenance through the openlegal4everyone MCP server.",
   "author": {
     "name": "PublicData-stream",
     "url": "https://github.com/PublicData-stream"
@@ -15,12 +15,23 @@
     "com.openai": {
       "interface": {
         "displayName": "openlegal4everyone",
-        "shortDescription": "Korean laws and precedents with provenance",
-        "longDescription": "Search the openlegal4everyone.stream corpus of Korean national statutes, ordinances and precedents, read exact text with source and freshness metadata, compare versions, and compare supplied texts. Legal information, not legal advice.",
+        "shortDescription": "Gov legal info with provenance",
+        "longDescription": "Search the openlegal4everyone MCP corpus of governments' statutes, ordinances and precedents, read exact text with source and freshness metadata, compare versions, and compare supplied texts. Legal information, not legal advice.",
         "developerName": "PublicData-stream",
-        "category": "Research",
+        "category": "Education & Research",
+        "brandColor": "#2357C6",
+        "brandColorDark": "#8CB4FF",
+
+        "composerIcon": "./logo.svg",
+        "composerIconDark": "./logo.svg",
+
+        "logo": "./logo.svg",
+        "logoDark": "./logo.svg",
         "capabilities": ["Read"],
-        "websiteURL": "https://github.com/PublicData-stream/openlegal4everyoneMCP",
+        "websiteURL": "https://publicdata.stream/servers/openlegal4everyonemcp/",
+        "supportURL": "https://publicdata.stream/servers/openlegal4everyonemcp/",
+        "privacyPolicyURL": "https://publicdata.stream/servers/openlegal4everyonemcp/privacy",
+        "termsOfServiceURL": "https://publicdata.stream/servers/openlegal4everyonemcp/terms",
         "defaultPrompt": [
           "민법 제750조 원문을 출처와 함께 보여줘",
           "근로기준법 최근 개정에서 바뀐 조문을 비교해줘",

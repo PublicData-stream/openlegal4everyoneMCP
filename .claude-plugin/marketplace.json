@@ -7,9 +7,9 @@
   },
   "plugins": [
     {
-      "name": "openlegal",
-      "source": "./plugins/openlegal",
-      "description": "Korean statutes, ordinances and precedents with provenance through the openlegal4everyone.stream MCP server."
+      "name": "openlegal4everyone",
+      "source": "./plugins/openlegal4everyone",
+      "description": "Search, read, cite and compare governments' statutes, ordinances and precedents with provenance through the openlegal4everyone.stream MCP server."
     }
   ]
 }
