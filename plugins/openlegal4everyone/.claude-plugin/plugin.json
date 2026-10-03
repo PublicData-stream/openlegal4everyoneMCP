@@ -9,7 +9,8 @@
   },
   "homepage": "https://github.com/PublicData-stream/openlegal4everyoneMCP/tree/main/plugins/openlegal4everyone",
   "repository": "https://github.com/PublicData-stream/openlegal4everyoneMCP",
-  "icon": "../logo.svg",
+  "icon": "./logo.svg",
   "license": "AGPL-3.0-only",
-  "keywords": ["legal", "korea", "law", "statute", "precedent", "mcp"]
+  "keywords": ["legal", "korea", "law", "statute", "precedent", "mcp"],
+  "privacyPolicyUrl": "https://publicdata.stream/servers/openlegal4everyonemcp/privacy"
 }
