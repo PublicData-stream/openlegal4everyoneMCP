@@ -578,7 +578,10 @@ class IngestionValidationTests(unittest.TestCase):
         original = data["server.toml"]
         for old, new in (
             ('enabled = true', 'enabled = false'),
-            ('retain_history_bodies = false', 'retain_history_bodies = true'),
+            ('retain_history_bodies = true', 'retain_history_bodies = false'),
+            ('requests_per_second = 5', 'requests_per_second = 6'),
+            ('max_in_flight = 4', 'max_in_flight = 5'),
+            ('continuous_daily_limit = "unlimited"', 'continuous_daily_limit = 1000'),
             ('context = "openlegal-document-controller"', 'context = "ambient"'),
             ('namespace = "openlegal-documents"', 'namespace = "default"'),
             ('/usr/local/bin/kubectl', 'kubectl'),

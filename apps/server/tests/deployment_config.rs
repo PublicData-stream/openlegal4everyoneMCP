@@ -125,7 +125,7 @@ fn ingestion_template_preserves_retained_config_and_explicit_controller_contract
     let config: Config = toml::from_str(raw).unwrap();
     let ingestion = config.database.unwrap().ingestion.unwrap();
     assert!(ingestion.enabled);
-    assert!(!ingestion.retain_history_bodies);
+    assert!(ingestion.retain_history_bodies);
     assert_eq!(
         ingestion.credential_env,
         "OPENLEGAL_LAW_PROVIDER_CREDENTIAL"
