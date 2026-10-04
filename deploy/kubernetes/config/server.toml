@@ -63,6 +63,7 @@ kind = "filesystem"
 path = "/var/lib/openlegal/cache-blobs/data"
 
 [database]
+auto_collection = true
 blob_path = "/var/lib/openlegal/corpus-blobs/data"
 index_path = "/var/lib/openlegal/corpus-index/data"
 widget_html = "/opt/openlegal/widgets/database.html"

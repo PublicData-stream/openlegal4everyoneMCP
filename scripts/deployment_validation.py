@@ -342,6 +342,7 @@ def validate_config(raw, profile="retained"):
             "blob": {"kind": "filesystem", "path": "/var/lib/openlegal/cache-blobs/data"},
         }, "persistent cache")
         equal(config["database"], {
+            "auto_collection": True,
             "blob_path": "/var/lib/openlegal/corpus-blobs/data",
             "index_path": "/var/lib/openlegal/corpus-index/data",
             "widget_html": "/opt/openlegal/widgets/database.html",
@@ -515,6 +516,7 @@ def validate_ingestion(documents, retained_documents):
         "enabled": True, "mode": "continuous", "retain_history_bodies": False,
         "detail_timeout_secs": 3600, "detail_job_workers": 4,
         "scan_interval_secs": 300,
+        "adaptive_polling": True,
         "provider_requests": {"continuous_daily_limit": 50000,
                               "on_demand_daily_limit": 1000, "min_interval_secs": 1},
     }, "continuous collection configuration")

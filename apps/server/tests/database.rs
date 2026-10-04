@@ -80,6 +80,7 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
     let persistent = fixture.open(time).await;
     let runtime = CorpusRuntime::open(
         &DatabaseConfig {
+            auto_collection: true,
             blob_path: fixture.directory.path().join("corpus-blobs"),
             index_path: fixture.directory.path().join("corpus-index"),
             mecab_dictionary_path: std::env::var_os("OPENLEGAL_TEST_MECAB_DICTIONARY")
@@ -148,6 +149,7 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
     let mut registry = server_info_registry(source.clone()).unwrap();
     registry
         .register_module(DatabaseTools {
+            demand: None,
             database: runtime.database.clone(),
             reader: runtime.reader.clone(),
             search: runtime.search.clone(),

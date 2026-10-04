@@ -1042,6 +1042,9 @@ mod cache_config_tests {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
+    /// Missing/stale eligible reads may enqueue bounded provider collection.
+    #[serde(default = "enabled_by_default")]
+    pub auto_collection: bool,
     pub blob_path: PathBuf,
     pub index_path: PathBuf,
     /// Operator-provisioned, pinned MeCab-Ko dictionary. Never downloaded at runtime.
@@ -1052,6 +1055,9 @@ pub struct DatabaseConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestionConfig {
+    /// Idle scans continue immediately; busy scans wait for shared wakeups.
+    #[serde(default = "enabled_by_default")]
+    pub adaptive_polling: bool,
     pub credential_env: String,
     /// Optional routing for LAW OPEN DATA inventory, details and attachments.
     pub proxy: Option<UpstreamProxyConfig>,
@@ -1084,9 +1090,13 @@ pub struct IngestionConfig {
     /// Background detail jobs claimed concurrently by this scheduler process.
     #[serde(default = "default_detail_job_workers")]
     pub detail_job_workers: u32,
-    /// Delay between completed incremental inventory scan passes.
+    /// Busy scan recheck interval, or fixed scan interval when adaptive polling is off.
     #[serde(default = "default_scan_interval_secs")]
     pub scan_interval_secs: u64,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 fn default_scan_interval_secs() -> u64 {
@@ -1456,7 +1466,16 @@ mod database_config_tests {
         );
         let defaults: DatabaseConfig = toml::from_str(base).unwrap();
         defaults.validate().unwrap();
+        assert!(defaults.auto_collection);
         let ingestion = defaults.ingestion.as_ref().unwrap();
+        assert!(ingestion.adaptive_polling);
+        let opted_out: DatabaseConfig = toml::from_str(&format!(
+            "auto_collection=false\n{base}adaptive_polling=false\n"
+        ))
+        .unwrap();
+        opted_out.validate().unwrap();
+        assert!(!opted_out.auto_collection);
+        assert!(!opted_out.ingestion.unwrap().adaptive_polling);
         assert_eq!(ingestion.scan_interval_secs, 3600);
         assert_eq!(ingestion.detail_timeout_secs, 3600);
         assert_eq!(ingestion.detail_job_workers, 1);

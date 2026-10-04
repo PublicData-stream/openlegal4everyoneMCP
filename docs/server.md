@@ -3,7 +3,8 @@
 The implemented foundation is one `apps/server` library/binary package. It serves
 anonymous MCP tools over Streamable HTTP and WebTransport. Extension tools are
 read-only; the built-in text comparison feature additionally permits deletion of
-a temporary result using its bearer handle. Both adapters
+a temporary result using its bearer handle. Configured corpus tools can enqueue
+explicit or automatic bounded collection for separate workers. Both adapters
 are required by the production binary. An explicitly configured synthetic provider,
 shared memory retrieval cache, progress notifications, and React MCP Apps widget
 extend this foundation. The optional legal corpus and LAW OPEN DATA adapter have
@@ -125,8 +126,11 @@ receives typed input and `ToolContext`, returning `Result<Value, ToolError>`.
 `register_with_annotations` supplies accurate MCP annotations; public registration
 accepts only read-only modules. A crate-private registration path permits only the
 built-in comparison deletion aliases, managed attachment upload/deletion operations,
-and `database.request_collection`. Existing database lookup and search tools keep
-`readOnlyHint: true` and never enqueue work. The explicit request tool has
+and `database.request_collection`, plus a narrow built-in registration path for
+eligible automatic corpus lookup/search tools. With `auto_collection = true`
+(the default), `database.get`, `database.get_metadata`, `database.query`,
+`database.rg`, `law.resolve_name`, and ChatGPT `search` advertise
+`readOnlyHint: false`; disabling it restores read-only annotations. The explicit request tool has
 `readOnlyHint: false`, `destructiveHint: false`, and a separate read-only status tool.
 Possession of a valid comparison or attachment handle authorizes its
 permitted reads/deletion. Uploads only allocate bounded temporary text, and patch
@@ -398,8 +402,10 @@ paging and provider acceptance boundaries are in [legal corpus](database.md).
 verified national-statute ID, exact precedent case number with optional expected provider ID, or a simple term and dataset selection. It does not
 return an upstream search result. Equivalent requests coalesce for 24 hours; use
 `database.collection_status` and then rerun the ordinary local lookup/search.
-Failed or skipped requests can be resubmitted after one hour; successful requests
-continue to coalesce for 24 hours. Deferred requests are retried by the scheduler after one hour while their 24-hour
+Failed, partial or skipped requests can be resubmitted one hour after completion; successful requests
+continue to coalesce for 24 hours. Quota-deferred requests are retried when
+admission becomes eligible; healthy capacity contention is rechecked after five
+seconds while their 24-hour
 request window remains open.
 The original request ID remains readable until its expiry after a retry. A search
 request can report `done` with a provider failure reason when some candidates
@@ -421,7 +427,7 @@ Use `requests_per_second` (1..1,000) for evenly paced starts, or the existing
 `min_interval_secs` (1..3,600). Explicitly specifying both fails validation.
 Omitting both keeps five-second spacing. LAW permits one outstanding request;
 rate configuration does not increase concurrency. The committed collector example
-keeps 50,000/1,000 daily attempts, one-second spacing and 300-second scan waits.
+keeps 50,000/1,000 daily attempts, one-second spacing and 300-second busy rechecks.
 
 | LAW policy field | Default | Accepted values |
 | --- | --- | --- |
@@ -435,8 +441,11 @@ Pilot start/window evidence survives restarts. Explicit operations snapshot thei
 limits when launched, so configuration changes do not shorten an active deadline.
 Shared provider admission still honors current daily/rate policy and safety pauses.
 The existing `detail_timeout_secs`, network and document-worker bounds are separate.
-`scan_interval_secs` controls the delay after a completed inventory pass, not
-freshness or collection-gap retry eligibility.
+`adaptive_polling` defaults to `true`: idle inventory cycles continue immediately,
+while `scan_interval_secs` bounds busy rechecks and notifications wake them earlier.
+A five-second readiness fallback does not start extra scans while busy. Disable
+adaptive polling to retain the original fixed delay after inventory passes.
+Neither setting defines freshness or collection-gap retry eligibility.
 
 `[demo.provider_requests]` configures the synthetic upstream independently:
 

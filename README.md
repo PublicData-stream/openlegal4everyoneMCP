@@ -31,6 +31,11 @@ an opt-in React MCP Apps browser now demonstrate upstream extensions. A separate
 paging, managed text-file attachments and strict atomic patch application. The optional
 [legal corpus tools](docs/database.md) provide indexed query/regex search, exact
 checkpoint retrieval, metadata, history and comparisons with provenance and HEAD TTL.
+Eligible HEAD reads and simple searches enqueue bounded demand collection by
+default; local results include collection status. Idle LAW collectors continue
+polling immediately, while eligible demand gets the next provider request slot.
+See [automatic collection](docs/database.md#automatic-demand-collection) for
+eligibility, response contracts and opt-outs.
 The [legal reference tools](docs/legal-reference.md) add Korean law-name and
 abbreviation resolution, citation checks and date-based revision selection on top of it,
 and the [legal analysis tools](docs/legal-analysis.md) add batch change watching,

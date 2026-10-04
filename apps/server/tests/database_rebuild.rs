@@ -26,6 +26,7 @@ impl openlegal_application::Clock for FixtureClock {
 
 fn config(fixture: &postgres::TestDatabase, destination: &str) -> DatabaseConfig {
     DatabaseConfig {
+        auto_collection: true,
         blob_path: fixture.directory.path().join("corpus-blobs"),
         index_path: fixture.directory.path().join(destination),
         mecab_dictionary_path: std::env::var_os("OPENLEGAL_TEST_MECAB_DICTIONARY")
@@ -122,6 +123,7 @@ async fn offline_rebuild_preserves_ack_retirement_withdrawal_and_previous_index(
     // Rebuilding must not initialize provider credentials or document workers,
     // even when normal serving would enable them with this configuration.
     rebuilt_config.ingestion = Some(IngestionConfig {
+        adaptive_polling: true,
         credential_env: "OPENLEGAL_UNUSED_REBUILD_FIXTURE_CREDENTIAL".into(),
         proxy: Some(openlegal_server::config::UpstreamProxyConfig {
             url_env: "OPENLEGAL_UNUSED_REBUILD_FIXTURE_PROXY".into(),

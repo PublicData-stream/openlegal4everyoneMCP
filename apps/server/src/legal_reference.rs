@@ -6,6 +6,7 @@
 use crate::{
     ServerError,
     database::map_error,
+    demand_result::{self, WithCollection},
     registry::{ToolError, ToolModule, ToolOptions, ToolOutput, ToolRegistry},
 };
 use openlegal_application::legal_reference::{ReferenceLookup, later_dates, select_in_force};
@@ -39,6 +40,7 @@ const BASIS: &str = "Selected the retained provider revision with the latest eff
 
 pub struct LegalReferenceTools {
     pub lookup: Arc<ReferenceLookup>,
+    pub demand: Option<Arc<openlegal_application::demand_collection::DemandCollectionCoordinator>>,
 }
 
 /// The parsing rules of one jurisdiction.
@@ -55,7 +57,7 @@ pub(crate) fn jurisdiction_arg(code: Option<&str>) -> Result<Jurisdiction, ToolE
     }
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ResolveNameInput {
     /// A law name or common abbreviation, such as `산안법 시행령`.
@@ -1098,16 +1100,24 @@ async fn in_force_at(
 impl ToolModule for LegalReferenceTools {
     fn register(self, registry: &mut ToolRegistry) -> Result<(), ServerError> {
         let lookup = self.lookup.clone();
-        registry.register_typed::<ResolveNameInput, ResolveNameResult, _, _>(
+        let demand = self.demand.clone();
+        registry.register_demand::<ResolveNameInput, WithCollection<ResolveNameResult>, _, _>(
             "law.resolve_name",
-            "Resolve a law name or common abbreviation to retained corpus objects using the naming rules of jurisdiction, an ISO 3166-1 alpha-3 code (default KOR, the only supported code so far). For KOR, spacing and middle-dot variants are ignored and abbreviations such as 산안법, 중처법 시행령 or 개인정보보호법 are expanded; any alias expansion is reported in resolution. Only objects of that jurisdiction match. Matches carry object identity and whether the title is current or only appears in a retained historical capture. No match means the corpus has no retained object with that title, not that the law does not exist.",
-            ToolOptions::default(),
+            "Resolve a law name or common abbreviation to retained corpus objects using the naming rules of jurisdiction, an ISO 3166-1 alpha-3 code (default KOR, the only supported code so far). For KOR, spacing and middle-dot variants are ignored and abbreviations such as 산안법, 중처법 시행령 or 개인정보보호법 are expanded; any alias expansion is reported in resolution. Only objects of that jurisdiction match. Matches carry object identity and whether the title is current or only appears in a retained historical capture. No match means the corpus has no retained object with that title, not that the law does not exist. When automatic collection is enabled, normalized statute names may enqueue bounded provider discovery with collection status.",
+            demand_result::options(demand.as_ref().is_some_and(|d| d.enabled())),
             move |input, ctx| {
                 let lookup = lookup.clone();
+                let demand = demand.clone();
                 async move {
-                    resolve_name(&lookup, input, ctx.deadline.into_std(), ctx.request.cancellation)
-                        .await
-                        .map(output)
+                    let profile = reference::profile(jurisdiction_arg(input.jurisdiction.as_deref())?);
+                    let datasets = if input.datasets.is_empty() { profile.statute_datasets().to_vec() } else { input.datasets.clone() };
+                    let result = resolve_name(&lookup, input, ctx.deadline.into_std(), ctx.request.cancellation.clone()).await?;
+                    let collection = if let Some(demand) = demand {
+                        if datasets.iter().all(|dataset| profile.statute_datasets().contains(dataset)) {
+                            Some(demand.term(&result.resolution.resolved, &datasets, &ctx.request.cancellation).await)
+                        } else { Some(openlegal_domain::collection::DemandCollectionStatus::reason(openlegal_domain::collection::DemandCollectionState::Unsupported, "unsupported_dataset")) }
+                    } else { None };
+                    Ok(output(WithCollection { result, collection }))
                 }
             },
         )?;
@@ -1301,6 +1311,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry
             .register_module(LegalReferenceTools {
+                demand: None,
                 lookup: Arc::new(lookup()),
             })
             .unwrap();

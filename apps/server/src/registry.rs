@@ -18,6 +18,7 @@ pub struct ToolContext {
 /// Public, sanitized failures. Keep provider errors and diagnostics inside the module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolError {
+    CollectionUnavailable { cause: CollectionReadFailure },
     ProcessingPending,
     NotObserved,
     CollectionIncomplete,
@@ -47,6 +48,14 @@ pub enum ToolError {
     NormalizationFailed,
     ResourceLimit,
     Internal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionReadFailure {
+    NotObserved,
+    ProcessingPending,
+    CollectionIncomplete,
+    FreshnessUnavailable,
 }
 
 /// Implemented by Rust modules compiled into the host; registration performs no network I/O.
@@ -201,6 +210,12 @@ impl ToolRegistry {
                         | "text.attachment.upload"
                         | "text.attachment.delete"
                         | "database.request_collection"
+                        | "database.get"
+                        | "database.get_metadata"
+                        | "database.query"
+                        | "database.rg"
+                        | "law.resolve_name"
+                        | "search"
                 ))
         {
             return Err("anonymous extension tools must be read-only".into());
@@ -303,9 +318,49 @@ impl ToolRegistry {
         F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<RichToolOutput<O>, ToolError>> + Send + 'static,
     {
-        self.register_typed::<I, O, _, _>(name, description, options, |_, _| async {
-            Err(ToolError::Internal)
-        })?;
+        self.register_rich_internal(name, description, options, handler, false)
+    }
+
+    pub(crate) fn register_demand_rich<I, O, F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        options: ToolOptions,
+        handler: F,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: serde::Serialize + JsonSchema + Send + 'static,
+        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RichToolOutput<O>, ToolError>> + Send + 'static,
+    {
+        if name != "search" {
+            return Err("unsupported built-in collection read".into());
+        }
+        self.register_rich_internal(name, description, options, handler, true)
+    }
+
+    fn register_rich_internal<I, O, F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        options: ToolOptions,
+        handler: F,
+        demand: bool,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: serde::Serialize + JsonSchema + Send + 'static,
+        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RichToolOutput<O>, ToolError>> + Send + 'static,
+    {
+        self.register_typed_internal::<I, O, _, _>(
+            name,
+            description,
+            options,
+            |_, _| async { Err(ToolError::Internal) },
+            demand,
+        )?;
         let handler = Arc::new(handler);
         let tool = self
             .tools
@@ -354,7 +409,7 @@ impl ToolRegistry {
         self.register_typed_internal(name, description, options, handler, true)
     }
 
-    /// The only durable public mutation: a bounded, coalesced collection request.
+    /// A bounded, coalesced explicit collection request.
     pub(crate) fn register_collection_request<I, O, F, Fut>(
         &mut self,
         handler: F,
@@ -375,6 +430,32 @@ impl ToolRegistry {
             handler,
             true,
         )
+    }
+
+    pub(crate) fn register_demand<I, O, F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        options: ToolOptions,
+        handler: F,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: serde::Serialize + JsonSchema + Send + 'static,
+        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
+    {
+        if !matches!(
+            name,
+            "database.get"
+                | "database.get_metadata"
+                | "database.query"
+                | "database.rg"
+                | "law.resolve_name"
+        ) {
+            return Err("unsupported built-in collection read".into());
+        }
+        self.register_typed_internal(name, description, options, handler, true)
     }
 
     fn register_typed_internal<I, O, F, Fut>(

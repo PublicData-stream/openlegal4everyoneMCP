@@ -88,6 +88,11 @@ still apply before freshness classification.
 Use an exact retained revision or capture selector to read historical evidence;
 an index entry neither renews HEAD validation nor proves corpus completeness.
 
+These are underlying local read outcomes. When automatic collection accepts an
+eligible HEAD refresh, `database.get` and `database.get_metadata` can instead
+return a pending response with the original reason and collection receipt. See
+[automatic collection](#automatic-demand-collection) below.
+
 Provider text, extracted attachment text, and OCR are distinct sections. OCR has
 source digest/page provenance and is excluded from search/comparison by default.
 The page excerpts do not alter stored evidence.
@@ -194,6 +199,41 @@ OCR, and selected attachment searches conservatively report incomplete coverage)
 explicit errors. PostgreSQL is authoritative. The index consumes an ordered durable
 outbox, commits before acknowledging events, and preserves old readers until their
 sessions expire. Referenced missing/corrupt evidence is a storage failure.
+
+## Automatic demand collection
+
+`[database].auto_collection` defaults to `true`. Initial `database.get` and
+`database.get_metadata` requests for numeric LAW national-statute HEAD IDs enqueue
+bounded collection when no usable local result exists or HEAD validation is at
+least one hour old. Local data remains available while refresh is pending.
+Successful `database.query`, literal `database.rg`, statute name resolution and
+ChatGPT `search` can enqueue a bounded provider discovery request. Successful
+discovery is reused for one hour per normalized target; it does not establish
+complete corpus coverage. Active explicit and automatic targets share work.
+
+`database.query`, `database.rg` and ChatGPT `search` accept optional
+`collection_term`. It is a separate bounded literal provider term, using only
+the selected datasets. The original local query and its filters stay intact.
+Complex DSL, regex, history, OCR, section or metadata-filter searches require an
+explicit term for collection; the server does not extract or simplify them.
+Invalid terms are rejected before local search. Cursor continuations never
+enqueue, including with a term. Historical selectors, capture/session reads,
+ChatGPT `fetch`, source URLs, resource reads and internal legal analysis stay
+capture-fixed and do not enqueue.
+
+Native successful responses retain their existing fields and may add `collection`
+with status `disabled`, `fresh`, `unsupported`, `pending` or `unavailable`, and an
+optional receipt/reason. If collection is accepted but the local HEAD is unusable,
+the response is `{schema_version: 1, state: "pending", reason, collection}`.
+If enqueueing fails, valid local results are preserved; missing results retain
+their original error with collection-unavailable context. ChatGPT search retains
+its results-only structured JSON and first JSON text; collection information is
+added to `_meta["openlegal/collection"]` and subsequent text content.
+
+The six eligible public tools advertise `readOnlyHint: false` while enabled.
+Set `auto_collection = false` for local-only behavior and read-only annotations.
+Automatic collection still requires a healthy configured collection scheduler;
+it never makes direct provider calls from serving.
 
 ## Explicit collection outcomes
 

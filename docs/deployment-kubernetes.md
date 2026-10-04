@@ -1223,10 +1223,12 @@ and a separate collection ConfigMap. Only the scheduler and its request Job Pods
 mount `Secret/openlegal-law-provider`; the serving Pod has neither that Secret nor
 a Kubernetes controller identity. The scheduler runs `--collection-scheduler` in
 `continuous` mode and launches a `--collection-job` Pod for each coalesced explicit
-MCP collection request. Applying this overlay starts live provider traffic and
+MCP collection request or eligible automatic demand. Applying this overlay starts live provider traffic and
 requires operator authorization and the provider ledger checks below.
 Until the scheduler publishes a fresh heartbeat, retained serving rejects new
-collection requests without storing them; ordinary database reads remain local.
+collection requests without storing them. Automatic collection defaults to enabled:
+eligible reads preserve local results and expose unavailable status until the
+scheduler is ready. Set `[database].auto_collection = false` for local-only reads.
 The scheduler's ServiceAccount can create request Jobs in the serving namespace;
 request Job Pods use a separate ServiceAccount with only the document-controller
 permission required for disposable processing Pods.
@@ -1237,10 +1239,18 @@ image digest in `scheduler-deployment.yaml` and `collection-job.json`, and stamp
 the accepted document-worker image digest in `server.toml`. The ordinary serving
 Deployment continues using the `runtime` image and its own generated ConfigMap.
 The collector ConfigMap contains `[database.ingestion]` with `mode = "continuous"`,
-`detail_timeout_secs = 3600`, `detail_job_workers = 4`, `scan_interval_secs = 300`, and
+`detail_timeout_secs = 3600`, `detail_job_workers = 4`, `scan_interval_secs = 300`,
+`adaptive_polling = true`, and
 `document_worker.pool_limit = 16`. The detail
 deadline accepts 60–7200 seconds and is read at startup. A claimed detail job's
 lease covers that deadline plus validation and publication.
+Idle inventory cycles resume immediately; ready backlog and provider admission
+delay scans. Notifications wake busy collectors and dispatchers, with a five-second
+readiness fallback. The configured scan interval is a busy recheck bound. Set
+`adaptive_polling = false` to restore the fixed post-cycle wait.
+Each request launch uses a distinct Job name and carries its launch epoch into the
+Pod. Deferred retry does not collide with a retained finished Job; stale Pod
+acknowledgements and terminal Job failures cannot settle a newer launch.
 Increase `detail_job_workers` to 8, then 16 only after at least one hour of
 healthy runtime at each stage, with provider usage, queue progress, Pod capacity,
 and error rates checked before each change.
@@ -1299,8 +1309,9 @@ Apply the document namespace/Role, the separate RoleBinding root, tailored DNS,
 PostgreSQL, API-server and provider NetworkPolicies, then the collection overlay.
 Confirm the provider Secret reference, exact images, Pod quotas, node placement,
 PVC access, and provider ledger before enabling the scheduler. The serving Pod's
-MCP queries remain local-only; `database.request_collection` is the explicit
-write operation and `database.collection_status` is read-only.
+MCP queries use local results and may enqueue bounded automatic collection when
+enabled; provider calls run in collection Pods. `database.request_collection`
+remains the explicit write operation and `database.collection_status` is read-only.
 
 For rollback, stop the collection scheduler and allow active request/document
 Pods to finish or reconcile them explicitly. Keep the ordinary serving Deployment

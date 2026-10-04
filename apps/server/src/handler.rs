@@ -474,6 +474,21 @@ impl ServerHandler for McpHandler {
 
 fn map_tool_error(error: ToolError) -> Result<CallToolResult, ErrorData> {
     let (code, message) = match error {
+        ToolError::CollectionUnavailable { cause } => {
+            use crate::registry::CollectionReadFailure;
+            let original = match cause {
+                CollectionReadFailure::NotObserved => ToolError::NotObserved,
+                CollectionReadFailure::ProcessingPending => ToolError::ProcessingPending,
+                CollectionReadFailure::CollectionIncomplete => ToolError::CollectionIncomplete,
+                CollectionReadFailure::FreshnessUnavailable => ToolError::FreshnessUnavailable,
+            };
+            let mut result = map_tool_error(original)?;
+            if let Some(structured) = result.structured_content.as_mut() {
+                structured["collection"] =
+                    serde_json::json!({"status":"unavailable", "reason":"collection_unavailable"});
+            }
+            return Ok(result);
+        }
         ToolError::InvalidInput => {
             return Err(ErrorData::invalid_params("invalid tool arguments", None));
         }

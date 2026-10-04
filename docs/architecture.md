@@ -80,8 +80,11 @@ interface and validates worker results before paging/publication. Public scalar
 range representations belong to domain. This is not a normalizer or retrieval
 cache implementation; callers cannot choose executables, paths or options. The
 public mutations are bounded temporary comparison/attachment operations and
-the explicit, coalesced `database.request_collection` tool; generic module
-registration and existing database lookups remain read-only. See the
+the explicit, coalesced `database.request_collection` tool and configured bounded
+demand collection from eligible corpus lookup/search tools. Generic module
+registration remains read-only. The application demand coordinator selects
+eligible targets; the durable adapter shares active requests and validates HEAD
+freshness under admission. See the
 [text comparison contract](text-diff.md) for bounds and lifecycle.
 
 The composition entrypoint loads configuration, constructs adapters and shared

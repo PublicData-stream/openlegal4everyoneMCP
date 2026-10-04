@@ -8,6 +8,7 @@ pub mod citation;
 pub mod config;
 pub mod corpus_runtime;
 pub mod database;
+mod demand_result;
 pub mod demo;
 mod edge_mtls;
 pub mod endpoint;

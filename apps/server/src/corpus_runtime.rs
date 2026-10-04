@@ -1,4 +1,4 @@
-//! Operator-selected corpus composition. Public lookups never launch ingestion.
+//! Operator-selected corpus composition and bounded demand collection.
 use crate::{
     ServerError,
     config::{DatabaseConfig, IngestionMode},
@@ -34,6 +34,7 @@ pub struct CorpusRuntime {
     detail_timeout_secs: u64,
     detail_job_workers: u32,
     scan_interval_secs: u64,
+    adaptive_polling: bool,
     ingestion_mode: Option<IngestionMode>,
     pilot_candidates: Vec<InventoryItem>,
     inventory_verified: Arc<std::sync::atomic::AtomicBool>,
@@ -424,17 +425,17 @@ impl CorpusRuntime {
     /// temporary index is used only to validate what serving can later index.
     pub async fn execute_collection_request(
         &self,
-        id: &str,
+        launch: &CollectionLaunch,
         cancel: CancellationToken,
     ) -> Result<(), DatabaseError> {
-        let launch = self.store.load_collection_launch(id).await?;
         let provider = self
             .provider
             .as_ref()
             .ok_or(DatabaseError::InvalidInput)?
-            .on_demand_client_with_limit(launch.attempt_limit)?;
+            .on_demand_client_with_limit(launch.attempt_limit)?
+            .with_collection_launch(launch)?;
         let result = self
-            .collect_explicit(&provider, &launch, launch.request.clone(), cancel)
+            .collect_explicit(&provider, launch, launch.request.clone(), cancel)
             .await;
         let (status, reason) = match &result {
             Ok(summary) => summary.settlement(),
@@ -450,8 +451,13 @@ impl CorpusRuntime {
             Err(DatabaseError::Conflict) => ("failed", Some("identity_conflict")),
             Err(_) => ("failed", Some("worker_failed")),
         };
+        let deferred_until = match &result {
+            Err(DatabaseError::Capacity) => Some(now().saturating_add(5)),
+            Err(DatabaseError::BudgetExhausted) => Some(provider.next_admissible_epoch().await?),
+            _ => None,
+        };
         self.store
-            .settle_collection_request_with_reason(id, status, reason)
+            .settle_collection_launch(launch, status, reason, deferred_until)
             .await?;
         match result {
             Ok(_)
@@ -605,20 +611,32 @@ impl CorpusRuntime {
         cancel: CancellationToken,
     ) -> Result<CollectionItemOutcome, DatabaseError> {
         let observed = self.store.state(&item.object).await?;
-        if observed.pending {
+        let budget_wait = observed.pending
+            && self
+                .store
+                .background_budget_wait_available(
+                    &item.object,
+                    &item.revision_id,
+                    item.effective_date.as_deref(),
+                    observed.version,
+                )
+                .await?;
+        if observed.pending && !budget_wait {
             return Ok(CollectionItemOutcome::Skipped(
                 CollectionSkipReason::Pending,
             ));
         }
-        if observed.head_capture.is_some() {
+        if let Some(capture_id) = &observed.head_capture {
+            let selector = if budget_wait {
+                RevisionSelector::Capture {
+                    id: capture_id.clone(),
+                }
+            } else {
+                RevisionSelector::Head
+            };
             match self
                 .store
-                .resolve(
-                    item.object.clone(),
-                    RevisionSelector::Head,
-                    now(),
-                    cancel.clone(),
-                )
+                .resolve(item.object.clone(), selector, now(), cancel.clone())
                 .await
             {
                 Ok(head) if head_observation_superseded(&item, &head, list_started_at) => {
@@ -655,20 +673,40 @@ impl CorpusRuntime {
         if let Some(value) = &item.amendment_type {
             metadata.insert("amendment_type".into(), value.clone());
         }
-        let queued = self
-            .store
-            .enqueue_job_for_collection_request(
-                item.object.clone(),
-                item.revision_id.clone(),
-                item.effective_date.clone(),
-                true,
-                false,
-                now(),
-                metadata,
-                Some(observed.version),
-                launch,
-            )
-            .await?;
+        let queued = if budget_wait {
+            let Some(job) = self
+                .store
+                .adopt_background_budget_wait(
+                    item.object.clone(),
+                    item.revision_id.clone(),
+                    item.effective_date.clone(),
+                    observed.version,
+                    metadata,
+                    launch,
+                    now(),
+                )
+                .await?
+            else {
+                return Ok(CollectionItemOutcome::Skipped(
+                    CollectionSkipReason::AlreadyInProgress,
+                ));
+            };
+            job
+        } else {
+            self.store
+                .enqueue_job_for_collection_request(
+                    item.object.clone(),
+                    item.revision_id.clone(),
+                    item.effective_date.clone(),
+                    true,
+                    false,
+                    now(),
+                    metadata,
+                    Some(observed.version),
+                    launch,
+                )
+                .await?
+        };
         if queued
             .source_metadata
             .get("collection_origin")
@@ -704,9 +742,11 @@ impl CorpusRuntime {
             return Err(DatabaseError::Capacity);
         };
         let attempt = cancel.child_token();
+        let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let detail_provider = provider.clone().with_reservation_observer(reserved.clone());
         let detail = tokio::time::timeout(
             Duration::from_secs(self.detail_timeout_secs),
-            provider.detail(&item, attempt.clone()),
+            detail_provider.detail(&item, attempt.clone()),
         )
         .await
         .unwrap_or_else(|_| {
@@ -715,6 +755,17 @@ impl CorpusRuntime {
         });
         let detail = match detail {
             Ok(detail) => detail,
+            Err(
+                error @ (DatabaseError::Capacity
+                | DatabaseError::Cancelled
+                | DatabaseError::BudgetExhausted),
+            ) if !reserved.load(std::sync::atomic::Ordering::Acquire) => {
+                match self.store.release_admission_wait(&job).await {
+                    Ok(()) | Err(DatabaseError::Conflict) => {}
+                    Err(error) => return Err(error),
+                }
+                return Err(error);
+            }
             Err(
                 error @ (DatabaseError::SourceUnavailable
                 | DatabaseError::SourceDataInvalid
@@ -911,6 +962,10 @@ impl CorpusRuntime {
             let _ = blobs.close().await;
             return Err(e.into());
         }
+        let provider = match provider {
+            Some(client) => Some(client.with_collection_events(store.collection_events().await?)),
+            None => None,
+        };
         let lease = if serving {
             match store.acquire_runtime_lease().await {
                 Ok(lease) => Some(lease),
@@ -1013,9 +1068,11 @@ impl CorpusRuntime {
                 .ingestion
                 .as_ref()
                 .map_or(3600, |c| c.scan_interval_secs),
+            adaptive_polling: config.ingestion.as_ref().is_none_or(|c| c.adaptive_polling),
         }))
     }
     pub async fn close(&self) -> Result<(), ServerError> {
+        self.store.close_collection_events().await;
         let blobs = self.blobs.close().await;
         let lease = if let Some(lease) = &self.lease {
             lease.close().await
@@ -1133,6 +1190,11 @@ impl CorpusRuntime {
         provider: &LawClient,
         cancel: CancellationToken,
     ) -> Result<(), DatabaseError> {
+        let mut events = if self.adaptive_polling {
+            Some(self.store.collection_events().await?)
+        } else {
+            None
+        };
         loop {
             self.store.requeue_due_details(now()).await?;
             self.inventory_verified
@@ -1446,7 +1508,22 @@ impl CorpusRuntime {
             }
             // A few moving pages cannot establish an atomic, complete upstream
             // catalog. Keep exact-date selectors and completeness claims closed.
-            tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(self.scan_interval_secs))=>{}}
+            if let Some(events) = &mut events {
+                while self.store.collection_backlog().await? || !provider.provider_idle().await? {
+                    // Events end the busy wait early. The five-second readiness
+                    // fallback repairs missed notifications without scanning.
+                    match events
+                        .wait(&cancel, Duration::from_secs(self.scan_interval_secs.min(5)))
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(_) if cancel.is_cancelled() => return Ok(()),
+                        Err(error) => return Err(error),
+                    }
+                }
+            } else {
+                tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(self.scan_interval_secs))=>{}}
+            }
         }
     }
     /// Check publication without waiting for a slow detail job. A page remains
@@ -1806,6 +1883,7 @@ impl CorpusRuntime {
         cancel: CancellationToken,
     ) -> Result<(), DatabaseError> {
         let provider = self.provider.as_ref().ok_or(DatabaseError::InvalidInput)?;
+        let mut events = self.store.collection_events().await?;
         const DATASETS: [Dataset; 8] = [
             Dataset::NationalStatute,
             Dataset::AdministrativeRule,
@@ -1841,7 +1919,11 @@ impl CorpusRuntime {
                     )
                     .await?
             }) else {
-                tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(1))=>{}}
+                match events.wait(&cancel, Duration::from_secs(1)).await {
+                    Ok(()) => {}
+                    Err(DatabaseError::Cancelled) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
                 continue;
             };
             let item = InventoryItem {
@@ -1861,9 +1943,11 @@ impl CorpusRuntime {
             };
             let attempt = cancel.child_token();
             let _attempt_guard = attempt.clone().drop_guard();
+            let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let detail_provider = provider.clone().with_reservation_observer(reserved.clone());
             let detail = match tokio::time::timeout(
                 Duration::from_secs(self.detail_timeout_secs),
-                provider.detail(&item, attempt.clone()),
+                detail_provider.detail(&item, attempt.clone()),
             )
             .await
             {
@@ -1927,12 +2011,26 @@ impl CorpusRuntime {
                     }
                 }
                 Err(DatabaseError::Cancelled) => {
-                    self.store.fail_claim(&job, true).await?;
+                    if reserved.load(std::sync::atomic::Ordering::Acquire) {
+                        self.store.fail_claim(&job, true).await?;
+                    } else {
+                        match self.store.release_admission_wait(&job).await {
+                            Ok(()) | Err(DatabaseError::Conflict) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
                     return Ok(());
                 }
                 Err(DatabaseError::BudgetExhausted) => {
                     let resume_at = provider.next_admissible_epoch().await?;
-                    match self.store.defer_budget_claim(&job, resume_at).await {
+                    let deferred = if reserved.load(std::sync::atomic::Ordering::Acquire) {
+                        self.store
+                            .defer_reserved_budget_claim(&job, resume_at)
+                            .await
+                    } else {
+                        self.store.defer_budget_claim(&job, resume_at).await
+                    };
+                    match deferred {
                         Ok(()) | Err(DatabaseError::Conflict) => {}
                         Err(error) => return Err(error),
                     }
@@ -1940,7 +2038,26 @@ impl CorpusRuntime {
                         cancel.cancel();
                         return Ok(());
                     }
-                    tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(60))=>{}}
+                    let wait = Duration::from_secs(resume_at.saturating_sub(now()).clamp(1, 60));
+                    match events.wait(&cancel, wait).await {
+                        Ok(()) => {}
+                        Err(DatabaseError::Cancelled) => return Ok(()),
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(DatabaseError::Capacity)
+                    if !reserved.load(std::sync::atomic::Ordering::Acquire) =>
+                {
+                    match self.store.release_admission_wait(&job).await {
+                        Ok(()) | Err(DatabaseError::Conflict) => {}
+                        Err(error) => return Err(error),
+                    }
+                    // Our own pending transition emits a wakeup; a bounded
+                    // pause avoids immediately reclaiming a ticket-full job.
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
                 }
                 Err(
                     error @ (DatabaseError::SourceUnavailable
@@ -2297,11 +2414,13 @@ mod manual_pilot_tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("candidates.json");
         let config = DatabaseConfig {
+            auto_collection: true,
             blob_path: "blobs".into(),
             index_path: "index".into(),
             mecab_dictionary_path: "dictionary".into(),
             widget_html: "widget".into(),
             ingestion: Some(IngestionConfig {
+                adaptive_polling: true,
                 credential_env: "PROVIDER_CREDENTIAL".into(),
                 proxy: None,
                 kubectl: "/usr/local/bin/kubectl".into(),

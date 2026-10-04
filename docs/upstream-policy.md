@@ -102,16 +102,19 @@ If these capabilities are unavailable, use bounded scheduled or demand-driven
 refresh. Do not perform full-corpus refresh for each user request or repeatedly
 download details already available under a valid cache identity.
 
-For the Korean corpus, ordinary MCP lookup/search tools never schedule provider
-traffic. `database.request_collection` is an explicit mutation that stores one
-coalesced request for a dedicated collection Job Pod; `database.collection_status`
-only reads its state. The scheduler and request Jobs share provider spacing and
+For the Korean corpus, `[database].auto_collection` defaults to `true`. Eligible
+HEAD lookups and local searches may enqueue bounded demand collection; they
+return local data and a receipt rather than waiting for provider results.
+`database.request_collection` stores an explicit coalesced request for the same
+dedicated collection Job path; `database.collection_status` only reads its state.
+Disable automatic collection to retain local-only lookup/search behavior.
+The scheduler and request Jobs share provider spacing and
 single-call admission. Operator configuration selects independent continuous and
 explicit daily caps, each accepting a positive limit or `"unlimited"`, and shared
 request pacing. These are UTC calendar-day caps, not rolling 24-hour windows. Defaults are 1,000 reserved
 attempts per UTC day for each mode and a five-second minimum interval. The
 ingestion template selects 50,000 continuous and 1,000 explicit attempts with a
-one-second minimum interval and a five-minute scan-cycle wait. This is operator
+one-second minimum interval and a five-minute busy recheck interval. This is operator
 policy, not a claim about provider quotas or achieved throughput. All clients use
 the same durable policy and charged counters, including after restarts. Increasing
 an exhausted budget may advance only budget-wait leases; it must preserve existing
@@ -119,6 +122,30 @@ Retry-After pauses, suspension and unresolved-response evidence. Lowering a cap
 retains already charged attempts and blocks further admission until allowance
 exists. Unlimited admission continues recording attempts, so returning to a finite
 cap cannot discard prior usage. The scan interval is independent of legal-data freshness and gap retries.
+
+`[database.ingestion].adaptive_polling` defaults to `true`. An idle LAW provider
+starts its next inventory cycle immediately, including without downstream demand.
+Actual HTTP admission, a claimable detail backlog or eligible foreground demand
+delays background collection. `scan_interval_secs` bounds busy rechecks; shared
+PostgreSQL notifications wake waiting collectors and the request scheduler earlier.
+A five-second readiness fallback re-reads state without initiating another scan
+while still busy. Setting `adaptive_polling = false` restores fixed waits after
+inventory cycles. This policy does not change synthetic retrieval.
+
+Eligible demand takes the next HTTP slot after the current call. Daily-exhausted
+demand and document parsing alone do not hold that slot. Session advisory locks
+and owner tokens fence durable attempts across processes. An abandoned response
+marker remains fail-closed; a waiter behind a live owner spends no request attempt.
+Processing claims released before any durable reservation are refunded with an
+owner fence. Retry-After, failure retries and finite operation deadlines still apply.
+
+Automatic national-statute HEAD collection rechecks authoritative one-hour
+freshness before enqueueing. Successful discovery is reused for one hour per
+normalized term, datasets and mode; failed/partial attempts cool down for one hour.
+Active automatic and explicit requests share canonical targets. Explicit successful
+requests and old receipt identities remain available for 24 hours. Capture,
+revision, historical, continuation and source-URL reads never enqueue collection.
+See [legal corpus](database.md) for eligible query inputs and response contracts.
 The scheduler marks an explicit request failed when its Kubernetes Job reports a
 terminal failure, including failure before the request Pod can open storage.
 Transient storage admission contention is retried only during collection Pod

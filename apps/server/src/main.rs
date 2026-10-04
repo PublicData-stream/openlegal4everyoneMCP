@@ -14,7 +14,7 @@ enum Command {
     Maintain,
     RebuildCorpusIndex,
     CollectionScheduler,
-    CollectionJob(String),
+    CollectionJob(String, Option<u64>),
 }
 
 fn main() -> Result<(), ServerError> {
@@ -31,11 +31,12 @@ fn main() -> Result<(), ServerError> {
     }
     let (command, path) = if first == "--collection-job" {
         let id = args.next().ok_or("collection job requires request id")?;
-        let id = id
+        let identity = id
             .into_string()
             .map_err(|_| "collection request id must be UTF-8")?;
+        let (id, epoch) = parse_collection_identity(&identity)?;
         (
-            Command::CollectionJob(id),
+            Command::CollectionJob(id, epoch),
             args.next().ok_or("collection job requires CONFIG.toml")?,
         )
     } else if first == "--migrate"
@@ -75,6 +76,37 @@ fn main() -> Result<(), ServerError> {
 fn now() -> u64 {
     use openlegal_application::Clock;
     openlegal_application::SystemClock::default().now()
+}
+
+fn parse_collection_identity(identity: &str) -> Result<(String, Option<u64>), ServerError> {
+    let (id, epoch) = match identity.split_once('@') {
+        Some((id, epoch)) => (id, Some(epoch.parse::<u64>()?)),
+        None => (identity, None),
+    };
+    if id.len() != 36
+        || !id.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err("invalid collection request identifier".into());
+    }
+    Ok((id.to_owned(), epoch))
+}
+
+fn collection_job_name(id: &str, epoch: u64) -> Result<String, ServerError> {
+    parse_collection_identity(id)?;
+    let name = format!(
+        "openlegal-request-{}-{epoch}",
+        id.replace('-', "").to_ascii_lowercase()
+    );
+    if name.len() > 63 {
+        return Err("collection launch name exceeds Kubernetes limit".into());
+    }
+    Ok(name)
 }
 
 async fn open_storage(
@@ -145,7 +177,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
     let config: Config = toml::from_str(&tokio::fs::read_to_string(path).await?)?;
     if matches!(
         command,
-        Command::CollectionScheduler | Command::CollectionJob(_)
+        Command::CollectionScheduler | Command::CollectionJob(_, _)
     ) {
         config.validate_storage()?;
         let database = config
@@ -186,12 +218,19 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                     },
                 }
             }
-            Command::CollectionJob(id) => {
+            Command::CollectionJob(id, epoch) => {
                 let id = id.clone();
-                let launch = runtime.store.load_collection_launch(&id).await?;
+                let launch = if let Some(epoch) = epoch {
+                    runtime
+                        .store
+                        .load_collection_launch_for_epoch(&id, *epoch)
+                        .await?
+                } else {
+                    runtime.store.load_collection_launch(&id).await?
+                };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(launch.remaining_secs(launch.observed_at)),
-                    runtime.execute_collection_request(&id, cancel.clone()),
+                    runtime.execute_collection_request(&launch, cancel.clone()),
                 )
                 .await
                 {
@@ -200,7 +239,12 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                         cancel.cancel();
                         runtime
                             .store
-                            .settle_collection_request(&id, "failed")
+                            .settle_collection_launch(
+                                &launch,
+                                "failed",
+                                Some("worker_failed"),
+                                None,
+                            )
                             .await?;
                         Err("collection request exceeded its operation deadline".into())
                     }
@@ -299,7 +343,9 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                 persistent.as_ref().ok_or("database storage unavailable")?,
             )
             .await?;
+            let demand = std::sync::Arc::new(openlegal_application::demand_collection::DemandCollectionCoordinator::new(runtime.store.clone(), database.auto_collection));
             registry.register_module(openlegal_server::database::DatabaseTools {
+                demand: Some(demand.clone()),
                 database: runtime.database.clone(),
                 reader: runtime.reader.clone(),
                 search: runtime.search.clone(),
@@ -313,6 +359,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                 ),
             );
             registry.register_module(openlegal_server::legal_reference::LegalReferenceTools {
+                demand: Some(demand.clone()),
                 lookup: lookup.clone(),
             })?;
             registry.register_module(openlegal_server::legal_analysis::LegalAnalysisTools { lookup })?;
@@ -327,6 +374,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                     )?,
                 );
                 registry.register_module(openlegal_server::citation::CitationTools {
+                    demand: Some(demand.clone()),
                     service: service.clone(),
                 })?;
                 citations = Some(service);
@@ -524,6 +572,8 @@ async fn run_collection_scheduler(
         }
     };
     let dispatch = async {
+        // LISTEN before the first queue scan; notifications only prompt a recheck.
+        let mut events = store.collection_events().await?;
         loop {
             if cancel.is_cancelled() {
                 return Ok(());
@@ -538,11 +588,18 @@ async fn run_collection_scheduler(
                 )
                 .await?
             else {
-                tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
+                match events
+                    .wait(&cancel, std::time::Duration::from_secs(5))
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(_) if cancel.is_cancelled() => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
                 continue;
             };
             let id = launch.id.clone();
-            let name = format!("openlegal-request-{}", id.replace('-', ""));
+            let name = collection_job_name(&id, launch.launched_at)?;
             let job = render_collection_job(&template, &launch, &ingestion.collection_namespace)?;
             let bytes = serde_json::to_vec(&job)?;
             let mut child = tokio::process::Command::new(&ingestion.kubectl)
@@ -579,7 +636,7 @@ async fn run_collection_scheduler(
                 tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
             match outcome {
                 Ok(Ok(status)) if status.success() => {
-                    store.mark_collection_running(&id, &name).await?;
+                    store.mark_collection_launch_running(&launch, &name).await?;
                 }
                 _ => {
                     // Creation may have reached the API server. Keep the claim
@@ -622,10 +679,13 @@ fn render_collection_job(
     }
     let mut job = template.clone();
     job["spec"]["activeDeadlineSeconds"] = launch.job_deadline_secs().into();
-    job["metadata"]["name"] = format!("openlegal-request-{}", launch.id.replace('-', "")).into();
+    job["metadata"]["name"] = collection_job_name(&launch.id, launch.launched_at)?.into();
     job["metadata"]["namespace"] = namespace.into();
-    job["spec"]["template"]["spec"]["containers"][0]["args"] =
-        serde_json::json!(["--collection-job", launch.id, "/etc/openlegal/server.toml"]);
+    job["spec"]["template"]["spec"]["containers"][0]["args"] = serde_json::json!([
+        "--collection-job",
+        format!("{}@{}", launch.id, launch.launched_at),
+        "/etc/openlegal/server.toml"
+    ]);
     Ok(job)
 }
 
@@ -649,11 +709,17 @@ async fn reconcile_failed_collection_jobs(
     store: &openlegal_adapters::corpus::PgCorpusStore,
     ingestion: &openlegal_server::config::IngestionConfig,
 ) -> Result<(), ServerError> {
-    for (id, stored_name) in store.unsettled_collection_jobs().await? {
-        let name = format!("openlegal-request-{}", id.replace('-', ""));
-        if stored_name.as_deref().is_some_and(|stored| stored != name) {
+    for (id, stored_name, epoch) in store.unsettled_collection_launches().await? {
+        let expected = collection_job_name(&id, epoch)?;
+        // Existing launched Jobs retain their stored name during upgrade.
+        let legacy = format!("openlegal-request-{}", id.replace('-', ""));
+        if stored_name
+            .as_deref()
+            .is_some_and(|stored| stored != expected && stored != legacy)
+        {
             return Err("collection request Job name is inconsistent".into());
         }
+        let name = stored_name.unwrap_or(expected);
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             tokio::process::Command::new(&ingestion.kubectl)
@@ -692,7 +758,9 @@ async fn reconcile_failed_collection_jobs(
             continue;
         };
         if collection_job_failed(&job, &name) {
-            store.fail_finished_collection_job(&id, &name).await?;
+            store
+                .fail_finished_collection_launch(&id, &name, epoch)
+                .await?;
         }
     }
     Ok(())
@@ -764,7 +832,7 @@ mod tests {
             assert_eq!(rendered["spec"]["activeDeadlineSeconds"], deadline);
             assert_eq!(
                 rendered["metadata"]["name"],
-                "openlegal-request-00000000000040008000000000000001"
+                "openlegal-request-00000000000040008000000000000001-100"
             );
             assert_eq!(
                 rendered["spec"]["template"]["spec"]["securityContext"],
@@ -776,6 +844,20 @@ mod tests {
             );
         }
         assert_eq!(template["spec"]["activeDeadlineSeconds"], 7500);
+        let first = render_collection_job(&template, &launch, "openlegal-serving").unwrap();
+        launch.launched_at += 5;
+        let retry = render_collection_job(&template, &launch, "openlegal-serving").unwrap();
+        assert_ne!(first["metadata"]["name"], retry["metadata"]["name"]);
+        assert_ne!(
+            first["spec"]["template"]["spec"]["containers"][0]["args"],
+            retry["spec"]["template"]["spec"]["containers"][0]["args"]
+        );
+        assert_eq!(
+            parse_collection_identity(&format!("{}@105", launch.id)).unwrap(),
+            (launch.id.clone(), Some(105))
+        );
+        assert!(parse_collection_identity(&format!("{}@bad", launch.id)).is_err());
+        assert!(parse_collection_identity("bad@105").is_err());
         launch.timeout_secs = 86401;
         assert!(render_collection_job(&template, &launch, "openlegal-serving").is_err());
         launch.timeout_secs = 60;

@@ -30,12 +30,14 @@ const MAX_REFERENCE_NODES: usize = 2048;
 
 pub struct CitationTools {
     pub service: Arc<CitationService>,
+    pub demand: Option<Arc<openlegal_application::demand_collection::DemandCollectionCoordinator>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SearchInput {
     query: String,
+    collection_term: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -52,14 +54,18 @@ struct SearchOutput {
 impl ToolModule for CitationTools {
     fn register(self, registry: &mut ToolRegistry) -> Result<(), ServerError> {
         let service = self.service.clone();
-        registry.register_rich::<SearchInput, SearchOutput, _, _>(
+        let demand = self.demand.clone();
+        registry.register_demand_rich::<SearchInput, SearchOutput, _, _>(
             "search",
-            "Search retained legal source items using the corpus query syntax. Returns capture-fixed source IDs and browser-openable citation URLs; fetch retrieves the complete bounded item. Partial coverage is qualified in additional text.",
-            ToolOptions::default(),
+            "Search retained legal source items using the corpus query syntax. Returns capture-fixed source IDs and browser-openable citation URLs; fetch retrieves the complete bounded item. Partial coverage is qualified in additional text. When automatic collection is enabled, eligible searches may enqueue bounded discovery. Optional collection_term is a separate literal provider term and preserves the local query. Collection status appears in metadata and additional text.",
+            crate::demand_result::options(demand.as_ref().is_some_and(|d| d.enabled())),
             move |input, context| {
                 let service = service.clone();
+                let demand = demand.clone();
                 async move {
-                    let search = service.search(input.query, context.deadline.into_std(), context.request.cancellation)
+                    openlegal_application::demand_collection::validate_collection_term(input.collection_term.as_deref(), &[]).map_err(crate::database::map_error)?;
+                    let query = input.query.clone();
+                    let search = service.search(input.query, context.deadline.into_std(), context.request.cancellation.clone())
                         .await.map_err(crate::database::map_error)?;
                     let mut output = RichToolOutput::new(SearchOutput { results: search.results });
                     if search.partial {
@@ -67,6 +73,12 @@ impl ToolModule for CitationTools {
                     }
                     for warning in search.warnings {
                         output.additional_content.push(ContentBlock::text(format!("Search qualification: {warning}")));
+                    }
+                    if let Some(demand) = demand {
+                        let request = openlegal_domain::legal_search::SearchRequest { query, filters: Default::default(), include_history: false, include_ocr: false, sections: vec![], limit: openlegal_application::citation::MAX_CITATION_SEARCH_RESULTS, cursor: None, literal: false, ignore_case: false, context_lines: 0 };
+                        let collection = demand.search(&request, openlegal_application::search::SearchMode::Query, input.collection_term.as_deref(), &context.request.cancellation).await.map_err(crate::database::map_error)?;
+                        output.output.meta = Some(MetaObject(serde_json::from_value(json!({"openlegal/collection": collection})).map_err(|_| crate::registry::ToolError::Internal)?));
+                        output.additional_content.push(ContentBlock::text(format!("Collection status: {}", serde_json::to_string(&collection).map_err(|_| crate::registry::ToolError::Internal)?)));
                     }
                     // Structured JSON is emitted as the first text block by the shared handler.
                     Ok(output)
@@ -1010,6 +1022,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry
             .register_module(CitationTools {
+                demand: None,
                 service: service.clone(),
             })
             .unwrap();

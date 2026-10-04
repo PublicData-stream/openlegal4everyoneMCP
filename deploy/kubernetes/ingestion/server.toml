@@ -63,6 +63,7 @@ kind = "filesystem"
 path = "/var/lib/openlegal/cache-blobs/data"
 
 [database]
+auto_collection = true
 blob_path = "/var/lib/openlegal/corpus-blobs/data"
 index_path = "/var/lib/openlegal/corpus-index/data"
 widget_html = "/opt/openlegal/widgets/database.html"
@@ -84,6 +85,7 @@ retain_history_bodies = false
 detail_timeout_secs = 3600
 detail_job_workers = 4
 scan_interval_secs = 300
+adaptive_polling = true
 
 # Optional LAW OPEN DATA routing, including lists, details and attachments.
 # Put the SOCKS5 URL in the named Secret environment value.

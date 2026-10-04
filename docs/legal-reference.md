@@ -1,7 +1,7 @@
 # Legal reference tools
 
 When the [legal corpus](database.md) is configured, the server also registers
-three read-only tools that build on its search, history and checkpoint reads:
+three tools that build on its search, history and checkpoint reads:
 
 | Tool | Purpose |
 | --- | --- |
@@ -9,7 +9,13 @@ three read-only tools that build on its search, history and checkpoint reads:
 | `citation.verify` | Check statute citations and court case numbers in supplied text |
 | `law.in_force_at` | Select the retained revision whose effective date is the latest on or before a date |
 
-They read only the managed corpus and never contact the provider. A missing match
+Results use the managed corpus. With automatic collection enabled,
+`law.resolve_name` may also enqueue bounded discovery of its normalized statute
+name and advertises `readOnlyHint: false`. It retains local matches and adds
+collection status; discovery is reused for one hour. `citation.verify` and
+`law.in_force_at`, including their internal name lookups, remain read-only.
+See [automatic collection](database.md#automatic-demand-collection) for opt-outs
+and admission behavior. A missing match
 means the corpus has no retained observation. It never means that a law, article
 or decision does not exist. Every result carries `corpus_complete` or an
 inventory flag, and object, revision and capture identities for the evidence used.

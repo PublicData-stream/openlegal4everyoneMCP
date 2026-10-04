@@ -1,11 +1,13 @@
 //! Thin MCP adapters for the shared corpus and comparison services.
 use crate::{
     ServerError,
+    demand_result::{self, CollectionSearchInput, ReadResult, WithCollection},
     registry::{ToolError, ToolModule, ToolOptions, ToolOutput, ToolRegistry},
 };
 use openlegal_application::{
     Clock,
     database::DatabaseService,
+    demand_collection::{DemandCollectionCoordinator, validate_collection_term},
     search::{SearchMode, SearchService},
     text_diff::TextDiffService,
 };
@@ -20,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 pub const WIDGET_URI: &str = "ui://openlegal/database-v1.html";
 pub struct DatabaseTools {
+    pub demand: Option<Arc<DemandCollectionCoordinator>>,
     pub database: Arc<DatabaseService>,
     pub reader: Arc<openlegal_application::database_read::DatabaseReader>,
     pub search: Arc<SearchService>,
@@ -116,13 +119,15 @@ impl ToolModule for DatabaseTools {
     fn register(self, registry: &mut ToolRegistry) -> Result<(), ServerError> {
         let service = self.reader.clone();
         let notices = self.store.clone();
-        registry.register_typed::<ReadInput, ContentPage, _, _>(
+        let demand = self.demand.clone();
+        registry.register_demand::<ReadInput, ReadResult<ContentPage>, _, _>(
             "database.get",
-            "Read one legal object at HEAD or an exact retained revision/capture. HEAD includes TTL and fetch/cache times. Content pages contain up to 32 KiB. Continue using selector kind=capture and the returned metadata.capture_id with next_offset and the same section; historical content never falls back to HEAD.",
-            ToolOptions::default(),
+            "Read one legal object at HEAD or an exact retained revision/capture. HEAD includes TTL and fetch/cache times. Content pages contain up to 32 KiB. Continue using selector kind=capture and the returned metadata.capture_id with next_offset and the same section; historical content never falls back to HEAD. When automatic collection is enabled, an initial missing or stale national-statute HEAD may enqueue bounded refresh and return collection status or a pending receipt.",
+            demand_result::options(demand.as_ref().is_some_and(|d| d.enabled())),
             move |input, ctx| {
                 let service = service.clone();
                 let notices = notices.clone();
+                let demand = demand.clone();
                 async move {
                     if input.section.as_ref().is_some_and(|s| s.len() > 256)
                         || input.offset > 64 * 1024 * 1024
@@ -131,18 +136,24 @@ impl ToolModule for DatabaseTools {
                     {
                         return Err(ToolError::InvalidInput);
                     }
-                    let (result, session) = service
-                        .get(
-                            GetRequest {
-                                object: input.object,
-                                selector: input.selector,
-                                fresh_only: input.fresh_only,
-                            },
+                    let request = GetRequest { object: input.object, selector: input.selector, fresh_only: input.fresh_only };
+                    let initial_head = matches!(request.selector, RevisionSelector::Head) && input.session.is_none() && input.offset == 0 && input.sections_offset == 0;
+                    let local = service.get(request.clone(),
                             input.session,
-                            ctx.request.cancellation,
+                            ctx.request.cancellation.clone(),
                         )
-                        .await
-                        .map_err(map_error)?;
+                        .await;
+                    let (result, session) = match local {
+                        Ok(local) => local,
+                        Err(error) if initial_head && demand_result::refreshable_error(error) => {
+                            if let Some(demand) = demand {
+                                let collection = demand.head(&request, true, &ctx.request.cancellation).await;
+                                return demand_result::pending(error, collection).map(output);
+                            }
+                            return Err(map_error(error));
+                        }
+                        Err(error) => return Err(map_error(error)),
+                    };
                     let record = &result.capture.record;
                     let section = input.section.unwrap_or_else(|| "body".into());
                     let text = match section.as_str() {
@@ -188,7 +199,12 @@ impl ToolModule for DatabaseTools {
                         (section_end < section_count).then_some(section_end);
                     let mut metadata: MetadataResult = result.into();
                     metadata.collection_notices = notices.collection_notices(&[metadata.object.dataset], Some(&metadata.object)).await.map_err(map_error)?;
-                    Ok(output(ContentPage {
+                    let collection = if initial_head {
+                        if let Some(demand) = demand {
+                            Some(demand.head(&request, metadata.freshness.as_ref().is_some_and(|f| f.state != openlegal_domain::FreshnessState::Fresh), &ctx.request.cancellation).await)
+                        } else { None }
+                    } else { None };
+                    Ok(output(ReadResult::Ready(WithCollection { result: ContentPage {
                         session,
                         schema_version: 1,
                         metadata,
@@ -199,24 +215,39 @@ impl ToolModule for DatabaseTools {
                         sections,
                         section_count,
                         next_sections_offset,
-                    }))
+                    }, collection })))
                 }
             },
         )?;
         let service = self.database.clone();
         let notices = self.store.clone();
-        registry.register_typed::<GetRequest, MetadataResult, _, _>(
+        let demand = self.demand.clone();
+        registry.register_demand::<GetRequest, ReadResult<MetadataResult>, _, _>(
             "database.get_metadata",
-            "Retrieve metadata and provenance for HEAD or an exact checkpoint, with HEAD freshness and upstream retrieval/validation/cache times. No legal body content is returned.",
-            ToolOptions::default(),
+            "Retrieve metadata and provenance for HEAD or an exact checkpoint, with HEAD freshness and upstream retrieval/validation/cache times. No legal body content is returned. Eligible missing or stale HEAD may enqueue bounded refresh when automatic collection is enabled.",
+            demand_result::options(demand.as_ref().is_some_and(|d| d.enabled())),
             move |input, ctx| {
                 let service = service.clone();
                 let notices = notices.clone();
+                let demand = demand.clone();
                 async move {
                     let object = input.object.clone();
-                    let mut result = service.get_metadata(input, ctx.request.cancellation).await.map_err(map_error)?;
+                    let mut result = match service.get_metadata(input.clone(), ctx.request.cancellation.clone()).await {
+                        Ok(result) => result,
+                        Err(error) if matches!(input.selector, RevisionSelector::Head) && demand_result::refreshable_error(error) => {
+                            if let Some(demand) = demand {
+                                let collection = demand.head(&input, true, &ctx.request.cancellation).await;
+                                return demand_result::pending(error, collection).map(output);
+                            }
+                            return Err(map_error(error));
+                        }
+                        Err(error) => return Err(map_error(error)),
+                    };
                     result.collection_notices = notices.collection_notices(&[object.dataset], Some(&object)).await.map_err(map_error)?;
-                    Ok(output(result))
+                    let collection = if matches!(input.selector, RevisionSelector::Head) {
+                        if let Some(demand) = demand { Some(demand.head(&input, result.freshness.as_ref().is_some_and(|f| f.state != openlegal_domain::FreshnessState::Fresh), &ctx.request.cancellation).await) } else { None }
+                    } else { None };
+                    Ok(output(ReadResult::Ready(WithCollection { result, collection })))
                 }
             },
         )?;
@@ -265,44 +296,54 @@ impl ToolModule for DatabaseTools {
             },
         )?;
         let search = self.search.clone();
-        registry.register_typed::<QuerySearchRequest, SearchPage, _, _>(
+        let demand = self.demand.clone();
+        registry.register_demand::<CollectionSearchInput<QuerySearchRequest>, WithCollection<SearchPage>, _, _>(
             "database.query",
-            "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, in:title:, in:body:, in:case_number:, analyzed words and prefixes). Bare title:, body:, and case_number: are invalid; use the in: prefix. Double quotes require an exact case-sensitive source substring. Alternatively, literal: true searches the entire query as a source substring; ignore_case applies only with literal: true. Literal excerpts surround the first matching source substring. Korean Lindera and MeCab-Ko analysis uses NFC and ASCII lowercase with no stopwords. Positive expressions must match within one engine; NOT excludes a match by either engine. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit.",
-            ToolOptions::default(),
+            "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, in:title:, in:body:, in:case_number:, analyzed words and prefixes). Bare title:, body:, and case_number: are invalid; use the in: prefix. Double quotes require an exact case-sensitive source substring. Alternatively, literal: true searches the entire query as a source substring; ignore_case applies only with literal: true. Literal excerpts surround the first matching source substring. Korean Lindera and MeCab-Ko analysis uses NFC and ASCII lowercase with no stopwords. Positive expressions must match within one engine; NOT excludes a match by either engine. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit. Optional collection_term is a separate bounded literal provider term; it never changes local query semantics. Eligible first-page searches may enqueue collection when enabled.",
+            demand_result::options(demand.as_ref().is_some_and(|d| d.enabled())),
             move |input, ctx| {
                 let search = search.clone();
+                let demand = demand.clone();
                 async move {
-                    search
+                    let request: SearchRequest = input.request.into();
+                    validate_collection_term(input.collection_term.as_deref(), &request.filters.datasets).map_err(map_error)?;
+                    let result = search
                         .search(
                             SearchMode::Query,
-                            input.into(),
+                            request.clone(),
                             ctx.deadline.into_std(),
-                            ctx.request.cancellation,
+                            ctx.request.cancellation.clone(),
                         )
                         .await
-                        .map(output)
-                        .map_err(map_error)
+                        .map_err(map_error)?;
+                    let collection = if let Some(demand) = demand { Some(demand.search(&request, SearchMode::Query, input.collection_term.as_deref(), &ctx.request.cancellation).await.map_err(map_error)?) } else { None };
+                    Ok(output(WithCollection { result, collection }))
                 }
             },
         )?;
         let search = self.search.clone();
-        registry.register_typed::<SearchRequest, SearchPage, _, _>(
+        let demand = self.demand.clone();
+        registry.register_demand::<CollectionSearchInput<SearchRequest>, WithCollection<SearchPage>, _, _>(
             "database.rg",
-            "Search managed legal content and case numbers using bounded ripgrep regex matching, case sensitive and line oriented by default. Typed literal, ignore_case, context_lines and filters are supported; filesystem paths and CLI arguments are never accepted. Continuations retain a fixed corpus generation for ten minutes.",
-            ToolOptions::default(),
+            "Search managed legal content and case numbers using bounded ripgrep regex matching, case sensitive and line oriented by default. Typed literal, ignore_case, context_lines and filters are supported; filesystem paths and CLI arguments are never accepted. Continuations retain a fixed corpus generation for ten minutes. Optional collection_term is a separate bounded literal provider term; literal first-page searches may enqueue collection when enabled. Regex and filtered searches require an explicit term.",
+            demand_result::options(demand.as_ref().is_some_and(|d| d.enabled())),
             move |input, ctx| {
                 let search = search.clone();
+                let demand = demand.clone();
                 async move {
-                    search
+                    let request = input.request;
+                    validate_collection_term(input.collection_term.as_deref(), &request.filters.datasets).map_err(map_error)?;
+                    let result = search
                         .search(
                             SearchMode::Ripgrep,
-                            input,
+                            request.clone(),
                             ctx.deadline.into_std(),
-                            ctx.request.cancellation,
+                            ctx.request.cancellation.clone(),
                         )
                         .await
-                        .map(output)
-                        .map_err(map_error)
+                        .map_err(map_error)?;
+                    let collection = if let Some(demand) = demand { Some(demand.search(&request, SearchMode::Ripgrep, input.collection_term.as_deref(), &ctx.request.cancellation).await.map_err(map_error)?) } else { None };
+                    Ok(output(WithCollection { result, collection }))
                 }
             },
         )?;
