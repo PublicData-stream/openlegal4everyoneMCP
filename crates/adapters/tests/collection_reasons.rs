@@ -77,7 +77,7 @@ async fn skip_reasons_survive_coalescing_and_terminal_receipts_but_clear_on_retr
                 .bind(&id).execute(&base.pool()).await.is_err()
         );
         sqlx::query(
-            "UPDATE openlegal.collection_request SET created_at=created_at-3601 WHERE id=$1::uuid",
+            "UPDATE openlegal.collection_request SET completed_at=completed_at-3601 WHERE id=$1::uuid",
         )
         .bind(&id)
         .execute(&base.pool())

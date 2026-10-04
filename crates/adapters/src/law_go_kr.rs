@@ -21,6 +21,8 @@ use std::{
 use tokio::{sync::Semaphore, time::Instant};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+mod admission;
+pub use admission::ProviderRequestGuard;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventoryItem {
@@ -103,6 +105,9 @@ pub struct LawClient {
     clock: Arc<dyn openlegal_application::Clock>,
     budget: Option<(PgPool, RequestBudgetMode)>,
     local_cap: Option<Arc<AtomicU32>>,
+    reservation_observer: Option<Arc<AtomicBool>>,
+    explicit_owner: Option<(uuid::Uuid, u64)>,
+    collection_events: Arc<tokio::sync::OnceCell<crate::collection_events::CollectionEvents>>,
     proxy: Option<crate::upstream_proxy::Socks5Proxy>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,6 +294,9 @@ impl LawClient {
             operator_suspended: Arc::new(AtomicBool::new(false)),
             budget: None,
             local_cap: None,
+            reservation_observer: None,
+            explicit_owner: None,
+            collection_events: Arc::new(tokio::sync::OnceCell::new()),
             proxy: None,
         })
     }
@@ -307,6 +315,23 @@ impl LawClient {
     pub fn with_local_cap(mut self, attempts: u32) -> Self {
         self.local_cap = Some(Arc::new(AtomicU32::new(attempts)));
         self
+    }
+    /// Records actual attempt reservation for an operation's timeout handling.
+    /// Ticket, semaphore, pacing and healthy contention waits leave it false.
+    pub fn with_reservation_observer(mut self, observer: Arc<AtomicBool>) -> Self {
+        self.reservation_observer = Some(observer);
+        self
+    }
+    /// Fence a request Pod to the exact launch it loaded. Reusing the receipt
+    /// UUID for a later launch never authorizes this earlier client's calls.
+    pub fn with_collection_launch(
+        mut self,
+        launch: &crate::corpus::CollectionLaunch,
+    ) -> Result<Self, DatabaseError> {
+        let owner = uuid::Uuid::parse_str(&launch.id).map_err(|_| DatabaseError::InvalidInput)?;
+        i64::try_from(launch.launched_at).map_err(|_| DatabaseError::InvalidInput)?;
+        self.explicit_owner = Some((owner, launch.launched_at));
+        Ok(self)
     }
     pub fn on_demand_client(&self) -> Result<Self, DatabaseError> {
         self.on_demand_client_with_limit(RequestLimit::Limited(32))
@@ -357,9 +382,52 @@ impl LawClient {
         let remaining = started.saturating_add(duration).saturating_sub(now).max(0);
         Ok(Duration::from_secs(remaining as u64))
     }
-    async fn reserve_request(&self, cancel: &CancellationToken) -> Result<(), DatabaseError> {
+    #[cfg(test)]
+    async fn reserve_request(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ProviderRequestGuard>, DatabaseError> {
+        let ticket = self.foreground_ticket().await?;
+        self.reserve_request_with_ticket(cancel, ticket.as_ref())
+            .await
+    }
+    async fn foreground_ticket(
+        &self,
+    ) -> Result<Option<admission::ForegroundTicket>, DatabaseError> {
+        match &self.budget {
+            Some((pool, RequestBudgetMode::OnDemand)) => {
+                admission::ForegroundTicket::open(pool).await.map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+    async fn reserve_request_with_ticket(
+        &self,
+        cancel: &CancellationToken,
+        ticket: Option<&admission::ForegroundTicket>,
+    ) -> Result<Option<ProviderRequestGuard>, DatabaseError> {
+        if cancel.is_cancelled() {
+            return Err(DatabaseError::Cancelled);
+        }
         if self.operator_suspended.load(Ordering::Acquire) {
             return Err(DatabaseError::BudgetExhausted);
+        }
+        if let Some((pool, mode)) = &self.budget {
+            let guard = admission::reserve(
+                pool,
+                *mode,
+                self.local_cap.as_ref(),
+                ticket,
+                &self.collection_events,
+                self.reservation_observer.as_ref(),
+                self.explicit_owner.as_ref(),
+                cancel,
+            )
+            .await?;
+            if let Some(observer) = &self.reservation_observer {
+                observer.store(true, Ordering::Release);
+            }
+            return Ok(Some(guard));
         }
         if let Some(cap) = &self.local_cap {
             cap.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
@@ -367,12 +435,16 @@ impl LawClient {
             })
             .map_err(|_| DatabaseError::BudgetExhausted)?;
         }
-        let Some((pool, mode)) = &self.budget else {
-            return Ok(());
-        };
-        Self::reserve_provider_request_budget(pool, mode, cancel).await
+        if let Some(observer) = &self.reservation_observer {
+            observer.store(true, Ordering::Release);
+        }
+        Ok(None)
     }
-    async fn pause_provider_requests(&self, delay: u64) -> Result<(), DatabaseError> {
+    async fn pause_provider_requests(
+        &self,
+        delay: u64,
+        guard: Option<&mut ProviderRequestGuard>,
+    ) -> Result<(), DatabaseError> {
         let suspended = delay > 7 * 86_400;
         self.operator_suspended.store(true, Ordering::Release);
         *self
@@ -380,69 +452,69 @@ impl LawClient {
             .lock()
             .map_err(|_| DatabaseError::StorageUnavailable)? =
             Instant::now().checked_add(Duration::from_secs(delay.min(7 * 86_400)));
-        if let Some((pool, _)) = &self.budget {
-            let durable_delay = i64::try_from(delay)
-                .unwrap_or(i64::MAX / 4)
-                .min(i64::MAX / 4);
-            sqlx::query("UPDATE openlegal.provider_request_budget SET next_allowed_at=GREATEST(next_allowed_at, floor(extract(epoch from clock_timestamp()))::bigint + $1),operator_suspended=operator_suspended OR $2,unresolved_response=false WHERE singleton")
-                .bind(durable_delay).bind(suspended)
-                .execute(pool).await.map_err(|_| DatabaseError::StorageUnavailable)?;
+        if let Some(guard) = guard {
+            guard.pause(delay).await?;
         }
         self.operator_suspended.store(suspended, Ordering::Release);
         Ok(())
     }
-    /// A deterministic rejection may also be an invalid or revoked credential.
-    /// A pilot must not repeat it after a process restart without operator review.
-    pub async fn suspend_after_source_rejection(&self) -> Result<(), DatabaseError> {
+    /// The owner token comes from this response's reservation, even when parsing
+    /// finishes after the HTTP guard has been released for another request.
+    async fn suspend_owned_response(&self, owner: Option<uuid::Uuid>) -> Result<(), DatabaseError> {
         self.operator_suspended.store(true, Ordering::Release);
         if let Some((pool, _)) = &self.budget {
-            let updated = sqlx::query(
-                "UPDATE openlegal.provider_request_budget SET operator_suspended=true,unresolved_response=false WHERE singleton",
-            )
-            .execute(pool)
-            .await
-            .map_err(|_| DatabaseError::StorageUnavailable)?;
-            if updated.rows_affected() != 1 {
-                return Err(DatabaseError::StorageUnavailable);
-            }
+            admission::suspend_owned_response(pool, owner.ok_or(DatabaseError::Conflict)?).await?;
         }
         Ok(())
     }
-    async fn complete_request(&self) -> Result<(), DatabaseError> {
-        if let Some((pool, _)) = &self.budget
-            && sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false WHERE singleton")
-                .execute(pool).await.is_err() {
-            self.operator_suspended.store(true, Ordering::Release);
-            return Err(DatabaseError::StorageUnavailable);
-        }
-        Ok(())
-    }
-    async fn settle_fetch<T>(&self, fetched: Result<T, DatabaseError>) -> Result<T, DatabaseError> {
+    async fn settle_fetch<T>(
+        &self,
+        fetched: Result<T, DatabaseError>,
+        mut guard: Option<&mut ProviderRequestGuard>,
+    ) -> Result<T, DatabaseError> {
         match fetched {
             Ok(value) => {
-                // The complete response is now local evidence. Document work
-                // may time out independently of provider admission.
-                self.complete_request().await?;
+                if let Some(guard) = &mut guard {
+                    guard.complete().await?;
+                }
                 Ok(value)
             }
             Err(error @ (DatabaseError::SourceRejected | DatabaseError::SourceUnauthorized)) => {
-                self.suspend_after_source_rejection().await?;
+                self.operator_suspended.store(true, Ordering::Release);
+                if let Some(guard) = &mut guard {
+                    guard.suspend().await?;
+                }
                 Err(error)
             }
             Err(error @ (DatabaseError::Cancelled | DatabaseError::StorageUnavailable)) => {
-                // A reserved attempt might have been sent. Cancellation and
-                // storage failure retain the marker for operator review.
                 Err(error)
             }
             Err(error) => {
-                // A bounded download failure spends its reserved GET attempt.
-                // The caller records an incomplete page, detail, or attachment.
-                if !self.operator_suspended.load(Ordering::Acquire) {
-                    self.complete_request().await?;
+                if !self.operator_suspended.load(Ordering::Acquire)
+                    && let Some(guard) = &mut guard
+                    && guard.is_active()
+                {
+                    // Retry-After may already have settled and released it.
+                    guard.complete().await?;
                 }
                 Err(error)
             }
         }
+    }
+    /// Reuse the process's continuously drained collection listener.
+    pub fn with_collection_events(
+        mut self,
+        events: crate::collection_events::CollectionEvents,
+    ) -> Self {
+        self.collection_events = Arc::new(tokio::sync::OnceCell::new_with(Some(events)));
+        self
+    }
+    /// Read shared readiness without reserving an attempt or changing counters.
+    pub async fn provider_idle(&self) -> Result<bool, DatabaseError> {
+        let Some((pool, mode)) = &self.budget else {
+            return Ok(self.admission.available_permits() > 0);
+        };
+        admission::idle(pool, *mode).await
     }
     /// A transient pause is durable for configured ingestion; the job worker
     /// uses this timestamp without burning another attempt while it waits.
@@ -504,112 +576,24 @@ impl LawClient {
         pool: &PgPool,
         mode: &RequestBudgetMode,
         cancel: &CancellationToken,
-    ) -> Result<(), DatabaseError> {
-        loop {
-            if cancel.is_cancelled() {
-                return Err(DatabaseError::Cancelled);
-            }
-            let mut tx = pool
-                .begin()
-                .await
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let row = sqlx::query("SELECT utc_day,daily_used,on_demand_used,continuous_daily_limit,on_demand_daily_limit,interval_ms,next_allowed_at,next_request_at_ms,operator_suspended,unresolved_response,pilot_started_at,pilot_used,pilot_attempt_limit,pilot_timeout_secs,pilot_duration_secs,floor(extract(epoch from clock_timestamp())*1000)::bigint AS now_ms FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
-                .fetch_one(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
-            let now_ms: i64 = row
-                .try_get("now_ms")
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let now = now_ms / 1000;
-            let day = now / 86_400;
-            let previous_day: i64 = row
-                .try_get("utc_day")
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let daily_used: i64 = if previous_day == day {
-                row.try_get("daily_used")
-                    .map_err(|_| DatabaseError::StorageUnavailable)?
-            } else {
-                0
-            };
-            let on_demand_used: i64 = if previous_day == day {
-                row.try_get("on_demand_used")
-                    .map_err(|_| DatabaseError::StorageUnavailable)?
-            } else {
-                0
-            };
-            let next: i64 = row
-                .try_get("next_allowed_at")
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let spacing: i64 = row
-                .try_get("next_request_at_ms")
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let next = next.saturating_mul(1000).max(spacing);
-            let interval: i32 = row
-                .try_get("interval_ms")
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let limit: Option<i32> = row
-                .try_get(if *mode == RequestBudgetMode::OnDemand {
-                    "on_demand_daily_limit"
-                } else {
-                    "continuous_daily_limit"
-                })
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let pilot_started: Option<i64> = row
-                .try_get("pilot_started_at")
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let pilot_used: i64 = row
-                .try_get("pilot_used")
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let pilot_limit: Option<i32> = row
-                .try_get("pilot_attempt_limit")
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            let pilot_duration: i64 = row
-                .try_get::<Option<i64>, _>("pilot_duration_secs")
-                .map_err(|_| DatabaseError::StorageUnavailable)?
-                .unwrap_or(
-                    row.try_get("pilot_timeout_secs")
-                        .map_err(|_| DatabaseError::StorageUnavailable)?,
-                );
-            if row
-                .try_get::<bool, _>("operator_suspended")
-                .map_err(|_| DatabaseError::StorageUnavailable)?
-                || row
-                    .try_get::<bool, _>("unresolved_response")
-                    .map_err(|_| DatabaseError::StorageUnavailable)?
-                || limit.is_some_and(|limit| {
-                    (if *mode == RequestBudgetMode::OnDemand {
-                        on_demand_used
-                    } else {
-                        daily_used
-                    }) >= i64::from(limit)
-                })
-                || (*mode == RequestBudgetMode::Pilot
-                    && (pilot_limit.is_some_and(|limit| pilot_used >= i64::from(limit))
-                        || pilot_started
-                            .is_some_and(|started| now.saturating_sub(started) >= pilot_duration)))
-            {
-                return Err(DatabaseError::BudgetExhausted);
-            }
-            if next > now_ms {
-                drop(tx);
-                if next - now_ms > 30_000 {
-                    return Err(DatabaseError::BudgetExhausted);
-                }
-                let delay = (next - now_ms).min(30_000) as u64;
-                tokio::select! {_ = cancel.cancelled() => return Err(DatabaseError::Cancelled), _ = tokio::time::sleep(Duration::from_millis(delay)) => {}}
-                continue;
-            }
-            sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=$1,daily_used=$2,on_demand_used=$3,next_request_at_ms=$4,unresolved_response=true,pilot_started_at=CASE WHEN $5 THEN COALESCE(pilot_started_at,$6) ELSE pilot_started_at END,pilot_duration_secs=CASE WHEN $5 THEN COALESCE(pilot_duration_secs,pilot_timeout_secs) ELSE pilot_duration_secs END,pilot_used=$7 WHERE singleton")
-                .bind(day)
-                .bind(daily_used.checked_add(i64::from(*mode != RequestBudgetMode::OnDemand)).ok_or(DatabaseError::StorageCorrupt)?)
-                .bind(on_demand_used.checked_add(i64::from(*mode == RequestBudgetMode::OnDemand)).ok_or(DatabaseError::StorageCorrupt)?)
-                .bind(now_ms.saturating_add(i64::from(interval)))
-                .bind(*mode == RequestBudgetMode::Pilot).bind(now)
-                .bind(pilot_used.checked_add(i64::from(*mode == RequestBudgetMode::Pilot)).ok_or(DatabaseError::StorageCorrupt)?)
-                .execute(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
-            tx.commit()
-                .await
-                .map_err(|_| DatabaseError::StorageUnavailable)?;
-            return Ok(());
-        }
+    ) -> Result<ProviderRequestGuard, DatabaseError> {
+        let ticket = if *mode == RequestBudgetMode::OnDemand {
+            Some(admission::ForegroundTicket::open(pool).await?)
+        } else {
+            None
+        };
+        let events = tokio::sync::OnceCell::new();
+        admission::reserve(
+            pool,
+            *mode,
+            None,
+            ticket.as_ref(),
+            &events,
+            None,
+            None,
+            cancel,
+        )
+        .await
     }
     pub async fn inventory(
         &self,
@@ -1094,8 +1078,9 @@ impl LawClient {
         })
         .await
     }
-    /// Run source-dependent checks before releasing the one-request admission
-    /// permit and finalizing the durable response state.
+    /// Finalize HTTP response evidence and release admission before running the
+    /// document processor and source-dependent checks. Late rejection retains
+    /// the response owner token and cannot clear another HTTP attempt's marker.
     async fn fetch_parse_timed_checked<T, F>(
         &self,
         url: Url,
@@ -1164,7 +1149,19 @@ impl LawClient {
         if literal_ip(&url).is_some() {
             return Err(DatabaseError::InvalidInput);
         }
-        let permit = tokio::select! {_=cancel.cancelled()=>return Err(DatabaseError::Cancelled),p=tokio::time::timeout(Duration::from_secs(30),self.admission.clone().acquire_owned())=>p.map_err(|_|DatabaseError::Capacity)?.map_err(|_|DatabaseError::Capacity)?};
+        if cancel.is_cancelled() {
+            return Err(DatabaseError::Cancelled);
+        }
+        let ticket = self.foreground_ticket().await?;
+        let ticket_failure = ticket
+            .as_ref()
+            .map(|ticket| ticket.failed().clone())
+            .unwrap_or_default();
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => return Err(DatabaseError::Cancelled),
+            _ = ticket_failure.cancelled() => return Err(DatabaseError::StorageUnavailable),
+            permit = self.admission.clone().acquire_owned() => permit.map_err(|_|DatabaseError::Capacity)?,
+        };
         let next = (*self
             .next_request
             .lock()
@@ -1185,7 +1182,11 @@ impl LawClient {
             .lock()
             .map_err(|_| DatabaseError::StorageUnavailable)? =
             Instant::now().checked_add(Duration::from_secs(u64::from(self.budget.is_none())));
-        self.reserve_request(&cancel).await?;
+        let mut guard = self
+            .reserve_request_with_ticket(&cancel, ticket.as_ref())
+            .await?;
+        let response_owner = guard.as_ref().map(|guard| guard.owner());
+        drop(ticket);
         let fetched = async {
         let host = url.host_str().ok_or(DatabaseError::InvalidInput)?;
         let ips = tokio::select! {_=cancel.cancelled()=>return Err(DatabaseError::Cancelled),r=self.resolver.lookup_ip(format!("{host}."))=>r.map_err(|_|download_failed("dns"))?};
@@ -1239,7 +1240,7 @@ impl LawClient {
                     .and_then(crate::retry_after)
                     .unwrap_or(60)
                     .max(1);
-                self.pause_provider_requests(delay).await?;
+                self.pause_provider_requests(delay, guard.as_mut()).await?;
                 return Err(if self.budget.is_some() {
                     DatabaseError::BudgetExhausted
                 } else {
@@ -1293,10 +1294,12 @@ impl LawClient {
         };
         tokio::select! {_ = cancel.cancelled()=>Err(DatabaseError::Cancelled),result=fetch=>result}
         }.await;
-        let (raw, html_content_type) = self.settle_fetch(fetched).await?;
+        let settled = self.settle_fetch(fetched, guard.as_mut()).await;
+        drop(guard);
+        drop(permit);
+        let (raw, html_content_type) = settled?;
         let retrieved_at = self.clock.now();
         if attachment_remaining_bytes.is_some() && !expected_document_magic(&raw, format) {
-            drop(permit);
             return Ok(FetchedDocument::UnexpectedAttachment {
                 html: html_content_type || looks_like_html(&raw),
                 raw,
@@ -1340,13 +1343,12 @@ impl LawClient {
                 });
             }
             Err(DatabaseError::SourceRejected | DatabaseError::SourceUnauthorized) => {
-                self.suspend_after_source_rejection().await?;
+                self.suspend_owned_response(response_owner).await?;
                 return output;
             }
             Err(DatabaseError::Cancelled) => return Err(DatabaseError::Cancelled),
             _ => {}
         }
-        drop(permit);
         output
     }
 }
@@ -2218,6 +2220,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_before_reservation_does_not_spend_local_attempts() {
+        let observer = Arc::new(AtomicBool::new(false));
+        let client = LawClient::new("fictional".into(), Arc::new(UnusedProcessor))
+            .unwrap()
+            .with_local_cap(1)
+            .with_reservation_observer(observer.clone());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert_eq!(
+            client.reserve_request(&cancellation).await,
+            Err(DatabaseError::Cancelled)
+        );
+        assert_eq!(
+            client.local_cap.as_ref().unwrap().load(Ordering::Acquire),
+            1
+        );
+        assert!(!observer.load(Ordering::Acquire));
+        client
+            .reserve_request(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(observer.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn old_collection_launch_cannot_reserve_under_relaunched_receipt_uuid() {
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let storage = fixture.open(100).await;
+        let pool = storage.pool();
+        let blobs = crate::blob::FsBlobStore::open(
+            &fixture.directory.path().join("launch-fenced-admission"),
+        )
+        .await
+        .unwrap();
+        let corpus = crate::corpus::PgCorpusStore::new(pool.clone(), blobs);
+        corpus.heartbeat_collection_scheduler().await.unwrap();
+        corpus
+            .request_collection(openlegal_domain::collection::CollectionRequest {
+                target: openlegal_domain::collection::CollectionTarget::Object {
+                    object: ObjectId {
+                        jurisdiction: "kr".into(),
+                        provider: "law_go_kr".into(),
+                        dataset: Dataset::NationalStatute,
+                        id: "001".into(),
+                    },
+                },
+            })
+            .await
+            .unwrap();
+        let old = corpus
+            .claim_collection_request_with_policy(60, RequestLimit::Limited(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let observer = Arc::new(AtomicBool::new(false));
+        let client = LawClient::new("fictional".into(), Arc::new(UnusedProcessor))
+            .unwrap()
+            .with_request_budget(pool.clone(), RequestBudgetMode::OnDemand)
+            .with_local_cap(1)
+            .with_collection_launch(&old)
+            .unwrap()
+            .with_reservation_observer(observer.clone());
+        let mut malformed = old.clone();
+        malformed.id = "invalid-owner".into();
+        assert_eq!(
+            client.clone().with_collection_launch(&malformed).err(),
+            Some(DatabaseError::InvalidInput)
+        );
+        sqlx::query("UPDATE openlegal.collection_request SET launched_at=launched_at+1,lease_until=lease_until+1 WHERE id=$1::uuid")
+            .bind(&old.id).execute(&pool).await.unwrap();
+        assert_eq!(
+            client.reserve_request(&CancellationToken::new()).await,
+            Err(DatabaseError::Cancelled)
+        );
+        assert!(!observer.load(Ordering::Acquire));
+        assert_eq!(
+            client.local_cap.as_ref().unwrap().load(Ordering::Acquire),
+            1
+        );
+        let state: (i64,bool) = sqlx::query_as("SELECT on_demand_used,unresolved_response FROM openlegal.provider_request_budget WHERE singleton")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(state, (0, false));
+        let current = corpus.load_collection_launch(&old.id).await.unwrap();
+        let fresh = client.clone().with_collection_launch(&current).unwrap();
+        let mut guard = fresh
+            .reserve_request(&CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(observer.load(Ordering::Acquire));
+        guard.complete().await.unwrap();
+        let charged: i64 = sqlx::query_scalar(
+            "SELECT on_demand_used FROM openlegal.provider_request_budget WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(charged, 1);
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "requires scripts/test-postgres.sh"]
     async fn settled_download_failure_allows_next_attempt_but_cancellation_blocks_it() {
         let fixture = crate::test_support::TestDatabase::new().await;
@@ -2226,7 +2331,7 @@ mod tests {
         let client = LawClient::new("fixture-credential".into(), Arc::new(UnusedProcessor))
             .unwrap()
             .with_request_budget(pool.clone(), RequestBudgetMode::Pilot);
-        LawClient::reserve_provider_request_budget(
+        let mut reservation = LawClient::reserve_provider_request_budget(
             &pool,
             &RequestBudgetMode::Pilot,
             &CancellationToken::new(),
@@ -2235,7 +2340,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             client
-                .settle_fetch::<()>(Err(DatabaseError::SourceDownloadFailed))
+                .settle_fetch::<()>(
+                    Err(DatabaseError::SourceDownloadFailed),
+                    Some(&mut reservation)
+                )
                 .await,
             Err(DatabaseError::SourceDownloadFailed)
         );
@@ -2250,14 +2358,17 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        LawClient::reserve_provider_request_budget(
+        let mut reservation = LawClient::reserve_provider_request_budget(
             &pool,
             &RequestBudgetMode::Pilot,
             &CancellationToken::new(),
         )
         .await
         .unwrap();
-        assert_eq!(client.settle_fetch(Ok(())).await, Ok(()));
+        assert_eq!(
+            client.settle_fetch(Ok(()), Some(&mut reservation)).await,
+            Ok(())
+        );
         let flags: (i64, bool) = sqlx::query_as(
             "SELECT pilot_used,unresolved_response FROM openlegal.provider_request_budget WHERE singleton",
         )
@@ -2269,7 +2380,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        LawClient::reserve_provider_request_budget(
+        let mut reservation = LawClient::reserve_provider_request_budget(
             &pool,
             &RequestBudgetMode::Pilot,
             &CancellationToken::new(),
@@ -2278,10 +2389,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             client
-                .settle_fetch::<()>(Err(DatabaseError::Cancelled))
+                .settle_fetch::<()>(Err(DatabaseError::Cancelled), Some(&mut reservation))
                 .await,
             Err(DatabaseError::Cancelled)
         );
+        drop(reservation);
         let flags: (i64, bool) = sqlx::query_as(
             "SELECT pilot_used,unresolved_response FROM openlegal.provider_request_budget WHERE singleton",
         )

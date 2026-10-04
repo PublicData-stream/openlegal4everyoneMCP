@@ -28,6 +28,196 @@ fn request(id: &str) -> CollectionRequest {
 fn metadata() -> BTreeMap<String, String> {
     BTreeMap::from([("collection_origin".into(), "explicit".into())])
 }
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn deferred_launch_reclaim_fences_stale_job_acknowledgement_failure_and_worker_load() {
+    use openlegal_domain::legal::DatabaseError;
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let pool = base.pool();
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("collection-launch-epoch"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::new(pool.clone(), blobs);
+    store.heartbeat_collection_scheduler().await.unwrap();
+    let receipt = store.request_collection(request("001")).await.unwrap();
+    let first = store
+        .claim_collection_request_with_policy(7200, RequestLimit::Limited(32))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .mark_collection_launch_running(&first, "openlegal-request-first")
+        .await
+        .unwrap();
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp()))::bigint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    store
+        .settle_collection_launch(&first, "deferred", None, Some((now + 5) as u64))
+        .await
+        .unwrap();
+    let lease: i64 =
+        sqlx::query_scalar("SELECT lease_until FROM openlegal.collection_request WHERE id=$1")
+            .bind(uuid::Uuid::parse_str(&receipt.request_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        lease,
+        now + 5,
+        "healthy capacity contention retries in five seconds"
+    );
+    assert!(store.claim_collection_request().await.unwrap().is_none());
+    // Fast Pod settlement before scheduler acknowledgement is safe for its
+    // same epoch and must leave the deferred request deferred.
+    store
+        .mark_collection_launch_running(&first, "openlegal-request-first")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .collection_status(&receipt.request_id)
+            .await
+            .unwrap()
+            .status,
+        "deferred"
+    );
+    sqlx::query("UPDATE openlegal.collection_request SET lease_until=floor(extract(epoch from clock_timestamp()))::bigint-1 WHERE id=$1")
+        .bind(uuid::Uuid::parse_str(&receipt.request_id).unwrap()).execute(&pool).await.unwrap();
+    let second = store
+        .claim_collection_request_with_policy(7200, RequestLimit::Limited(32))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.id, first.id);
+    assert!(
+        second.launched_at > first.launched_at,
+        "same-second reclaim needs a distinct ownership epoch"
+    );
+    assert_eq!(
+        store.unsettled_collection_launches().await.unwrap(),
+        vec![(second.id.clone(), None, second.launched_at)]
+    );
+    assert!(matches!(
+        store
+            .load_collection_launch_for_epoch(&first.id, first.launched_at)
+            .await,
+        Err(DatabaseError::NotFound)
+    ));
+    assert_eq!(
+        store
+            .load_collection_launch_for_epoch(&second.id, second.launched_at)
+            .await
+            .unwrap()
+            .launched_at,
+        second.launched_at
+    );
+    assert_eq!(
+        store
+            .mark_collection_launch_running(&first, "openlegal-request-first")
+            .await,
+        Err(DatabaseError::Conflict)
+    );
+    // The first Job can remain failed in Kubernetes for its one-hour TTL; its
+    // reconciliation must not settle the second launch or populate its Job name.
+    store
+        .fail_finished_collection_launch(&first.id, "openlegal-request-first", first.launched_at)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.collection_status(&second.id).await.unwrap().status,
+        "launching"
+    );
+    assert_eq!(
+        store
+            .settle_collection_launch(&first, "failed", Some("worker_failed"), None)
+            .await,
+        Err(DatabaseError::Conflict)
+    );
+    store
+        .mark_collection_launch_running(&second, "openlegal-request-second")
+        .await
+        .unwrap();
+    store
+        .mark_collection_launch_running(&second, "openlegal-request-second")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.unsettled_collection_launches().await.unwrap(),
+        vec![(
+            second.id.clone(),
+            Some("openlegal-request-second".into()),
+            second.launched_at
+        )]
+    );
+    store
+        .fail_finished_collection_launch(&second.id, "openlegal-request-first", second.launched_at)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.collection_status(&second.id).await.unwrap().status,
+        "running"
+    );
+    store
+        .fail_finished_collection_launch(&second.id, "openlegal-request-second", second.launched_at)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.collection_status(&second.id).await.unwrap().status,
+        "failed"
+    );
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn same_epoch_fast_terminal_settlement_does_not_reopen_the_collection_launch() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("collection-fast-settlement"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::new(base.pool(), blobs);
+    store.heartbeat_collection_scheduler().await.unwrap();
+    store.request_collection(request("001")).await.unwrap();
+    let launch = store
+        .claim_collection_request_with_policy(7200, RequestLimit::Limited(32))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .settle_collection_launch(&launch, "done", None, None)
+        .await
+        .unwrap();
+    store
+        .mark_collection_launch_running(&launch, "openlegal-request-finished")
+        .await
+        .unwrap();
+    store
+        .fail_finished_collection_launch(
+            &launch.id,
+            "openlegal-request-finished",
+            launch.launched_at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.collection_status(&launch.id).await.unwrap().status,
+        "done"
+    );
+    assert!(
+        store
+            .unsettled_collection_launches()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    base.close().await.unwrap();
+}
 #[test]
 fn collection_operation_deadlines_keep_startup_and_recovery_margins() {
     for (seconds, deadline) in [(60, 360), (7200, 7500), (86400, 86700)] {

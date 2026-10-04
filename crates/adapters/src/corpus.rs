@@ -31,6 +31,7 @@ pub struct PgCorpusStore {
     blobs: Arc<dyn BlobStore>,
     blocked: Arc<AtomicBool>,
     publication_clock: Arc<dyn openlegal_application::Clock>,
+    collection_events: Arc<tokio::sync::OnceCell<crate::collection_events::CollectionEvents>>,
 }
 fn db(_: sqlx::Error) -> DatabaseError {
     DatabaseError::StorageUnavailable
@@ -71,6 +72,30 @@ fn check(cancel: &CancellationToken) -> Result<(), DatabaseError> {
     }
 }
 impl PgCorpusStore {
+    pub async fn collection_events(
+        &self,
+    ) -> Result<crate::collection_events::CollectionEvents, DatabaseError> {
+        self.gate().await?;
+        Ok(self
+            .collection_events
+            .get_or_try_init(|| crate::collection_events::CollectionEvents::open(&self.pool))
+            .await?
+            .clone())
+    }
+
+    pub async fn close_collection_events(&self) {
+        if let Some(events) = self.collection_events.get() {
+            events.close().await;
+        }
+    }
+
+    /// Only work claimable by normal detail workers delays another scan. Explicit
+    /// outbound readiness is represented by provider tickets, not parsing Jobs.
+    pub async fn collection_backlog(&self) -> Result<bool, DatabaseError> {
+        self.gate().await?;
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) JOIN openlegal.provider_request_budget b ON b.singleton WHERE NOT o.withdrawn AND (NOT j.install_head OR j.revision_id=o.desired_head_revision) AND j.attempts<b.max_job_attempts AND (j.status='pending' OR (j.status='running' AND j.lease_until<=floor(extract(epoch from clock_timestamp()))::bigint)) AND j.explicit_request_id IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit' AND (b.continuous_daily_limit IS NULL OR b.utc_day<>floor(extract(epoch from clock_timestamp()))::bigint/86400 OR b.daily_used<b.continuous_daily_limit) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>floor(extract(epoch from clock_timestamp()))::bigint))")
+            .fetch_one(&self.pool).await.map_err(db)
+    }
     /// Metadata-only checkpoint for an observed current-list revision. This
     /// never reads blob bodies and never asserts provider inventory completeness.
     pub async fn head_revision_ready(
@@ -227,6 +252,7 @@ impl PgCorpusStore {
         publication_clock: Arc<dyn openlegal_application::Clock>,
     ) -> Self {
         Self {
+            collection_events: Arc::new(tokio::sync::OnceCell::new()),
             publication_clock,
             pool,
             blobs,

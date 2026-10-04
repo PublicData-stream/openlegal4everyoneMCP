@@ -250,6 +250,20 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0014_citation_leases.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            15,
+            "provider admission".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0015_provider_admission.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            16,
+            "demand collection".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0016_demand_collection.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

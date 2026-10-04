@@ -125,6 +125,103 @@ impl PgCorpusStore {
         )
         .await
     }
+    /// A read-only hint for the exact HEAD job. Adoption rechecks these facts
+    /// under the claim lock; this hint alone never authorizes a provider call.
+    pub async fn background_budget_wait_available(
+        &self,
+        object: &ObjectId,
+        revision_id: &str,
+        effective_date: Option<&str>,
+        observed_version: u64,
+    ) -> Result<bool, DatabaseError> {
+        self.gate().await?;
+        let k = key(object)?;
+        let version = i64::try_from(observed_version).map_err(|_| DatabaseError::InvalidInput)?;
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE j.object_key=$1 AND j.revision_id=$2 AND j.effective_date=$3 AND j.install_head AND j.status='running' AND j.error_category='budget_wait' AND j.expected_version=$4 AND o.version=$4 AND o.pending AND NOT o.withdrawn AND o.desired_head_revision=$2 AND j.explicit_request_id IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit' AND j.attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton))")
+            .bind(k).bind(revision_id).bind(effective_date.unwrap_or(""))
+            .bind(version).fetch_one(&self.pool).await.map_err(db)
+    }
+    /// Move a completed background admission wait to a live explicit request.
+    /// Execution attempts are preserved; version advancement fences every late
+    /// settlement/publication by the original background claimant.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn adopt_background_budget_wait(
+        &self,
+        object: ObjectId,
+        revision_id: String,
+        effective_date: Option<String>,
+        observed_version: u64,
+        mut source_metadata: std::collections::BTreeMap<String, String>,
+        launch: &CollectionLaunch,
+        now: u64,
+    ) -> Result<Option<Job>, DatabaseError> {
+        source_metadata.insert("collection_origin".into(), "explicit".into());
+        if source_metadata.len() > 128
+            || source_metadata
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+                > 65536
+            || effective_date
+                .as_deref()
+                .is_some_and(|date| !valid_date(date))
+        {
+            return Err(DatabaseError::InvalidInput);
+        }
+        RevisionSelector::Revision {
+            id: revision_id.clone(),
+        }
+        .validate()?;
+        self.gate().await?;
+        let k = key(&object)?;
+        let version = i64::try_from(observed_version).map_err(|_| DatabaseError::InvalidInput)?;
+        let next_version = version
+            .checked_add(1)
+            .ok_or(DatabaseError::StorageCorrupt)?;
+        let owner = Uuid::parse_str(&launch.id).map_err(|_| DatabaseError::InvalidInput)?;
+        let recovery =
+            i64::try_from(launch.recovery_at()).map_err(|_| DatabaseError::InvalidInput)?;
+        let launched_at =
+            i64::try_from(launch.launched_at).map_err(|_| DatabaseError::InvalidInput)?;
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+        let current: Option<i64> = sqlx::query_scalar("SELECT version FROM openlegal.corpus_object WHERE object_key=$1 AND pending AND NOT withdrawn AND desired_head_revision=$2 FOR UPDATE")
+            .bind(&k).bind(&revision_id).fetch_optional(&mut *tx).await.map_err(db)?;
+        if current != Some(version) {
+            return Ok(None);
+        }
+        let candidate = sqlx::query("SELECT j.id,j.attempts FROM openlegal.corpus_job j WHERE j.object_key=$1 AND j.revision_id=$2 AND j.effective_date=$3 AND j.install_head AND j.status='running' AND j.error_category='budget_wait' AND j.expected_version=$4 AND j.explicit_request_id IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit' AND j.attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>$5::text::numeric) AND EXISTS(SELECT 1 FROM openlegal.collection_request r WHERE r.id=$6 AND r.launched_at=$7 AND r.status IN ('launching','running') AND r.lease_until>$5::bigint) FOR UPDATE OF j")
+            .bind(&k).bind(&revision_id).bind(effective_date.as_deref().unwrap_or(""))
+            .bind(version).bind(now.to_string()).bind(owner).bind(launched_at).fetch_optional(&mut *tx).await.map_err(db)?;
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let id: Uuid = candidate.try_get("id").map_err(db)?;
+        let attempts: i32 = candidate.try_get("attempts").map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_object SET version=$2 WHERE object_key=$1")
+            .bind(&k)
+            .bind(next_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_job SET status='pending',expected_version=$2,source_metadata=$3,explicit_request_id=$4,explicit_recovery_at=$5,lease_until=NULL,error_category=NULL,started_at=NULL,completed_at=NULL WHERE id=$1")
+            .bind(id).bind(next_version).bind(serde_json::to_value(&source_metadata).map_err(corrupt)?)
+            .bind(owner).bind(recovery).execute(&mut *tx).await.map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(Some(Job {
+            id: id.to_string(),
+            object,
+            revision_id,
+            effective_date,
+            install_head: true,
+            source_metadata,
+            expected_version: next_version.try_into().map_err(corrupt)?,
+            attempts: attempts.try_into().map_err(corrupt)?,
+        }))
+    }
     #[allow(clippy::too_many_arguments)]
     async fn enqueue_job_with_owner(
         &self,
@@ -170,6 +267,15 @@ impl PgCorpusStore {
             .fetch_one(&mut *tx)
             .await
             .map_err(db)?;
+        if let Some(launch) = launch {
+            let authorized: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.collection_request WHERE id=$1 AND launched_at=$2 AND status IN ('launching','running') AND lease_until>$3 FOR SHARE)")
+                .bind(owner).bind(i64::try_from(launch.launched_at).map_err(|_|DatabaseError::InvalidInput)?)
+                .bind(i64::try_from(now).map_err(|_|DatabaseError::InvalidInput)?)
+                .fetch_one(&mut *tx).await.map_err(db)?;
+            if !authorized {
+                return Err(DatabaseError::Cancelled);
+            }
+        }
         sqlx::query("INSERT INTO openlegal.corpus_object(object_key,identity) VALUES($1,$2) ON CONFLICT DO NOTHING").bind(&k).bind(serde_json::to_value(&object).map_err(corrupt)?).execute(&mut *tx).await.map_err(db)?;
         let row=sqlx::query("SELECT identity,version,withdrawn,desired_head_revision,pending FROM openlegal.corpus_object WHERE object_key=$1 FOR UPDATE").bind(&k).fetch_one(&mut *tx).await.map_err(db)?;
         if serde_json::from_value::<ObjectId>(row.try_get("identity").map_err(db)?)
@@ -511,17 +617,51 @@ impl PgCorpusStore {
         sqlx::query("UPDATE openlegal.corpus_job SET status=CASE WHEN $2 AND attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) THEN 'pending' ELSE 'failed' END,lease_until=NULL,error_category='processing_failed',completed_at=CASE WHEN $2 AND attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) THEN NULL ELSE floor(extract(epoch from clock_timestamp()))::bigint END WHERE id=$1 AND expected_version=$3 AND attempts=$4 AND status='running'").bind(id).bind(retry).bind(i64::try_from(job.expected_version).map_err(|_|DatabaseError::InvalidInput)?).bind(job.attempts as i32).execute(&self.pool).await.map_err(db)?;
         Ok(())
     }
+    /// A claim that never reserved an upstream attempt does not spend a
+    /// processing execution. A later claim has a new object version, so an old
+    /// claimant cannot refund a newly reclaimed job with the same attempt count.
+    pub async fn release_admission_wait(&self, job: &Job) -> Result<(), DatabaseError> {
+        let id = Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
+        if job.attempts == 0 {
+            return Err(DatabaseError::InvalidInput);
+        }
+        let changed = sqlx::query("UPDATE openlegal.corpus_job SET status='pending',attempts=attempts-1,lease_until=NULL,error_category=NULL,started_at=NULL,completed_at=NULL WHERE id=$1 AND expected_version=$2 AND attempts=$3 AND status='running'")
+            .bind(id).bind(i64::try_from(job.expected_version).map_err(|_|DatabaseError::InvalidInput)?)
+            .bind(job.attempts as i32).execute(&self.pool).await.map_err(db)?.rows_affected();
+        if changed != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        Ok(())
+    }
     /// A daily upstream cap is admission policy, not a failed processing
     /// attempt. Keep the claim leased until the next UTC day across restarts.
     pub async fn defer_budget_claim(&self, job: &Job, resume_at: u64) -> Result<(), DatabaseError> {
+        self.defer_budget_claim_inner(job, resume_at, true).await
+    }
+    /// A response with Retry-After has already spent a provider attempt. Keep
+    /// that execution charged while preserving the durable next-eligible lease.
+    /// An exhausted execution fails immediately; the provider pause is untouched.
+    pub async fn defer_reserved_budget_claim(
+        &self,
+        job: &Job,
+        resume_at: u64,
+    ) -> Result<(), DatabaseError> {
+        self.defer_budget_claim_inner(job, resume_at, false).await
+    }
+    async fn defer_budget_claim_inner(
+        &self,
+        job: &Job,
+        resume_at: u64,
+        refund: bool,
+    ) -> Result<(), DatabaseError> {
         let id = Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
         if job.attempts == 0 || resume_at == 0 {
             return Err(DatabaseError::InvalidInput);
         }
-        let rows = sqlx::query("UPDATE openlegal.corpus_job SET attempts=attempts-1,lease_until=$1::text::numeric,error_category='budget_wait' WHERE id=$2 AND expected_version=$3 AND attempts=$4 AND status='running'")
+        let rows = sqlx::query("UPDATE openlegal.corpus_job j SET attempts=j.attempts-CASE WHEN $5 THEN 1 ELSE 0 END,status=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN 'failed' ELSE 'running' END,lease_until=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN NULL ELSE $1::text::numeric END,error_category=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN 'processing_failed' ELSE 'budget_wait' END,completed_at=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN floor(extract(epoch from clock_timestamp()))::bigint ELSE NULL END FROM openlegal.provider_request_budget b WHERE b.singleton AND j.id=$2 AND j.expected_version=$3 AND j.attempts=$4 AND j.status='running'")
             .bind(resume_at.to_string()).bind(id)
             .bind(i64::try_from(job.expected_version).map_err(|_|DatabaseError::InvalidInput)?)
-            .bind(job.attempts as i32).execute(&self.pool).await.map_err(db)?.rows_affected();
+            .bind(job.attempts as i32).bind(refund).execute(&self.pool).await.map_err(db)?.rows_affected();
         if rows != 1 {
             return Err(DatabaseError::Conflict);
         }

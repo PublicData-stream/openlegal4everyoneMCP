@@ -8,6 +8,7 @@ pub(crate) mod test_support;
 
 pub mod blob;
 mod cache;
+pub mod collection_events;
 pub mod corpus;
 pub mod document_jobs;
 pub mod postgres;

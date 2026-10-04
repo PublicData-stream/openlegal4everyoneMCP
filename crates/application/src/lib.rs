@@ -6,6 +6,7 @@
 pub mod blob;
 pub mod citation;
 pub mod database;
+pub mod demand_collection;
 pub mod document;
 pub mod legal_reference;
 pub mod persistence;

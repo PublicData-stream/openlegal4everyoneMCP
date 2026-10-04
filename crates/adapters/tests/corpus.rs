@@ -9,7 +9,6 @@ use openlegal_adapters::{
 use openlegal_application::{
     citation::CitationLease,
     database::{DatabaseStore, Publication},
-    document::{DocumentError, DocumentInput, DocumentOutput, DocumentProcessor},
     persistence::PersistentStore,
 };
 use openlegal_domain::collection::{CollectionRequest, CollectionTarget};
@@ -17,17 +16,6 @@ use openlegal_domain::legal::*;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
-
-struct UnusedDocumentProcessor;
-impl DocumentProcessor for UnusedDocumentProcessor {
-    fn process(
-        &self,
-        _input: DocumentInput,
-        _cancellation: CancellationToken,
-    ) -> futures::future::BoxFuture<'static, Result<DocumentOutput, DocumentError>> {
-        Box::pin(async { Err(DocumentError::InvalidInput) })
-    }
-}
 
 struct FixtureClock;
 impl openlegal_application::Clock for FixtureClock {
@@ -38,6 +26,362 @@ impl openlegal_application::Clock for FixtureClock {
 fn token() -> CancellationToken {
     CancellationToken::new()
 }
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn admission_wait_refunds_are_fenced_against_reclaimed_attempt_numbers() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let pool = base.pool();
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("admission-refunds"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::new(pool.clone(), blobs);
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp()))::bigint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let now = now as u64;
+    store
+        .enqueue_job(object(), "r1".into(), None, true, true, now)
+        .await
+        .unwrap();
+    assert!(store.collection_backlog().await.unwrap());
+    let first = store.claim_job(now).await.unwrap().unwrap();
+    assert_eq!(first.attempts, 1);
+    assert!(!store.collection_backlog().await.unwrap());
+    store.release_admission_wait(&first).await.unwrap();
+    assert_eq!(
+        store.release_admission_wait(&first).await,
+        Err(DatabaseError::Conflict)
+    );
+    let state: (String,i32,Option<String>,Option<String>) = sqlx::query_as("SELECT status,attempts,lease_until::text,error_category FROM openlegal.corpus_job WHERE id=$1::uuid")
+        .bind(&first.id).fetch_one(&pool).await.unwrap();
+    assert_eq!(state, ("pending".into(), 0, None, None));
+    assert!(store.collection_backlog().await.unwrap());
+    let mut current = store.claim_job(now + 1).await.unwrap().unwrap();
+    assert_eq!(current.attempts, first.attempts);
+    assert!(current.expected_version > first.expected_version);
+    assert_eq!(
+        store.release_admission_wait(&first).await,
+        Err(DatabaseError::Conflict)
+    );
+    assert_eq!(
+        store.defer_budget_claim(&first, now + 1000).await,
+        Err(DatabaseError::Conflict)
+    );
+    // More healthy admission timeouts than the configured execution maximum
+    // still leave an eligible first execution, with a fresh fence every claim.
+    for iteration in 0..10 {
+        store.release_admission_wait(&current).await.unwrap();
+        let next = store.claim_job(now + 2 + iteration).await.unwrap().unwrap();
+        assert_eq!(next.attempts, 1);
+        assert!(next.expected_version > current.expected_version);
+        assert_eq!(
+            store.release_admission_wait(&current).await,
+            Err(DatabaseError::Conflict)
+        );
+        current = next;
+    }
+    let mut invalid = current.clone();
+    invalid.attempts = 0;
+    assert_eq!(
+        store.release_admission_wait(&invalid).await,
+        Err(DatabaseError::InvalidInput)
+    );
+    store.fail_claim(&current, false).await.unwrap();
+    assert!(!store.collection_backlog().await.unwrap());
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn budget_wait_refunds_only_unreserved_executions_and_preserves_eligibility() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let pool = base.pool();
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("admission-budget-waits"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::new(pool.clone(), blobs);
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp()))::bigint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let now = now as u64;
+    store
+        .enqueue_job(object(), "r1".into(), None, true, true, now)
+        .await
+        .unwrap();
+    let first = store.claim_job(now).await.unwrap().unwrap();
+    store.defer_budget_claim(&first, now + 300).await.unwrap();
+    assert!(!store.collection_backlog().await.unwrap());
+    assert!(store.claim_job(now + 299).await.unwrap().is_none());
+    let second = store.claim_job(now + 300).await.unwrap().unwrap();
+    assert_eq!(second.attempts, 1);
+    store
+        .defer_reserved_budget_claim(&second, now + 600)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.defer_reserved_budget_claim(&first, now + 900).await,
+        Err(DatabaseError::Conflict)
+    );
+    assert!(store.claim_job(now + 599).await.unwrap().is_none());
+    let third = store.claim_job(now + 600).await.unwrap().unwrap();
+    assert_eq!(third.attempts, 2);
+    store.release_admission_wait(&third).await.unwrap();
+    assert!(store.collection_backlog().await.unwrap());
+    let next = store.claim_job(now + 601).await.unwrap().unwrap();
+    assert_eq!(next.attempts, 2);
+    store.fail_claim(&next, false).await.unwrap();
+
+    // A final reserved execution cannot retry after Retry-After. Terminalize
+    // now while retaining its charged attempts and the global provider pause.
+    let pause_until = now + 86400;
+    sqlx::query("UPDATE openlegal.provider_request_budget SET max_job_attempts=1,daily_used=1,on_demand_used=1,next_allowed_at=$1 WHERE singleton")
+        .bind(pause_until as i64).execute(&pool).await.unwrap();
+    store
+        .enqueue_job(object(), "r2".into(), None, true, true, now + 602)
+        .await
+        .unwrap();
+    let waiting = store.claim_job(now + 602).await.unwrap().unwrap();
+    store.defer_budget_claim(&waiting, now + 603).await.unwrap();
+    let final_execution = store.claim_job(now + 603).await.unwrap().unwrap();
+    assert_eq!(final_execution.attempts, 1);
+    store
+        .defer_reserved_budget_claim(&final_execution, pause_until)
+        .await
+        .unwrap();
+    let terminal: (String,i32,Option<String>,Option<String>,bool) = sqlx::query_as("SELECT status,attempts,lease_until::text,error_category,completed_at IS NOT NULL FROM openlegal.corpus_job WHERE id=$1::uuid")
+        .bind(&final_execution.id).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        terminal,
+        (
+            "failed".into(),
+            1,
+            None,
+            Some("processing_failed".into()),
+            true
+        )
+    );
+    let ledger: (i64,i64,i64) = sqlx::query_as("SELECT daily_used,on_demand_used,next_allowed_at FROM openlegal.provider_request_budget WHERE singleton")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(ledger, (1, 1, pause_until as i64));
+    assert!(store.claim_job(pause_until).await.unwrap().is_none());
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn explicit_collection_adopts_exact_background_budget_wait_without_resetting_attempts() {
+    for reserved in [false, true] {
+        let fixture = support::TestDatabase::new().await;
+        let base = fixture.open(100).await;
+        let pool = base.pool();
+        let blobs = FsBlobStore::open(&fixture.directory.path().join("budget-wait-takeover"))
+            .await
+            .unwrap();
+        let store = PgCorpusStore::new(pool.clone(), blobs);
+        let now: i64 =
+            sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp()))::bigint")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let now = now as u64;
+        let target = ObjectId {
+            provider: "law_go_kr".into(),
+            ..object()
+        };
+        store
+            .enqueue_job(target.clone(), "r1".into(), None, true, true, now)
+            .await
+            .unwrap();
+        let background = store.claim_job(now).await.unwrap().unwrap();
+        store.heartbeat_collection_scheduler().await.unwrap();
+        store
+            .request_collection(CollectionRequest {
+                target: CollectionTarget::Object {
+                    object: target.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        let launch = store
+            .claim_collection_request_with_policy(
+                7200,
+                openlegal_application::upstream_policy::RequestLimit::Limited(32),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut metadata = BTreeMap::new();
+        metadata.insert("title".into(), "Fictional statute".into());
+        // A healthy HTTP attempt or document processor cannot be taken over.
+        assert!(
+            !store
+                .background_budget_wait_available(&target, "r1", None, background.expected_version)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .adopt_background_budget_wait(
+                    target.clone(),
+                    "r1".into(),
+                    None,
+                    background.expected_version,
+                    metadata.clone(),
+                    &launch,
+                    now
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if reserved {
+            store
+                .defer_reserved_budget_claim(&background, now + 600)
+                .await
+                .unwrap();
+        } else {
+            store
+                .defer_budget_claim(&background, now + 600)
+                .await
+                .unwrap();
+        }
+        let charged: (i64,i64) = sqlx::query_as("SELECT daily_used,on_demand_used FROM openlegal.provider_request_budget WHERE singleton")
+            .fetch_one(&pool).await.unwrap();
+        assert!(
+            store
+                .background_budget_wait_available(&target, "r1", None, background.expected_version)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .background_budget_wait_available(
+                    &target,
+                    "different",
+                    None,
+                    background.expected_version
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .background_budget_wait_available(
+                    &target,
+                    "r1",
+                    Some("20260201"),
+                    background.expected_version
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .adopt_background_budget_wait(
+                    target.clone(),
+                    "r1".into(),
+                    None,
+                    background.expected_version + 1,
+                    metadata.clone(),
+                    &launch,
+                    now
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let adopted = store
+            .adopt_background_budget_wait(
+                target.clone(),
+                "r1".into(),
+                None,
+                background.expected_version,
+                metadata,
+                &launch,
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.id, background.id);
+        assert_eq!(adopted.attempts, u32::from(reserved));
+        assert!(adopted.expected_version > background.expected_version);
+        assert_eq!(
+            adopted
+                .source_metadata
+                .get("collection_origin")
+                .map(String::as_str),
+            Some("explicit")
+        );
+        assert!(store.claim_job(now).await.unwrap().is_none());
+        let explicit = store
+            .claim_explicit_job_for_request(&adopted.id, &launch.id, now, 600)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(explicit.attempts, u32::from(reserved) + 1);
+        assert!(explicit.expected_version > adopted.expected_version);
+        store.fail_claim(&background, false).await.unwrap();
+        assert_eq!(
+            store.release_admission_wait(&background).await,
+            Err(DatabaseError::Conflict)
+        );
+        assert_eq!(
+            store.defer_budget_claim(&background, now + 900).await,
+            Err(DatabaseError::Conflict)
+        );
+        let mut obsolete = record("r1", "obsolete background response");
+        obsolete.object = target;
+        assert_eq!(
+            store
+                .publish(
+                    Publication {
+                        record: obsolete,
+                        raw: b"obsolete background response".to_vec(),
+                        additional_evidence: vec![],
+                        processor_version: "fixture_v1".into(),
+                        retrieved_at: now,
+                        now,
+                        expected_version: background.expected_version,
+                        install_head: true,
+                        job_id: Some(background.id.clone()),
+                    },
+                    token()
+                )
+                .await
+                .err(),
+            Some(DatabaseError::Conflict)
+        );
+        let state: (String, i32, i64) = sqlx::query_as(
+            "SELECT status,attempts,expected_version FROM openlegal.corpus_job WHERE id=$1::uuid",
+        )
+        .bind(&explicit.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            (
+                "running".into(),
+                explicit.attempts as i32,
+                explicit.expected_version as i64
+            )
+        );
+        let unchanged: (i64,i64) = sqlx::query_as("SELECT daily_used,on_demand_used FROM openlegal.provider_request_budget WHERE singleton")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(unchanged, charged);
+        store.fail_claim(&explicit, false).await.unwrap();
+        base.close().await.unwrap();
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires scripts/test-postgres.sh"]
 async fn explicit_collection_requests_coalesce_and_clear_completed_payloads() {
@@ -181,7 +525,7 @@ async fn terminal_failed_job_clears_request_without_touching_provider_budget() {
     );
     let coalesced = store.request_collection(request.clone()).await.unwrap();
     assert_eq!(coalesced.request_id, id);
-    sqlx::query("UPDATE openlegal.collection_request SET created_at=created_at-3601 WHERE id=$1")
+    sqlx::query("UPDATE openlegal.collection_request SET completed_at=completed_at-3601 WHERE id=$1")
         .bind(uuid::Uuid::parse_str(&id).unwrap())
         .execute(&base.pool())
         .await
@@ -941,16 +1285,11 @@ async fn source_rejection_suspends_restart_admission_and_clears_resolved_attempt
     let fixture = support::TestDatabase::new().await;
     let base = fixture.open(100).await;
     let pool = base.pool();
-    let client = LawClient::new(
-        "fixture-credential".into(),
-        Arc::new(UnusedDocumentProcessor),
-    )
-    .unwrap()
-    .with_request_budget(pool.clone(), RequestBudgetMode::Pilot);
-    LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::Pilot, &token())
-        .await
-        .unwrap();
-    client.suspend_after_source_rejection().await.unwrap();
+    let mut reservation =
+        LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::Pilot, &token())
+            .await
+            .unwrap();
+    reservation.suspend().await.unwrap();
     let flags: (bool, bool) = sqlx::query_as(
         "SELECT operator_suspended,unresolved_response FROM openlegal.provider_request_budget WHERE singleton",
     )

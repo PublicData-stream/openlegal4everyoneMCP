@@ -196,3 +196,41 @@ pub struct CollectionReceipt {
 pub struct CollectionStatusInput {
     pub request_id: String,
 }
+
+/// Collection is asynchronous: this status never asserts corpus completeness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DemandCollectionState {
+    Disabled,
+    Fresh,
+    Unsupported,
+    Pending,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DemandCollectionStatus {
+    pub status: DemandCollectionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<CollectionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl DemandCollectionStatus {
+    pub fn new(status: DemandCollectionState) -> Self {
+        Self {
+            status,
+            receipt: None,
+            reason: None,
+        }
+    }
+    pub fn reason(status: DemandCollectionState, reason: impl Into<String>) -> Self {
+        Self {
+            status,
+            receipt: None,
+            reason: Some(reason.into()),
+        }
+    }
+}
