@@ -9,7 +9,8 @@ pub const FRESH_SECONDS: u64 = 3600;
 pub const MAX_STALE_SECONDS: u64 = 86400;
 pub const MAX_SOURCE_BYTES: usize = 100 * 1024 * 1024;
 pub const SESSION_SECONDS: u64 = 600;
-pub const HISTORY_RETENTION_SECONDS: u64 = 30 * 86400;
+/// Archived corpus evidence has no age based expiry.
+pub const HISTORY_RETENTION_SECONDS: u64 = u64::MAX;
 
 pub trait DatabaseStore: Send + Sync + 'static {
     /// Must verify retained raw evidence as well as the processed representation.
@@ -42,6 +43,16 @@ pub trait DatabaseStore: Send + Sync + 'static {
             })
         })
     }
+    /// Exact rights-authorized original evidence. Implementations without an
+    /// original archive fail closed rather than returning transformed body text.
+    fn original_evidence(
+        &self,
+        _capture_id: String,
+        _ordinal: u32,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<openlegal_domain::rights::OriginalEvidence, DatabaseError>> {
+        Box::pin(async { Err(DatabaseError::RevisionUnavailable) })
+    }
     fn history(
         &self,
         object: ObjectId,
@@ -63,6 +74,22 @@ impl DatabaseService {
     }
     pub fn store(&self) -> Arc<dyn DatabaseStore> {
         self.store.clone()
+    }
+    pub async fn original_evidence(
+        &self,
+        capture_id: &str,
+        ordinal: u32,
+        cancel: CancellationToken,
+    ) -> Result<openlegal_domain::rights::OriginalEvidence, DatabaseError> {
+        if !openlegal_domain::history::valid_snapshot_id(capture_id) {
+            return Err(DatabaseError::InvalidInput);
+        }
+        if cancel.is_cancelled() {
+            return Err(DatabaseError::Cancelled);
+        }
+        self.store
+            .original_evidence(capture_id.to_owned(), ordinal, cancel)
+            .await
     }
     pub async fn get(
         &self,
@@ -183,6 +210,13 @@ impl DatabaseService {
             || a.capture.record.representation != b.capture.record.representation
         {
             return Err(DatabaseError::InvalidInput);
+        }
+        if [&a, &b].iter().any(|result| {
+            openlegal_domain::rights::resources(&result.capture.record.metadata)
+                .iter()
+                .any(|resource| resource.ordinal == 0 && !resource.rights.can_process())
+        }) {
+            return Err(DatabaseError::SourceDataInvalid);
         }
         Ok((a, b))
     }

@@ -26,6 +26,7 @@ impl openlegal_application::Clock for FixtureClock {
 
 fn config(fixture: &postgres::TestDatabase, destination: &str) -> DatabaseConfig {
     DatabaseConfig {
+        max_raw_bytes: Default::default(),
         auto_collection: true,
         blob_path: fixture.directory.path().join("corpus-blobs"),
         index_path: fixture.directory.path().join(destination),
@@ -75,7 +76,7 @@ async fn publish(store: &PgCorpusStore, id: &str, revision: &str, time: u64) -> 
 
 #[tokio::test]
 #[ignore = "requires scripts/test-postgres.sh and pinned MeCab-Ko dictionary"]
-async fn offline_rebuild_preserves_ack_retirement_withdrawal_and_previous_index() {
+async fn offline_rebuild_preserves_ack_history_withdrawal_and_previous_index() {
     let fixture = postgres::TestDatabase::new().await;
     let persistent = fixture.open(100).await;
     let original = config(&fixture, "old-index");
@@ -117,7 +118,7 @@ async fn offline_rebuild_preserves_ack_retirement_withdrawal_and_previous_index(
             .to_string()
             .contains("--rebuild-corpus-index")
     );
-    assert_eq!(store.maintain(3_000_001, 250).await.unwrap(), 1);
+    assert_eq!(store.maintain(3_000_001, 250).await.unwrap(), 0);
     drop(old_index);
     let mut rebuilt_config = config(&fixture, "new-index");
     // Rebuilding must not initialize provider credentials or document workers,
@@ -170,9 +171,15 @@ async fn offline_rebuild_preserves_ack_retirement_withdrawal_and_previous_index(
             &CancellationToken::new(),
         )
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1.capture.capture_id, current.capture_id);
-    assert!(rows[0].1.current);
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .any(|(_, row)| row.capture.capture_id == current.capture_id && row.current)
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, row)| row.capture.capture_id == retired.capture_id && !row.current)
+    );
     let preserved = CorpusIndex::open(&original.index_path, analyzer).unwrap();
     assert_eq!(preserved.snapshot().unwrap().generation, removal);
     assert!(

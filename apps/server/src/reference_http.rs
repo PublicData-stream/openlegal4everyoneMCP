@@ -78,6 +78,7 @@ fn render(source: &CitationSource, korean: bool) -> String {
                 }
                 Dataset::LegalInterpretation => label("Legal interpretation", "법령해석"),
                 Dataset::AdministrativeAppeal => label("Administrative appeal", "행정심판"),
+                other => other.as_str().to_owned(),
             },
         ),
         (
@@ -151,6 +152,39 @@ fn render(source: &CitationSource, korean: bool) -> String {
                 "이 제공기관의 공식 웹 링크는 확인되지 않았습니다."
             )
         ));
+    }
+    if meta
+        .metadata
+        .get("transport_credentials_redacted")
+        .is_some_and(|value| value == "true")
+    {
+        html.push_str(&format!("<p role=\"status\">{}</p>", label("Authentication query values were removed from the retained transport response. Legal text was not changed.", "보관된 API 응답의 인증 쿼리값을 제거했습니다. 법률 본문은 변경하지 않았습니다.")));
+    }
+    for resource in openlegal_domain::rights::resources(&meta.metadata) {
+        html.push_str(&format!(
+            "<p><b>{}</b>: {} — {}</p>",
+            label("Original material", "원문 자료"),
+            escape(&resource.title),
+            escape(&resource.rights.attribution)
+        ));
+        for warning in resource.rights.warnings() {
+            html.push_str(&format!(
+                "<p role=\"status\">{}: {}</p>",
+                label("Reuse condition", "이용 조건"),
+                escape(warning)
+            ));
+        }
+        if resource.retained
+            && resource.rights.can_store()
+            && openlegal_domain::history::valid_snapshot_id(&meta.capture_id)
+        {
+            html.push_str(&format!(
+                "<p><a href=\"/source-file/{}/{}\">{}</a></p>",
+                meta.capture_id,
+                resource.ordinal,
+                label("Download retained original", "보관 원문 다운로드")
+            ));
+        }
     }
     if let Some(document) = &source.document {
         let kind = document.metadata.get("section_kind").map(String::as_str);
@@ -265,6 +299,99 @@ pub(crate) async fn source_page(
     }
 }
 
+/// Canonical IDs only: no encoded paths, aliases or arbitrary resource URLs.
+pub(crate) fn original_selector(path: &str) -> Option<(&str, u32)> {
+    let (capture, ordinal) = path.strip_prefix("/source-file/")?.split_once('/')?;
+    if !openlegal_domain::history::valid_snapshot_id(capture) {
+        return None;
+    }
+    let parsed = ordinal.parse::<u32>().ok()?;
+    (ordinal == parsed.to_string()).then_some((capture, parsed))
+}
+
+fn original_response(original: openlegal_domain::rights::OriginalEvidence) -> Response {
+    if !original.rights.can_store() {
+        return StatusCode::GONE.into_response();
+    }
+    if original.bytes.len() > openlegal_application::database::MAX_SOURCE_BYTES {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let media_type = original
+        .media_type
+        .parse::<http::HeaderValue>()
+        .ok()
+        .filter(|_| {
+            original.media_type.len() <= 128
+                && original.media_type.contains('/')
+                && !original.media_type.contains(';')
+        })
+        .unwrap_or_else(|| http::HeaderValue::from_static("application/octet-stream"));
+    let credentials_redacted = original.credentials_redacted;
+    let mut response = original.bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, media_type);
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        http::HeaderValue::from_static("attachment; filename=\"original.bin\""),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        http::HeaderValue::from_static(
+            "default-src 'none'; sandbox; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        http::HeaderValue::from_static("no-referrer"),
+    );
+    if credentials_redacted {
+        headers.insert(
+            "x-openlegal-transport-credentials-redacted",
+            http::HeaderValue::from_static("true"),
+        );
+    }
+    if !original.rights.warnings().is_empty()
+        && let Ok(warnings) = original.rights.warnings().join(",").parse()
+    {
+        headers.insert("x-openlegal-rights-warning", warnings);
+    }
+    response
+}
+
+pub(crate) async fn source_file(
+    State(handler): State<McpHandler>,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    let Some((capture, ordinal)) = original_selector(uri.path()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if uri.query().is_some() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let cancel = CancellationToken::new();
+    let _guard = cancel.clone().drop_guard();
+    match handler.citation_original(capture, ordinal, cancel).await {
+        Ok(original) => original_response(original),
+        Err(DatabaseError::InvalidInput) => StatusCode::BAD_REQUEST.into_response(),
+        Err(DatabaseError::Withdrawn | DatabaseError::RevisionUnavailable) => {
+            StatusCode::GONE.into_response()
+        }
+        Err(DatabaseError::NotFound | DatabaseError::NotObserved) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(DatabaseError::Capacity) => StatusCode::TOO_MANY_REQUESTS.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +479,126 @@ mod tests {
         assert_eq!(language(Some("lang=ko")), Ok(true));
         assert!(language(Some("lang=en&lang=ko")).is_err());
         assert!(language(Some("lang=unknown")).is_err());
+    }
+    #[test]
+    fn original_paths_are_canonical_and_cannot_select_filesystem_paths() {
+        let id = "a".repeat(64);
+        assert_eq!(
+            original_selector(&format!("/source-file/{id}/1")),
+            Some((id.as_str(), 1))
+        );
+        for path in [
+            format!("/source-file/{id}/01"),
+            format!("/source-file/{id}/+1"),
+            format!("/source-file/{id}/1/extra"),
+            "/source-file/../../etc/passwd".into(),
+            format!("/source-file/{id}/%31"),
+        ] {
+            assert!(original_selector(&path).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn original_download_is_byte_exact_inert_and_rights_gated() {
+        use openlegal_domain::rights::{OriginalEvidence, SourceRights};
+        let bytes = b"<script>active-looking provider bytes</script>\0\xff".to_vec();
+        let response = original_response(OriginalEvidence {
+            credentials_redacted: false,
+            bytes: bytes.clone(),
+            title: "Provider \r\n hostile title".into(),
+            media_type: "text/html\r\nSet-Cookie: forbidden".into(),
+            rights: SourceRights::kogl(4, "https://example.test/license".into(), "issuer".into()),
+        });
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"original.bin\""
+        );
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert!(
+            response.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .contains("sandbox")
+        );
+        assert!(
+            response.headers()["x-openlegal-rights-warning"]
+                .to_str()
+                .unwrap()
+                .contains("noncommercial_only")
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes
+        );
+        let denied = original_response(OriginalEvidence {
+            credentials_redacted: false,
+            bytes,
+            title: "Unverified".into(),
+            media_type: "text/plain".into(),
+            rights: SourceRights::default(),
+        });
+        assert_eq!(denied.status(), StatusCode::GONE);
+    }
+
+    #[test]
+    fn redacted_transport_provenance_is_visible_on_downloads_and_source_pages() {
+        use openlegal_domain::rights::{OriginalEvidence, SourceRights};
+        let response = original_response(OriginalEvidence {
+            credentials_redacted: true,
+            bytes: b"<law>fixture</law>".to_vec(),
+            title: "Fixture".into(),
+            media_type: "application/xml".into(),
+            rights: SourceRights::legal_information(),
+        });
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-openlegal-transport-credentials-redacted"],
+            "true"
+        );
+        let mut source = fixture();
+        source
+            .metadata
+            .metadata
+            .insert("transport_credentials_redacted".into(), "true".into());
+        assert!(render(&source, true).contains("인증 쿼리값을 제거"));
+        assert!(render(&source, false).contains("Authentication query values were removed"));
+    }
+
+    #[test]
+    fn original_links_and_reuse_conditions_are_visible_on_source_pages() {
+        use openlegal_domain::rights::{OriginalResource, SourceRights};
+        let mut source = fixture();
+        source.metadata.capture_id = "b".repeat(64);
+        source.metadata.metadata.insert(
+            "original_resources".into(),
+            serde_json::to_string(&vec![OriginalResource {
+                ordinal: 1,
+                title: "<Original>".into(),
+                media_type: "application/pdf".into(),
+                source_url: "https://example.test/file".into(),
+                retained: true,
+                rights: SourceRights::kogl(
+                    3,
+                    "https://example.test/license".into(),
+                    "<issuer>".into(),
+                ),
+            }])
+            .unwrap(),
+        );
+        let page = render(&source, true);
+        assert!(page.contains(&format!("/source-file/{}/1", "b".repeat(64))));
+        assert!(page.contains("no_derivatives_original_only"));
+        assert!(page.contains("&lt;Original&gt;") && page.contains("&lt;issuer&gt;"));
     }
 }

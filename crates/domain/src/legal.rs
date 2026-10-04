@@ -14,12 +14,230 @@ pub enum Dataset {
     ConstitutionalDecision,
     LegalInterpretation,
     AdministrativeAppeal,
+    EnglishStatute,
+    SchoolRule,
+    LocalPublicCorporationRule,
+    PublicInstitutionRule,
+    LegalTerm,
+    PpcDecision,
+    EiacDecision,
+    FtcDecision,
+    AcrDecision,
+    FscDecision,
+    NlrcDecision,
+    KccDecision,
+    IaciacDecision,
+    OcltDecision,
+    EccDecision,
+    SfcDecision,
+    NhrckDecision,
+    MoelInterpretation,
+    MolitInterpretation,
+    MoefInterpretation,
+    MofInterpretation,
+    MoisInterpretation,
+    MeInterpretation,
+    KcsInterpretation,
+    NtsInterpretation,
+    MoeInterpretation,
+    MsitInterpretation,
+    MpvaInterpretation,
+    MndInterpretation,
+    MafraInterpretation,
+    McstInterpretation,
+    MojInterpretation,
+    MohwInterpretation,
+    MotieInterpretation,
+    MogefInterpretation,
+    MofaInterpretation,
+    MssInterpretation,
+    MouInterpretation,
+    MolegInterpretation,
+    MfdsInterpretation,
+    MpmInterpretation,
+    KmaInterpretation,
+    KhsInterpretation,
+    RdaInterpretation,
+    NpaInterpretation,
+    DapaInterpretation,
+    MmaInterpretation,
+    KfsInterpretation,
+    NfaInterpretation,
+    OkaInterpretation,
+    PpsInterpretation,
+    KdcaInterpretation,
+    KostatInterpretation,
+    KipoInterpretation,
+    KcgInterpretation,
+    NaaccInterpretation,
+    TtSpecialAppeal,
+    KmstSpecialAppeal,
+    AcrSpecialAppeal,
+    AdapSpecialAppeal,
+    AuditConsultation,
 }
 impl Dataset {
+    /// Closed provider-independent data families; caller input cannot create routes.
+    pub const ALL: &'static [Self] = &[
+        Self::NationalStatute,
+        Self::AdministrativeRule,
+        Self::Ordinance,
+        Self::Treaty,
+        Self::Precedent,
+        Self::ConstitutionalDecision,
+        Self::LegalInterpretation,
+        Self::AdministrativeAppeal,
+        Self::EnglishStatute,
+        Self::SchoolRule,
+        Self::LocalPublicCorporationRule,
+        Self::PublicInstitutionRule,
+        Self::LegalTerm,
+        Self::PpcDecision,
+        Self::EiacDecision,
+        Self::FtcDecision,
+        Self::AcrDecision,
+        Self::FscDecision,
+        Self::NlrcDecision,
+        Self::KccDecision,
+        Self::IaciacDecision,
+        Self::OcltDecision,
+        Self::EccDecision,
+        Self::SfcDecision,
+        Self::NhrckDecision,
+        Self::MoelInterpretation,
+        Self::MolitInterpretation,
+        Self::MoefInterpretation,
+        Self::MofInterpretation,
+        Self::MoisInterpretation,
+        Self::MeInterpretation,
+        Self::KcsInterpretation,
+        Self::NtsInterpretation,
+        Self::MoeInterpretation,
+        Self::MsitInterpretation,
+        Self::MpvaInterpretation,
+        Self::MndInterpretation,
+        Self::MafraInterpretation,
+        Self::McstInterpretation,
+        Self::MojInterpretation,
+        Self::MohwInterpretation,
+        Self::MotieInterpretation,
+        Self::MogefInterpretation,
+        Self::MofaInterpretation,
+        Self::MssInterpretation,
+        Self::MouInterpretation,
+        Self::MolegInterpretation,
+        Self::MfdsInterpretation,
+        Self::MpmInterpretation,
+        Self::KmaInterpretation,
+        Self::KhsInterpretation,
+        Self::RdaInterpretation,
+        Self::NpaInterpretation,
+        Self::DapaInterpretation,
+        Self::MmaInterpretation,
+        Self::KfsInterpretation,
+        Self::NfaInterpretation,
+        Self::OkaInterpretation,
+        Self::PpsInterpretation,
+        Self::KdcaInterpretation,
+        Self::KostatInterpretation,
+        Self::KipoInterpretation,
+        Self::KcgInterpretation,
+        Self::NaaccInterpretation,
+        Self::TtSpecialAppeal,
+        Self::KmstSpecialAppeal,
+        Self::AcrSpecialAppeal,
+        Self::AdapSpecialAppeal,
+        Self::AuditConsultation,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NationalStatute => "national_statute",
+            Self::AdministrativeRule => "administrative_rule",
+            Self::Ordinance => "ordinance",
+            Self::Treaty => "treaty",
+            Self::Precedent => "precedent",
+            Self::ConstitutionalDecision => "constitutional_decision",
+            Self::LegalInterpretation => "legal_interpretation",
+            Self::AdministrativeAppeal => "administrative_appeal",
+            Self::EnglishStatute => "english_statute",
+            Self::SchoolRule => "school_rule",
+            Self::LocalPublicCorporationRule => "local_public_corporation_rule",
+            Self::PublicInstitutionRule => "public_institution_rule",
+            Self::LegalTerm => "legal_term",
+            Self::PpcDecision => "ppc_decision",
+            Self::EiacDecision => "eiac_decision",
+            Self::FtcDecision => "ftc_decision",
+            Self::AcrDecision => "acr_decision",
+            Self::FscDecision => "fsc_decision",
+            Self::NlrcDecision => "nlrc_decision",
+            Self::KccDecision => "kcc_decision",
+            Self::IaciacDecision => "iaciac_decision",
+            Self::OcltDecision => "oclt_decision",
+            Self::EccDecision => "ecc_decision",
+            Self::SfcDecision => "sfc_decision",
+            Self::NhrckDecision => "nhrck_decision",
+            Self::MoelInterpretation => "moel_interpretation",
+            Self::MolitInterpretation => "molit_interpretation",
+            Self::MoefInterpretation => "moef_interpretation",
+            Self::MofInterpretation => "mof_interpretation",
+            Self::MoisInterpretation => "mois_interpretation",
+            Self::MeInterpretation => "me_interpretation",
+            Self::KcsInterpretation => "kcs_interpretation",
+            Self::NtsInterpretation => "nts_interpretation",
+            Self::MoeInterpretation => "moe_interpretation",
+            Self::MsitInterpretation => "msit_interpretation",
+            Self::MpvaInterpretation => "mpva_interpretation",
+            Self::MndInterpretation => "mnd_interpretation",
+            Self::MafraInterpretation => "mafra_interpretation",
+            Self::McstInterpretation => "mcst_interpretation",
+            Self::MojInterpretation => "moj_interpretation",
+            Self::MohwInterpretation => "mohw_interpretation",
+            Self::MotieInterpretation => "motie_interpretation",
+            Self::MogefInterpretation => "mogef_interpretation",
+            Self::MofaInterpretation => "mofa_interpretation",
+            Self::MssInterpretation => "mss_interpretation",
+            Self::MouInterpretation => "mou_interpretation",
+            Self::MolegInterpretation => "moleg_interpretation",
+            Self::MfdsInterpretation => "mfds_interpretation",
+            Self::MpmInterpretation => "mpm_interpretation",
+            Self::KmaInterpretation => "kma_interpretation",
+            Self::KhsInterpretation => "khs_interpretation",
+            Self::RdaInterpretation => "rda_interpretation",
+            Self::NpaInterpretation => "npa_interpretation",
+            Self::DapaInterpretation => "dapa_interpretation",
+            Self::MmaInterpretation => "mma_interpretation",
+            Self::KfsInterpretation => "kfs_interpretation",
+            Self::NfaInterpretation => "nfa_interpretation",
+            Self::OkaInterpretation => "oka_interpretation",
+            Self::PpsInterpretation => "pps_interpretation",
+            Self::KdcaInterpretation => "kdca_interpretation",
+            Self::KostatInterpretation => "kostat_interpretation",
+            Self::KipoInterpretation => "kipo_interpretation",
+            Self::KcgInterpretation => "kcg_interpretation",
+            Self::NaaccInterpretation => "naacc_interpretation",
+            Self::TtSpecialAppeal => "tt_special_appeal",
+            Self::KmstSpecialAppeal => "kmst_special_appeal",
+            Self::AcrSpecialAppeal => "acr_special_appeal",
+            Self::AdapSpecialAppeal => "adap_special_appeal",
+            Self::AuditConsultation => "audit_consultation",
+        }
+    }
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|dataset| dataset.as_str() == name)
+    }
     pub fn has_provider_revisions(self) -> bool {
         matches!(
             self,
-            Self::NationalStatute | Self::AdministrativeRule | Self::Ordinance
+            Self::NationalStatute
+                | Self::AdministrativeRule
+                | Self::Ordinance
+                | Self::EnglishStatute
+                | Self::SchoolRule
+                | Self::LocalPublicCorporationRule
+                | Self::PublicInstitutionRule
         )
     }
 }
@@ -157,6 +375,62 @@ impl LegalRecord {
             id: self.revision_id.clone(),
         }
         .validate()?;
+        if self.metadata.contains_key("original_resources") {
+            let resources: Vec<crate::rights::OriginalResource> =
+                serde_json::from_str(&self.metadata["original_resources"])
+                    .map_err(|_| DatabaseError::InvalidInput)?;
+            if resources.len() > 65
+                || resources
+                    .iter()
+                    .map(|r| r.ordinal)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != resources.len()
+            {
+                return Err(DatabaseError::InvalidInput);
+            }
+            for resource in &resources {
+                if !crate::rights::public_source_url(&resource.source_url)
+                    || (!resource.rights.evidence_url.is_empty()
+                        && !crate::rights::public_source_url(&resource.rights.evidence_url))
+                {
+                    return Err(DatabaseError::InvalidInput);
+                }
+                if !resource.rights.can_process() {
+                    if resource.ordinal == 0 && (!self.body.is_empty() || !self.sections.is_empty())
+                    {
+                        return Err(DatabaseError::InvalidInput);
+                    }
+                    let prefix = format!("attachment:{}:", resource.ordinal);
+                    if resource.ordinal > 0
+                        && self.sections.iter().any(|s| s.id.starts_with(&prefix))
+                    {
+                        return Err(DatabaseError::InvalidInput);
+                    }
+                }
+            }
+        }
+        // Bound the complete decoded record, including repeated titles. This
+        // also bounds escaped JSON retained by the database driver on reads.
+        let aggregate = self
+            .title
+            .len()
+            .saturating_add(self.body.len())
+            .saturating_add(
+                self.metadata
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.sections
+                    .iter()
+                    .map(|section| section.id.len() + section.title.len() + section.text.len())
+                    .sum::<usize>(),
+            );
+        if aggregate > 64 * 1024 * 1024 {
+            return Err(DatabaseError::InvalidInput);
+        }
         let url = url::Url::parse(&self.source_url).map_err(|_| DatabaseError::InvalidInput)?;
         if url.scheme() != "https"
             || url.host_str().is_none()
@@ -425,6 +699,27 @@ impl std::error::Error for DatabaseError {}
 mod tests {
     use super::*;
     #[test]
+    fn closed_dataset_names_preserve_existing_wire_values() {
+        for (dataset, name) in [
+            (Dataset::NationalStatute, "national_statute"),
+            (Dataset::AdministrativeRule, "administrative_rule"),
+            (Dataset::Ordinance, "ordinance"),
+            (Dataset::Treaty, "treaty"),
+            (Dataset::Precedent, "precedent"),
+            (Dataset::ConstitutionalDecision, "constitutional_decision"),
+            (Dataset::LegalInterpretation, "legal_interpretation"),
+            (Dataset::AdministrativeAppeal, "administrative_appeal"),
+        ] {
+            assert_eq!(dataset.as_str(), name);
+            assert_eq!(Dataset::from_name(name), Some(dataset));
+        }
+        for dataset in Dataset::ALL {
+            let json = serde_json::to_value(dataset).unwrap();
+            assert_eq!(json.as_str(), Some(dataset.as_str()));
+        }
+        assert_eq!(Dataset::from_name("arbitrary_provider_target"), None);
+    }
+    #[test]
     fn validates_dates_without_inventing_instants() {
         assert!(valid_date("20240229"));
         for d in ["20230229", "20241301", "00000101", "20240100", "2024-01-01"] {
@@ -464,6 +759,40 @@ mod tests {
         assert!(r.validate().is_ok());
         r.sections.push(r.sections[0].clone());
         assert!(r.validate().is_err());
+    }
+    #[test]
+    fn repeated_titles_count_toward_total_decoded_record_bound() {
+        let mut record = LegalRecord {
+            object: ObjectId {
+                jurisdiction: "kr".into(),
+                provider: "fictional".into(),
+                dataset: Dataset::NationalStatute,
+                id: "1".into(),
+            },
+            revision_id: "1".into(),
+            title: "Fictional".into(),
+            body: String::new(),
+            sections: Vec::new(),
+            metadata: BTreeMap::new(),
+            publication_date: None,
+            effective_date: None,
+            source_url: "https://example.test/fictional".into(),
+            representation: "provider".into(),
+        };
+        // Each section is individually small; repeated titles exceed the aggregate cap.
+        for i in 0..8192 {
+            record.sections.push(LegalSection {
+                id: format!("article:{i}"),
+                title: "x".repeat(8192),
+                text: "text".into(),
+                kind: SectionKind::ProviderText,
+                source_document_sha256: None,
+                page: None,
+            });
+        }
+        assert_eq!(record.validate(), Err(DatabaseError::InvalidInput));
+        record.sections.truncate(8000);
+        assert_eq!(record.validate(), Ok(()));
     }
     #[test]
     fn namespaces_and_selectors_are_checked() {

@@ -69,6 +69,25 @@ impl CitationService {
         &self.base_url
     }
 
+    pub fn original_url(&self, capture_id: &str, ordinal: u32) -> Result<String, E> {
+        if !openlegal_domain::history::valid_snapshot_id(capture_id) {
+            return Err(E::InvalidInput);
+        }
+        Ok(format!(
+            "{}/source-file/{capture_id}/{ordinal}",
+            self.base_url
+        ))
+    }
+    pub async fn original_evidence(
+        &self,
+        capture_id: &str,
+        ordinal: u32,
+        cancel: CancellationToken,
+    ) -> Result<openlegal_domain::rights::OriginalEvidence, E> {
+        self.database
+            .original_evidence(capture_id, ordinal, cancel)
+            .await
+    }
     pub fn reference_url(&self, id: &CitationId) -> Result<String, E> {
         id.reference_url(&self.base_url)
     }
@@ -134,11 +153,15 @@ impl CitationService {
             return Err(E::StorageCorrupt);
         }
         let mut results = Vec::new();
+        let mut rights_warnings = std::collections::BTreeSet::new();
         for hit in &page.hits {
             let result = self
                 .database
                 .get(exact_request(&hit.object, &hit.capture_id), cancel.clone())
                 .await?;
+            rights_warnings.extend(openlegal_domain::rights::warnings(
+                &result.capture.record.metadata,
+            ));
             let id = projection_for_hit(&result.capture, hit)?;
             let text = project_text(&result.capture, &id)?;
             if text.len() > MAX_CITATION_TEXT_BYTES {
@@ -150,7 +173,7 @@ impl CitationService {
                 url: self.reference_url(&id)?,
             });
         }
-        let mut warnings = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
         if !page.corpus_complete {
             warnings.push("The retained corpus is incomplete; absence of a match does not establish absence of law or decisions.".into());
         }
@@ -165,9 +188,13 @@ impl CitationService {
         if !page.collection_notices.is_empty() {
             warnings.push("Some source collection or processing is incomplete.".into());
         }
+        let partial = !warnings.is_empty();
+        warnings.extend(rights_warnings.into_iter().map(|warning| {
+            format!("Source reuse condition: {warning}. Consult the source rights and attribution.")
+        }));
         Ok(CitationSearch {
             results,
-            partial: !warnings.is_empty(),
+            partial,
             warnings,
         })
     }
@@ -397,12 +424,18 @@ impl CitationService {
                 compact.insert(key.into(), value.clone());
             }
         }
+        for key in ["original_resources", "source_rights", "rights_warnings"] {
+            if let Some(value) = capture.record.metadata.get(key) {
+                compact.insert(key.into(), value.clone());
+            }
+        }
         for key in [
             "case_number",
             "authority",
             "court",
             "judgment_date",
             "attachment_status",
+            "transport_credentials_redacted",
             "section_locator_semantics",
         ] {
             if let Some(value) = capture.record.metadata.get(key).filter(|v| v.len() <= 1024) {

@@ -116,6 +116,7 @@ impl Server {
             shutdown: CancellationToken::new(),
             ready: Arc::new(AtomicBool::new(true)),
             buffers: Arc::new(Semaphore::new(limits.max_buffer_bytes)),
+            original_buffers: Arc::new(Semaphore::new(limits.max_original_buffer_bytes)),
             requests: Arc::new(Semaphore::new(limits.max_in_flight)),
             connections: Arc::new(Semaphore::new(limits.max_connections)),
         };

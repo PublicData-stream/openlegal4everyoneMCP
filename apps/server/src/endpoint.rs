@@ -39,6 +39,7 @@ pub struct EndpointContext {
     pub limits: Arc<Limits>,
     pub shutdown: CancellationToken,
     pub buffers: Arc<Semaphore>,
+    pub original_buffers: Arc<Semaphore>,
     pub requests: Arc<Semaphore>,
     pub connections: Arc<Semaphore>,
     pub ready: Arc<AtomicBool>,
@@ -162,6 +163,7 @@ impl ServerBuilder {
             )?
             .with_citations(self.citations)?,
             buffers: Arc::new(Semaphore::new(limits.max_buffer_bytes)),
+            original_buffers: Arc::new(Semaphore::new(limits.max_original_buffer_bytes)),
             requests: Arc::new(Semaphore::new(limits.max_in_flight)),
             connections: Arc::new(Semaphore::new(limits.max_connections)),
             limits,

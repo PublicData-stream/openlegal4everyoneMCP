@@ -172,6 +172,45 @@ impl McpHandler {
         self.citation_lookup(id, cancel, true).await
     }
 
+    pub async fn citation_original(
+        &self,
+        capture_id: &str,
+        ordinal: u32,
+        cancel: CancellationToken,
+    ) -> Result<openlegal_domain::rights::OriginalEvidence, DatabaseError> {
+        let service = self.citations.as_ref().ok_or(DatabaseError::NotFound)?;
+        let _permit = self
+            .calls
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| DatabaseError::Capacity)?;
+        self.counters.calls.fetch_add(1, Ordering::Relaxed);
+        let rate = if self.verified_tunnel {
+            self.verified_rate.as_ref().unwrap_or(&self.rate)
+        } else {
+            &self.rate
+        };
+        if !rate.try_admit().await {
+            self.counters.failures.fetch_add(1, Ordering::Relaxed);
+            self.counters.rate_limited.fetch_add(1, Ordering::Relaxed);
+            return Err(DatabaseError::Capacity);
+        }
+        let cancel = cancel.child_token();
+        let _guard = cancel.clone().drop_guard();
+        let lookup = service.original_evidence(capture_id, ordinal, cancel.clone());
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(DatabaseError::Cancelled),
+            result = tokio::time::timeout(Duration::from_secs(self.limits.call_timeout_secs), lookup) => {
+                result.unwrap_or(Err(DatabaseError::Capacity))
+            }
+        };
+        if result.is_err() {
+            self.counters.failures.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
     async fn citation_lookup(
         &self,
         id: &str,

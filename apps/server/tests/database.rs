@@ -80,6 +80,7 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
     let persistent = fixture.open(time).await;
     let runtime = CorpusRuntime::open(
         &DatabaseConfig {
+            max_raw_bytes: Default::default(),
             auto_collection: true,
             blob_path: fixture.directory.path().join("corpus-blobs"),
             index_path: fixture.directory.path().join("corpus-index"),

@@ -12,6 +12,7 @@ pub mod jurisdiction;
 pub mod legal;
 pub mod legal_analysis;
 pub mod legal_reference;
+pub mod rights;
 pub mod search_query;
 pub mod text_diff;
 

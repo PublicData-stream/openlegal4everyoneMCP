@@ -166,6 +166,10 @@ impl Endpoint for HttpEndpoint {
             app = app.merge(
                 Router::new()
                     .route("/source/{*id}", get(crate::reference_http::source_page))
+                    .route(
+                        "/source-file/{capture_id}/{ordinal}",
+                        get(crate::reference_http::source_file),
+                    )
                     .with_state(source_handler),
             );
         }
@@ -218,12 +222,24 @@ async fn guard(
                 context.limits.call_timeout_secs + context.limits.io_timeout_secs,
             ))
         });
+    let original = (request.method() == http::Method::GET
+        || request.method() == http::Method::HEAD)
+        && crate::reference_http::original_selector(request.uri().path()).is_some();
+    let response_limit = if original {
+        openlegal_application::database::MAX_SOURCE_BYTES
+    } else {
+        context.limits.max_message_bytes
+    };
+    let (buffers, reserve_bytes) = if original {
+        (context.original_buffers.clone(), 768 * 1024 * 1024)
+    } else {
+        (
+            context.buffers.clone(),
+            context.limits.max_message_bytes * 4,
+        )
+    };
     // Reserve capacity before collecting, including room for the SDK's decoding and serialization copies.
-    let Ok(buffer_permit) = context
-        .buffers
-        .clone()
-        .try_acquire_many_owned((context.limits.max_message_bytes * 4) as u32)
-    else {
+    let Ok(buffer_permit) = buffers.try_acquire_many_owned(reserve_bytes as u32) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let (parts, body) = request.into_parts();
@@ -269,17 +285,27 @@ async fn guard(
         context,
         deadline,
         watchdog,
+        response_limit,
     );
     let stream = futures::stream::try_unfold(
         state,
-        |(mut stream, request_permit, buffer_permit, used, context, deadline, watchdog)| async move {
+        |(
+            mut stream,
+            request_permit,
+            buffer_permit,
+            used,
+            context,
+            deadline,
+            watchdog,
+            response_limit,
+        )| async move {
             let chunk = tokio::select! {
                 biased;
                 _ = context.shutdown.cancelled() => return Err(std::io::Error::other("server shutdown")),
                 result = tokio::time::timeout_at(deadline, stream.next()) => result.map_err(|_| std::io::Error::other("response deadline"))?,
             };
             match chunk {
-                Some(Ok(bytes)) if used + bytes.len() <= context.limits.max_message_bytes => {
+                Some(Ok(bytes)) if used + bytes.len() <= response_limit => {
                     let used = used + bytes.len();
                     Ok(Some((
                         bytes,
@@ -291,6 +317,7 @@ async fn guard(
                             context,
                             deadline,
                             watchdog,
+                            response_limit,
                         ),
                     )))
                 }

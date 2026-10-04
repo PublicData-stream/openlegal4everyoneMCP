@@ -28,6 +28,7 @@ fn unlimited() -> ProviderRequestLimits {
         pilot_attempt_limit: RequestLimit::Unlimited,
         on_demand_attempt_limit: RequestLimit::Unlimited,
         interval_ms: 1,
+        max_in_flight: 4,
         pilot_timeout_secs: 1800,
         on_demand_timeout_secs: 7200,
         max_job_attempts: 3,
@@ -46,23 +47,20 @@ async fn unlimited_keeps_bigint_accounting_pacing_and_safety_fences() {
     sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=floor(extract(epoch from clock_timestamp()))::bigint/86400,daily_used=2147483647,on_demand_used=1000000,pilot_used=100,next_request_at_ms=0")
         .execute(&pool).await.unwrap();
     let cancel = CancellationToken::new();
-    LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::Pilot, &cancel)
-        .await
-        .unwrap();
+    let mut pilot =
+        LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::Pilot, &cancel)
+            .await
+            .unwrap();
     let first: (i64,i64,i64,i64) = sqlx::query_as("SELECT daily_used,on_demand_used,pilot_used,next_request_at_ms FROM openlegal.provider_request_budget WHERE singleton").fetch_one(&pool).await.unwrap();
     assert_eq!((first.0, first.1, first.2), (2147483648, 1000000, 101));
-    assert_eq!(
+    // A healthy response owner leaves capacity for another mode; explicit
+    // settlement, rather than clearing a singleton flag, releases its evidence.
+    let mut demand =
         LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::OnDemand, &cancel)
-            .await,
-        Err(DatabaseError::BudgetExhausted)
-    );
-    sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false")
-        .execute(&pool)
-        .await
-        .unwrap();
-    LawClient::reserve_provider_request_budget(&pool, &RequestBudgetMode::OnDemand, &cancel)
-        .await
-        .unwrap();
+            .await
+            .unwrap();
+    pilot.complete().await.unwrap();
+    demand.complete().await.unwrap();
     let second: (i64,i64,i64) = sqlx::query_as("SELECT daily_used,on_demand_used,next_request_at_ms FROM openlegal.provider_request_budget WHERE singleton").fetch_one(&pool).await.unwrap();
     assert_eq!((second.0, second.1), (2147483648, 1000001));
     assert!(second.2 > first.3);
@@ -104,7 +102,7 @@ async fn unlimited_keeps_bigint_accounting_pacing_and_safety_fences() {
         .execute(&pool)
         .await
         .unwrap();
-    LawClient::reserve_provider_request_budget(
+    let mut final_request = LawClient::reserve_provider_request_budget(
         &pool,
         &RequestBudgetMode::Continuous,
         &CancellationToken::new(),
@@ -113,6 +111,7 @@ async fn unlimited_keeps_bigint_accounting_pacing_and_safety_fences() {
     .unwrap();
     let reset: (i64,i64,i64) = sqlx::query_as("SELECT daily_used,on_demand_used,pilot_used FROM openlegal.provider_request_budget WHERE singleton").fetch_one(&pool).await.unwrap();
     assert_eq!(reset, (1, 0, 101));
+    final_request.complete().await.unwrap();
     base.close().await.unwrap();
 }
 

@@ -5,7 +5,10 @@ use crate::{
 };
 use openlegal_adapters::{
     blob::FsBlobStore,
-    corpus::{CollectionLaunch, CorpusRuntimeLease, PageGapObservation, PgCorpusStore},
+    corpus::{
+        CloneView, CollectionLaunch, CorpusRuntimeLease, PageGapObservation, PgCorpusStore,
+        SourceObservationInput, SupplementJobStatus,
+    },
     corpus_search::CorpusSearch,
     korean_analysis::KoreanAnalyzer,
     law_go_kr::{InventoryItem, InventoryPage, LawClient, RequestBudgetMode},
@@ -842,10 +845,52 @@ impl CorpusRuntime {
         cancel: CancellationToken,
     ) -> Result<Option<InventoryPage>, DatabaseError> {
         match provider
-            .inventory_page_class(dataset, page, historical, None, class, cancel)
+            .inventory_page_class(dataset, page, historical, None, class, cancel.clone())
             .await
         {
-            Ok(result) => {
+            Ok(mut result) => {
+                if let Some(evidence) = result.source_evidence.take() {
+                    let family = openlegal_adapters::law_go_kr::catalog::source_family(dataset);
+                    let mut metadata = std::collections::BTreeMap::new();
+                    metadata.insert("dataset".into(), dataset.as_str().into());
+                    metadata.insert("page".into(), page.to_string());
+                    metadata.insert("historical".into(), historical.to_string());
+                    if evidence.credentials_redacted {
+                        metadata.insert("credentials_redacted".into(), "true".into());
+                    }
+                    if let Some(total) = result.total {
+                        metadata.insert("total".into(), total.to_string());
+                    }
+                    let rights = if family.metadata_only {
+                        openlegal_domain::rights::SourceRights::default()
+                    } else {
+                        openlegal_domain::rights::SourceRights::legal_information()
+                    };
+                    if family.metadata_only {
+                        metadata.insert("status".into(), "rights_unverified_metadata_only".into());
+                    }
+                    self.store
+                        .retain_source_observation(
+                            SourceObservationInput {
+                                source_key: format!(
+                                    "law_go_kr:{}:{}:{}:{}:{}",
+                                    family.list_guide,
+                                    dataset.as_str(),
+                                    historical,
+                                    class.unwrap_or(0),
+                                    page
+                                ),
+                                raw: (!family.metadata_only).then_some(evidence.raw),
+                                media_type: "application/xml".into(),
+                                rights,
+                                metadata,
+                                observed_at: evidence.retrieved_at,
+                            },
+                            cancel.clone(),
+                        )
+                        .await?;
+                }
+
                 if result.incomplete {
                     self.store
                         .record_page_gap(
@@ -962,8 +1007,17 @@ impl CorpusRuntime {
             let _ = blobs.close().await;
             return Err(e.into());
         }
+        if serving {
+            store
+                .configure_archive_capacity(config.max_raw_bytes.as_option())
+                .await?;
+        }
         let provider = match provider {
-            Some(client) => Some(client.with_collection_events(store.collection_events().await?)),
+            Some(client) => Some(
+                client
+                    .with_source_archive(store.clone())
+                    .with_collection_events(store.collection_events().await?),
+            ),
             None => None,
         };
         let lease = if serving {
@@ -1121,6 +1175,11 @@ impl CorpusRuntime {
                     None => Err(DatabaseError::InvalidInput),
                 }
             });
+            if self.ingestion_mode == Some(IngestionMode::Continuous) {
+                let runtime = self.clone();
+                let token = ingestion.clone();
+                tasks.spawn(async move { runtime.process_supplements(token).await });
+            }
             for slot in 0..self.detail_job_workers {
                 let runtime = self.clone();
                 let token = ingestion.clone();
@@ -1146,7 +1205,7 @@ impl CorpusRuntime {
                         break Err(e);
                     }
                     if self.lease.is_some() && maintenance.elapsed() >= Duration::from_secs(60) {
-                        if let Err(e) = self.store.maintain(now(), now().saturating_sub(30 * 86400)).await {
+                        if let Err(e) = self.store.maintain(now(), 0).await {
                             break Err(e);
                         }
                         if let Err(e) = self.store.prune_collection_requests().await {
@@ -1196,372 +1255,286 @@ impl CorpusRuntime {
             None
         };
         loop {
+            for request in openlegal_adapters::law_go_kr::supplements::global_requests(1)? {
+                self.store.enqueue_supplement(&request, now()).await?;
+            }
             self.store.requeue_due_details(now()).await?;
             self.inventory_verified
                 .store(false, std::sync::atomic::Ordering::Release);
-            for dataset in [
-                Dataset::NationalStatute,
-                Dataset::AdministrativeRule,
-                Dataset::Ordinance,
-                Dataset::Treaty,
-                Dataset::Precedent,
-                Dataset::ConstitutionalDecision,
-                Dataset::LegalInterpretation,
-                Dataset::AdministrativeAppeal,
-            ] {
+            for view in CloneView::all() {
                 if cancel.is_cancelled() {
                     return Ok(());
                 }
-                let page = self.store.inventory_cursor(dataset, false).await?;
-                if dataset == Dataset::Treaty {
-                    for class in [1u8, 2] {
-                        if let Some(due) = self
-                            .store
-                            .due_gap_page(dataset, false, Some(class), now())
-                            .await?
-                        {
-                            match self
-                                .observed_page(
-                                    provider,
-                                    dataset,
-                                    due,
-                                    false,
-                                    Some(class),
-                                    cancel.clone(),
-                                )
-                                .await
-                            {
-                                Ok(Some(revisited)) => {
-                                    for item in revisited.items {
-                                        let expected = if class == 1 { "440101" } else { "440102" };
-                                        if item.treaty_class_code.as_deref() == Some(expected)
-                                            && !self
-                                                .refresh_with_fair_capacity(
-                                                    provider,
-                                                    item,
-                                                    true,
-                                                    cancel.clone(),
-                                                )
-                                                .await?
-                                        {
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => {
-                                    break;
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        }
-                    }
-                }
-                if page > 1 {
-                    // Moving offset pages can shift records behind the cursor.
-                    // Alternate a front-page refresh with one-page overlap;
-                    // neither observation certifies a complete inventory.
-                    let revisit = if (now() / 3600).is_multiple_of(2) {
-                        1
-                    } else {
-                        page - 1
-                    };
-                    match self
-                        .observed_page(provider, dataset, revisit, false, None, cancel.clone())
-                        .await
-                    {
-                        Ok(Some(overlap)) => {
-                            for item in overlap.items {
-                                if !self
-                                    .refresh_with_fair_capacity(
-                                        provider,
-                                        item,
-                                        true,
-                                        cancel.clone(),
-                                    )
-                                    .await?
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => break,
-                        Err(error) => return Err(error),
-                    }
-                }
-                if let Some(due) = self.store.due_gap_page(dataset, false, None, now()).await?
-                    && due != page
-                {
-                    match self
-                        .observed_page(provider, dataset, due, false, None, cancel.clone())
-                        .await
-                    {
-                        Ok(Some(revisited)) => {
-                            for item in revisited.items {
-                                if !self
-                                    .refresh_with_fair_capacity(
-                                        provider,
-                                        item,
-                                        true,
-                                        cancel.clone(),
-                                    )
-                                    .await?
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => break,
-                        Err(error) => return Err(error),
-                    }
-                }
-                let page_data = match self
-                    .observed_page(provider, dataset, page, false, None, cancel.clone())
+                let (page, _) = self.store.clone_cursor(view).await?;
+                let result = match self
+                    .observed_page(
+                        provider,
+                        view.dataset,
+                        page,
+                        view.historical,
+                        view.treaty_class,
+                        cancel.clone(),
+                    )
                     .await
                 {
                     Ok(Some(result)) => result,
-                    Ok(None) => {
-                        self.store
-                            .advance_inventory_cursor(dataset, false, page, false)
-                            .await?;
-                        continue;
-                    }
-                    Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => break,
+                    Ok(None) => continue,
+                    Err(DatabaseError::BudgetExhausted | DatabaseError::Capacity) => break,
                     Err(error) => return Err(error),
                 };
-                let items = page_data.items;
-                let done = page_data.done;
-                let mut offset = self
-                    .store
-                    .inventory_item_offset(dataset, false, page)
-                    .await?;
-                if offset > items.len() {
+                let mut offset = self.store.clone_page_offset(view, page, &result).await?;
+                if offset > result.items.len() {
                     offset = 0;
                 }
-                if let Some(missing) = self.first_unscheduled_item(&items, true, &cancel).await? {
-                    offset = offset.min(missing);
-                }
-                while offset < items.len() {
-                    if !self
-                        .refresh_with_fair_capacity(
-                            provider,
-                            items[offset].clone(),
-                            true,
-                            cancel.clone(),
-                        )
-                        .await?
-                    {
-                        break;
-                    }
-                    offset += 1;
-                }
-                self.store
-                    .set_inventory_item_offset(dataset, false, page, offset)
-                    .await?;
-                if offset < items.len() {
-                    continue;
-                }
-                if self
-                    .first_unpublished_item(&items, true, &cancel)
+                if let Some(missing) = self
+                    .first_unscheduled_item(&result.items, !view.historical, &cancel)
                     .await?
-                    .is_some()
-                {
-                    if let Some(missing) =
-                        self.first_unscheduled_item(&items, true, &cancel).await?
-                    {
-                        self.store
-                            .set_inventory_item_offset(dataset, false, page, missing)
-                            .await?;
-                    }
-                    continue;
-                }
-                self.store
-                    .advance_inventory_cursor(dataset, false, page, done)
-                    .await?;
-            }
-            for dataset in [
-                Dataset::NationalStatute,
-                Dataset::AdministrativeRule,
-                Dataset::Ordinance,
-            ] {
-                if cancel.is_cancelled() {
-                    return Ok(());
-                }
-                let page = self.store.inventory_cursor(dataset, true).await?;
-                if let Some(due) = self.store.due_gap_page(dataset, true, None, now()).await?
-                    && due != page
-                {
-                    match self
-                        .observed_page(provider, dataset, due, true, None, cancel.clone())
-                        .await
-                    {
-                        Ok(Some(revisited)) => {
-                            for item in revisited.items {
-                                self.store
-                                    .record_revision_catalog(
-                                        &item.object,
-                                        &item.revision_id,
-                                        item.publication_date.as_deref(),
-                                        item.effective_date.as_deref(),
-                                        now(),
-                                    )
-                                    .await?;
-                                if self.retain_history_bodies
-                                    && !self
-                                        .refresh_with_fair_capacity(
-                                            provider,
-                                            item,
-                                            false,
-                                            cancel.clone(),
-                                        )
-                                        .await?
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => break,
-                        Err(error) => return Err(error),
-                    }
-                }
-                let page_data = match self
-                    .observed_page(provider, dataset, page, true, None, cancel.clone())
-                    .await
-                {
-                    Ok(Some(result)) => result,
-                    Ok(None) => {
-                        self.store
-                            .advance_inventory_cursor(dataset, true, page, false)
-                            .await?;
-                        continue;
-                    }
-                    Err(DatabaseError::Capacity | DatabaseError::BudgetExhausted) => break,
-                    Err(error) => return Err(error),
-                };
-                let items = page_data.items;
-                let done = page_data.done;
-                let mut offset = self
-                    .store
-                    .inventory_item_offset(dataset, true, page)
-                    .await?;
-                if offset > items.len() {
-                    offset = 0;
-                }
-                if self.retain_history_bodies
-                    && let Some(missing) =
-                        self.first_unscheduled_item(&items, false, &cancel).await?
                 {
                     offset = offset.min(missing);
                 }
-                while offset < items.len() {
-                    let item = &items[offset];
-                    self.store
-                        .record_revision_catalog(
-                            &item.object,
-                            &item.revision_id,
-                            item.publication_date.as_deref(),
-                            item.effective_date.as_deref(),
-                            now(),
-                        )
-                        .await?;
-                    if self.retain_history_bodies
+                while offset < result.items.len() {
+                    let item = &result.items[offset];
+                    if view.historical {
+                        self.store
+                            .record_revision_catalog(
+                                &item.object,
+                                &item.revision_id,
+                                item.publication_date.as_deref(),
+                                item.effective_date.as_deref(),
+                                now(),
+                            )
+                            .await?;
+                    }
+                    if (!view.historical || self.retain_history_bodies)
                         && !self
                             .refresh_with_fair_capacity(
                                 provider,
                                 item.clone(),
-                                false,
+                                !view.historical,
                                 cancel.clone(),
                             )
                             .await?
                     {
                         break;
                     }
+                    if item.object.provider == "law_go_kr" {
+                        for request in openlegal_adapters::law_go_kr::supplements::seeded_requests(
+                            openlegal_adapters::law_go_kr::supplements::record_seed(item)?,
+                            1,
+                        )? {
+                            self.store.enqueue_supplement(&request, now()).await?;
+                        }
+                    }
                     offset += 1;
                 }
                 self.store
-                    .set_inventory_item_offset(dataset, true, page, offset)
-                    .await?;
-                if offset < items.len() {
-                    continue;
-                }
-                if self.retain_history_bodies
-                    && self
-                        .first_unpublished_item(&items, false, &cancel)
-                        .await?
-                        .is_some()
-                {
-                    if let Some(missing) =
-                        self.first_unscheduled_item(&items, false, &cancel).await?
-                    {
-                        self.store
-                            .set_inventory_item_offset(dataset, true, page, missing)
-                            .await?;
-                    }
-                    continue;
-                }
-                self.store
-                    .advance_inventory_cursor(dataset, true, page, done)
+                    .clone_page_scheduled(view, page, offset, &result, now(), &cancel)
                     .await?;
             }
-            // A few moving pages cannot establish an atomic, complete upstream
-            // catalog. Keep exact-date selectors and completeness claims closed.
             if let Some(events) = &mut events {
-                while self.store.collection_backlog().await? || !provider.provider_idle().await? {
-                    // Events end the busy wait early. The five-second readiness
-                    // fallback repairs missed notifications without scanning.
-                    match events
-                        .wait(&cancel, Duration::from_secs(self.scan_interval_secs.min(5)))
-                        .await
-                    {
-                        Ok(()) => {}
-                        Err(_) if cancel.is_cancelled() => return Ok(()),
-                        Err(error) => return Err(error),
-                    }
-                }
+                events
+                    .wait(&cancel, Duration::from_secs(self.scan_interval_secs.min(5)))
+                    .await
+                    .or_else(|error| {
+                        if cancel.is_cancelled() {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    })?;
             } else {
                 tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(self.scan_interval_secs))=>{}}
             }
         }
     }
-    /// Check publication without waiting for a slow detail job. A page remains
-    /// due until every required capture is published or has a durable gap.
-    async fn first_unpublished_item(
-        &self,
-        items: &[InventoryItem],
-        head: bool,
-        cancel: &CancellationToken,
-    ) -> Result<Option<usize>, DatabaseError> {
-        for (index, item) in items.iter().enumerate() {
+    /// Each lease is durable and UUID fenced. Raw observations survive parser
+    /// retries, which never spend another upstream request for unchanged bytes.
+    async fn process_supplements(&self, cancel: CancellationToken) -> Result<(), DatabaseError> {
+        use openlegal_adapters::law_go_kr::supplements::{self, SupplementOutcome};
+        let provider = self.provider.as_ref().ok_or(DatabaseError::InvalidInput)?;
+        loop {
             if cancel.is_cancelled() {
-                return Err(DatabaseError::Cancelled);
+                return Ok(());
             }
-            if self
-                .store
-                .detail_gap_active(&item.object, &item.revision_id)
-                .await?
-            {
+            let Some(job) = self.store.claim_supplement(now()).await? else {
+                tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(5))=>{}}
                 continue;
-            }
-            if head {
-                if !self
+            };
+            let attempt = cancel.child_token();
+            let _guard = attempt.clone().drop_guard();
+            // Finish within the 600-second fenced lease, including parsing and storage.
+            let outcome = tokio::time::timeout(Duration::from_secs(480), async {
+            let fetched = if let Some(id) = &job.observation_id {
+                let raw = self
                     .store
-                    .head_revision_published(&item.object, &item.revision_id)
-                    .await?
-                {
-                    return Ok(Some(index));
+                    .source_observation_bytes(id, attempt.clone())
+                    .await?;
+                let observed = self.store.source_observation(id, attempt.clone()).await?;
+                let result = provider
+                    .analyze_supplement(&job.request, &raw, job.observed_before, attempt.clone())
+                    .await;
+                match result {
+                    Ok((page, processor_version)) => Ok(SupplementOutcome::Captured(
+                        supplements::SupplementCapture {
+                            observation_key: job.key.clone(),
+                            source_url: job.request.source_url()?.into(),
+                            raw,
+                            retrieved_at: observed.observed_at,
+                            credentials_redacted: observed.metadata.get("credentials_redacted").is_some_and(|value| value == "true"),
+                            processor_version,
+                            processing_error: None,
+                            page,
+                        },
+                    )),
+                    Err(error) => Err(error),
                 }
-            } else if !self
-                .store
-                .revision_capture_published(&item.object, &item.revision_id, now())
-                .await?
-            {
-                return Ok(Some(index));
+            } else {
+                provider
+                    .fetch_supplement(&job.request, job.observed_before, attempt.clone())
+                    .await
+            };
+            match fetched {
+                Ok(SupplementOutcome::Deferred {
+                    observation_key,
+                    source_url,
+                    reason,
+                }) => {
+                    let mut metadata = std::collections::BTreeMap::new();
+                    metadata.insert("status".into(), reason.into());
+                    metadata.insert("source_url".into(), source_url);
+                    let observed = self
+                        .store
+                        .retain_source_observation(
+                            SourceObservationInput {
+                                source_key: observation_key,
+                                raw: None,
+                                media_type: "application/xml".into(),
+                                rights: openlegal_domain::rights::SourceRights::default(),
+                                metadata,
+                                observed_at: now(),
+                            },
+                            attempt.clone(),
+                        )
+                        .await?;
+                    self.store
+                        .settle_supplement(
+                            &job,
+                            SupplementJobStatus::Deferred,
+                            Some(&observed.observation_id),
+                            0,
+                            now(),
+                        )
+                        .await?;
+                }
+                Ok(SupplementOutcome::Captured(capture)) => {
+                    let mut metadata = std::collections::BTreeMap::new();
+                    metadata.insert("source_url".into(), capture.source_url);
+                    metadata.insert("processor_version".into(), capture.processor_version);
+                    if capture.credentials_redacted {
+                        metadata.insert("credentials_redacted".into(), "true".into());
+                    }
+                    metadata.insert("incomplete".into(), capture.page.incomplete.to_string());
+                    if let Some(error) = capture.processing_error {
+                        metadata.insert("processing_error".into(), format!("{error:?}"));
+                    }
+                    let observed = self
+                        .store
+                        .retain_source_observation(
+                            SourceObservationInput {
+                                source_key: capture.observation_key,
+                                raw: Some(capture.raw),
+                                media_type: if job.request.format()
+                                    == openlegal_application::document::DocumentFormat::Html
+                                {
+                                    "text/html"
+                                } else {
+                                    "application/xml"
+                                }
+                                .into(),
+                                rights: openlegal_domain::rights::SourceRights::legal_information(),
+                                metadata,
+                                observed_at: capture.retrieved_at,
+                            },
+                            attempt.clone(),
+                        )
+                        .await?;
+                    for seed in capture.page.seeds {
+                        for request in supplements::seeded_requests(seed, 1)? {
+                            self.store.enqueue_supplement(&request, now()).await?;
+                        }
+                    }
+                    let status = if capture.page.incomplete || capture.page.done.is_none() {
+                        SupplementJobStatus::Incomplete
+                    } else {
+                        SupplementJobStatus::Done
+                    };
+                    let next = if status == SupplementJobStatus::Done
+                        && capture.page.done == Some(false)
+                    {
+                        Some(job.request.next_page()?)
+                    } else {
+                        None
+                    };
+                    self.store
+                        .settle_supplement_with_successor(
+                            &job,
+                            status,
+                            Some(&observed.observation_id),
+                            capture.page.observed_rows,
+                            now(),
+                            next.as_ref(),
+                        )
+                        .await?;
+                }
+                Err(DatabaseError::BudgetExhausted | DatabaseError::Capacity) => {
+                    self.store
+                        .settle_supplement(&job, SupplementJobStatus::Pending, None, 0, now())
+                        .await?;
+                    tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(5))=>{}}
+                }
+                Err(
+                    DatabaseError::SourceUnavailable
+                    | DatabaseError::SourceDataInvalid
+                    | DatabaseError::SourceDownloadFailed
+                    | DatabaseError::ProcessingPending,
+                ) => {
+                    self.store
+                        .settle_supplement(
+                            &job,
+                            SupplementJobStatus::Incomplete,
+                            job.observation_id.as_deref(),
+                            0,
+                            now(),
+                        )
+                        .await?;
+                }
+                Err(DatabaseError::Cancelled) if cancel.is_cancelled() => return Ok(()),
+                Err(error) => return Err(error),
+            }
+                Ok::<(), DatabaseError>(())
+            }).await;
+            match outcome {
+                Ok(Ok(())) | Ok(Err(DatabaseError::Conflict)) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    attempt.cancel();
+                    match self
+                        .store
+                        .settle_supplement(
+                            &job,
+                            SupplementJobStatus::Incomplete,
+                            job.observation_id.as_deref(),
+                            0,
+                            now(),
+                        )
+                        .await
+                    {
+                        Ok(()) | Err(DatabaseError::Conflict) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         }
-        Ok(None)
     }
     /// Move the saved page offset only to work that has neither published nor
     /// been queued. Rewinding to an active first-page job would starve later
@@ -1884,16 +1857,7 @@ impl CorpusRuntime {
     ) -> Result<(), DatabaseError> {
         let provider = self.provider.as_ref().ok_or(DatabaseError::InvalidInput)?;
         let mut events = self.store.collection_events().await?;
-        const DATASETS: [Dataset; 8] = [
-            Dataset::NationalStatute,
-            Dataset::AdministrativeRule,
-            Dataset::Ordinance,
-            Dataset::Treaty,
-            Dataset::Precedent,
-            Dataset::ConstitutionalDecision,
-            Dataset::LegalInterpretation,
-            Dataset::AdministrativeAppeal,
-        ];
+        const DATASETS: &[Dataset] = Dataset::ALL;
         let mut next_dataset = slot as usize % DATASETS.len();
         loop {
             if cancel.is_cancelled() {
@@ -1958,7 +1922,17 @@ impl CorpusRuntime {
                 }
             };
             match detail {
-                Ok(detail) => {
+                Ok(mut detail) => {
+                    for observation in std::mem::take(&mut detail.source_observations) {
+                        let retained = self
+                            .store
+                            .retain_source_observation(observation, attempt.clone())
+                            .await?;
+                        detail
+                            .record
+                            .metadata
+                            .insert("original_observation_id".into(), retained.observation_id);
+                    }
                     let candidate = detail.record.clone();
                     let index = self.index.clone();
                     let admission_cancel = attempt.child_token();
@@ -1976,6 +1950,28 @@ impl CorpusRuntime {
                         admission_cancel.cancel();
                         self.store.fail_claim(&job, false).await?;
                         continue;
+                    }
+                    if item.object.dataset == Dataset::NationalStatute {
+                        let numbers: Vec<String> = detail
+                            .record
+                            .metadata
+                            .get("provider_provisions_json")
+                            .map(|value| {
+                                serde_json::from_str(value)
+                                    .map_err(|_| DatabaseError::StorageCorrupt)
+                            })
+                            .transpose()?
+                            .unwrap_or_default();
+                        for number in numbers {
+                            let seed = openlegal_adapters::law_go_kr::supplements::SupplementSeed::Provision { object: item.object.clone(), number };
+                            for request in
+                                openlegal_adapters::law_go_kr::supplements::seeded_requests(
+                                    seed, 1,
+                                )?
+                            {
+                                self.store.enqueue_supplement(&request, now()).await?;
+                            }
+                        }
                     }
                     let publication = tokio::time::timeout(
                         Duration::from_secs(40),
@@ -2126,6 +2122,7 @@ mod explicit_collection_tests {
 
     fn page(items: Vec<InventoryItem>, incomplete: bool) -> InventoryPage {
         InventoryPage {
+            source_evidence: None,
             items,
             total: Some(200),
             done: false,
@@ -2290,6 +2287,7 @@ mod manual_pilot_tests {
         incomplete: bool,
     ) -> InventoryPage {
         InventoryPage {
+            source_evidence: None,
             items: cases
                 .iter()
                 .map(|(id, case_number)| InventoryItem {
@@ -2414,6 +2412,7 @@ mod manual_pilot_tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("candidates.json");
         let config = DatabaseConfig {
+            max_raw_bytes: Default::default(),
             auto_collection: true,
             blob_path: "blobs".into(),
             index_path: "index".into(),

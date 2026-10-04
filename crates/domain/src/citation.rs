@@ -170,31 +170,10 @@ fn unescape(value: &str) -> Result<String, E> {
     Ok(result)
 }
 pub fn dataset_name(dataset: Dataset) -> &'static str {
-    match dataset {
-        Dataset::NationalStatute => "national_statute",
-        Dataset::AdministrativeRule => "administrative_rule",
-        Dataset::Ordinance => "ordinance",
-        Dataset::Treaty => "treaty",
-        Dataset::Precedent => "precedent",
-        Dataset::ConstitutionalDecision => "constitutional_decision",
-        Dataset::LegalInterpretation => "legal_interpretation",
-        Dataset::AdministrativeAppeal => "administrative_appeal",
-    }
+    dataset.as_str()
 }
 fn parse_dataset(value: &str) -> Result<Dataset, E> {
-    [
-        Dataset::NationalStatute,
-        Dataset::AdministrativeRule,
-        Dataset::Ordinance,
-        Dataset::Treaty,
-        Dataset::Precedent,
-        Dataset::ConstitutionalDecision,
-        Dataset::LegalInterpretation,
-        Dataset::AdministrativeAppeal,
-    ]
-    .into_iter()
-    .find(|d| dataset_name(*d) == value)
-    .ok_or(E::InvalidInput)
+    Dataset::from_name(value).ok_or(E::InvalidInput)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -260,7 +239,7 @@ pub fn official_browser_url(metadata: &MetadataResult) -> Option<String> {
         Dataset::ConstitutionalDecision => ("detcInfoP.do", "detcSeq"),
         Dataset::LegalInterpretation => ("expcInfoP.do", "expcSeq"),
         Dataset::AdministrativeAppeal => ("deccInfoP.do", "deccSeq"),
-        Dataset::Ordinance => return None,
+        _ => return None,
     };
     let mut url = url::Url::parse(&format!("https://www.law.go.kr/LSW/{path}")).ok()?;
     url.query_pairs_mut().append_pair(key, serial);

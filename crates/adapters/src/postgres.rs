@@ -264,6 +264,41 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0016_demand_collection.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            17,
+            "provider parallel admission".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0017_provider_parallel_admission.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            18,
+            "corpus permanent archive".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0018_corpus_permanent_archive.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            19,
+            "source observations".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0019_corpus_source_observations.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            20,
+            "clone progress".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0020_clone_progress.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            21,
+            "supplement jobs".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0021_supplement_jobs.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

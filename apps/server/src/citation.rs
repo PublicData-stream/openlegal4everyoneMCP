@@ -93,8 +93,12 @@ impl ToolModule for CitationTools {
             move |input, context| {
                 let service = service.clone();
                 async move {
-                    service.fetch(&input.id, context.request.cancellation).await
-                        .map(RichToolOutput::new).map_err(crate::database::map_error)
+                    let document = service.fetch(&input.id, context.request.cancellation).await.map_err(crate::database::map_error)?;
+                    let mut output = RichToolOutput::new(document);
+                    for warning in openlegal_domain::rights::warnings(&output.output.structured.metadata) {
+                        output.additional_content.push(ContentBlock::text(format!("Source reuse condition: {warning}.")));
+                    }
+                    Ok(output)
                 }
             },
         )?;
@@ -148,6 +152,9 @@ fn metadata_text(metadata: &MetadataResult) -> Result<String, ErrorData> {
         "processor_version": metadata.processor_version,
         "raw_sha256": metadata.raw_sha256,
         "source_url": metadata.source_url,
+        "original_resources": openlegal_domain::rights::resources(&metadata.metadata),
+        "rights_warnings": openlegal_domain::rights::warnings(&metadata.metadata),
+        "transport_credentials_redacted": metadata.metadata.get("transport_credentials_redacted").is_some_and(|value| value == "true"),
         "evidence": "metadata_only"
     }))
     .map_err(|_| ErrorData::internal_error("Source metadata could not be encoded.", None))
@@ -176,6 +183,9 @@ pub(crate) fn resource_result(
         json!({
             "openlegal/source": source.descriptor,
             "openlegal/provenance": provenance,
+            "openlegal/originalResources": openlegal_domain::rights::resources(&source.metadata.metadata),
+            "openlegal/rightsWarnings": openlegal_domain::rights::warnings(&source.metadata.metadata),
+            "openlegal/transportCredentialsRedacted": source.metadata.metadata.get("transport_credentials_redacted").is_some_and(|value| value == "true"),
             "openlegal/bodyUnavailable": source.unavailable,
             "openlegal/previous": source.previous,
             "openlegal/next": source.next,
@@ -386,13 +396,101 @@ impl ReferenceScan {
     }
 }
 
+fn append_original_references(service: &CitationService, output: &mut InvocationOutput) {
+    fn collect(
+        value: &Value,
+        depth: usize,
+        visited: &mut usize,
+        resources: &mut Vec<(String, openlegal_domain::rights::OriginalResource)>,
+    ) {
+        *visited += 1;
+        if depth > 16 || *visited > MAX_REFERENCE_NODES {
+            return;
+        }
+        match value {
+            Value::Object(fields) => {
+                let metadata = fields.get("metadata").and_then(|v| {
+                    serde_json::from_value::<std::collections::BTreeMap<String, String>>(v.clone())
+                        .ok()
+                });
+                let capture = fields
+                    .get("capture_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        fields
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .and_then(|id| CitationId::decode(id).ok())
+                            .map(|id| id.capture_id)
+                    });
+                if let (Some(capture), Some(metadata)) = (capture, metadata) {
+                    for resource in openlegal_domain::rights::resources(&metadata) {
+                        if resources.len() >= 65 * MAX_REFERENCES {
+                            break;
+                        }
+                        if !resources.iter().any(|(id, existing)| {
+                            id == &capture && existing.ordinal == resource.ordinal
+                        }) {
+                            resources.push((capture.clone(), resource));
+                        }
+                    }
+                }
+                for value in fields.values() {
+                    collect(value, depth + 1, visited, resources);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    collect(value, depth + 1, visited, resources);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut originals = Vec::new();
+    collect(&output.structured, 0, &mut 0, &mut originals);
+    let mut references = Vec::new();
+    let mut warnings = BTreeSet::new();
+    for (capture, resource) in originals {
+        warnings.extend(resource.rights.warnings());
+        let url = if resource.retained && resource.rights.can_store() {
+            service.original_url(&capture, resource.ordinal).ok()
+        } else {
+            None
+        };
+        if let Some(url) = &url {
+            output.additional_content.push(ContentBlock::resource_link(Resource::new(url, format!("original-{}-{}", capture, resource.ordinal))
+                .with_title(&resource.title).with_mime_type(&resource.media_type)
+                .with_meta(MetaObject(json!({"openlegal/rights": resource.rights, "openlegal/warnings": resource.rights.warnings()}).as_object().expect("object literal").clone()))));
+        }
+        references.push(json!({"capture_id":capture,"ordinal":resource.ordinal,"title":resource.title,"media_type":resource.media_type,"retained":resource.retained,"rights":resource.rights,"url":url}));
+    }
+    if !references.is_empty() {
+        let meta = output
+            .meta
+            .get_or_insert_with(|| MetaObject(Default::default()));
+        meta.0
+            .insert("openlegal/originalReferences".into(), json!(references));
+        meta.0
+            .insert("openlegal/rightsWarnings".into(), json!(warnings));
+    }
+    for warning in warnings {
+        output.additional_content.push(ContentBlock::text(format!("Source reuse condition: {warning}. Observe the attached source rights and attribution before reuse.")));
+    }
+}
+
 pub(crate) fn append_native_references(
     name: &str,
     service: &CitationService,
     input_object: Option<&Value>,
     output: &mut InvocationOutput,
 ) {
-    if !is_native_citation_tool(name) {
+    if !is_native_citation_tool(name) && name != "fetch" {
+        return;
+    }
+    append_original_references(service, output);
+    if name == "fetch" {
         return;
     }
     let input_object =
@@ -1240,5 +1338,121 @@ mod tests {
         assert!(!expired_page.contains("가나다 citation evidence"));
         shutdown.cancel();
         task.await.unwrap().unwrap();
+    }
+    #[test]
+    fn native_original_links_keep_reuse_conditions_without_linking_unverified_bytes() {
+        use openlegal_domain::rights::{OriginalResource, SourceRights};
+        let (service, mut metadata, _) = fixture();
+        metadata.metadata.insert(
+            "original_resources".into(),
+            serde_json::to_string(&vec![
+                OriginalResource {
+                    ordinal: 1,
+                    title: "Licensed original".into(),
+                    media_type: "application/pdf".into(),
+                    source_url: "https://example.test/file".into(),
+                    retained: true,
+                    rights: SourceRights::kogl(
+                        4,
+                        "https://example.test/license".into(),
+                        "issuer".into(),
+                    ),
+                },
+                OriginalResource {
+                    ordinal: 2,
+                    title: "Unknown rights".into(),
+                    media_type: "application/pdf".into(),
+                    source_url: "https://example.test/unknown".into(),
+                    retained: false,
+                    rights: SourceRights::default(),
+                },
+            ])
+            .unwrap(),
+        );
+        let mut output = InvocationOutput {
+            structured: json!({"metadata":metadata}),
+            text: None,
+            meta: None,
+            additional_content: Vec::new(),
+            strict_result_limit: false,
+        };
+        append_native_references("database.get", &service, None, &mut output);
+        let meta = &output.meta.as_ref().unwrap().0;
+        let originals = meta["openlegal/originalReferences"].as_array().unwrap();
+        assert_eq!(originals.len(), 2);
+        assert!(
+            originals[0]["url"]
+                .as_str()
+                .unwrap()
+                .contains("/source-file/")
+        );
+        assert!(originals[1]["url"].is_null());
+        let warnings = meta["openlegal/rightsWarnings"].as_array().unwrap();
+        for expected in [
+            "noncommercial_only",
+            "no_derivatives_original_only",
+            "rights_unverified",
+        ] {
+            assert!(warnings.contains(&json!(expected)));
+        }
+        assert!(
+            output
+                .additional_content
+                .iter()
+                .any(|content| matches!(content, ContentBlock::ResourceLink(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn original_http_route_refuses_legacy_resources_and_noncanonical_selectors() {
+        use crate::{ServerBuilder, config::AccessPolicy, http::HttpEndpoint};
+        let (service, metadata, _) = fixture();
+        let mut builder = ServerBuilder::new(
+            ToolRegistry::new(),
+            Limits::default(),
+            SourceOffer::new("https://source.test/running").unwrap(),
+        )
+        .with_citations(service);
+        builder
+            .register_endpoint(HttpEndpoint {
+                tls: None,
+                edge_mtls: None,
+                bind: "127.0.0.1:0".parse().unwrap(),
+                access: AccessPolicy {
+                    allowed_hosts: vec!["test.local".into()],
+                    allowed_origins: vec![],
+                },
+            })
+            .unwrap();
+        let server = builder.bind().await.unwrap();
+        let address = server.addresses()[0].1[0];
+        let shutdown = CancellationToken::new();
+        let running = tokio::spawn(server.run(shutdown.clone()));
+        let client = reqwest::Client::new();
+        let origin = format!("http://{address}");
+        for (path, expected) in [
+            (
+                format!("/source-file/{}/0", metadata.capture_id),
+                reqwest::StatusCode::GONE,
+            ),
+            (
+                format!("/source-file/{}/00", metadata.capture_id),
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/source-file/{}/0?file=/etc/passwd", metadata.capture_id),
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = client
+                .get(format!("{origin}{path}"))
+                .header("Host", "test.local")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        shutdown.cancel();
+        running.await.unwrap().unwrap();
     }
 }

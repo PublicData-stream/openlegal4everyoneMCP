@@ -189,6 +189,7 @@ fn dataset_label(dataset: Dataset) -> &'static str {
         Dataset::ConstitutionalDecision => "헌재결정례",
         Dataset::LegalInterpretation => "법령해석례",
         Dataset::AdministrativeAppeal => "행정심판례",
+        _ => dataset.as_str(),
     }
 }
 

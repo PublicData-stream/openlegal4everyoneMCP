@@ -1071,9 +1071,13 @@ impl PgCorpusStore {
             .map_err(db)?;
         Ok(())
     }
-    /// One bounded pass. Current HEADs, live index/session pins and citation leases are protected.
-    /// Metadata removal is committed before physical blob deletion.
-    pub async fn maintain(&self, now: u64, historical_before: u64) -> Result<usize, DatabaseError> {
+    /// Bounded cleanup of temporary stages, sessions and citation leases. Captures
+    /// and attachment evidence are permanent; the legacy cutoff is ignored.
+    pub async fn maintain(
+        &self,
+        now: u64,
+        _historical_before: u64,
+    ) -> Result<usize, DatabaseError> {
         self.gate().await?;
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
@@ -1086,70 +1090,10 @@ impl PgCorpusStore {
             .execute(&mut *tx)
             .await
             .map_err(db)?;
-        let candidates=sqlx::query("SELECT c.id,c.object_key,o.version FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.captured_at<$1::text::numeric AND c.id IS DISTINCT FROM o.head_capture AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_retirement t WHERE t.capture_id=c.id) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_citation_lease l WHERE l.capture_id=c.id AND l.expires_at>$2::text::numeric) ORDER BY c.captured_at,c.id LIMIT 128").bind(historical_before.to_string()).bind(now.to_string()).fetch_all(&mut *tx).await.map_err(db)?;
-        for row in candidates {
-            let id: String = row.try_get("id").map_err(db)?;
-            let event:i64=sqlx::query_scalar("UPDATE openlegal.corpus_control SET next_event=next_event+1 RETURNING next_event-1").fetch_one(&mut *tx).await.map_err(db)?;
-            sqlx::query("INSERT INTO openlegal.corpus_retirement VALUES($1,$2)")
-                .bind(&id)
-                .bind(event)
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
-            sqlx::query("INSERT INTO openlegal.corpus_outbox VALUES($1,$2,$3,$4,false,false,true)")
-                .bind(event)
-                .bind(row.try_get::<String, _>("object_key").map_err(db)?)
-                .bind(row.try_get::<i64, _>("version").map_err(db)?)
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
-        }
-        let rows=sqlx::query("SELECT c.id,c.object_key,c.storage_key,c.raw_sha256,c.raw_size FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.captured_at<$1::text::numeric AND EXISTS(SELECT 1 FROM openlegal.corpus_retirement t JOIN openlegal.corpus_control x ON true WHERE t.capture_id=c.id AND t.event_sequence<=x.index_ack) AND c.id IS DISTINCT FROM o.head_capture AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_pin p WHERE p.capture_id=c.id) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_session s WHERE s.generation>=c.event_sequence AND s.expires_at>$2::text::numeric AND NOT s.invalidated) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_citation_lease l WHERE l.capture_id=c.id AND l.expires_at>$2::text::numeric) ORDER BY c.captured_at,c.id LIMIT 128 FOR UPDATE OF c").bind(historical_before.to_string()).bind(now.to_string()).fetch_all(&mut *tx).await.map_err(db)?;
-        let count = rows.len();
-        for row in rows {
-            let id: String = row.try_get("id").map_err(db)?;
-            let mut size: i64 = row.try_get("raw_size").map_err(db)?;
-            let attachments = sqlx::query(
-                "SELECT raw_size FROM openlegal.corpus_capture_blob WHERE capture_id=$1",
-            )
-            .bind(&id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db)?;
-            for a in attachments {
-                size += a.try_get::<i64, _>("raw_size").map_err(db)?;
-            }
-            sqlx::query("INSERT INTO openlegal.corpus_blob_deletion SELECT storage_key,raw_sha256,raw_size FROM openlegal.corpus_capture_blob WHERE capture_id=$1 ON CONFLICT DO NOTHING").bind(&id).execute(&mut *tx).await.map_err(db)?;
-            sqlx::query("INSERT INTO openlegal.corpus_blob_deletion VALUES($1,$2,$3) ON CONFLICT DO NOTHING").bind(row.try_get::<String,_>("storage_key").map_err(db)?).bind(row.try_get::<Vec<u8>,_>("raw_sha256").map_err(db)?).bind(row.try_get::<i64,_>("raw_size").map_err(db)?).execute(&mut *tx).await.map_err(db)?;
-            sqlx::query(
-                "UPDATE openlegal.corpus_revision SET latest_capture=NULL WHERE latest_capture=$1",
-            )
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
-            sqlx::query("DELETE FROM openlegal.corpus_retirement WHERE capture_id=$1")
-                .bind(&id)
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
-            sqlx::query("DELETE FROM openlegal.corpus_capture WHERE id=$1")
-                .bind(&id)
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
-            sqlx::query("UPDATE openlegal.corpus_control SET raw_bytes=raw_bytes-$1,historical_bytes=historical_bytes-$1")
-                .bind(size)
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
-            sqlx::query("UPDATE openlegal.corpus_object SET version=version+1 WHERE object_key=$1")
-                .bind(row.try_get::<String, _>("object_key").map_err(db)?)
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
-        }
+        // A pending deletion must never remove still-referenced archive bytes,
+        // including queues left by a previous release.
+        sqlx::query("DELETE FROM openlegal.corpus_blob_deletion d WHERE EXISTS(SELECT 1 FROM openlegal.corpus_capture c WHERE c.storage_key=d.storage_key) OR EXISTS(SELECT 1 FROM openlegal.corpus_capture_blob b WHERE b.storage_key=d.storage_key) OR EXISTS(SELECT 1 FROM openlegal.corpus_source_observation s WHERE s.storage_key=d.storage_key)")
+            .execute(&mut *tx).await.map_err(db)?;
         let stages=sqlx::query("SELECT * FROM openlegal.corpus_staging WHERE created_at<$1::text::numeric ORDER BY created_at LIMIT 128 FOR UPDATE").bind(now.saturating_sub(3600).to_string()).fetch_all(&mut *tx).await.map_err(db)?;
         for row in stages {
             let location: String = row.try_get("storage_key").map_err(db)?;
@@ -1167,7 +1111,7 @@ impl PgCorpusStore {
                 .map_err(db)?;
         }
         tx.commit().await.map_err(db)?;
-        let deletions = sqlx::query("SELECT * FROM openlegal.corpus_blob_deletion LIMIT 128")
+        let deletions = sqlx::query("SELECT * FROM openlegal.corpus_blob_deletion d WHERE NOT EXISTS(SELECT 1 FROM openlegal.corpus_capture c WHERE c.storage_key=d.storage_key) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_capture_blob b WHERE b.storage_key=d.storage_key) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_source_observation s WHERE s.storage_key=d.storage_key) LIMIT 128")
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
@@ -1195,6 +1139,6 @@ impl PgCorpusStore {
                 .await
                 .map_err(db)?;
         }
-        Ok(count)
+        Ok(0)
     }
 }

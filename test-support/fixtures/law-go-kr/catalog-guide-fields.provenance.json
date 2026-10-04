@@ -1,0 +1,13 @@
+{
+  "provider": "law_go_kr",
+  "captured_at": "2026-10-04",
+  "source_url": "https://open.law.go.kr/LSO/openApi/guideList.do",
+  "displayed_guide_count": 191,
+  "observed_unique_guide_links": 195,
+  "content": "endpoint and field-name facts extracted from unauthenticated public documentation; no sample records or response bodies",
+  "multiple_response_tables": "Union every documented response table in first-appearance order; alternate outputs within one guide are not overwritten by the final table. Corrected on 2026-10-04 for ordinListGuide, lsOrdinConListGuide, ordinLsConListGuide, ftcInfoGuide and thdCmpInfoGuide.",
+  "sanitization": "OC sample query values and full sample URLs omitted; request field OC retained as public schema name",
+  "live_api_acceptance": false,
+  "rights_source": "https://open.law.go.kr/LSO/information/guide.do",
+  "rights_limit": "Free legal-information reuse does not establish rights in third-party dictionaries, institutional works, linked supplements or attachments."
+}

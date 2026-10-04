@@ -278,6 +278,7 @@ async fn automatic_collection_contracts_hold_through_http_and_webtransport() {
         let persistent = fixture.open(SystemClock::default().now()).await;
         let runtime = CorpusRuntime::open(
             &DatabaseConfig {
+                max_raw_bytes: Default::default(),
                 auto_collection: enabled,
                 blob_path: fixture.directory.path().join("blobs-corpus"),
                 index_path: fixture.directory.path().join("index"),

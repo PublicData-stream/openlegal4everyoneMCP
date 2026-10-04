@@ -1,0 +1,17 @@
+{
+  "provider": "law_go_kr",
+  "observed_at": "2026-10-04",
+  "environment": "authorized bounded dev acceptance",
+  "evidence": "Parent-agent tag-only and identifier-shape diagnostics; no legal record values, raw responses, request URLs, credentials or headers retained in this fixture.",
+  "aliases": [
+    {
+      "guide": "baiPvcsListGuide",
+      "documentation_url": "https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=baiPvcsListGuide",
+      "documented_field": "감사원사전컨설팅의견서일련번호",
+      "observed_field": "감사원사전컨설팅일련번호",
+      "observed_rows": 100,
+      "identifier_shape": "All observed values were nonzero decimal identifiers of at most four characters.",
+      "scope": "Inventory identification only. A later bounded dev probe projected one representative detail using the documented detail serial; the documented detail field remains required and broader response-form coverage is not established."
+    }
+  ]
+}

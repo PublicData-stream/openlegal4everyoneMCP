@@ -11,6 +11,7 @@ pub struct Limits {
     /// Omitted values retain the message-relative tool output budget.
     pub max_tool_result_bytes: Option<usize>,
     pub max_buffer_bytes: usize,
+    pub max_original_buffer_bytes: usize,
     pub max_in_flight: usize,
     pub max_connections: usize,
     pub max_calls_per_connection: usize,
@@ -54,6 +55,7 @@ impl Default for Limits {
             max_message_bytes: 1024 * 1024,
             max_tool_result_bytes: None,
             max_buffer_bytes: 64 * 1024 * 1024,
+            max_original_buffer_bytes: 768 * 1024 * 1024,
             max_in_flight: 64,
             max_connections: 128,
             max_calls_per_connection: 8,
@@ -78,6 +80,8 @@ impl Limits {
                 .max_tool_result_bytes
                 .is_some_and(|value| value == 0 || value > self.max_message_bytes / 8)
             || self.max_buffer_bytes < self.max_message_bytes * 4
+            || self.max_original_buffer_bytes < 768 * 1024 * 1024
+            || self.max_original_buffer_bytes > u32::MAX as usize
             || self.max_buffer_bytes > u32::MAX as usize
             || self.max_in_flight == 0
             || self.max_in_flight > 128_000
@@ -1038,6 +1042,39 @@ mod cache_config_tests {
     }
 }
 
+/// A positive retained-evidence ceiling or permanent, unlimited storage.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum ArchiveByteLimit {
+    #[default]
+    Unlimited,
+    Limited(u64),
+}
+impl ArchiveByteLimit {
+    pub fn as_option(self) -> Option<u64> {
+        match self {
+            Self::Unlimited => None,
+            Self::Limited(value) => Some(value),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for ArchiveByteLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Number(u64),
+            Text(String),
+        }
+        match Input::deserialize(deserializer)? {
+            Input::Number(value) if value > 0 => Ok(Self::Limited(value)),
+            Input::Text(value) if value == "unlimited" => Ok(Self::Unlimited),
+            _ => Err(serde::de::Error::custom(
+                "expected a positive byte limit or unlimited",
+            )),
+        }
+    }
+}
+
 /// Serving an existing corpus does not require provider credentials or Kubernetes.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1045,6 +1082,9 @@ pub struct DatabaseConfig {
     /// Missing/stale eligible reads may enqueue bounded provider collection.
     #[serde(default = "enabled_by_default")]
     pub auto_collection: bool,
+    /// Total retained original evidence; unlimited never removes archived history.
+    #[serde(default)]
+    pub max_raw_bytes: ArchiveByteLimit,
     pub blob_path: PathBuf,
     pub index_path: PathBuf,
     /// Operator-provisioned, pinned MeCab-Ko dictionary. Never downloaded at runtime.
@@ -1082,7 +1122,7 @@ pub struct IngestionConfig {
     pub mode: IngestionMode,
     /// Explicit nonsecret manual-list candidate manifest for a bounded pilot.
     pub manual_candidates_path: Option<PathBuf>,
-    #[serde(default)]
+    #[serde(default = "enabled_by_default")]
     pub retain_history_bodies: bool,
     /// Maximum time allowed for one provider detail request and its attachments.
     #[serde(default = "default_detail_timeout_secs")]
@@ -1124,6 +1164,7 @@ pub struct ProviderRequestConfig {
     /// Mutually exclusive with explicit legacy min_interval_secs.
     pub requests_per_second: Option<u32>,
     pub min_interval_secs: Option<u32>,
+    pub max_in_flight: u32,
     pub pilot_attempt_limit: openlegal_application::upstream_policy::RequestLimit,
     pub on_demand_attempt_limit: openlegal_application::upstream_policy::RequestLimit,
     pub pilot_timeout_secs: u64,
@@ -1135,10 +1176,11 @@ impl Default for ProviderRequestConfig {
     fn default() -> Self {
         use openlegal_application::upstream_policy::RequestLimit::Limited;
         Self {
-            continuous_daily_limit: Limited(1000),
+            continuous_daily_limit: openlegal_application::upstream_policy::RequestLimit::Unlimited,
             on_demand_daily_limit: Limited(1000),
             requests_per_second: None,
             min_interval_secs: None,
+            max_in_flight: 4,
             pilot_attempt_limit: Limited(100),
             on_demand_attempt_limit: Limited(32),
             pilot_timeout_secs: 1800,
@@ -1160,12 +1202,13 @@ impl ProviderRequestConfig {
             (Some(_), None) => return Err("requests_per_second must be between 1 and 1000".into()),
             (None, Some(interval)) if (1..=3600).contains(&interval) => interval * 1000 + 1,
             (None, Some(_)) => return Err("min_interval_secs must be between 1 and 3600".into()),
-            (None, None) => 5001,
+            (None, None) => 200,
         };
         openlegal_adapters::law_go_kr::ProviderRequestLimits {
             continuous_daily_limit: self.continuous_daily_limit,
             on_demand_daily_limit: self.on_demand_daily_limit,
             interval_ms,
+            max_in_flight: self.max_in_flight,
             pilot_attempt_limit: self.pilot_attempt_limit,
             on_demand_attempt_limit: self.on_demand_attempt_limit,
             pilot_timeout_secs: self.pilot_timeout_secs,
@@ -1361,9 +1404,10 @@ mod database_config_tests {
     #[test]
     fn provider_budget_defaults_partial_settings_and_validation() {
         let defaults: ProviderRequestConfig = toml::from_str("").unwrap();
-        assert_eq!(defaults.continuous_daily_limit.as_option(), Some(1000));
+        assert_eq!(defaults.continuous_daily_limit.as_option(), None);
         assert_eq!(defaults.on_demand_daily_limit.as_option(), Some(1000));
-        assert_eq!(defaults.limits().unwrap().interval_ms, 5001);
+        assert_eq!(defaults.limits().unwrap().interval_ms, 200);
+        assert_eq!(defaults.limits().unwrap().max_in_flight, 4);
         defaults.limits().unwrap();
 
         let selected: ProviderRequestConfig =
@@ -1377,6 +1421,8 @@ mod database_config_tests {
             "continuous_daily_limit = 1000001",
             "on_demand_daily_limit = 1000001",
             "min_interval_secs = 3601",
+            "max_in_flight = 0",
+            "max_in_flight = 17",
         ] {
             if let Ok(invalid) = toml::from_str::<ProviderRequestConfig>(raw) {
                 assert!(invalid.limits().is_err(), "{raw}");
@@ -1481,7 +1527,7 @@ mod database_config_tests {
         assert_eq!(ingestion.detail_job_workers, 1);
         assert_eq!(
             ingestion.provider_requests.limits().unwrap().interval_ms,
-            5001
+            200
         );
         for seconds in [60, 300, 86400] {
             let configured: DatabaseConfig =

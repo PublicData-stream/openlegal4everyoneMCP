@@ -16,6 +16,14 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod citation;
+mod clone_progress;
+pub use clone_progress::CloneView;
+mod supplement_jobs;
+pub use supplement_jobs::{SupplementJob, SupplementJobStatus};
+mod source_observations;
+pub use source_observations::{SourceObservation, SourceObservationInput};
+mod original;
+pub use original::OriginalEvidence;
 mod collection_gaps;
 mod collection_requests;
 pub use collection_requests::CollectionLaunch;
@@ -45,6 +53,21 @@ fn blob_error(error: openlegal_domain::RetrievalError) -> DatabaseError {
 }
 fn corrupt<T>(_: T) -> DatabaseError {
     DatabaseError::StorageCorrupt
+}
+fn json_hash(value: &serde_json::Value) -> Result<Vec<u8>, DatabaseError> {
+    struct DigestWriter(Sha256);
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = DigestWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, value).map_err(corrupt)?;
+    Ok(writer.0.finalize().to_vec())
 }
 fn bytes_hash(v: &[u8]) -> Vec<u8> {
     Sha256::digest(v).to_vec()
@@ -135,7 +158,7 @@ impl PgCorpusStore {
     ) -> Result<bool, DatabaseError> {
         self.gate().await?;
         let identity = key(object)?;
-        let ready: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_revision r JOIN openlegal.corpus_capture c ON c.id=r.latest_capture JOIN openlegal.corpus_object o ON o.object_key=r.object_key WHERE r.object_key=$1 AND r.revision_id=$2 AND COALESCE(c.payload->'record'->'metadata'->>'attachment_status','complete') <> 'incomplete' AND r.last_validated_at<=$3::text::numeric AND r.last_validated_at>$3::text::numeric-3600 AND (o.head_capture=c.id OR c.captured_at>$3::text::numeric-2592000) AND (c.expires_at IS NULL OR c.expires_at>$3::text::numeric))")
+        let ready: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_revision r JOIN openlegal.corpus_capture c ON c.id=r.latest_capture JOIN openlegal.corpus_object o ON o.object_key=r.object_key WHERE r.object_key=$1 AND r.revision_id=$2 AND COALESCE(c.payload->'record'->'metadata'->>'attachment_status','complete') <> 'incomplete' AND r.last_validated_at<=$3::text::numeric AND r.last_validated_at>$3::text::numeric-3600 AND NOT o.withdrawn)")
             .bind(identity).bind(revision_id).bind(now.to_string())
             .fetch_one(&self.pool).await.map_err(db)?;
         Ok(ready)
@@ -144,12 +167,12 @@ impl PgCorpusStore {
         &self,
         object: &ObjectId,
         revision_id: &str,
-        now: u64,
+        _now: u64,
     ) -> Result<bool, DatabaseError> {
         self.gate().await?;
         let identity = key(object)?;
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_revision r JOIN openlegal.corpus_capture c ON c.id=r.latest_capture JOIN openlegal.corpus_object o ON o.object_key=r.object_key WHERE r.object_key=$1 AND r.revision_id=$2 AND COALESCE(c.payload->'record'->'metadata'->>'attachment_status','complete') <> 'incomplete' AND (o.head_capture=c.id OR c.captured_at>$3::text::numeric-2592000) AND (c.expires_at IS NULL OR c.expires_at>$3::text::numeric))")
-            .bind(identity).bind(revision_id).bind(now.to_string())
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_revision r JOIN openlegal.corpus_capture c ON c.id=r.latest_capture JOIN openlegal.corpus_object o ON o.object_key=r.object_key WHERE r.object_key=$1 AND r.revision_id=$2 AND COALESCE(c.payload->'record'->'metadata'->>'attachment_status','complete') <> 'incomplete' AND NOT o.withdrawn)")
+            .bind(identity).bind(revision_id)
             .fetch_one(&self.pool).await.map_err(db)
     }
     pub async fn inventory_cursor(
@@ -259,6 +282,26 @@ impl PgCorpusStore {
             blocked: Arc::new(AtomicBool::new(false)),
         }
     }
+    /// Shared archive capacity. `None` admits storage without a configured total
+    /// cap; per-publication and staging bounds still apply. Lowering a cap never
+    /// removes existing evidence, and takes effect at the next reservation.
+    pub async fn configure_archive_capacity(
+        &self,
+        max_raw_bytes: Option<u64>,
+    ) -> Result<(), DatabaseError> {
+        if max_raw_bytes == Some(0) {
+            return Err(DatabaseError::InvalidInput);
+        }
+        self.gate().await?;
+        sqlx::query(
+            "UPDATE openlegal.corpus_control SET max_raw_bytes=$1::text::numeric WHERE singleton",
+        )
+        .bind(max_raw_bytes.map(|n| n.to_string()))
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
     pub fn healthy(&self) -> bool {
         !self.blocked.load(Ordering::Acquire) && !self.pool.is_closed()
     }
@@ -343,20 +386,19 @@ impl PgCorpusStore {
     async fn capture_inner(
         &self,
         id: &str,
-        now: u64,
+        _now: u64,
         index_read: bool,
         cancel: CancellationToken,
     ) -> Result<Capture, DatabaseError> {
         self.gate().await?;
         check(&cancel)?;
-        let row=sqlx::query("SELECT c.*,c.captured_at::text AS time_text,o.withdrawn FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.id=$1 AND ($3 OR o.head_capture=c.id OR c.captured_at>$2::text::numeric-2592000 OR EXISTS(SELECT 1 FROM openlegal.corpus_session s WHERE s.generation>=c.event_sequence AND s.expires_at>$2::text::numeric AND NOT s.invalidated) OR EXISTS(SELECT 1 FROM openlegal.corpus_citation_lease l WHERE l.capture_id=c.id AND l.expires_at>$2::text::numeric))").bind(id).bind(now.to_string()).bind(index_read).fetch_optional(&self.pool).await.map_err(db)?.ok_or(DatabaseError::RevisionUnavailable)?;
+        let row=sqlx::query("SELECT c.*,c.captured_at::text AS time_text,o.withdrawn FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.id=$1").bind(id).fetch_optional(&self.pool).await.map_err(db)?.ok_or(DatabaseError::RevisionUnavailable)?;
         if !index_read && row.try_get::<bool, _>("withdrawn").map_err(db)? {
             return Err(DatabaseError::Withdrawn);
         }
         let value: serde_json::Value = row.try_get("payload").map_err(db)?;
-        let encoded = serde_json::to_vec(&value).map_err(corrupt)?;
         let expected: Vec<u8> = row.try_get("payload_sha256").map_err(db)?;
-        if bytes_hash(&encoded) != expected {
+        if json_hash(&value)? != expected {
             self.blocked.store(true, Ordering::Release);
             return Err(DatabaseError::StorageCorrupt);
         }
@@ -692,13 +734,22 @@ impl PgCorpusStore {
             staged_blobs.push((location, d, raw.len() as i64));
         }
         let mut reserve = self.pool.begin().await.map_err(db)?;
-        let counts=sqlx::query("SELECT raw_bytes,staged_bytes,(SELECT count(*) FROM openlegal.corpus_staging) AS stages FROM openlegal.corpus_control WHERE singleton FOR UPDATE").fetch_one(&mut *reserve).await.map_err(db)?;
-        if counts.try_get::<i64, _>("raw_bytes").map_err(db)?
-            + counts.try_get::<i64, _>("staged_bytes").map_err(db)?
-            + total_size as i64
-            > 480_i64 * 1024 * 1024 * 1024
-            || counts.try_get::<i64, _>("staged_bytes").map_err(db)? + total_size as i64
-                > 16_i64 * 1024 * 1024 * 1024
+        let counts=sqlx::query("SELECT raw_bytes,staged_bytes,max_raw_bytes::text,(SELECT count(*) FROM openlegal.corpus_staging) AS stages FROM openlegal.corpus_control WHERE singleton FOR UPDATE").fetch_one(&mut *reserve).await.map_err(db)?;
+        let staged_bytes = counts.try_get::<i64, _>("staged_bytes").map_err(db)?;
+        let reserved_bytes = counts
+            .try_get::<i64, _>("raw_bytes")
+            .map_err(db)?
+            .checked_add(staged_bytes)
+            .and_then(|n| n.checked_add(total_size as i64))
+            .ok_or(DatabaseError::Capacity)?;
+        let max_raw_bytes = counts
+            .try_get::<Option<String>, _>("max_raw_bytes")
+            .map_err(db)?
+            .map(|n| n.parse::<u64>())
+            .transpose()
+            .map_err(corrupt)?;
+        if max_raw_bytes.is_some_and(|max| reserved_bytes as u64 > max)
+            || staged_bytes + total_size as i64 > 16_i64 * 1024 * 1024 * 1024
             || counts.try_get::<i64, _>("stages").map_err(db)? + staged_blobs.len() as i64
                 > 128 * 65
         {
@@ -902,14 +953,6 @@ impl PgCorpusStore {
         } else {
             total_size as i64
         };
-        let history_size: i64 =
-            sqlx::query_scalar("SELECT historical_bytes FROM openlegal.corpus_control")
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(db)?;
-        if history_size + historical_add > 64_i64 * 1024 * 1024 * 1024 {
-            return Err(DatabaseError::Capacity);
-        }
         sqlx::query("UPDATE openlegal.corpus_control SET historical_bytes=historical_bytes+$1")
             .bind(historical_add)
             .execute(&mut *tx)
@@ -984,6 +1027,14 @@ impl PgCorpusStore {
 }
 
 impl DatabaseStore for PgCorpusStore {
+    fn original_evidence(
+        &self,
+        capture_id: String,
+        ordinal: u32,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<openlegal_domain::rights::OriginalEvidence, DatabaseError>> {
+        self.original_evidence_future(capture_id, ordinal, cancel)
+    }
     fn resolve(
         &self,
         object: ObjectId,
@@ -1031,5 +1082,18 @@ impl DatabaseStore for PgCorpusStore {
             this.history_inner(object, kind, cursor, limit, now, cancel)
                 .await
         })
+    }
+}
+
+#[cfg(test)]
+mod archive_hash_tests {
+    use super::*;
+    #[test]
+    fn streamed_manifest_hash_preserves_existing_json_identity() {
+        let value = serde_json::json!({"escaped": "\\\"\n\u{0000}", "nested": [null, true, 1, "한글"], "empty": {}});
+        assert_eq!(
+            json_hash(&value).unwrap(),
+            bytes_hash(&serde_json::to_vec(&value).unwrap())
+        );
     }
 }

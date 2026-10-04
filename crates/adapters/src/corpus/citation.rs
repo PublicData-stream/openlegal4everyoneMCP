@@ -1,5 +1,5 @@
-//! Durable, capture-scoped citation retention. All admission and retirement
-//! operations serialize on the corpus control row, never on search sessions.
+//! Durable, capture-scoped citation leases. Evidence is permanently archived;
+//! lease admission serializes with withdrawal on the corpus control row.
 use super::*;
 use openlegal_application::citation::{
     CITATION_LEASE_SECONDS, CitationLease, MAX_CITATION_LEASES, MAX_CITATION_SEARCH_RESULTS,
@@ -59,8 +59,8 @@ impl PgCorpusStore {
                 return Err(DatabaseError::SessionExpired);
             }
         }
-        // Withdrawal and GC hold the same control lock. Expired leases never
-        // grant eligibility to revive an otherwise unavailable capture.
+        // Withdrawal and lease admission hold the same control lock. Lease expiry
+        // bounds bookkeeping without making archived evidence unavailable.
         sqlx::query("DELETE FROM openlegal.corpus_citation_lease l WHERE l.expires_at<=$1::text::numeric OR EXISTS(SELECT 1 FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.id=l.capture_id AND o.withdrawn)")
             .bind(now.to_string())
             .execute(&mut *tx)
@@ -73,9 +73,8 @@ impl PgCorpusStore {
                 .map_err(db)?;
         let mut additional = 0usize;
         for (capture_id, (object, object_key)) in &selected {
-            let row = sqlx::query("SELECT c.object_key,o.identity,o.withdrawn,(COALESCE(o.head_capture=c.id,false) OR c.captured_at>$2::text::numeric-2592000 OR EXISTS(SELECT 1 FROM openlegal.corpus_session s WHERE s.generation>=c.event_sequence AND s.expires_at>$2::text::numeric AND NOT s.invalidated) OR EXISTS(SELECT 1 FROM openlegal.corpus_citation_lease l WHERE l.capture_id=c.id AND l.expires_at>$2::text::numeric)) AS eligible,EXISTS(SELECT 1 FROM openlegal.corpus_citation_lease l WHERE l.capture_id=c.id) AS leased FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.id=$1")
+            let row = sqlx::query("SELECT c.object_key,o.identity,o.withdrawn,EXISTS(SELECT 1 FROM openlegal.corpus_citation_lease l WHERE l.capture_id=c.id) AS leased FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.id=$1")
                 .bind(capture_id)
-                .bind(now.to_string())
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(db)?
@@ -90,9 +89,6 @@ impl PgCorpusStore {
             }
             if row.try_get::<bool, _>("withdrawn").map_err(db)? {
                 return Err(DatabaseError::Withdrawn);
-            }
-            if !row.try_get::<bool, _>("eligible").map_err(db)? {
-                return Err(DatabaseError::RevisionUnavailable);
             }
             additional += usize::from(!row.try_get::<bool, _>("leased").map_err(db)?);
         }

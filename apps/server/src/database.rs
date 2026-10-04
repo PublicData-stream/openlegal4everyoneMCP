@@ -31,6 +31,14 @@ pub struct DatabaseTools {
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct CorpusStatusInput {}
+/// The progress payload is a JSON object, including its diagnostic
+/// fields. MCP rejects an unconstrained `Value` output schema at registration.
+#[derive(Serialize, JsonSchema)]
+#[serde(transparent)]
+struct CorpusStatusOutput(serde_json::Map<String, serde_json::Value>);
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReadInput {
     object: ObjectId,
     #[serde(default)]
@@ -250,6 +258,18 @@ impl ToolModule for DatabaseTools {
                     Ok(output(ReadResult::Ready(WithCollection { result, collection })))
                 }
             },
+        )?;
+        let clone_store = self.store.clone();
+        registry.register_typed::<CorpusStatusInput, CorpusStatusOutput, _, _>(
+            "database.corpus_status",
+            "Read durable progress of finite canonical corpus cloning, including independent current/history/treaty views, stable traversals, missing bodies and open gaps. This does not contact the provider. Canonical clone completion is not an atomic upstream snapshot or completeness of deferred supplementary sources.",
+            ToolOptions::default(),
+            move |_, _| { let store=clone_store.clone(); async move {
+                match store.clone_progress().await.map_err(map_error)? {
+                    serde_json::Value::Object(progress) => Ok(output(CorpusStatusOutput(progress))),
+                    _ => Err(ToolError::StorageCorrupt),
+                }
+            } }
         )?;
         let status_store = self.store.clone();
         registry.register_typed::<ObjectStatusInput, ObjectStatus, _, _>(
@@ -490,6 +510,29 @@ pub async fn load_widget(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn corpus_progress_registers_as_an_object_without_changing_wire_fields() {
+        let progress = json!({"initial_canonical_clone_complete":false,
+            "full_available_clone_complete":false,"views":[]});
+        let fields = progress.as_object().unwrap().clone();
+        assert_eq!(
+            serde_json::to_value(CorpusStatusOutput(fields.clone())).unwrap(),
+            progress
+        );
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_typed::<CorpusStatusInput, CorpusStatusOutput, _, _>(
+                "database.corpus_status",
+                "Read local clone progress",
+                ToolOptions::default(),
+                move |_, _| {
+                    let fields = fields.clone();
+                    async move { Ok(output(CorpusStatusOutput(fields))) }
+                },
+            )
+            .unwrap();
+    }
 
     #[test]
     fn query_input_excludes_ripgrep_context_but_preserves_search_options() {
