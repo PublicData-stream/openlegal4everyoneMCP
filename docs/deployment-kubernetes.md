@@ -88,8 +88,9 @@ Configurations without verified edge mTLS continue to use the existing default
 bucket.
 
 The serving Deployment has exactly one desired replica and uses `Recreate`.
-Application budgets and upstream coordination assume one backend, and concurrent
-processes must not share the corpus index. Preserve the existing database advisory
+Serving and index ownership assume one backend; concurrent serving processes
+must not share the corpus index. LAW ingestion admission is shared durably across
+scheduler and request Job Pods, including spacing and concurrent HTTP slots. Preserve the existing database advisory
 lease between corpus serving and rebuilding; deployment settings do not replace
 it or the operator's responsibility to stop serving for offline work. Multi-replica
 serving, distributed indexing and automatic failover are outside this design.
@@ -1255,23 +1256,46 @@ Increase `detail_job_workers` to 8, then 16 only after at least one hour of
 healthy runtime at each stage, with provider usage, queue progress, Pod capacity,
 and error rates checked before each change.
 
-`[database.ingestion.provider_requests]` selects 50,000 automatic attempts per
-UTC day, 1,000 explicit on-demand attempts per UTC day and a shared one-second
-minimum interval. These are operator policy values, not documented provider
-quotas or achieved collection throughput. The omitted-table defaults remain
-1,000/1,000 attempts and five-second spacing. On enabled-ingestion startup the
-durable provider ledger receives this policy before client use; already charged
-counts, `Retry-After` pauses, unresolved responses and operator suspension remain
-in force. An increased budget can wake collection jobs deferred solely by the
-old daily budget. The scan interval is a delay after a completed pass; it does
-not shorten freshness periods or gap retry eligibility. Deploy scheduler and
-request Jobs with the same ConfigMap policy.
+`[database.ingestion.provider_requests]` selects unlimited continuous attempts,
+1,000 explicit attempts per UTC day, five request starts per second without burst
+and `max_in_flight = 4`. These are also the omitted-table defaults. Rate accepts
+1..1000 starts/second; shared concurrency accepts 1..16. A legacy explicit
+`min_interval_secs` remains supported but cannot coexist with
+`requests_per_second`. Each daily cap accepts a positive number or `"unlimited"`.
+These choices do not establish provider permission or achieved throughput.
+On enabled-ingestion startup the durable provider ledger receives the policy
+before client use, preserving charged counts, `Retry-After`, suspension and
+unresolved responses. Increased budgets may wake only budget-deferred work.
+Deploy scheduler and request Jobs with the same ConfigMap policy; a scan interval
+change does not shorten freshness periods or gap retry eligibility. See the
+[server contract](server.md) for finite pilot/explicit deadlines and retry limits.
 
-Each daily cap also accepts `"unlimited"`. A new LAW `requests_per_second` field
-supports 1..1000 starts per second with no burst and one outstanding request;
-remove an explicit legacy interval when selecting it. The committed values above
-remain unchanged. See the [server contract](server.md) for pilot/on-demand attempt
-caps, finite operation timeouts up to 24 hours, and finite processing retry counts.
+The template enables `retain_history_bodies = true`. Permitted current/historical
+bodies, attachments and corrected captures are permanently archived. Set
+`[database].max_raw_bytes` to `"unlimited"` (the default) or a positive byte limit;
+a finite cap pauses further publication without pruning archived history. Staging
+and individual response limits stay finite. Monitor disk headroom, raw/staging
+accounting, pending work and index lag. Provide additional storage or raise an
+operator-selected cap before resuming capacity-blocked ingestion; do not delete
+corpus blobs or historical rows to make space. Withdrawal and material-specific
+reuse restrictions continue to govern public access.
+
+Each active request owns a `provider_request_admission` row and a detached
+session advisory lock identified by `(1869376611, 1818326864 + slot)`. A live row
+permits other available slots; an abandoned row globally blocks admission until
+operator review. Inspect both this ledger and the legacy singleton
+`unresolved_response`/`admission_owner` fields. Do not clear uncertain rows merely
+because a collection Job ended. Stop old collection Pods before applying the
+parallel-admission migration/activation: old single-lock binaries and new slot-lock
+binaries must not concurrently issue provider requests. Config changes never
+reset counts or clear pauses and fences automatically.
+
+The expanded source registry and permanent archive do not establish a completed
+production clone. Review the [source catalog evidence](../test-support/fixtures/law-go-kr/CATALOG.md): 69 original families group 195
+observed guide links despite the index's displayed 191 total. Access permission,
+rights, dependent supplement traversal and live contracts require separate proof;
+query-only APIs have no finite exhaustive download. Production activation and
+full-copy execution remain distinct operator-authorized gates.
 
 At request launch, the scheduler snapshots the operation limits privately and
 renders Kubernetes `activeDeadlineSeconds = on_demand_timeout_secs + 300`.

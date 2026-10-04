@@ -3,8 +3,9 @@
 ## Scope
 
 These invariants apply to every provider, normalization path, cache representation,
-MCP tool, and future API. The framework currently exercises synthetic data only;
-real legal mappings remain unimplemented. Contributor review requirements are in
+MCP tool, and future API. The opt-in Korean LAW adapter also applies these
+invariants; implemented mapping and documentation evidence do not establish
+complete authenticated collection. Contributor review requirements are in
 [Contributing](../CONTRIBUTING.md#review-gates).
 
 ## Identity, names, and languages
@@ -83,6 +84,15 @@ Request context and references must omit credentials and other sensitive values.
 A digest identifies retained evidence; it does not prove the provider's legal
 authority or recover a payload that has been discarded.
 
+When a provider echoes authentication in documented transport-link fields, its
+profile may redact those authentication query values before processing or storage.
+This exception must leave legal wording and non-authentication fields unchanged,
+record the redaction in provenance and diagnostics, and withhold any remaining
+credential-bearing response. A retained digest identifies the sanitized evidence,
+not the untouched HTTP response. An original-download description must disclose
+this exception rather than claim unconditional byte identity with the upstream.
+It does not authorize rewriting a separately licensed document or its legal text.
+
 Citations preserve provider, instrument/revision identity, and provision locator
 where available. Use authoritative source references or documented link-generation
 rules. A search result, reconstructed title, or current-version link must not be
@@ -96,20 +106,33 @@ semantics and qualification that support them.
 ## Retained evidence and fixtures
 
 The optional [retained-source citation interface](citations.md) pins links to an
-exact capture and text projection. Renewable short leases protect access within
-bounded storage; they do not promise a permanent archive. Body expiry leaves a
-qualified metadata reference, and withdrawal overrides retention. Extracted and
-OCR text must remain visibly distinguished from provider text across tool,
-resource and browser representations.
+exact capture and text projection. The LAW corpus permanently retains permitted
+current and historical bodies, attachments and observations of corrected bytes,
+including multiple captures of the same official revision. Renewable short leases
+still coordinate readers and index generations; they do not authorize eviction of
+archived evidence. Withdrawal overrides public access and leases while preserving
+qualified capture metadata and retained evidence. Extracted and OCR text remain
+visibly distinguished from provider text across tools, resources and browser pages.
 
-Retain source payloads alongside cached normalized records within a documented,
-bounded provider retention policy. Keep the linkage between payload, digest,
-normalization version, and record explicit. Store only permitted evidence; apply
-data minimization, sanitization, and relevant source reuse restrictions.
+Keep source payload, digest, normalization version and record linked. An optional
+positive raw-byte cap stops additional publication without deleting old captures;
+the default is `"unlimited"`. Staging, responses and processing retain finite bounds.
+Storage exhaustion pauses collection and resumes after capacity becomes available.
+Previously deleted bytes cannot be reconstructed merely by changing retention:
+recollection produces a new observation, never the old capture identity.
 
-Expiration must not be represented as continued exact reproducibility. Source
-evidence retention is not a promise to maintain a permanent legal archive. Preserve
-curated fixtures for important regression cases rather than committing bulk dumps.
+Verify reuse conditions for each material independently. Permission for primary
+legal text does not establish permission for attachments, commentary or other
+third-party works. Preserve source attribution and explicit noncommercial warnings.
+Verified no-derivatives material is retained and offered only as original bytes
+with provider metadata; it skips OCR, extraction, body indexing, excerpts,
+comparison and transformation. Unverified rights preserve metadata, official links
+and a hold reason; original download and public content remain withheld until
+applicable conditions are established. A warning is not a substitute for permission.
+
+Permanent archival storage does not establish freshness, legal applicability,
+complete upstream coverage or continued public permission. Preserve curated
+fixtures for regression cases instead of committing bulk dumps.
 
 Each curated fixture records provider/dataset, authoritative source reference,
 record/revision context, capture date, relevant reuse conditions, and the behavior
@@ -130,8 +153,9 @@ must assess existing caches and public outputs. Explain whether entries need
 invalidation or reprocessing, whether identifiers/citations change, and how to
 avoid serving mixed normalization versions under an indistinguishable key.
 
-Do not overwrite valid source evidence to hide a correction. Preserve the bounded
-history needed to explain the change, respecting retention and data constraints.
+Do not overwrite valid source evidence to hide a correction. Preserve prior
+captures needed to explain the change, respecting withdrawal and material-specific
+reuse constraints.
 Use the [data-integrity report template](../.github/ISSUE_TEMPLATE/data-integrity.md)
 for ordinary discrepancies. Suspected security vulnerabilities follow
 [SECURITY.md](../SECURITY.md).

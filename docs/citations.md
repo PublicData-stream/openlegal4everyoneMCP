@@ -60,17 +60,27 @@ bounded to 20; warnings report missing or omitted references.
 share call admission, rate, cancellation and deadline policies. Modern responses
 use public cache scope and zero TTL. Static widget resources remain separate.
 
-Historical body retention remains 30 days with existing HEAD/session protection
-and a renewable 600-second citation lease. Search establishes leases before
-releasing generation protection. One durable row covers all projections of a
-capture; repeated clicks do not accumulate read sessions. At most 2,048 captures
-may have live citation leases; existing storage byte limits still apply. Frequent
-access can extend availability beyond 30 days. This is not a permanent archive.
+Permitted historical bodies and corrected captures remain permanently archived.
+The renewable 600-second citation lease still coordinates protected readers and
+index generations. Search establishes leases before releasing generation
+protection. One durable row covers all projections of a capture; repeated clicks
+do not accumulate read sessions. At most 2,048 captures may have live citation
+leases. Lease expiration no longer makes archived bodies expire; withdrawal and
+material-specific reuse restrictions still override public access.
 
 Confirmed official links identify provider records, whose pages may change after
 capture. Unsupported mappings, including ordinances without sufficient routing
 evidence, use a qualified official lookup. The credential-free API `source_url`
 remains provenance rather than proof of a browser-accessible historical copy.
+
+Evidence digests identify the stored artifact. LAW can echo API authentication in
+documented XML source-link fields; the exact credential in a law.go.kr link's `OC`
+query value is redacted before processing and storage, with the transformation
+recorded in provenance and diagnostics.
+Legal wording and other source fields remain unchanged. Such an artifact is
+authentication-redacted evidence, rather than an untouched HTTP response. The
+[provider profile](providers/kr-law-go-kr.md#text-evidence-and-references) defines
+this exception. Citations still pin the exact retained capture and text unit.
 
 ## Browser pages
 
@@ -79,7 +89,18 @@ translated. Metadata/document overviews show the first retained body unit and
 navigation. HTML is escaped, scripts are disabled and source links are click-only.
 Provider text, extracted text and OCR carry distinct provenance.
 
-Expired pages return 410 with retained document metadata and unavailable text.
+`/source-file/{capture_id}/{ordinal}` returns the selected permitted retained
+artifact with download disposition, disabled sniffing and no caching. It does
+not accept a provider URL or filesystem path. Its bytes match the retained
+artifact; a LAW XML artifact can include the disclosed authentication-link
+redaction described above. Verified no-derivatives attachments remain unchanged
+files, with extraction and OCR disabled. Unknown rights and withdrawal withhold
+the download. Private transport observations do not acquire this public route
+or a legal citation merely because they were retained.
+
+Permanently retained corpus text does not expire with a serving-cache entry or
+citation lease. Pages for withdrawn or otherwise withheld text return 410 with
+retained document metadata and unavailable text.
 Without a body, a requested section/range cannot be verified. Unknown references
 return 404; malformed IDs return 400. Withdrawal overrides leases. `fetch` and
 body resource reads fail instead of substituting a new capture. Metadata resource
@@ -111,7 +132,7 @@ developer mode and check:
 3. Follow a native `law.article` or history reference. Confirm exact provenance
    and body access rather than selection of another HEAD.
 4. Query unobserved material. Confirm incomplete coverage is qualified.
-5. Check both page languages and an expired fixture. Confirm explicit unavailable
+5. Check both page languages and a withheld fixture. Confirm explicit unavailable
    evidence without text replacement.
 
 Record deployment revision/digests and the user's citation/click observations

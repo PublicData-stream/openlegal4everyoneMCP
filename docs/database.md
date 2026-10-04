@@ -324,12 +324,21 @@ startup initiates background traffic in a separate scheduler Pod; applying it
 requires separate operator authorization after sandbox acceptance. The serving
 Pod has no provider credential and its lookups do not schedule collection.
 
-Current HEAD data is retained independently of ordinary historical retention.
-Historical bodies are retained for 30 days, with bounded session extensions;
-revision catalog metadata survives body eviction. Current corpus raw evidence has a
-480 GiB ledger cap and staging a 16 GiB cap. Reserve additional space for PostgreSQL,
-index generations/rebuilds, history and filesystem overhead within the deployment's
-1.5 TiB managed-storage ceiling. These software bounds are not ZFS configuration.
+Current and historical bodies, attachments and corrected captures are archived
+permanently, including older captures of the same official revision. Revision
+metadata remains independently readable; withdrawal blocks public body access.
+`[database].max_raw_bytes` defaults to `"unlimited"` or accepts a positive byte
+count. Reaching that cap stops new publication without evicting archived history.
+The separate 64 GiB historical cap is removed; staging retains its 16 GiB cap.
+Reserve capacity for PostgreSQL, index generations/rebuilds and filesystem overhead.
+The deployment's provisional 1.5 TiB managed-storage ceiling is capacity planning,
+not a full-corpus estimate or a software guarantee of unlimited physical space.
+Previously deleted bytes require recollection as new captures.
+Finite inventory and supplement observations share the same raw-byte cap and
+staging accounting. They preserve exact response bytes and independent rights
+metadata under content-derived IDs, without becoming legal captures or public
+citations. Corrections preserve earlier responses; unchanged responses only update
+validation timing. Temporary-stage cleanup never removes their referenced blobs.
 
 ## Offline index rebuild
 
@@ -386,3 +395,18 @@ reader/session behavior, withdrawal, patch round trips and bounded MCP results.
 Live upstream coverage and hardened-cluster acceptance are separate opt-in checks.
 The [endpoint review](mcp-endpoints-review.md) records compatibility, independent
 review scope, local verification and remaining deployment gates.
+
+## Original observations and durable clone work
+
+Migrations 0019–0021 retain original source observations, independent inventory
+view cursors, and supplemental jobs. Each supplemental request has a closed,
+immutable descriptor and a 600-second UUID-fenced lease. Workers bound an attempt
+to 480 seconds. Parser retries reuse stored bytes during the first 24 hours;
+thereafter a new download can capture upstream corrections while every earlier
+observation remains archived. Successful work is revalidated after 24 hours.
+Pagination successors are committed atomically with their preceding page.
+
+Global roots and record-derived requests share a durable fair queue. An unknown
+reuse license records metadata without authorizing a body download. Missing
+source contracts, unsupported change-date universes, unavailable attachments,
+and unverified identities stay visible as incomplete coverage.

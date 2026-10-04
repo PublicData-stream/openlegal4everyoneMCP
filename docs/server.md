@@ -267,6 +267,7 @@ lists tools and calls `server_info`; never disable certificate verification.
 | `max_message_bytes` | 1,048,576 |
 | `max_tool_result_bytes` | `max_message_bytes / 8` when omitted |
 | `max_buffer_bytes` | 67,108,864 |
+| `max_original_buffer_bytes` | 805,306,368 |
 | `max_in_flight` | 64 |
 | `max_connections` | 128 |
 | `max_calls_per_connection` | 8 |
@@ -420,17 +421,21 @@ No public arbitrary URL, SQL, filesystem search, or direct corpus mutation tool 
 Operator ingestion configuration is a separate startup decision.
 `[database.ingestion.provider_requests]` selects shared durable LAW admission.
 `continuous_daily_limit` and `on_demand_daily_limit` each accept 1..1,000,000 or
-`"unlimited"`, defaulting to 1,000. Usage resets at UTC midnight. Unlimited usage
+`"unlimited"`. Automatic collection defaults to `"unlimited"`; explicit collection
+retains a 1,000-attempt daily default. Usage resets at UTC midnight. Unlimited usage
 is still charged; configuration changes preserve counts and safety pauses.
 
 Use `requests_per_second` (1..1,000) for evenly paced starts, or the existing
 `min_interval_secs` (1..3,600). Explicitly specifying both fails validation.
-Omitting both keeps five-second spacing. LAW permits one outstanding request;
-rate configuration does not increase concurrency. The committed collector example
-keeps 50,000/1,000 daily attempts, one-second spacing and 300-second busy rechecks.
+Omitting both selects **five starts per second**, with a minimum 200ms interval
+and no burst. `max_in_flight` defaults to **4** and accepts 1..16 simultaneous
+HTTP attempts across every client sharing the LAW PostgreSQL ledger. The collector
+example uses these defaults and 300-second busy rechecks. Rate is an admission
+ceiling, not a promise of achieved throughput or provider permission to increase it.
 
 | LAW policy field | Default | Accepted values |
 | --- | --- | --- |
+| `max_in_flight` | 4 | 1..16 shared HTTP attempts |
 | `pilot_attempt_limit` | 100 | 1..1,000,000 or `"unlimited"` |
 | `on_demand_attempt_limit` | 32 | 1..1,000,000 or `"unlimited"` |
 | `pilot_timeout_secs` | 1800 | 60..86400 |
@@ -446,6 +451,34 @@ while `scan_interval_secs` bounds busy rechecks and notifications wake them earl
 A five-second readiness fallback does not start extra scans while busy. Disable
 adaptive polling to retain the original fixed delay after inventory passes.
 Neither setting defines freshness or collection-gap retry eligibility.
+
+`[database].max_raw_bytes` defaults to `"unlimited"` and optionally accepts a
+positive byte count. A finite cap stops further publication when reached; it
+never evicts historical evidence. Current and historical bodies, attachments and
+corrected captures remain archived permanently. The staging cap and individual
+response/document limits remain finite; withdrawal still blocks public access.
+`retain_history_bodies` defaults to `true` in enabled ingestion.
+
+Registered source families are a closed operator-maintained catalog; callers
+cannot add arbitrary provider targets or URLs. Materials carry independent reuse
+evidence and warnings. Verified noncommercial materials expose
+`noncommercial_only`; no-derivatives materials expose
+`no_derivatives_original_only` and are offered as original bytes without OCR,
+extraction, excerpting, comparison or body indexing. Unverified materials retain
+metadata, an official link and `rights_unverified`, with their original download
+and public content withheld. Primary legal-information reuse permission does not
+transfer automatically to attachments, commentary or third-party content.
+
+LAW authentication echoed in documented XML transport-link fields is redacted
+only from the exact credential in a law.go.kr link's `OC` query value before
+processing and retention. Provenance and diagnostics disclose that change;
+legal wording and other source fields remain unchanged. Capture digests identify
+the retained artifact. An original XML download returns that artifact with
+the authentication-link redaction, while permitted PDF/HWP/HWPX attachments remain
+unchanged files. Credential-bearing HTML or opaque binary responses are withheld
+without alteration. Private transport observations do not automatically acquire a
+public source-file link or legal citation. See the
+[provider profile](providers/kr-law-go-kr.md#text-evidence-and-references).
 
 `[demo.provider_requests]` configures the synthetic upstream independently:
 
@@ -467,7 +500,8 @@ For admission governed only by request rate and finite execution deadlines:
 [database.ingestion.provider_requests]
 continuous_daily_limit = "unlimited"
 on_demand_daily_limit = "unlimited"
-requests_per_second = 10
+requests_per_second = 5
+max_in_flight = 4
 pilot_attempt_limit = "unlimited"
 on_demand_attempt_limit = "unlimited"
 
@@ -485,3 +519,17 @@ uses a separate scheduler and request Job Pods with explicit kubeconfig/context
 and projected tokens. The serving Pod has no provider credential. See the
 [document controller contract](document-sandbox.md#input-output-and-lifecycle)
 for subprocess environment and credential boundaries.
+
+The original-download budget is separate from serialized MCP results. Each
+`/source-file/{capture_id}/{ordinal}` download reserves 768 MiB before loading
+its capture and evidence; decoded records are bounded to 64 MiB and the exact
+original response remains bounded to 100 MiB. A smaller original budget is
+invalid, and simultaneous downloads share this budget.
+
+`database.corpus_status` reads durable clone progress without contacting LAW.
+`initial_canonical_clone_complete` requires two stable inventory traversals,
+all required verified bodies, no unfinished jobs or gaps, and index acknowledgement.
+`full_available_clone_complete` additionally requires supplemental coverage and
+no unresolved guide contracts. An English response retained with unverified
+identity cannot satisfy required-body coverage. Completion describes a stable
+observed traversal, not an atomic provider snapshot.

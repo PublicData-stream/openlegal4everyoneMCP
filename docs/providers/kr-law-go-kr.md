@@ -4,21 +4,48 @@
 
 The repository implements an opt-in adapter for the Republic of Korea's Ministry
 of Government Legislation (법제처), through 국가법령정보 공동활용 / LAW OPEN DATA.
-Configured ingestion covers national statutes (`eflaw`), administrative rules
-(`admrul`), ordinances (`ordin`), treaties (`trty`), precedents (`prec`),
-constitutional decisions (`detc`), legal interpretations (`expc`) and
-administrative appeals (`decc`). The treaty record keeps the provider's
-bilateral/multilateral code as a `document_type` search facet; these are nine
-public categories across eight stored datasets. The existing NTS precedent HTML
-path remains. Provider integration is disabled without explicit configuration
-and a document sandbox.
+The closed source registry contains **69 original families**, preserving the
+existing statute (`eflaw`), administrative-rule (`admrul`), ordinance (`ordin`),
+treaty (`trty`), precedent (`prec`), constitutional-decision (`detc`), interpretation
+(`expc`) and appeal (`decc`) identities. Institution and ministry/commission
+namespaces remain distinct. Mobile, customized-subset and provision views do not
+create new legal objects. List-only families do not acquire an invented detail
+endpoint; knowledge-base result ordinals do not become stable legal-object IDs.
+The existing NTS precedent HTML path remains. Ingestion requires explicit
+configuration and a document sandbox.
 
-Official documentation was inspected during the September 2026 implementation.
-The checked-in mapping tests use **fictional fixtures**, not captured legal records.
-No authenticated endpoint, account approval, quota, live response contract, or
-production deployment has been verified. Implemented request construction and
-local tests do not establish successful live integration. In particular, actual
-NTS HTML identity markers remain unverified; unrecognized markup fails closed.
+Public documentation was captured on **2026-10-04**. The guide index displays 191
+items, while its fetched HTML contains **195 unique guide links**. The catalog
+preserves all 195 without assuming an explanation for this discrepancy; it groups
+them into original families, finite metadata, identified supplements and query-only
+features. Query-only services have no finite query-space traversal. These counts
+are documentation evidence, not an account-scope inventory or proof that all
+families have been downloaded. The [catalog evidence and unresolved contracts](../../test-support/fixtures/law-go-kr/CATALOG.md) distinguish those limits.
+
+The date-filtered [statute change inventory](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=lsChgListGuide)
+and [daily provision change inventory](https://open.law.go.kr/LSO/openApi/guideResult.do?htmlName=lsDayJoRvsListGuide)
+remain `NeedsVerification`, with requests disabled. Their date filters do not
+establish an earliest supported date or a complete change-date universe. The
+daily provision endpoint documents next-day availability. Neither sample dates,
+promulgation/effective dates nor an empty response for today establish full coverage.
+
+Mapping tests use fictional records and public guide-field fixtures, rather than
+an authenticated full-corpus capture. Successful local tests do not establish
+account approval, actual provider limits, all live response contracts or production
+rollout. Actual NTS HTML identity markers remain unverified; unrecognized markup
+fails closed. Existing eight-dataset live observations, when separately recorded,
+do not establish successful access to newly registered families.
+
+Finite inventory and identified-supplement responses can also be retained as
+permanent source observations that preserve the retained evidence bytes. LAW
+authentication echoed in documented link fields is redacted before storage; this
+exception is recorded rather than presented as untouched HTTP evidence. Their
+content-derived observation IDs
+are separate from legal-record captures and citations; a retained list or relation
+response does not establish the identity, currentness or completeness of a legal
+record. Duplicate bytes for the same registered source key update validation time
+without additional retained-byte accounting. Corrected responses preserve both
+observations. Unverified materials remain metadata-only.
 
 ## Authoritative sources
 
@@ -56,6 +83,17 @@ DRF APIs. Do not characterize the configured `eflaw`, `admrul`, `ordin`, `trty`,
 The separately licensed file-data conversion APIs on `data.go.kr` are different
 services; their licenses do not establish restrictions on these DRF routes.
 Preserve required source attribution and approved access conditions.
+
+Reuse permission is recorded per material, with evidence URL and attribution.
+The generic legal-information guidance does not establish third-party dictionary,
+institutional-document, linked-content or attachment rights. Verified noncommercial
+materials preserve `noncommercial_only`; their warning does not confer additional
+permission. Verified no-derivatives materials preserve original bytes and provider
+metadata only, skipping OCR, extraction, body indexing, excerpts, comparisons and
+conversion. They expose `no_derivatives_original_only`. Unverified materials retain
+metadata, official links and `rights_unverified` while original download and public
+content remain withheld. Permission for a primary legal record is never inherited
+by commentary or attachments automatically.
 
 ## Identity, views and dates
 
@@ -124,9 +162,24 @@ provider-field text. OCR never replaces provider text.
 
 The adapter downloads documented national PDF/HWP attachment-link fields through
 an exact host/path allowlist. Ordinance attachment filenames alone do not justify
-inventing a download URL. Primary and attachment bytes are immutable evidence;
+inventing a download URL. Retained primary and attachment bytes are immutable
+evidence;
 extracted sections carry their source digest and physical page. XML, HTML, PDF,
 HWP5, HWPX and OCR parsing use the configured no-network document sandbox.
+
+LAW may echo the request's authentication query in documented XML detail-link
+fields. Only the exact active credential in a law.go.kr link's `OC` query value
+is redacted before sandbox processing, permanent retention and public metadata.
+This is a narrow exception to preserving upstream response bytes: legal wording
+and non-authentication fields
+remain unchanged. Retained digests, captures and original downloads identify the
+authentication-redacted artifact, not the untouched HTTP response. Provenance and
+processing diagnostics report the transformation through `credentials_redacted`,
+`transport_credentials_redacted` and `provider_credential_redacted`. A response
+that still contains the active credential is withheld; neither the credential nor
+that response enters the archive. HTML and opaque PDF/HWP/HWPX responses containing
+the credential are withheld without alteration. This exception does not authorize
+body rewriting or weaken material-specific reuse restrictions.
 
 An attachment endpoint can return HTTP success with bytes in the wrong document
 format. An HTML response gets at most two additional requests through the same
@@ -173,12 +226,16 @@ These are application choices, not claimed upstream service guarantees:
 - HEAD is fresh for one hour; disclosed stale serving ends at 24 hours after
   validation. An observed replacement immediately makes HEAD processing-pending,
   including when the durable job queue is full.
-- Current bodies remain durable. Historical bodies have a 30-day retention policy;
-  independent revision and capture metadata catalogs survive body eviction.
-  Active sessions and index acknowledgment protect bytes during retention.
-- `mode = "pilot"` queues up to two revision-only manual candidates and two
-  live current-list HEAD candidates for each of the nine public categories,
-  scanning at most five live list pages per category. It stops upstream work
+- Permitted current and historical bodies, attachments and corrected captures
+  remain permanently archived, including multiple captures of one official
+  revision. Withdrawal still blocks public access; archived evidence does not
+  become current merely because it remains stored. Reader/session leases retain
+  their coordination role. Previously deleted bytes must be recollected as new
+  captures and cannot be restored under an old capture identity.
+- `mode = "pilot"` uses bounded manual candidates for the legacy categories and
+  live list candidates, scanning at most five live list pages per category.
+  Extended families remain subject to the same finite pilot request allowance;
+  a pilot is not a complete source inventory. It stops upstream work
   after 30 minutes by default. The durable PostgreSQL ledger defaults to at most
   100 attempts in this pilot, including list, detail and attachment requests.
   `pilot_attempt_limit` accepts a positive number or `"unlimited"`, and
@@ -217,39 +274,40 @@ These are application choices, not claimed upstream service guarantees:
   catalogs or corpus-wide coverage complete. Historical details are revalidated
   when their previous validation is over one hour old; unchanged bytes and
   records keep the existing capture, while corrected content creates a new
-  capture. A body past its 30-day public retention age must be recaptured.
-  Identical observations do not advance publication fences or sequences.
-- Admission allows one fetch at a time and reserves an attempt before DNS.
+  capture without removing the previous one. Identical observations do not
+  advance publication fences or sequences. Historical access has no 30-day
+  expiry; successful revalidation changes validation timing, not capture time.
+- Admission reserves an attempt before DNS, with four simultaneous HTTP
+  attempts by default across all clients sharing the PostgreSQL LAW ledger.
   `[database.ingestion.provider_requests]` configures independent
-  `continuous_daily_limit` and `on_demand_daily_limit` budgets and their shared
-  spacing, persisted in PostgreSQL across restarts. Select `requests_per_second`
-  (1..1000, evenly paced and rounded up to milliseconds) or the legacy
-  `min_interval_secs`; specifying both is invalid. Omitted
-  settings default to 1,000 attempts per UTC day for each budget and five seconds
-  between attempts. Daily limits accept 1–1,000,000 attempts or `"unlimited"`;
-  unlimited attempts remain charged. These are UTC calendar-day limits, not
-  rolling 24-hour windows. Minimum spacing
-  accepts 1–3,600 seconds. The active collection template selects 50,000 automatic
-  attempts, 1,000 explicit on-demand attempts and one-second minimum spacing,
-  for an aggregate daily admission ceiling of 51,000 attempts. List, detail,
-  attachment and retry attempts all spend the selected budget. These are operator
-  policy, not a provider quota assertion or a promise of achieved throughput.
-  Applying changed settings preserves already charged daily counts, admission
-  pauses, unresolved responses and operator suspension. The next admissible time
-  is conservatively rounded to a whole second.
+  `continuous_daily_limit` and `on_demand_daily_limit` budgets, shared spacing
+  and `max_in_flight` (1..16). Select `requests_per_second` (1..1000, evenly
+  paced and rounded up to milliseconds) or legacy `min_interval_secs` (1..3600);
+  selecting both is invalid. Omission defaults to five starts per second, no
+  burst, unlimited continuous attempts and 1,000 explicit attempts per UTC day.
+  Daily limits accept 1..1,000,000 or `"unlimited"`, and unlimited attempts remain
+  charged. The committed collection template selects these same defaults.
+  Daily limits use UTC calendar days, not rolling windows. Lists, details,
+  attachments and retries all share admission. The rate is operator policy,
+  not a provider quota assertion or a throughput guarantee. Both waiting modes
+  alternate admission; expired waiting tickets relinquish priority. Configuration
+  preserves charged counts, pauses, uncertain evidence and suspension, including
+  when changing concurrency. The next admissible time rounds to whole seconds.
   HTTP 429/503 persists admission pauses from `Retry-After` across restarts,
   including HTTP dates. Guidance over seven days sets durable
   `operator_suspended=true` and blocks further attempts until the operator
   verifies the provider state, clears the suspension and restarts ingestion;
   the recorded `next_allowed_at` still prevents an early retry.
-  Each reserved request remains marked `unresolved_response` until its outcome
-  is handled. A bounded failed download clears the marker only after its charged
-  attempt is classified for an incomplete page, detail, or attachment.
-  Cancellation before outcome handling leaves that marker set,
-  even if the request may not have been sent. A crash while that marker remains,
-  or a failed pause or source suspension write, leaves ingestion stopped after
-  restart; the operator must
-  inspect the provider state before clearing it.
+  Each reservation has an owner/slot in `provider_request_admission` and a
+  detached advisory-lock session. A live owner permits other slots to proceed;
+  loss of any owner's session leaves durable uncertain evidence and globally
+  stops new requests. A bounded classified failure can settle only its own
+  reservation. Cancellation before outcome handling keeps that evidence, even
+  if the request may not have been sent. Late rejection or another owner's
+  completion cannot erase it. Legacy singleton `unresolved_response` remains
+  a separate global fence. Operator review of provider state is required before
+  clearing either form of uncertain evidence. A failed pause or suspension write
+  also preserves the unresolved reservation.
   Deferred claims do not spend another job attempt while
   the pause holds. Individual 404/410, bounded download failures, and corrupt
   downloaded bytes are classified separately from authentication and unsafe
@@ -260,8 +318,11 @@ These are application choices, not claimed upstream service guarantees:
 - The queue holds at most 128 active jobs, with three total attempts by default
   (`max_job_attempts` accepts 1..10, including the first execution) and fenced
   claims. A publication accepts at most 100 MiB combined source bytes and 64
-  attachments; extracted/OCR text is limited to 16 MiB. Raw corpus, historical
-  and staging accounting have separate limits of 480 GiB, 64 GiB and 16 GiB.
+  attachments; extracted/OCR text is limited to 16 MiB. Raw corpus accounting
+  defaults to `"unlimited"`; `[database].max_raw_bytes` optionally accepts a
+  positive byte count. Reaching it blocks new publication without removing old
+  evidence. There is no separate 64 GiB history cap. Staging retains a 16 GiB cap;
+  filesystem exhaustion also blocks new writes until capacity becomes available.
 
 On-demand operations default to 32 admission attempts and 7200 seconds.
 `on_demand_attempt_limit` accepts 1..1,000,000 or `"unlimited"` and
@@ -292,9 +353,36 @@ validation timing without inventing a new capture.
 
 ## Remaining external validation
 
+The [2026-10-04 acceptance record](../../test-support/fixtures/law-go-kr/ACCEPTANCE.md)
+separates offline tests, native dev execution and a bounded authenticated probe.
+The probe observed first-page inventories for all 69 families; it did not complete
+an operational clone or establish every detail/attachment contract.
+
 Approved credentials, actual quotas, conditional validators, upstream error bodies,
 correction/deletion semantics, attachment availability and representative provider
 fixtures still require authorized verification. Preserve this distinction in
 release notes and coverage reporting. Ordinary tests must not make live provider
 requests. See the [legal-data policy](../legal-data-policy.md),
 [upstream policy](../upstream-policy.md) and [database contract](../database.md).
+
+### Transport evidence and separately licensed material
+
+Approved primary legal-information API responses are retained privately as
+transport evidence before parsing, including when parsing fails. The only permitted
+transport redaction replaces only the exact active credential in a law.go.kr
+link's `OC` query value in documented XML fields. Retained evidence is exact after
+that disclosed transformation. This implements
+the requested permanent audit archive under the service's
+[legal-information reuse guidance](https://open.law.go.kr/LSO/information/guide.do)
+and [copyright policy](https://www.law.go.kr/lawPetitionForm.do?menuId=13&subMenuId=79).
+Treating the API envelope as transport evidence is an implementation interpretation;
+it does not verify reuse rights for every embedded third-party work. Unknown
+inline supplementary content is excluded from body projection, and its containing
+original response is not exported through source-file. Unknown separate attachments
+are metadata-only and never trigger an extra body download. Unknown source families
+also retain metadata only. Primary transport evidence is never automatically promoted
+to a public resource when supplementary rights remain unresolved.
+
+Verified primary article units seed provision-history and term relations from
+explicit numeric article and branch fields (JO: four plus two digits). Article
+keys and missing branch fields never supply inferred JO identifiers.

@@ -37,8 +37,9 @@ owns query identity, compatible current heads, immutable observed occurrences an
 retention metadata. Blob storage owns content-addressed source bytes. Explicit
 memory mode is non-persistent and is suitable for isolated demonstrations/tests.
 Cold starts and persistent misses remain within the same upstream request budget.
-A retained capture is an observation, not an authoritative legal revision or a
-promise of permanent archival storage.
+A retained capture is an observation, not an authoritative legal revision. The
+LAW corpus permanently archives permitted evidence; freshness and withdrawal
+remain independent of that storage policy.
 
 Keys must distinguish all dimensions affecting the result: provider, dataset,
 record or query identity, revision/date selector, language/representation,
@@ -108,20 +109,21 @@ return local data and a receipt rather than waiting for provider results.
 `database.request_collection` stores an explicit coalesced request for the same
 dedicated collection Job path; `database.collection_status` only reads its state.
 Disable automatic collection to retain local-only lookup/search behavior.
-The scheduler and request Jobs share provider spacing and
-single-call admission. Operator configuration selects independent continuous and
-explicit daily caps, each accepting a positive limit or `"unlimited"`, and shared
-request pacing. These are UTC calendar-day caps, not rolling 24-hour windows. Defaults are 1,000 reserved
-attempts per UTC day for each mode and a five-second minimum interval. The
-ingestion template selects 50,000 continuous and 1,000 explicit attempts with a
-one-second minimum interval and a five-minute busy recheck interval. This is operator
-policy, not a claim about provider quotas or achieved throughput. All clients use
-the same durable policy and charged counters, including after restarts. Increasing
-an exhausted budget may advance only budget-wait leases; it must preserve existing
+The scheduler and request Jobs share provider spacing and bounded parallel
+admission. Operator configuration selects independent continuous and explicit
+daily caps, each accepting a positive limit or `"unlimited"`, and shared request
+pacing. These are UTC calendar-day caps, not rolling 24-hour windows. Continuous
+collection defaults to `"unlimited"`, explicit collection to 1,000 reserved
+attempts per day, and the shared rate to five starts per second without burst.
+`max_in_flight` defaults to four shared HTTP attempts and accepts 1..16. The
+ingestion template uses these defaults and a five-minute busy recheck interval.
+These are operator choices, not evidence of provider permission or throughput.
+All clients use the same durable policy and charged counters after restarts.
+Increasing an exhausted budget may advance only budget-wait leases; it preserves
 Retry-After pauses, suspension and unresolved-response evidence. Lowering a cap
-retains already charged attempts and blocks further admission until allowance
-exists. Unlimited admission continues recording attempts, so returning to a finite
-cap cannot discard prior usage. The scan interval is independent of legal-data freshness and gap retries.
+retains charged attempts and blocks admission until allowance exists. Unlimited
+admission continues recording attempts, so returning to a finite cap cannot
+discard prior usage. The scan interval is independent of freshness and gap retries.
 
 `[database.ingestion].adaptive_polling` defaults to `true`. An idle LAW provider
 starts its next inventory cycle immediately, including without downstream demand.
@@ -132,10 +134,15 @@ A five-second readiness fallback re-reads state without initiating another scan
 while still busy. Setting `adaptive_polling = false` restores fixed waits after
 inventory cycles. This policy does not change synthetic retrieval.
 
-Eligible demand takes the next HTTP slot after the current call. Daily-exhausted
-demand and document parsing alone do not hold that slot. Session advisory locks
-and owner tokens fence durable attempts across processes. An abandoned response
-marker remains fail-closed; a waiter behind a live owner spends no request attempt.
+When continuous and on-demand work both wait, eligible modes alternate HTTP
+admission. Daily-exhausted demand and document parsing do not hold HTTP slots.
+Bounded leased waiting tickets relinquish priority on expiry. Each charged HTTP
+attempt has its own durable UUID, slot and detached advisory-lock session; live
+owners permit other slots to proceed. An abandoned response in any slot globally
+blocks new attempts until operator review, including after lowering concurrency.
+Response settlement and late source rejection never clear another owner's
+uncertain evidence. Legacy singleton `unresolved_response` remains a global
+fence; new per-request evidence lives in `provider_request_admission`.
 Processing claims released before any durable reservation are refunded with an
 owner fence. Retry-After, failure retries and finite operation deadlines still apply.
 
@@ -153,8 +160,8 @@ startup, before any provider request is made. An uncertain Job creation outcome
 remains fenced until it can be reconciled or its lease expires.
 
 LAW accepts `requests_per_second = 1..1000` instead of an explicitly selected
-`min_interval_secs`; specifying both is invalid. Requests remain single-flight,
-with start spacing rounded up to milliseconds. This is an upper bound, not a
+`min_interval_secs`; specifying both is invalid. Start spacing is rounded up to
+milliseconds and all concurrent slots share it. This is an upper bound, not a
 throughput guarantee. Daily exhaustion never clears a provider pause.
 
 Synthetic retrieval has its own `[demo.provider_requests]` policy. Its daily cap
