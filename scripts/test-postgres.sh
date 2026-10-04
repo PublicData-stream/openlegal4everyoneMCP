@@ -7,6 +7,13 @@ container="openlegal-postgres-test-$$"
 unsupported_container="${container}-unsupported"
 unsupported_image=postgres@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
 network="openlegal-postgres-network-$$"
+prebuilt_directory=""
+if [[ ${1:-} == --prebuilt-directory ]]; then
+    [[ $# == 2 && -n $2 ]] || { echo 'usage: test-postgres.sh --prebuilt-directory DIR' >&2; exit 2; }
+    prebuilt_directory=$2
+    [[ -n ${OPENLEGAL_TEST_MECAB_DICTIONARY:-} ]] || { echo 'Prebuilt execution requires an explicitly provisioned OPENLEGAL_TEST_MECAB_DICTIONARY.' >&2; exit 2; }
+    shift 2
+fi
 runner_container=""
 dictionary_fixture=""
 cleanup() {
@@ -20,7 +27,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-for command in docker cargo python3 timeout openssl; do
+required_commands=(docker python3 timeout openssl)
+if [[ -z $prebuilt_directory ]]; then required_commands+=(cargo); fi
+for command in "${required_commands[@]}"; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
 # Corpus integration tests use the complete explicitly provisioned dictionary.
@@ -99,7 +108,9 @@ export OPENLEGAL_TEST_POSTGRES_CONTAINER="$container"
 export OPENLEGAL_TEST_DATABASE_URL="postgresql://postgres:$password@$endpoint/postgres"
 cd "$repo"
 # All ignored tests are explicitly invoked here, never silently skipped for missing fixtures.
-if (( $# )); then
+if [[ -n $prebuilt_directory ]]; then
+    python3 "$repo/scripts/run-prebuilt-postgres-tests.py" "$prebuilt_directory"
+elif (( $# )); then
     cargo test --locked "$@" -- --ignored --test-threads=1
 else
     cargo test --workspace --locked -- --ignored --test-threads=1
