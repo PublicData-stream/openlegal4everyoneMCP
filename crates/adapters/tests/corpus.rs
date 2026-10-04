@@ -525,11 +525,13 @@ async fn terminal_failed_job_clears_request_without_touching_provider_budget() {
     );
     let coalesced = store.request_collection(request.clone()).await.unwrap();
     assert_eq!(coalesced.request_id, id);
-    sqlx::query("UPDATE openlegal.collection_request SET completed_at=completed_at-3601 WHERE id=$1")
-        .bind(uuid::Uuid::parse_str(&id).unwrap())
-        .execute(&base.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE openlegal.collection_request SET completed_at=completed_at-3601 WHERE id=$1",
+    )
+    .bind(uuid::Uuid::parse_str(&id).unwrap())
+    .execute(&base.pool())
+    .await
+    .unwrap();
     let retried = store.request_collection(request).await.unwrap();
     assert_ne!(retried.request_id, id);
     assert_eq!(retried.status, "queued");
