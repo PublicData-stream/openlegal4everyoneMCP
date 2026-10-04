@@ -1,5 +1,92 @@
 /** Bounded wire validation for the legal database browser. Fixture data is explicitly synthetic. */
-export type Dataset = 'national_statute' | 'administrative_rule' | 'ordinance' | 'treaty' | 'precedent' | 'constitutional_decision' | 'legal_interpretation' | 'administrative_appeal';
+/** Closed wire names matching openlegal_domain::legal::Dataset::ALL. */
+export const DATASETS = [
+  'national_statute',
+  'administrative_rule',
+  'ordinance',
+  'treaty',
+  'precedent',
+  'constitutional_decision',
+  'legal_interpretation',
+  'administrative_appeal',
+  'english_statute',
+  'school_rule',
+  'local_public_corporation_rule',
+  'public_institution_rule',
+  'legal_term',
+  'ppc_decision',
+  'eiac_decision',
+  'ftc_decision',
+  'acr_decision',
+  'fsc_decision',
+  'nlrc_decision',
+  'kcc_decision',
+  'iaciac_decision',
+  'oclt_decision',
+  'ecc_decision',
+  'sfc_decision',
+  'nhrck_decision',
+  'moel_interpretation',
+  'molit_interpretation',
+  'moef_interpretation',
+  'mof_interpretation',
+  'mois_interpretation',
+  'me_interpretation',
+  'kcs_interpretation',
+  'nts_interpretation',
+  'moe_interpretation',
+  'msit_interpretation',
+  'mpva_interpretation',
+  'mnd_interpretation',
+  'mafra_interpretation',
+  'mcst_interpretation',
+  'moj_interpretation',
+  'mohw_interpretation',
+  'motie_interpretation',
+  'mogef_interpretation',
+  'mofa_interpretation',
+  'mss_interpretation',
+  'mou_interpretation',
+  'moleg_interpretation',
+  'mfds_interpretation',
+  'mpm_interpretation',
+  'kma_interpretation',
+  'khs_interpretation',
+  'rda_interpretation',
+  'npa_interpretation',
+  'dapa_interpretation',
+  'mma_interpretation',
+  'kfs_interpretation',
+  'nfa_interpretation',
+  'oka_interpretation',
+  'pps_interpretation',
+  'kdca_interpretation',
+  'kostat_interpretation',
+  'kipo_interpretation',
+  'kcg_interpretation',
+  'naacc_interpretation',
+  'tt_special_appeal',
+  'kmst_special_appeal',
+  'acr_special_appeal',
+  'adap_special_appeal',
+  'audit_consultation',
+] as const;
+export type Dataset = typeof DATASETS[number];
+const DATASET_NAMES: ReadonlySet<string> = new Set(DATASETS);
+export function isDataset(value: string): value is Dataset { return DATASET_NAMES.has(value); }
+const DATASET_LABELS: Partial<Record<Dataset, string>> = {
+  national_statute: 'National statutes', administrative_rule: 'Administrative rules',
+  ordinance: 'Ordinances', treaty: 'Treaties', precedent: 'Precedents',
+  constitutional_decision: 'Constitutional decisions', legal_interpretation: 'Legal interpretations',
+  administrative_appeal: 'Administrative appeals',
+};
+export function datasetLabel(value: Dataset): string { return DATASET_LABELS[value] ?? value.replaceAll('_', ' ').replace(/^./, first => first.toUpperCase()); }
+/** Only these families expose provider-owned revision histories. */
+const PROVIDER_REVISION_DATASETS: ReadonlySet<Dataset> = new Set([
+  'national_statute', 'administrative_rule', 'ordinance', 'english_statute',
+  'school_rule', 'local_public_corporation_rule', 'public_institution_rule',
+]);
+export function hasProviderRevisions(value: Dataset): boolean { return PROVIDER_REVISION_DATASETS.has(value); }
 export type ObjectId = { jurisdiction: string; provider: string; dataset: Dataset; id: string };
 export type CollectionNotice = { dataset: Dataset; scope: 'page' | 'detail'; code: 'source_unavailable' | 'source_data_invalid' | 'download_failed' | 'attachment_incomplete'; affected_count: number; last_seen_at: number; retry_at: number };
 export type Selector = { kind: 'head' } | { kind: 'revision' | 'capture'; id: string };
@@ -16,8 +103,8 @@ function hash(value: unknown): string { const result = text(value, 64); if (!/^[
 export function data(result: unknown): Record<string, unknown> { const response = object(result); if (response.isError) throw new Error('The database operation failed. Data may be unavailable, incomplete or expired.'); const value = object(response.structuredContent); if (bytes(JSON.stringify(value)) > 2 * 1024 * 1024) throw new Error('The response exceeds the browser display budget.'); return value; }
 export function identity(value: unknown): ObjectId {
   const id = object(value); const dataset = text(id.dataset, 32);
-  if (!['national_statute', 'administrative_rule', 'ordinance', 'treaty', 'precedent', 'constitutional_decision', 'legal_interpretation', 'administrative_appeal'].includes(dataset)) throw new Error('Unsupported dataset.');
-  const result = { jurisdiction: text(id.jurisdiction, 32), provider: text(id.provider, 64), dataset: dataset as ObjectId['dataset'], id: text(id.id, 128) };
+  if (!isDataset(dataset)) throw new Error('Unsupported dataset.');
+  const result = { jurisdiction: text(id.jurisdiction, 32), provider: text(id.provider, 64), dataset, id: text(id.id, 128) };
   if (![result.jurisdiction, result.provider, result.id].every(s => /^[A-Za-z0-9_-]+$/.test(s))) throw new Error('The server returned an invalid object identity.');
   return result;
 }
@@ -25,7 +112,7 @@ export function sameObject(a: ObjectId, b: ObjectId): boolean { return a.jurisdi
 export function collectionNotices(value: unknown): CollectionNotice[] {
   if (value == null) return [];
   if (!Array.isArray(value) || value.length > 64) throw new Error('The collection notices are invalid.');
-  return value.map(raw => { const n = object(raw); const dataset = text(n.dataset, 32); const scope = text(n.scope, 16); const code = text(n.code, 40); if (!['national_statute','administrative_rule','ordinance','treaty','precedent','constitutional_decision','legal_interpretation','administrative_appeal'].includes(dataset) || !['page','detail'].includes(scope) || !['source_unavailable','source_data_invalid','download_failed','attachment_incomplete'].includes(code)) throw new Error('The collection notice is unsupported.'); return { dataset: dataset as Dataset, scope: scope as CollectionNotice['scope'], code: code as CollectionNotice['code'], affected_count: number(n.affected_count), last_seen_at: number(n.last_seen_at), retry_at: number(n.retry_at) }; });
+  return value.map(raw => { const n = object(raw); const dataset = text(n.dataset, 32); const scope = text(n.scope, 16); const code = text(n.code, 40); if (!isDataset(dataset) || !['page','detail'].includes(scope) || !['source_unavailable','source_data_invalid','download_failed','attachment_incomplete'].includes(code)) throw new Error('The collection notice is unsupported.'); return { dataset, scope: scope as CollectionNotice['scope'], code: code as CollectionNotice['code'], affected_count: number(n.affected_count), last_seen_at: number(n.last_seen_at), retry_at: number(n.retry_at) }; });
 }
 export function searchPage(result: unknown): SearchPage {
   const value = data(result);

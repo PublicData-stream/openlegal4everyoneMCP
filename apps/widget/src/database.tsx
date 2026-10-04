@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from '@modelcontextprotocol/ext-apps';
 import { SourceOffer } from './SourceOffer.tsx';
-import { data, getResult, mergeCatalog, historyPage, metadata, searchPage, type ObjectId, type Selector, type SearchPage, type HistoryEntry, type CollectionNotice } from './database-model.ts';
+import { DATASETS, datasetLabel, isDataset, hasProviderRevisions, type Dataset, data, getResult, mergeCatalog, historyPage, metadata, searchPage, type ObjectId, type Selector, type SearchPage, type HistoryEntry, type CollectionNotice } from './database-model.ts';
 import { parseSummary, parsePage, parseDelete, type Comparison, type DiffPage } from './text-diff-model.ts';
 import './style.css';
 import './text-diff.css';
@@ -12,7 +12,7 @@ function noticeText(n: CollectionNotice) { const reason = n.code === 'source_una
 type Content = ReturnType<typeof getResult>;
 function DatabaseBrowser() {
   const [ready, setReady] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState('');
-  const [query, setQuery] = useState(''); const [mode, setMode] = useState<'query' | 'rg'>('query'); const [dataset, setDataset] = useState('');
+  const [query, setQuery] = useState(''); const [mode, setMode] = useState<'query' | 'rg'>('query'); const [dataset, setDataset] = useState<Dataset | ''>('');
   const [search, setSearch] = useState<SearchPage | null>(null); const [selected, setSelected] = useState<ObjectId | null>(null);
   const [content, setContent] = useState<Content | null>(null); const [history, setHistory] = useState<ReturnType<typeof historyPage> | null>(null);
   const [historyKind, setHistoryKind] = useState<'revisions' | 'captures'>('revisions');
@@ -47,7 +47,7 @@ function DatabaseBrowser() {
     if (live.current) setContent(merged);
   }
   function choose(id: ObjectId, selector: Selector) { void perform(async () => {
-    await clearComparison(); setSelected(id); setContent(null); setHistory(null); setBefore(null); setAfter(null); setHistoryKind(id.dataset === 'precedent' ? 'captures' : 'revisions');
+    await clearComparison(); setSelected(id); setContent(null); setHistory(null); setBefore(null); setAfter(null); setHistoryKind(hasProviderRevisions(id.dataset) ? 'revisions' : 'captures');
     await read(id, selector);
   }); }
   function listHistory(cursor: string | null = null) { if (selected) void perform(async () => {
@@ -72,7 +72,7 @@ function DatabaseBrowser() {
   return <main><header><p className="eyebrow">openlegal4everyone</p><h1>Legal corpus</h1><p>Search retained source records and compare checkpoints. Coverage may be incomplete; textual differences do not establish legal applicability.</p></header>
     <section aria-label="Corpus search"><label>Search expression<input value={query} disabled={busy} onChange={e => { setQuery(e.target.value); setSearch(null); }} /></label>
       <label>Search method<select value={mode} disabled={busy} onChange={e => { setMode(e.target.value as 'query' | 'rg'); setSearch(null); }}><option value="query">Analyzed query</option><option value="rg">Ripgrep regular expression</option></select></label>
-      <label>Dataset<select value={dataset} disabled={busy} onChange={e => { setDataset(e.target.value); setSearch(null); }}><option value="">All available datasets</option><option value="national_statute">National statutes</option><option value="administrative_rule">Administrative rules</option><option value="ordinance">Ordinances</option><option value="treaty">Treaties</option><option value="precedent">Precedents</option><option value="constitutional_decision">Constitutional decisions</option><option value="legal_interpretation">Legal interpretations</option><option value="administrative_appeal">Administrative appeals</option></select></label>
+      <label>Dataset<select value={dataset} disabled={busy} onChange={e => { const value = e.target.value; if (value === '' || isDataset(value)) { setDataset(value); setSearch(null); } }}><option value="">All available datasets</option>{DATASETS.map(value => <option key={value} value={value}>{datasetLabel(value)}</option>)}</select></label>
       <button disabled={!ready || busy} onClick={() => find()}>Search corpus</button></section>
     {busy && <p role="status">Loading corpus data…</p>}{error && <p role="alert">{error}</p>}
     {error && !comparison && handles.current.size > 0 && <button disabled={busy} onClick={() => void perform(clearComparison)}>Retry comparison cleanup</button>}
@@ -88,7 +88,7 @@ function DatabaseBrowser() {
         <label>Content section<select value={content.section} disabled={busy} onChange={e => void perform(() => read(selected, { kind: 'capture', id: meta.capture_id }, e.target.value, 0, content.session))}><option value="body">Body</option><option value="title">Title</option>{content.sections.map(s => <option key={s.id} value={s.id}>{s.title} ({s.kind})</option>)}</select></label>
         <p>{content.sections.length} of {content.section_count} section summaries loaded.</p><button disabled={busy || content.next_sections_offset === null} onClick={() => void perform(() => read(selected, { kind: 'capture', id: meta.capture_id }, content.section, content.offset, content.session, content.next_sections_offset!))}>Load more sections</button>
         <pre aria-label="Object content">{content.text}</pre><p>UTF-8 byte offset {content.offset}</p><button disabled={busy || content.next_offset === null} onClick={() => void perform(() => read(selected, { kind: 'capture', id: meta.capture_id }, content.section, content.next_offset!, content.session))}>Next content page</button></>}
-      <label>History type<select value={historyKind} disabled={busy} onChange={e => { setHistoryKind(e.target.value as 'revisions' | 'captures'); setHistory(null); setBefore(null); setAfter(null); }}><option value="revisions" disabled={selected.dataset === 'precedent'}>Provider revisions</option><option value="captures">Capture observations</option></select></label><button disabled={busy} onClick={() => listHistory()}>Load history</button>
+      <label>History type<select value={historyKind} disabled={busy} onChange={e => { setHistoryKind(e.target.value as 'revisions' | 'captures'); setHistory(null); setBefore(null); setAfter(null); }}><option value="revisions" disabled={!hasProviderRevisions(selected.dataset)}>Provider revisions</option><option value="captures">Capture observations</option></select></label><button disabled={busy} onClick={() => listHistory()}>Load history</button>
       {history && <><p>{history.inventory_complete ? 'Reported history inventory complete' : 'History inventory incomplete; retained entries may have gaps.'}</p>{history.entries.map((entry, index) => <p key={index}>{entry.revision_id} · {entry.captured_at === null ? 'Catalog entry; no retained capture observation' : `observed ${date(entry.captured_at)}`}  · publication {entry.publication_date ?? 'unknown'} · effective {entry.effective_date ?? 'unknown'} <button disabled={busy} onClick={() => void perform(() => read(selected, checkpoint(entry)))}>Read checkpoint</button> <button disabled={busy} onClick={() => setBefore(checkpoint(entry))}>Use as before</button> <button disabled={busy} onClick={() => setAfter(checkpoint(entry))}>Use as after</button></p>)}<button disabled={busy || !history.next_cursor} onClick={() => listHistory(history.next_cursor)}>Next history page</button></>}
       <p>Before: {before ? JSON.stringify(before) : 'not selected'} · After: {after ? JSON.stringify(after) : 'not selected'}</p><button disabled={busy || !before || !after} onClick={compare}>Compare checkpoints</button>
       {comparison && <section aria-label="Checkpoint comparison"><p>{diffProvenance}</p><p>{comparison.additions} added lines · {comparison.deletions} deleted lines</p>{comparison.equal && <p>Texts are equal.</p>}{diffPage?.fragments.map((f, index) => <pre key={index}>{f.patch}</pre>)}<button disabled={busy || !diffPage || diffPage.page + 1 >= comparison.change_pages} onClick={() => void perform(async () => { const page = diffPage!.page + 1; const next = parsePage(await call('text.diff.page', { comparison_id: comparison.comparison_id, view: 'changes', page }), { comparison_id: comparison.comparison_id, view: 'changes', page }); setDiffPage(next); })}>Next diff page</button><button disabled={busy} onClick={() => void perform(clearComparison)}>Clear comparison</button></section>}

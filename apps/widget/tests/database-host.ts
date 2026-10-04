@@ -3,7 +3,7 @@ import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/
 import { fixtureSummary, fixtureFragment } from './text-diff-fixtures.ts';
 const frame = document.querySelector('iframe')!;
 const bridge = new AppBridge(null, { name: 'Fictional database test host', version: '1' }, { serverTools: {}, openLinks: {} });
-const object = { jurisdiction: 'kr', provider: 'fixture', dataset: 'national_statute', id: 'fictional-1' };
+let object = { jurisdiction: 'kr', provider: 'fixture', dataset: 'national_statute', id: 'fictional-1' };
 const firstId = 'a'.repeat(64); const secondId = 'b'.repeat(64);
 const now = Math.floor(Date.now() / 1000);
 const downloadNotice = { dataset: 'national_statute', scope: 'page', code: 'download_failed', affected_count: 1, last_seen_at: now - 60, retry_at: now + 3540 };
@@ -14,6 +14,10 @@ bridge.onopenlink = async () => ({ isError: false });
 bridge.oncalltool = async ({ name, arguments: args }) => {
   const input = args ?? {}; const log = document.getElementById('calls')!;
   log.textContent = JSON.stringify([...JSON.parse(log.textContent || '[]'), { name, arguments: input }]);
+  if (name === 'database.query' || name === 'database.rg') {
+    const datasets = (input.filters as { datasets?: string[] } | undefined)?.datasets;
+    object = { ...object, dataset: datasets?.[0] ?? 'national_statute' };
+  }
   if (name === 'database.query' || name === 'database.rg') return ok({ schema_version: 1, hits: [{ object, revision_id: 'r1', capture_id: firstId, title: 'Fictional sample statute', match_scope: name === 'database.query' ? 'object' : 'line', excerpt_section: 'body', includes_ocr: false, section: name === 'database.query' ? 'object' : 'body', line: name === 'database.query' ? 0 : 1, text: '<b>fictional evidence</b>', byte_start: 0, byte_end: 10, derived_ocr: false }], next_cursor: null, generation: 7, corpus_complete: false, scanned_bytes: 10, analyzer_version: 'fixture', index_lag: 2, collection_notices: [downloadNotice] });
   if (name === 'database.get') return ok({ session: input.session ?? 'e'.repeat(64), schema_version: 1, metadata: metadata(input.selector as Record<string, unknown>), section: input.section, text: input.section !== 'body' ? 'Fictional section content' : input.offset ? 'second fictional page' : 'first fictional page', offset: input.offset, next_offset: input.section !== 'body' || input.offset ? null : new TextEncoder().encode('first fictional page').length, section_count: 2, next_sections_offset: input.sections_offset ? null : 1, sections: [{ id: input.sections_offset ? 'x'.repeat(256) : 'first', title: input.sections_offset ? 'Second fictional section' : 'First fictional section', kind: 'provider_text', bytes: 25 }] });
   if (name === 'database.history') return ok({ entries: ['r1', 'r2'].map((revision_id, index) => ({ revision_id, capture_id: input.kind === 'captures' ? (index ? secondId : firstId) : null, sequence: index + 1, captured_at: input.kind === 'captures' ? now - 20 : null, publication_date: null, effective_date: null })), next_cursor: null, inventory_complete: false });

@@ -1,8 +1,41 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getResult, identity, metadata, searchPage, mergeCatalog, historyPage } from '../src/database-model.ts';
+import { readFileSync } from 'node:fs';
+import { DATASETS, datasetLabel, hasProviderRevisions, getResult, identity, metadata, searchPage, mergeCatalog, historyPage } from '../src/database-model.ts';
 const id = { jurisdiction: 'kr', provider: 'fixture', dataset: 'national_statute' as const, id: 'fictional' };
 const meta = { object: id, revision_id: 'r1', capture_id: 'a'.repeat(64), title: 'Fictional', source_url: 'https://fixture.example/', retrieved_at: 1, captured_at: 2, validated_at: 3, raw_sha256: 'b'.repeat(64), processor_version: 'fixture', metadata: {}, freshness: null };
+test('browser dataset and history contracts match the closed Rust domain', () => {
+  const domain = readFileSync(new URL('../../../crates/domain/src/legal.rs', import.meta.url), 'utf8');
+  const names = new Map([...domain.split('pub fn as_str')[1].split('pub fn from_name')[0].matchAll(/Self::(\w+) => "([a-z_]+)"/g)].map(match => [match[1], match[2]]));
+  const expected = [...domain.split('pub const ALL:')[1].split('];')[0].matchAll(/Self::(\w+)/g)].map(match => names.get(match[1]));
+  assert.equal(DATASETS.length, 69);
+  assert.equal(new Set(DATASETS).size, DATASETS.length);
+  assert.deepEqual(DATASETS, expected);
+  const revisionFamilies = [...domain.split('pub fn has_provider_revisions')[1].split('\n    }')[0].matchAll(/Self::(\w+)/g)].map(match => names.get(match[1]));
+  assert.deepEqual(DATASETS.filter(hasProviderRevisions), revisionFamilies);
+  assert.equal(datasetLabel('national_statute'), 'National statutes');
+  assert.equal(datasetLabel('ppc_decision'), 'Ppc decision');
+});
+test('new source records and notices remain valid in mixed dataset search pages', () => {
+  const datasets = ['english_statute', 'public_institution_rule', 'ppc_decision', 'mof_interpretation', 'audit_consultation'] as const;
+  const hits = datasets.map(dataset => ({ object: { ...id, dataset }, revision_id: 'r1', capture_id: meta.capture_id, title: 'Fictional source', section: 'article:1', line: 1, text: 'Fictional text', derived_ocr: false, match_scope: 'line', excerpt_section: 'article:1', includes_ocr: false }));
+  const notices = datasets.map(dataset => ({ dataset, scope: 'detail', code: 'source_data_invalid', affected_count: 1, last_seen_at: 100, retry_at: 3700 }));
+  const page = searchPage({ structuredContent: { schema_version: 1, hits, next_cursor: null, generation: 1, corpus_complete: false, index_lag: 0, collection_notices: notices } });
+  assert.deepEqual(page.hits.map(hit => hit.object.dataset), datasets);
+  assert.deepEqual(page.collection_notices, notices);
+  for (const dataset of DATASETS) {
+    const object = { ...id, dataset };
+    assert.deepEqual(identity(object), object);
+    assert.deepEqual(metadata({ ...meta, object, collection_notices: [{ ...notices[0], dataset }] }, object, { kind: 'capture', id: meta.capture_id }).collection_notices[0].dataset, dataset);
+  }
+  for (const dataset of ['arbitrary_source', '../ppc_decision', 'PpcDecision']) {
+    assert.throws(() => identity({ ...id, dataset }), /Unsupported dataset/);
+    assert.throws(() => searchPage({ structuredContent: { schema_version: 1, hits: [], next_cursor: null, generation: 0, corpus_complete: false, index_lag: 0, collection_notices: [{ ...notices[0], dataset }] } }), /unsupported/);
+  }
+  assert.equal(hasProviderRevisions('english_statute'), true);
+  assert.equal(hasProviderRevisions('ppc_decision'), false);
+  assert.equal(hasProviderRevisions('audit_consultation'), false);
+});
 test('database object and selector validation prevents checkpoint substitution', () => {
   assert.deepEqual(identity(id), id);
   assert.throws(() => identity({ ...id, provider: '../escape' }));

@@ -1,4 +1,22 @@
 import { test, expect } from '@playwright/test';
+test('expanded dataset filters render new records and select capture history', async ({ page }) => {
+  await page.goto('/database'); const widget = page.frameLocator('iframe');
+  await expect(widget.getByRole('button', { name: 'Search corpus' })).toBeEnabled();
+  const datasets = widget.getByLabel('Dataset');
+  await expect(datasets.locator('option')).toHaveCount(70);
+  await datasets.selectOption('ppc_decision');
+  await widget.getByRole('button', { name: 'Search corpus' }).click();
+  await expect(widget.locator('article')).toContainText('ppc_decision');
+  await widget.getByRole('button', { name: 'Fictional sample statute' }).click();
+  await expect(widget.getByLabel('Object content')).toHaveText('first fictional page');
+  await expect(widget.getByLabel('History type')).toHaveValue('captures');
+  await expect(widget.getByLabel('History type').locator('option[value="revisions"]')).toHaveAttribute('disabled', '');
+  await widget.getByRole('button', { name: 'Load history' }).click();
+  await expect(widget.getByRole('button', { name: 'Read checkpoint' })).toHaveCount(2);
+  const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  expect(calls[0].arguments.filters.datasets).toEqual(['ppc_decision']);
+  expect(calls.at(-1).arguments.kind).toBe('captures');
+});
 test('fictional database bridge pins content pages and shows HEAD freshness', async ({ page }) => {
   await page.goto('/database'); const widget = page.frameLocator('iframe');
   await expect(widget.getByRole('button', { name: 'Search corpus' })).toBeEnabled();
