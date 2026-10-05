@@ -170,7 +170,11 @@ impl PgCorpusStore {
             .bind(id).bind(timeout_secs as i64).bind(attempt_limit.as_option().map(i64::from))
             .fetch_one(&mut *tx).await.map_err(db)?;
         let launch = launch_from_row(&row)?;
-        tx.commit().await.map_err(db)?;
+        // Claim COMMIT acknowledgements cannot be retried as pre-admission
+        // contention: the new launch epoch may already be durable.
+        tx.commit()
+            .await
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
         Ok(Some(launch))
     }
 
@@ -298,29 +302,7 @@ impl PgCorpusStore {
         if !matches!(status, "done" | "skipped" | "deferred" | "failed") {
             return Err(DatabaseError::InvalidInput);
         }
-        if reason.is_some_and(|value| {
-            !matches!(
-                value,
-                "ambiguous"
-                    | "source_inventory_incomplete"
-                    | "not_found"
-                    | "source_data_invalid"
-                    | "source_unavailable"
-                    | "download_failed"
-                    | "identity_conflict"
-                    | "worker_failed"
-                    | "worker_lost"
-                    | "collection_pending"
-                    | "already_fresh"
-                    | "collection_already_in_progress"
-                    | "head_observation_superseded"
-                    | "publication_superseded"
-                    | "no_matches"
-                    | "multiple_skip_reasons"
-            )
-        }) {
-            return Err(DatabaseError::InvalidInput);
-        }
+        validate_settlement_reason(reason)?;
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
         let changed = sqlx::query("UPDATE openlegal.collection_request SET status=$2,payload=CASE WHEN $2='deferred' THEN payload ELSE '{}'::jsonb END,lease_until=CASE WHEN $2='deferred' THEN floor(extract(epoch from clock_timestamp()))::bigint+3600 ELSE NULL END,reason=$3 WHERE id=$1 AND status IN ('launching','running')")
             .bind(id).bind(status).bind(reason).execute(&self.pool).await.map_err(db)?.rows_affected();
@@ -342,6 +324,10 @@ impl PgCorpusStore {
         if !matches!(status, "done" | "skipped" | "deferred" | "failed")
             || (status == "deferred") != deferred_until.is_some()
         {
+            return Err(DatabaseError::InvalidInput);
+        }
+        validate_settlement_reason(reason)?;
+        if deferred_until.is_some_and(|value| i64::try_from(value).is_err()) {
             return Err(DatabaseError::InvalidInput);
         }
         let id = Uuid::parse_str(&launch.id).map_err(|_| DatabaseError::InvalidInput)?;
@@ -407,7 +393,7 @@ impl PgCorpusStore {
         }
         // Both origins share any active canonical request, including deferred
         // requests. Their old terminal receipts remain addressable for 24 hours.
-        let active = sqlx::query("SELECT id,status,reason FROM openlegal.collection_request WHERE canonical_key=$1 AND status IN ('queued','launching','running','deferred') AND (expires_at>$2 OR status IN ('launching','running')) ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE")
+        let active = sqlx::query("SELECT id,status,reason,lease_until,floor(extract(epoch from clock_timestamp()))::bigint AS observed_at FROM openlegal.collection_request WHERE canonical_key=$1 AND status IN ('queued','launching','running','deferred') AND (expires_at>$2 OR status IN ('launching','running')) ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE")
             .bind(&canonical).bind(now).fetch_optional(&mut *tx).await.map_err(db)?;
         if let Some(row) = active {
             let receipt = receipt_from_row(&row)?;
@@ -425,10 +411,10 @@ impl PgCorpusStore {
             });
         }
         let latest = if demand {
-            sqlx::query("SELECT id,status,reason,completed_at,created_at FROM openlegal.collection_request WHERE canonical_key=$1 AND status IN ('done','skipped','failed') AND expires_at>$2 ORDER BY completed_at DESC NULLS LAST,created_at DESC,id DESC LIMIT 1 FOR UPDATE")
+            sqlx::query("SELECT id,status,reason,lease_until,completed_at,created_at,floor(extract(epoch from clock_timestamp()))::bigint AS observed_at FROM openlegal.collection_request WHERE canonical_key=$1 AND status IN ('done','skipped','failed') AND expires_at>$2 ORDER BY completed_at DESC NULLS LAST,created_at DESC,id DESC LIMIT 1 FOR UPDATE")
                 .bind(&canonical).bind(now).fetch_optional(&mut *tx).await.map_err(db)?
         } else {
-            sqlx::query("SELECT id,status,reason,completed_at,created_at FROM openlegal.collection_request WHERE canonical_key=$1 AND explicit_until>$2 AND status IN ('done','skipped','failed') ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE")
+            sqlx::query("SELECT id,status,reason,lease_until,completed_at,created_at,floor(extract(epoch from clock_timestamp()))::bigint AS observed_at FROM openlegal.collection_request WHERE canonical_key=$1 AND explicit_until>$2 AND status IN ('done','skipped','failed') ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE")
                 .bind(&canonical).bind(now).fetch_optional(&mut *tx).await.map_err(db)?
         };
         if let Some(row) = latest {
@@ -525,27 +511,13 @@ impl PgCorpusStore {
     pub async fn collection_status(&self, id: &str) -> Result<CollectionReceipt, DatabaseError> {
         self.gate().await?;
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
-        let row = sqlx::query("SELECT status,reason FROM openlegal.collection_request WHERE id=$1")
+        let row = sqlx::query("SELECT id,status,reason,lease_until,floor(extract(epoch from clock_timestamp()))::bigint AS observed_at FROM openlegal.collection_request WHERE id=$1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .map_err(db)?
             .ok_or(DatabaseError::NotFound)?;
-        let status: String = row.try_get("status").map_err(db)?;
-        let reason: Option<String> = row.try_get("reason").map_err(db)?;
-        let retry_after_seconds = if status == "deferred" {
-            3600
-        } else if matches!(status.as_str(), "queued" | "launching" | "running") {
-            10
-        } else {
-            0
-        };
-        Ok(CollectionReceipt {
-            request_id: id.to_string(),
-            status,
-            retry_after_seconds,
-            reason,
-        })
+        receipt_from_row(&row)
     }
 
     pub async fn prune_collection_requests(&self) -> Result<(), DatabaseError> {
@@ -563,19 +535,66 @@ impl PgCorpusStore {
 
 fn receipt_from_row(row: &PgRow) -> Result<CollectionReceipt, DatabaseError> {
     let status: String = row.try_get("status").map_err(db)?;
-    let retry_after_seconds = if status == "deferred" {
-        3600
-    } else if matches!(status.as_str(), "queued" | "launching" | "running") {
-        10
-    } else {
-        0
-    };
+    let retry_after_seconds = receipt_retry_after(
+        &status,
+        row.try_get("lease_until").map_err(db)?,
+        row.try_get("observed_at").map_err(db)?,
+    )?;
     Ok(CollectionReceipt {
         request_id: row.try_get::<Uuid, _>("id").map_err(db)?.to_string(),
         status,
         retry_after_seconds,
         reason: row.try_get("reason").map_err(db)?,
     })
+}
+
+fn receipt_retry_after(
+    status: &str,
+    lease_until: Option<i64>,
+    observed_at: i64,
+) -> Result<u32, DatabaseError> {
+    if status == "deferred" {
+        let until = lease_until.ok_or(DatabaseError::StorageCorrupt)?;
+        Ok(u32::try_from(until.saturating_sub(observed_at).max(0)).unwrap_or(u32::MAX))
+    } else if matches!(status, "queued" | "launching" | "running") {
+        Ok(10)
+    } else {
+        Ok(0)
+    }
+}
+
+fn validate_settlement_reason(reason: Option<&str>) -> Result<(), DatabaseError> {
+    if reason.is_some_and(|value| {
+        !matches!(
+            value,
+            "ambiguous"
+                | "source_inventory_incomplete"
+                | "not_found"
+                | "source_data_invalid"
+                | "source_unavailable"
+                | "download_failed"
+                | "identity_conflict"
+                | "worker_failed"
+                | "worker_lost"
+                | "collection_pending"
+                | "already_fresh"
+                | "collection_already_in_progress"
+                | "head_observation_superseded"
+                | "publication_superseded"
+                | "no_matches"
+                | "multiple_skip_reasons"
+                | "provider_daily_limit"
+                | "provider_suspended"
+                | "provider_response_uncertain"
+                | "provider_retry_after"
+                | "operation_attempt_limit"
+                | "provider_admission_wait"
+                | "capacity_wait"
+        )
+    }) {
+        return Err(DatabaseError::InvalidInput);
+    }
+    Ok(())
 }
 
 impl DemandCollectionStore for PgCorpusStore {
@@ -590,5 +609,193 @@ impl DemandCollectionStore for PgCorpusStore {
                 .request_collection_shared(request, true, &cancel)
                 .await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn deferred_status_and_coalesced_receipt_share_reason_and_actual_lease() {
+        use openlegal_application::persistence::PersistentStore;
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let base = fixture.open(100).await;
+        let pool = base.pool();
+        let blobs =
+            crate::blob::FsBlobStore::open(&fixture.directory.path().join("deferral-receipts"))
+                .await
+                .unwrap();
+        let store = PgCorpusStore::new(pool.clone(), blobs);
+        store.heartbeat_collection_scheduler().await.unwrap();
+        let request = CollectionRequest {
+            target: CollectionTarget::Object {
+                object: ObjectId {
+                    jurisdiction: "kr".into(),
+                    provider: "law_go_kr".into(),
+                    dataset: Dataset::NationalStatute,
+                    id: "001".into(),
+                },
+            },
+        };
+        let requested = store.request_collection(request.clone()).await.unwrap();
+        let launch = store
+            .claim_collection_request_with_policy(7200, RequestLimit::Limited(32))
+            .await
+            .unwrap()
+            .unwrap();
+        let until: i64 =
+            sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp()))::bigint+120")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            store
+                .settle_collection_launch(
+                    &launch,
+                    "deferred",
+                    Some("untrusted-owner-detail"),
+                    Some(until as u64)
+                )
+                .await,
+            Err(DatabaseError::InvalidInput)
+        );
+        assert_eq!(
+            store
+                .settle_collection_launch(&launch, "deferred", None, Some(u64::MAX))
+                .await,
+            Err(DatabaseError::InvalidInput)
+        );
+        store
+            .settle_collection_launch(
+                &launch,
+                "deferred",
+                Some("provider_retry_after"),
+                Some(until as u64),
+            )
+            .await
+            .unwrap();
+        let status = store
+            .collection_status(&requested.request_id)
+            .await
+            .unwrap();
+        assert_eq!(status.reason.as_deref(), Some("provider_retry_after"));
+        assert!((115..=120).contains(&status.retry_after_seconds));
+        let coalesced = store.request_collection(request).await.unwrap();
+        assert_eq!(coalesced.request_id, requested.request_id);
+        assert_eq!(coalesced.reason, status.reason);
+        assert!((115..=120).contains(&coalesced.retry_after_seconds));
+        sqlx::query("UPDATE openlegal.collection_request SET lease_until=floor(extract(epoch from clock_timestamp()))::bigint-1 WHERE id=$1::uuid")
+            .bind(&requested.request_id).execute(&pool).await.unwrap();
+        assert_eq!(
+            store
+                .collection_status(&requested.request_id)
+                .await
+                .unwrap()
+                .retry_after_seconds,
+            0
+        );
+        base.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn deferral_reason_migration_preserves_legacy_receipts_and_rejects_raw_details() {
+        use openlegal_application::persistence::PersistentStore;
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let base = fixture.open(100).await;
+        let pool = base.pool();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0011_collection_skip_reasons.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let legacy_null: Uuid = sqlx::query_scalar("INSERT INTO openlegal.collection_request(request_key,canonical_key,payload,status,created_at,expires_at) VALUES(repeat('0',64),repeat('0',64),'{}','done',100,200) RETURNING id")
+            .fetch_one(&pool).await.unwrap();
+        let legacy_reason: Uuid = sqlx::query_scalar("INSERT INTO openlegal.collection_request(request_key,canonical_key,payload,status,reason,created_at,expires_at) VALUES(repeat('1',64),repeat('1',64),'{}','failed','source_inventory_incomplete',100,200) RETURNING id")
+            .fetch_one(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0022_collection_deferral_reasons.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let null: Option<String> =
+            sqlx::query_scalar("SELECT reason FROM openlegal.collection_request WHERE id=$1")
+                .bind(legacy_null)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(null, None);
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT reason FROM openlegal.collection_request WHERE id=$1")
+                .bind(legacy_reason)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some("source_inventory_incomplete"));
+        for reason in [
+            "provider_response_uncertain",
+            "provider_suspended",
+            "provider_daily_limit",
+            "provider_retry_after",
+            "operation_attempt_limit",
+            "provider_admission_wait",
+            "capacity_wait",
+        ] {
+            sqlx::query("UPDATE openlegal.collection_request SET reason=$2 WHERE id=$1")
+                .bind(legacy_null)
+                .bind(reason)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        assert!(
+            sqlx::query(
+                "UPDATE openlegal.collection_request SET reason='raw-owner-secret' WHERE id=$1"
+            )
+            .bind(legacy_null)
+            .execute(&pool)
+            .await
+            .is_err()
+        );
+        base.close().await.unwrap();
+    }
+
+    #[test]
+    fn deferred_receipt_uses_remaining_lease_and_bounds_old_or_long_leases() {
+        assert_eq!(receipt_retry_after("deferred", Some(105), 100), Ok(5));
+        assert_eq!(receipt_retry_after("deferred", Some(100), 105), Ok(0));
+        assert_eq!(
+            receipt_retry_after("deferred", Some(i64::MAX), 100),
+            Ok(u32::MAX)
+        );
+        assert_eq!(
+            receipt_retry_after("deferred", None, 100),
+            Err(DatabaseError::StorageCorrupt)
+        );
+        assert_eq!(receipt_retry_after("running", Some(7200), 100), Ok(10));
+        assert_eq!(receipt_retry_after("done", None, 100), Ok(0));
+    }
+
+    #[test]
+    fn settlement_reasons_reject_untrusted_details() {
+        for reason in [
+            "provider_daily_limit",
+            "provider_suspended",
+            "provider_response_uncertain",
+            "provider_retry_after",
+            "operation_attempt_limit",
+            "provider_admission_wait",
+            "capacity_wait",
+        ] {
+            assert_eq!(validate_settlement_reason(Some(reason)), Ok(()));
+        }
+        assert_eq!(
+            validate_settlement_reason(Some("internal-owner-secret")),
+            Err(DatabaseError::InvalidInput)
+        );
     }
 }

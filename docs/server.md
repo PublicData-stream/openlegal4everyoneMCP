@@ -408,6 +408,14 @@ continue to coalesce for 24 hours. Quota-deferred requests are retried when
 admission becomes eligible; healthy capacity contention is rechecked after five
 seconds while their 24-hour
 request window remains open.
+Deferred receipts include a bounded `reason` when classified: `provider_daily_limit`,
+`provider_suspended`, `provider_response_uncertain`, `provider_retry_after`,
+`operation_attempt_limit`, or `provider_admission_wait`; resource capacity uses
+`capacity_wait`. Older receipts may omit the reason. `retry_after_seconds` is the
+remaining time until the stored retry lease, clamped to zero when it is due;
+queued/launching/running receipts retain their ten-second polling hint. A retry
+time is a recheck hint, not a promise that collection will succeed. Suspension and
+uncertain-response evidence require operator review rather than automatic clearing.
 The original request ID remains readable until its expiry after a retry. A search
 request can report `done` with a provider failure reason when some candidates
 published and other bounded source attempts failed; `skipped` with that reason

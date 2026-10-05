@@ -173,14 +173,81 @@ pub(super) async fn uncertain_in_transaction(
     Ok(live_owner_count(tx).await?.is_none())
 }
 
-/// Read uncertainty for conservative retry ETA without charging an attempt or
-/// deleting abandoned evidence. The row lock serializes this probe with response
-/// settlement, so a response completing normally is never classified abandoned.
-pub(super) async fn uncertain(pool: &PgPool) -> Result<bool, DatabaseError> {
+/// Sanitized admission diagnostics from one locked provider snapshot. A recheck
+/// time does not promise recovery from operator suspension or uncertain evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderDeferral {
+    pub reason: &'static str,
+    pub recheck_at: u64,
+}
+
+pub(super) async fn deferral_snapshot(
+    pool: &PgPool,
+    mode: RequestBudgetMode,
+    operation_exhausted: bool,
+    locally_suspended: bool,
+) -> Result<ProviderDeferral, DatabaseError> {
     let mut tx = pool.begin().await.map_err(storage)?;
-    let legacy: bool = sqlx::query_scalar("SELECT unresolved_response FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
-        .fetch_one(&mut *tx).await.map_err(storage)?;
-    Ok(legacy || uncertain_in_transaction(&mut tx).await?)
+    let row =
+        sqlx::query("SELECT * FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(storage)?;
+    // Read time after acquiring the row lock. Waiting for settlement must not
+    // produce an ETA from a stale clock or pair it with a different policy row.
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp()))::bigint")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(storage)?;
+    let number = |name| row.try_get::<i64, _>(name).map_err(storage);
+    let uncertain = row
+        .try_get::<bool, _>("unresolved_response")
+        .map_err(storage)?
+        || uncertain_in_transaction(&mut tx).await?;
+    let suspended = row
+        .try_get::<bool, _>("operator_suspended")
+        .map_err(storage)?
+        || locally_suspended;
+    let (used, limit) = if mode == RequestBudgetMode::OnDemand {
+        (
+            number("on_demand_used")?,
+            row.try_get::<Option<i32>, _>("on_demand_daily_limit")
+                .map_err(storage)?,
+        )
+    } else {
+        (
+            number("daily_used")?,
+            row.try_get::<Option<i32>, _>("continuous_daily_limit")
+                .map_err(storage)?,
+        )
+    };
+    let day = now / 86400;
+    let daily_exhausted =
+        number("utc_day")? == day && limit.is_some_and(|limit| used >= i64::from(limit));
+    let pause = number("next_allowed_at")?;
+    let spacing = number("next_request_at_ms")?;
+    let spacing = spacing / 1000 + i64::from(spacing % 1000 != 0);
+    let earliest = pause.max(spacing).max(now.saturating_add(10));
+    let (reason, recheck) = if uncertain {
+        ("provider_response_uncertain", now.saturating_add(3600))
+    } else if suspended {
+        ("provider_suspended", now.saturating_add(3600))
+    } else if daily_exhausted {
+        ("provider_daily_limit", earliest.max((day + 1) * 86400 + 10))
+    } else if operation_exhausted {
+        ("operation_attempt_limit", earliest)
+    } else if pause > now {
+        ("provider_retry_after", earliest)
+    } else {
+        // The blocker can settle before this snapshot, or a pilot/local limit
+        // can be exhausted. Do not invent a provider failure in either case.
+        ("provider_admission_wait", earliest)
+    };
+    Ok(ProviderDeferral {
+        reason,
+        recheck_at: u64::try_from(recheck).map_err(|_| DatabaseError::StorageCorrupt)?,
+    })
 }
 
 async fn demand_waiting(
@@ -697,6 +764,127 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires scripts/test-postgres.sh"]
+    async fn deferral_snapshot_distinguishes_blockers_without_mutating_evidence_or_usage() {
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let store = fixture.open(100).await;
+        let pool = store.pool();
+        unrestricted(&pool).await;
+        sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=floor(extract(epoch from clock_timestamp()))::bigint/86400,daily_used=4,on_demand_used=3,on_demand_daily_limit=3")
+            .execute(&pool).await.unwrap();
+        let daily = deferral_snapshot(&pool, RequestBudgetMode::OnDemand, false, false)
+            .await
+            .unwrap();
+        assert_eq!(daily.reason, "provider_daily_limit");
+        let now: i64 =
+            sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp()))::bigint")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(daily.recheck_at, ((now / 86400 + 1) * 86400 + 10) as u64);
+        sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=utc_day-1,next_allowed_at=floor(extract(epoch from clock_timestamp()))::bigint+120")
+            .execute(&pool).await.unwrap();
+        let pause = deferral_snapshot(&pool, RequestBudgetMode::OnDemand, false, false)
+            .await
+            .unwrap();
+        assert_eq!(pause.reason, "provider_retry_after");
+        assert!(pause.recheck_at >= (now + 120) as u64);
+        sqlx::query("UPDATE openlegal.provider_request_budget SET operator_suspended=true")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let suspended = deferral_snapshot(&pool, RequestBudgetMode::OnDemand, false, false)
+            .await
+            .unwrap();
+        assert_eq!(suspended.reason, "provider_suspended");
+        assert!(suspended.recheck_at >= (now + 3600) as u64);
+        sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=true")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            deferral_snapshot(&pool, RequestBudgetMode::OnDemand, false, false)
+                .await
+                .unwrap()
+                .reason,
+            "provider_response_uncertain"
+        );
+        let evidence: (bool, bool, i64, i64) = sqlx::query_as("SELECT unresolved_response,operator_suspended,daily_used,on_demand_used FROM openlegal.provider_request_budget")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(evidence, (true, true, 4, 3));
+        // Only the fixture operator clears fences; the diagnostic never does.
+        sqlx::query("UPDATE openlegal.provider_request_budget SET unresolved_response=false,operator_suspended=false,next_allowed_at=0,next_request_at_ms=0")
+            .execute(&pool).await.unwrap();
+        assert_eq!(
+            deferral_snapshot(&pool, RequestBudgetMode::OnDemand, true, false)
+                .await
+                .unwrap()
+                .reason,
+            "operation_attempt_limit"
+        );
+        assert_eq!(
+            deferral_snapshot(&pool, RequestBudgetMode::OnDemand, false, false)
+                .await
+                .unwrap()
+                .reason,
+            "provider_admission_wait"
+        );
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn snapshot_distinguishes_live_and_abandoned_slots_including_lowered_capacity() {
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let store = fixture.open(100).await;
+        let pool = store.pool();
+        unrestricted(&pool).await;
+        let mut first = start(&pool).await;
+        let second = start(&pool).await;
+        sqlx::query("UPDATE openlegal.provider_request_budget SET max_in_flight=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            deferral_snapshot(&pool, RequestBudgetMode::Continuous, false, false)
+                .await
+                .unwrap()
+                .reason,
+            "provider_admission_wait"
+        );
+        let abandoned_owner = second.owner();
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = deferral_snapshot(&pool, RequestBudgetMode::Continuous, false, false)
+                    .await
+                    .unwrap();
+                if status.reason == "provider_response_uncertain" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let owners: Vec<Uuid> =
+            sqlx::query_scalar("SELECT owner FROM openlegal.provider_request_admission")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(owners.contains(&abandoned_owner));
+        first.complete().await.unwrap();
+        assert_eq!(
+            deferral_snapshot(&pool, RequestBudgetMode::Continuous, false, false)
+                .await
+                .unwrap()
+                .reason,
+            "provider_response_uncertain"
+        );
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
     async fn healthy_contention_wakes_after_completion_without_spending_while_busy() {
         let fixture = crate::test_support::TestDatabase::new().await;
         let store = fixture.open(100).await;
@@ -1055,7 +1243,13 @@ mod tests {
         abandoned.connection.take().unwrap().close().await.unwrap();
         drop(abandoned);
         assert!(!idle(&pool, RequestBudgetMode::Continuous).await.unwrap());
-        assert!(uncertain(&pool).await.unwrap());
+        assert_eq!(
+            deferral_snapshot(&pool, RequestBudgetMode::Continuous, false, false)
+                .await
+                .unwrap()
+                .reason,
+            "provider_response_uncertain"
+        );
         assert_eq!(
             LawClient::reserve_provider_request_budget(
                 &pool,

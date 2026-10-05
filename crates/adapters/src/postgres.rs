@@ -299,6 +299,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0021_supplement_jobs.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            22,
+            "collection deferral reasons".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0022_collection_deferral_reasons.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

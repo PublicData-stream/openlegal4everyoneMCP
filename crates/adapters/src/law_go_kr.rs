@@ -25,7 +25,7 @@ use url::Url;
 mod admission;
 pub mod catalog;
 pub mod supplements;
-pub use admission::ProviderRequestGuard;
+pub use admission::{ProviderDeferral, ProviderRequestGuard};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventoryItem {
@@ -571,59 +571,25 @@ impl LawClient {
         };
         admission::idle(pool, *mode).await
     }
+    /// Read one consistent provider snapshot without spending an attempt. The
+    /// returned time is a recheck time; suspended/uncertain evidence still needs
+    /// operator review and is never cleared by this observation.
+    pub async fn admission_deferral(&self) -> Result<ProviderDeferral, DatabaseError> {
+        let (pool, mode) = self.budget.as_ref().ok_or(DatabaseError::InvalidInput)?;
+        admission::deferral_snapshot(
+            pool,
+            *mode,
+            self.local_cap
+                .as_ref()
+                .is_some_and(|cap| cap.load(Ordering::Acquire) == 0),
+            self.operator_suspended.load(Ordering::Acquire),
+        )
+        .await
+    }
     /// A transient pause is durable for configured ingestion; the job worker
     /// uses this timestamp without burning another attempt while it waits.
     pub async fn next_admissible_epoch(&self) -> Result<u64, DatabaseError> {
-        let Some((pool, mode)) = &self.budget else {
-            return Err(DatabaseError::InvalidInput);
-        };
-        let row = sqlx::query("SELECT utc_day,daily_used,on_demand_used,continuous_daily_limit,on_demand_daily_limit,next_allowed_at,next_request_at_ms,operator_suspended,unresolved_response,floor(extract(epoch from clock_timestamp()))::bigint AS now FROM openlegal.provider_request_budget WHERE singleton")
-            .fetch_one(pool).await.map_err(|_| DatabaseError::StorageUnavailable)?;
-        let now: i64 = row
-            .try_get("now")
-            .map_err(|_| DatabaseError::StorageUnavailable)?;
-        let day = now / 86_400;
-        let used: i64 = row
-            .try_get(if *mode == RequestBudgetMode::OnDemand {
-                "on_demand_used"
-            } else {
-                "daily_used"
-            })
-            .map_err(|_| DatabaseError::StorageUnavailable)?;
-        let stored_day: i64 = row
-            .try_get("utc_day")
-            .map_err(|_| DatabaseError::StorageUnavailable)?;
-        let next: i64 = row
-            .try_get("next_allowed_at")
-            .map_err(|_| DatabaseError::StorageUnavailable)?;
-        if row
-            .try_get::<bool, _>("operator_suspended")
-            .map_err(|_| DatabaseError::StorageUnavailable)?
-            || row
-                .try_get::<bool, _>("unresolved_response")
-                .map_err(|_| DatabaseError::StorageUnavailable)?
-            || admission::uncertain(pool).await?
-        {
-            return u64::try_from(now.saturating_add(3600))
-                .map_err(|_| DatabaseError::StorageUnavailable);
-        }
-        let limit: Option<i32> = row
-            .try_get(if *mode == RequestBudgetMode::OnDemand {
-                "on_demand_daily_limit"
-            } else {
-                "continuous_daily_limit"
-            })
-            .map_err(|_| DatabaseError::StorageUnavailable)?;
-        let spacing: i64 = row
-            .try_get("next_request_at_ms")
-            .map_err(|_| DatabaseError::StorageUnavailable)?;
-        let next = next.max(spacing / 1000 + i64::from(spacing % 1000 != 0));
-        let daily = if stored_day == day && limit.is_some_and(|limit| used >= i64::from(limit)) {
-            (day + 1) * 86_400 + 10
-        } else {
-            now + 10
-        };
-        u64::try_from(next.max(daily)).map_err(|_| DatabaseError::StorageUnavailable)
+        Ok(self.admission_deferral().await?.recheck_at)
     }
     /// Reserve a provider attempt without transmitting it. Exposed for the
     /// explicit PostgreSQL integration gate; callers must not split one
@@ -1654,6 +1620,9 @@ impl LawClient {
                         .push("provider_credential_redacted".into());
                 }
                 check(output, raw.clone(), retrieved_at).map_err(|error| {
+                    // Only bounded error categories identify the rejection stage;
+                    // legal content, source URLs and credentials stay private.
+                    eprintln!("law provider: response rejected at response_validation ({error:?})");
                     if error == DatabaseError::StorageCorrupt {
                         DatabaseError::SourceDataInvalid
                     } else {

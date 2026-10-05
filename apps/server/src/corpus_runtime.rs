@@ -440,7 +440,7 @@ impl CorpusRuntime {
         let result = self
             .collect_explicit(&provider, launch, launch.request.clone(), cancel)
             .await;
-        let (status, reason) = match &result {
+        let (status, mut reason) = match &result {
             Ok(summary) => summary.settlement(),
             Err(DatabaseError::BudgetExhausted | DatabaseError::Capacity) => ("deferred", None),
             Err(DatabaseError::SourceUnavailable) => ("skipped", Some("source_unavailable")),
@@ -455,8 +455,15 @@ impl CorpusRuntime {
             Err(_) => ("failed", Some("worker_failed")),
         };
         let deferred_until = match &result {
-            Err(DatabaseError::Capacity) => Some(now().saturating_add(5)),
-            Err(DatabaseError::BudgetExhausted) => Some(provider.next_admissible_epoch().await?),
+            Err(DatabaseError::Capacity) => {
+                reason = Some("capacity_wait");
+                Some(now().saturating_add(5))
+            }
+            Err(DatabaseError::BudgetExhausted) => {
+                let deferral = provider.admission_deferral().await?;
+                reason = Some(deferral.reason);
+                Some(deferral.recheck_at)
+            }
             _ => None,
         };
         self.store
