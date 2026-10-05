@@ -144,3 +144,7 @@ file was preserved and its contents were never printed.
 
 See [the source catalog](CATALOG.md), [the provider profile](../../../docs/providers/kr-law-go-kr.md),
 [database contract](../../../docs/database.md) and [upstream policy](../../../docs/upstream-policy.md).
+
+The later [collection recovery validation](COLLECTION-RECOVERY.md) records
+deferral diagnostics and scheduler contention checks separately from this
+permanent-clone and bounded-provider evidence.
