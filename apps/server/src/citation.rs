@@ -31,6 +31,7 @@ const MAX_REFERENCE_NODES: usize = 2048;
 pub struct CitationTools {
     pub service: Arc<CitationService>,
     pub demand: Option<Arc<openlegal_application::demand_collection::DemandCollectionCoordinator>>,
+    pub admission_store: Option<Arc<openlegal_adapters::corpus::PgCorpusStore>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -55,6 +56,7 @@ impl ToolModule for CitationTools {
     fn register(self, registry: &mut ToolRegistry) -> Result<(), ServerError> {
         let service = self.service.clone();
         let demand = self.demand.clone();
+        let admission_store = self.admission_store.clone();
         registry.register_demand_rich::<SearchInput, SearchOutput, _, _>(
             "search",
             "Search retained legal source items using the corpus query syntax. Returns capture-fixed source IDs and browser-openable citation URLs; fetch retrieves the complete bounded item. Partial coverage is qualified in additional text. When automatic collection is enabled, eligible searches may enqueue bounded discovery. Optional collection_term is a separate literal provider term and preserves the local query. Collection status appears in metadata and additional text.",
@@ -62,6 +64,7 @@ impl ToolModule for CitationTools {
             move |input, context| {
                 let service = service.clone();
                 let demand = demand.clone();
+                let admission_store = admission_store.clone();
                 async move {
                     openlegal_application::demand_collection::validate_collection_term(input.collection_term.as_deref(), &[]).map_err(crate::database::map_error)?;
                     let query = input.query.clone();
@@ -77,8 +80,14 @@ impl ToolModule for CitationTools {
                     if let Some(demand) = demand {
                         let request = openlegal_domain::legal_search::SearchRequest { query, filters: Default::default(), include_history: false, include_ocr: false, sections: vec![], limit: openlegal_application::citation::MAX_CITATION_SEARCH_RESULTS, cursor: None, literal: false, ignore_case: false, context_lines: 0 };
                         let collection = demand.search(&request, openlegal_application::search::SearchMode::Query, input.collection_term.as_deref(), &context.request.cancellation).await.map_err(crate::database::map_error)?;
-                        output.output.meta = Some(MetaObject(serde_json::from_value(json!({"openlegal/collection": collection})).map_err(|_| crate::registry::ToolError::Internal)?));
+                        output.output.meta.get_or_insert_with(|| MetaObject(Default::default())).0.insert(
+                            "openlegal/collection".into(),
+                            serde_json::to_value(&collection).map_err(|_| crate::registry::ToolError::Internal)?,
+                        );
                         output.additional_content.push(ContentBlock::text(format!("Collection status: {}", serde_json::to_string(&collection).map_err(|_| crate::registry::ToolError::Internal)?)));
+                    }
+                    if let Some(store) = admission_store {
+                        crate::demand_result::add_admission(&mut output, store.provider_admission_snapshot().await);
                     }
                     // Structured JSON is emitted as the first text block by the shared handler.
                     Ok(output)
@@ -903,6 +912,7 @@ mod tests {
             meta: None,
             additional_content: Vec::new(),
             strict_result_limit: false,
+            error: None,
         };
         append_native_references("database.get_metadata", &service, None, &mut output);
         assert!(
@@ -936,6 +946,7 @@ mod tests {
             meta: None,
             additional_content: Vec::new(),
             strict_result_limit: false,
+            error: None,
         };
         append_native_references("database.object_status", &service, None, &mut output);
         let id =
@@ -949,6 +960,7 @@ mod tests {
             meta: None,
             additional_content: Vec::new(),
             strict_result_limit: false,
+            error: None,
         };
         append_native_references("law.lineage", &service, None, &mut output);
         assert_eq!(
@@ -1121,6 +1133,7 @@ mod tests {
         registry
             .register_module(CitationTools {
                 demand: None,
+                admission_store: None,
                 service: service.clone(),
             })
             .unwrap();
@@ -1375,6 +1388,7 @@ mod tests {
             meta: None,
             additional_content: Vec::new(),
             strict_result_limit: false,
+            error: None,
         };
         append_native_references("database.get", &service, None, &mut output);
         let meta = &output.meta.as_ref().unwrap().0;

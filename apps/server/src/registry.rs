@@ -85,6 +85,17 @@ pub struct RichToolOutput<T> {
     pub output: ToolOutput<T>,
     pub additional_content: Vec<ContentBlock>,
 }
+
+/// Core legal reads can qualify an existing tool failure without replacing its
+/// code, envelope, or advertised successful output schema.
+pub(crate) enum RichToolResult<T> {
+    Ready(RichToolOutput<T>),
+    Failure {
+        error: ToolError,
+        meta: Option<MetaObject>,
+        additional_content: Vec<ContentBlock>,
+    },
+}
 impl<T> RichToolOutput<T> {
     pub fn new(structured: T) -> Self {
         Self {
@@ -129,6 +140,7 @@ pub(crate) struct InvocationOutput {
     pub meta: Option<MetaObject>,
     pub additional_content: Vec<ContentBlock>,
     pub strict_result_limit: bool,
+    pub error: Option<ToolError>,
 }
 
 type Invoke = dyn Fn(Value, ToolExecutionContext) -> BoxFuture<'static, Result<InvocationOutput, ToolError>>
@@ -270,6 +282,7 @@ impl ToolRegistry {
                         meta: None,
                         additional_content: Vec::new(),
                         strict_result_limit: false,
+                        error: None,
                     })
             }
             .boxed()
@@ -334,7 +347,15 @@ impl ToolRegistry {
         F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<RichToolOutput<O>, ToolError>> + Send + 'static,
     {
-        if name != "search" {
+        if !matches!(
+            name,
+            "search"
+                | "database.get"
+                | "database.get_metadata"
+                | "database.query"
+                | "database.rg"
+                | "law.resolve_name"
+        ) {
             return Err("unsupported built-in collection read".into());
         }
         self.register_rich_internal(name, description, options, handler, true)
@@ -378,6 +399,7 @@ impl ToolRegistry {
                     meta: result.output.meta,
                     additional_content: result.additional_content,
                     strict_result_limit: true,
+                    error: None,
                 })
             }
             .boxed()
@@ -418,9 +440,9 @@ impl ToolRegistry {
         I: DeserializeOwned + JsonSchema + Send + 'static,
         O: serde::Serialize + JsonSchema + Send + 'static,
         F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ToolOutput<O>, ToolError>> + Send + 'static,
+        Fut: Future<Output = Result<RichToolResult<O>, ToolError>> + Send + 'static,
     {
-        self.register_typed_internal(
+        self.register_core_rich_result(
             "database.request_collection",
             "Explicitly request bounded collection of one Korean national statute, one precedent case by exact case number, or simple search candidates. This queues a background provider job; use database.collection_status and then requery the corpus.",
             ToolOptions {
@@ -428,8 +450,70 @@ impl ToolRegistry {
                 meta: None,
             },
             handler,
-            true,
         )
+    }
+
+    pub(crate) fn register_core_rich_result<I, O, F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        options: ToolOptions,
+        handler: F,
+    ) -> Result<(), ServerError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: serde::Serialize + JsonSchema + Send + 'static,
+        F: Fn(I, ToolExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RichToolResult<O>, ToolError>> + Send + 'static,
+    {
+        let demand = match name {
+            "database.get" | "database.get_metadata" | "database.request_collection" => true,
+            "database.collection_status" => false,
+            _ => return Err("unsupported built-in provider status result".into()),
+        };
+        self.register_typed_internal::<I, O, _, _>(
+            name,
+            description,
+            options,
+            |_, _| async { Err(ToolError::Internal) },
+            demand,
+        )?;
+        let handler = Arc::new(handler);
+        let tool = self
+            .tools
+            .get_mut(name)
+            .ok_or("registered tool disappeared")?;
+        tool.invoke = Arc::new(move |value, context| {
+            let handler = handler.clone();
+            async move {
+                let input = serde_json::from_value(value).map_err(|_| ToolError::InvalidInput)?;
+                match handler(input, context).await? {
+                    RichToolResult::Ready(result) => Ok(InvocationOutput {
+                        structured: serde_json::to_value(result.output.structured)
+                            .map_err(|_| ToolError::Internal)?,
+                        text: result.output.text,
+                        meta: result.output.meta,
+                        additional_content: result.additional_content,
+                        strict_result_limit: true,
+                        error: None,
+                    }),
+                    RichToolResult::Failure {
+                        error,
+                        meta,
+                        additional_content,
+                    } => Ok(InvocationOutput {
+                        structured: Value::Null,
+                        text: None,
+                        meta,
+                        additional_content,
+                        strict_result_limit: true,
+                        error: Some(error),
+                    }),
+                }
+            }
+            .boxed()
+        });
+        Ok(())
     }
 
     pub(crate) fn register_demand<I, O, F, Fut>(
@@ -501,6 +585,7 @@ impl ToolRegistry {
                     meta: output.meta,
                     additional_content: Vec::new(),
                     strict_result_limit: false,
+                    error: None,
                 })
             }
             .boxed()

@@ -128,7 +128,7 @@ impl ToolModule for DatabaseTools {
         let service = self.reader.clone();
         let notices = self.store.clone();
         let demand = self.demand.clone();
-        registry.register_demand::<ReadInput, ReadResult<ContentPage>, _, _>(
+        registry.register_core_rich_result::<ReadInput, ReadResult<ContentPage>, _, _>(
             "database.get",
             "Read one legal object at HEAD or an exact retained revision/capture. HEAD includes TTL and fetch/cache times. Content pages contain up to 32 KiB. Continue using selector kind=capture and the returned metadata.capture_id with next_offset and the same section; historical content never falls back to HEAD. When automatic collection is enabled, an initial missing or stale national-statute HEAD may enqueue bounded refresh and return collection status or a pending receipt.",
             demand_result::options(demand.as_ref().is_some_and(|d| d.enabled())),
@@ -156,11 +156,11 @@ impl ToolModule for DatabaseTools {
                         Err(error) if initial_head && demand_result::refreshable_error(error) => {
                             if let Some(demand) = demand {
                                 let collection = demand.head(&request, true, &ctx.request.cancellation).await;
-                                return demand_result::pending(error, collection).map(output);
+                                return Ok(demand_result::admission_result(demand_result::pending(error, collection).map(output), &notices).await);
                             }
-                            return Err(map_error(error));
+                            return Ok(demand_result::admission_result(Err(map_error(error)), &notices).await);
                         }
-                        Err(error) => return Err(map_error(error)),
+                        Err(error) => return Ok(demand_result::admission_result(Err(map_error(error)), &notices).await),
                     };
                     let record = &result.capture.record;
                     let section = input.section.unwrap_or_else(|| "body".into());
@@ -212,7 +212,7 @@ impl ToolModule for DatabaseTools {
                             Some(demand.head(&request, metadata.freshness.as_ref().is_some_and(|f| f.state != openlegal_domain::FreshnessState::Fresh), &ctx.request.cancellation).await)
                         } else { None }
                     } else { None };
-                    Ok(output(ReadResult::Ready(WithCollection { result: ContentPage {
+                    Ok(demand_result::admission_result(Ok(output(ReadResult::Ready(WithCollection { result: ContentPage {
                         session,
                         schema_version: 1,
                         metadata,
@@ -223,14 +223,14 @@ impl ToolModule for DatabaseTools {
                         sections,
                         section_count,
                         next_sections_offset,
-                    }, collection })))
+                    }, collection }))), &notices).await)
                 }
             },
         )?;
         let service = self.database.clone();
         let notices = self.store.clone();
         let demand = self.demand.clone();
-        registry.register_demand::<GetRequest, ReadResult<MetadataResult>, _, _>(
+        registry.register_core_rich_result::<GetRequest, ReadResult<MetadataResult>, _, _>(
             "database.get_metadata",
             "Retrieve metadata and provenance for HEAD or an exact checkpoint, with HEAD freshness and upstream retrieval/validation/cache times. No legal body content is returned. Eligible missing or stale HEAD may enqueue bounded refresh when automatic collection is enabled.",
             demand_result::options(demand.as_ref().is_some_and(|d| d.enabled())),
@@ -245,34 +245,34 @@ impl ToolModule for DatabaseTools {
                         Err(error) if matches!(input.selector, RevisionSelector::Head) && demand_result::refreshable_error(error) => {
                             if let Some(demand) = demand {
                                 let collection = demand.head(&input, true, &ctx.request.cancellation).await;
-                                return demand_result::pending(error, collection).map(output);
+                                return Ok(demand_result::admission_result(demand_result::pending(error, collection).map(output), &notices).await);
                             }
-                            return Err(map_error(error));
+                            return Ok(demand_result::admission_result(Err(map_error(error)), &notices).await);
                         }
-                        Err(error) => return Err(map_error(error)),
+                        Err(error) => return Ok(demand_result::admission_result(Err(map_error(error)), &notices).await),
                     };
                     result.collection_notices = notices.collection_notices(&[object.dataset], Some(&object)).await.map_err(map_error)?;
                     let collection = if matches!(input.selector, RevisionSelector::Head) {
                         if let Some(demand) = demand { Some(demand.head(&input, result.freshness.as_ref().is_some_and(|f| f.state != openlegal_domain::FreshnessState::Fresh), &ctx.request.cancellation).await) } else { None }
                     } else { None };
-                    Ok(output(ReadResult::Ready(WithCollection { result, collection })))
+                    Ok(demand_result::admission_result(Ok(output(ReadResult::Ready(WithCollection { result, collection }))), &notices).await)
                 }
             },
         )?;
         let clone_store = self.store.clone();
-        registry.register_typed::<CorpusStatusInput, CorpusStatusOutput, _, _>(
+        registry.register_rich::<CorpusStatusInput, CorpusStatusOutput, _, _>(
             "database.corpus_status",
             "Read durable progress of finite canonical corpus cloning, including independent current/history/treaty views, stable traversals, missing bodies and open gaps. This does not contact the provider. Canonical clone completion is not an atomic upstream snapshot or completeness of deferred supplementary sources.",
             ToolOptions::default(),
             move |_, _| { let store=clone_store.clone(); async move {
                 match store.clone_progress().await.map_err(map_error)? {
-                    serde_json::Value::Object(progress) => Ok(output(CorpusStatusOutput(progress))),
+                    serde_json::Value::Object(progress) => Ok(demand_result::admission_output(output(CorpusStatusOutput(progress)), &store).await),
                     _ => Err(ToolError::StorageCorrupt),
                 }
             } }
         )?;
         let status_store = self.store.clone();
-        registry.register_typed::<ObjectStatusInput, ObjectStatus, _, _>(
+        registry.register_rich::<ObjectStatusInput, ObjectStatus, _, _>(
             "database.object_status",
             "Read local observation, current collection job, index visibility and a bounded processing estimate for one legal object. This does not contact the provider or enqueue collection.",
             ToolOptions::default(),
@@ -289,7 +289,8 @@ impl ToolModule for DatabaseTools {
                     if ctx.request.cancellation.is_cancelled() {
                         return Err(ToolError::Unavailable);
                     }
-                    Ok(output(result))
+                    let snapshot = store.provider_admission_snapshot().await;
+                    Ok(demand_result::object_admission_output(output(result), snapshot))
                 }
             },
         )?;
@@ -317,13 +318,15 @@ impl ToolModule for DatabaseTools {
         )?;
         let search = self.search.clone();
         let demand = self.demand.clone();
-        registry.register_demand::<CollectionSearchInput<QuerySearchRequest>, WithCollection<SearchPage>, _, _>(
+        let admission = self.store.clone();
+        registry.register_demand_rich::<CollectionSearchInput<QuerySearchRequest>, WithCollection<SearchPage>, _, _>(
             "database.query",
             "Search the managed corpus using the query DSL (AND, OR, NOT, grouping, in:title:, in:body:, in:case_number:, analyzed words and prefixes). Bare title:, body:, and case_number: are invalid; use the in: prefix. Double quotes require an exact case-sensitive source substring. Alternatively, literal: true searches the entire query as a source substring; ignore_case applies only with literal: true. Literal excerpts surround the first matching source substring. Korean Lindera and MeCab-Ko analysis uses NFC and ASCII lowercase with no stopwords. Positive expressions must match within one engine; NOT excludes a match by either engine. Stable bounded pages may contain zero hits and a continuation; coverage and index lag are explicit. Optional collection_term is a separate bounded literal provider term; it never changes local query semantics. Eligible first-page searches may enqueue collection when enabled.",
             demand_result::options(demand.as_ref().is_some_and(|d| d.enabled())),
             move |input, ctx| {
                 let search = search.clone();
                 let demand = demand.clone();
+                let admission = admission.clone();
                 async move {
                     let request: SearchRequest = input.request.into();
                     validate_collection_term(input.collection_term.as_deref(), &request.filters.datasets).map_err(map_error)?;
@@ -337,19 +340,21 @@ impl ToolModule for DatabaseTools {
                         .await
                         .map_err(map_error)?;
                     let collection = if let Some(demand) = demand { Some(demand.search(&request, SearchMode::Query, input.collection_term.as_deref(), &ctx.request.cancellation).await.map_err(map_error)?) } else { None };
-                    Ok(output(WithCollection { result, collection }))
+                    Ok(demand_result::admission_output(output(WithCollection { result, collection }), &admission).await)
                 }
             },
         )?;
         let search = self.search.clone();
         let demand = self.demand.clone();
-        registry.register_demand::<CollectionSearchInput<SearchRequest>, WithCollection<SearchPage>, _, _>(
+        let admission = self.store.clone();
+        registry.register_demand_rich::<CollectionSearchInput<SearchRequest>, WithCollection<SearchPage>, _, _>(
             "database.rg",
             "Search managed legal content and case numbers using bounded ripgrep regex matching, case sensitive and line oriented by default. Typed literal, ignore_case, context_lines and filters are supported; filesystem paths and CLI arguments are never accepted. Continuations retain a fixed corpus generation for ten minutes. Optional collection_term is a separate bounded literal provider term; literal first-page searches may enqueue collection when enabled. Regex and filtered searches require an explicit term.",
             demand_result::options(demand.as_ref().is_some_and(|d| d.enabled())),
             move |input, ctx| {
                 let search = search.clone();
                 let demand = demand.clone();
+                let admission = admission.clone();
                 async move {
                     let request = input.request;
                     validate_collection_term(input.collection_term.as_deref(), &request.filters.datasets).map_err(map_error)?;
@@ -363,7 +368,7 @@ impl ToolModule for DatabaseTools {
                         .await
                         .map_err(map_error)?;
                     let collection = if let Some(demand) = demand { Some(demand.search(&request, SearchMode::Ripgrep, input.collection_term.as_deref(), &ctx.request.cancellation).await.map_err(map_error)?) } else { None };
-                    Ok(output(WithCollection { result, collection }))
+                    Ok(demand_result::admission_output(output(WithCollection { result, collection }), &admission).await)
                 }
             },
         )?;
@@ -372,22 +377,26 @@ impl ToolModule for DatabaseTools {
             move |input, _| {
                 let requests = requests.clone();
                 async move {
-                    requests
+                    let receipt = requests
                         .request_collection(input)
                         .await
                         .map(output)
-                        .map_err(map_error)
+                        .map_err(map_error);
+                    Ok(demand_result::admission_result(receipt, &requests).await)
                 }
             },
         )?;
         let requests = self.store.clone();
-        registry.register_typed::<CollectionStatusInput, CollectionReceipt, _, _>(
+        registry.register_core_rich_result::<CollectionStatusInput, CollectionReceipt, _, _>(
             "database.collection_status",
             "Read the status of an explicit collection request by request_id. This does not initiate collection.",
             ToolOptions::default(),
             move |input, _| {
                 let requests = requests.clone();
-                async move { requests.collection_status(&input.request_id).await.map(output).map_err(map_error) }
+                async move {
+                    let receipt = requests.collection_status(&input.request_id).await.map(output).map_err(map_error);
+                    Ok(demand_result::admission_result(receipt, &requests).await)
+                }
             },
         )?;
         let service = self.database;

@@ -125,6 +125,37 @@ async fn queued_count(fixture: &postgres::TestDatabase) -> i64 {
         .unwrap()
 }
 
+fn assert_public_admission(response: &Value) {
+    let meta = &response["result"]["_meta"]["openlegal/provider_admission"];
+    assert_eq!(meta["version"], 1, "{response}");
+    assert!(meta["observed_at"].is_u64());
+    assert_eq!(meta["retry_after_semantics"], "status_recheck");
+    assert!(meta["paused_since"].is_null());
+    assert!(meta["uncertainty_first_observed_at"].is_null());
+    for mode in ["continuous", "on_demand"] {
+        assert!(meta[mode]["ready"].is_boolean());
+        assert!(meta[mode]["requires_operator_review"].is_boolean());
+    }
+    for private in [
+        "hold_generation",
+        "active_slots",
+        "abandoned_slots",
+        "legacy_identity",
+        "slot_owners",
+    ] {
+        assert!(meta.get(private).is_none());
+    }
+    assert!(
+        response["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|content| content["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("status recheck")))
+    );
+}
+
 async fn exercise(
     wire: &mut Wire,
     runtime: &CorpusRuntime,
@@ -151,6 +182,7 @@ async fn exercise(
     let target = object(&format!("10{index}"));
     let before = queued_count(fixture).await;
     let missing = wire.call(2, "database.get", json!({"object":target})).await;
+    assert_public_admission(&missing);
     if enabled {
         assert_eq!(
             missing["result"]["structuredContent"]["state"], "pending",
@@ -200,6 +232,7 @@ async fn exercise(
         .await;
     assert_ne!(local["result"]["isError"], true, "{local}");
     assert_eq!(local["result"]["structuredContent"]["hits"], json!([]));
+    assert_public_admission(&local);
     assert_eq!(
         local["result"]["structuredContent"]["collection"]["status"],
         if enabled { "pending" } else { "disabled" }
@@ -212,6 +245,7 @@ async fn exercise(
         )
         .await;
     assert_ne!(compat["result"]["isError"], true, "{compat}");
+    assert_public_admission(&compat);
     assert_eq!(compat["result"]["structuredContent"], json!({"results":[]}));
     let first_text: Value =
         serde_json::from_str(compat["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -238,6 +272,7 @@ async fn exercise(
             )
             .await;
         assert_eq!(unavailable["result"]["isError"], true, "{unavailable}");
+        assert_public_admission(&unavailable);
         assert_eq!(
             unavailable["result"]["structuredContent"]["code"], "not_observed",
             "{unavailable}"
@@ -335,6 +370,7 @@ async fn automatic_collection_contracts_hold_through_http_and_webtransport() {
             .register_module(CitationTools {
                 service: citations.clone(),
                 demand: Some(demand),
+                admission_store: Some(runtime.store.clone()),
             })
             .unwrap();
         let identity =

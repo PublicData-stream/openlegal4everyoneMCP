@@ -437,9 +437,12 @@ impl CorpusRuntime {
             .ok_or(DatabaseError::InvalidInput)?
             .on_demand_client_with_limit(launch.attempt_limit)?
             .with_collection_launch(launch)?;
-        let result = self
-            .collect_explicit(&provider, launch, launch.request.clone(), cancel)
-            .await;
+        let result = if self.store.provider_collection_held().await? {
+            Err(DatabaseError::BudgetExhausted)
+        } else {
+            self.collect_explicit(&provider, launch, launch.request.clone(), cancel)
+                .await
+        };
         let (status, mut reason) = match &result {
             Ok(summary) => summary.settlement(),
             Err(DatabaseError::BudgetExhausted | DatabaseError::Capacity) => ("deferred", None),
@@ -454,6 +457,7 @@ impl CorpusRuntime {
             Err(DatabaseError::Conflict) => ("failed", Some("identity_conflict")),
             Err(_) => ("failed", Some("worker_failed")),
         };
+        let mut blocker_fingerprint = None;
         let deferred_until = match &result {
             Err(DatabaseError::Capacity) => {
                 reason = Some("capacity_wait");
@@ -462,12 +466,19 @@ impl CorpusRuntime {
             Err(DatabaseError::BudgetExhausted) => {
                 let deferral = provider.admission_deferral().await?;
                 reason = Some(deferral.reason);
+                blocker_fingerprint = deferral.fingerprint;
                 Some(deferral.recheck_at)
             }
             _ => None,
         };
         self.store
-            .settle_collection_launch(launch, status, reason, deferred_until)
+            .settle_collection_launch_with_fingerprint(
+                launch,
+                status,
+                reason,
+                deferred_until,
+                blocker_fingerprint.as_ref(),
+            )
             .await?;
         match result {
             Ok(_)
@@ -1262,6 +1273,16 @@ impl CorpusRuntime {
             None
         };
         loop {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            if self.store.provider_collection_held().await? {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+                continue;
+            }
             for request in openlegal_adapters::law_go_kr::supplements::global_requests(1)? {
                 self.store.enqueue_supplement(&request, now()).await?;
             }
@@ -1362,6 +1383,13 @@ impl CorpusRuntime {
         loop {
             if cancel.is_cancelled() {
                 return Ok(());
+            }
+            if self.store.provider_collection_held().await? {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+                continue;
             }
             let Some(job) = self.store.claim_supplement(now()).await? else {
                 tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(5))=>{}}
@@ -1870,6 +1898,13 @@ impl CorpusRuntime {
             if cancel.is_cancelled() {
                 return Ok(());
             }
+            if self.store.provider_collection_held().await? {
+                match events.wait(&cancel, Duration::from_secs(5)).await {
+                    Ok(()) => continue,
+                    Err(DatabaseError::Cancelled) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
             let preferred = DATASETS[next_dataset];
             next_dataset = (next_dataset + 1) % DATASETS.len();
             let claim = self
@@ -2025,14 +2060,17 @@ impl CorpusRuntime {
                     return Ok(());
                 }
                 Err(DatabaseError::BudgetExhausted) => {
-                    let resume_at = provider.next_admissible_epoch().await?;
-                    let deferred = if reserved.load(std::sync::atomic::Ordering::Acquire) {
-                        self.store
-                            .defer_reserved_budget_claim(&job, resume_at)
-                            .await
-                    } else {
-                        self.store.defer_budget_claim(&job, resume_at).await
-                    };
+                    let deferral = provider.admission_deferral().await?;
+                    let resume_at = deferral.recheck_at;
+                    let deferred = self
+                        .store
+                        .defer_budget_claim_with_fingerprint(
+                            &job,
+                            resume_at,
+                            deferral.fingerprint.as_ref(),
+                            reserved.load(std::sync::atomic::Ordering::Acquire),
+                        )
+                        .await;
                     match deferred {
                         Ok(()) | Err(DatabaseError::Conflict) => {}
                         Err(error) => return Err(error),

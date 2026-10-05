@@ -73,3 +73,35 @@ test('fictional section catalog merges pages and keeps long section IDs with the
   expect(catalog.arguments.session).toBe('e'.repeat(64));
   expect(catalog.arguments.selector).toEqual({ kind: 'capture', id: 'a'.repeat(64) });
 });
+
+test('provider diagnostics distinguish recheck from recovery and show pending HEAD', async ({ page }) => {
+  await page.goto('/database?provider=pending'); const widget = page.frameLocator('iframe');
+  await expect(widget.getByRole('button', { name: 'Search corpus' })).toBeEnabled();
+  await widget.getByRole('button', { name: 'Search corpus' }).click();
+  const admission = widget.getByLabel('Provider admission');
+  await expect(admission).toContainText('Operator action required');
+  await expect(admission).toContainText('Blocked since: unknown');
+  await expect(admission).toContainText('Uncertainty first observed:');
+  await expect(admission).toContainText('Recheck timing is not a recovery estimate');
+  await widget.getByRole('button', { name: 'Fictional sample statute' }).click();
+  await widget.getByRole('button', { name: 'Read HEAD' }).click();
+  await expect(widget.getByText('HEAD collection pending:', { exact: false })).toContainText('deferred');
+  await expect(widget.getByLabel('Object content')).toHaveCount(0);
+  const calls = JSON.parse(await page.locator('#calls').textContent() || '[]');
+  const before = calls.length;
+  await page.waitForTimeout(500);
+  expect(JSON.parse(await page.locator('#calls').textContent() || '[]')).toHaveLength(before);
+});
+
+for (const source of ['', '?provider=malformed']) {
+  test(`missing or invalid diagnostic keeps local corpus evidence usable (${source || 'older server'})`, async ({ page }) => {
+    await page.goto(`/database${source}`); const widget = page.frameLocator('iframe');
+    await expect(widget.getByRole('button', { name: 'Search corpus' })).toBeEnabled();
+    await widget.getByRole('button', { name: 'Search corpus' }).click();
+    await expect(widget.getByLabel('Provider admission')).toContainText('status unknown');
+    await expect(widget.getByLabel('Provider admission')).not.toContainText('admission available');
+    await widget.getByRole('button', { name: 'Fictional sample statute' }).click();
+    await expect(widget.getByLabel('Object content')).toHaveText('first fictional page');
+    await expect(widget.getByLabel('Provider admission')).toContainText('status unknown');
+  });
+}

@@ -541,3 +541,35 @@ all required verified bodies, no unfinished jobs or gaps, and index acknowledgem
 no unresolved guide contracts. An English response retained with unverified
 identity cannot satisfy required-body coverage. Completion describes a stable
 observed traversal, not an atomic provider snapshot.
+
+
+## Current provider admission diagnostics
+
+Collection request/status, database query/rg, HEAD get/get_metadata, object status,
+corpus status and citation search include a common best-effort current snapshot in
+`_meta["openlegal/provider_admission"]` and additional explanatory text. Existing
+structured results and output schemas are unchanged; strict older clients need
+not accept new body fields. Existing collection and citation metadata are merged.
+
+Version 1 contains `observed_at` (Unix seconds), `flags` for
+`provider_response_uncertain`, `operator_suspended`, `provider_recovery_hold`,
+nullable `paused_since`, `flag_times`, `uncertainty_first_observed_at`, and
+`continuous`/`on_demand` mode diagnostics (`reason`, `ready`, `recheck_at`,
+`requires_operator_review`). `retry_after_semantics` is `"status_recheck"`.
+Receipt `reason` remains historical settlement evidence, whereas this snapshot
+reports current provider admission. Recheck times and `retry_after_seconds` do not
+predict successful collection or operator recovery. A ready snapshot is an
+observation, not a reserved request slot or a completeness claim.
+
+Migrated uncertain responses have unknown actual start times. The collector
+records first observation once; public status reads never create observations.
+A hold created by offline recovery has a known start time. Unsettled abandoned
+parallel slots count as uncertainty even when the legacy flag is false. The
+public projection omits owner IDs, slots, lock keys, internal generations and
+raw database/provider errors. If diagnostics cannot be read, retained results
+remain usable with an explicit unknown-status qualification, and the widget
+shows unknown rather than assuming healthy admission.
+
+The legal widget reads the same metadata and displays pending HEAD receipts
+without manufacturing content. Exact capture/revision reads and retained content
+paging remain strict. It does not recover providers or automatically poll.

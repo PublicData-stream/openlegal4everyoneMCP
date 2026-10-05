@@ -101,6 +101,35 @@ function boolean(value: unknown): boolean { if (typeof value !== 'boolean') thro
 function optionalText(value: unknown, max: number): string | null { return value === null || value === undefined ? null : text(value, max); }
 function hash(value: unknown): string { const result = text(value, 64); if (!/^[0-9a-f]{64}$/.test(result)) throw new Error('The server returned an invalid content identifier.'); return result; }
 export function data(result: unknown): Record<string, unknown> { const response = object(result); if (response.isError) throw new Error('The database operation failed. Data may be unavailable, incomplete or expired.'); const value = object(response.structuredContent); if (bytes(JSON.stringify(value)) > 2 * 1024 * 1024) throw new Error('The response exceeds the browser display budget.'); return value; }
+export type AdmissionMode = { reason: string; ready: boolean; recheck_at: number | null; requires_operator_review: boolean };
+export type ProviderAdmission = { observed_at: number; flags: { provider_recovery_hold: boolean; operator_suspended: boolean; provider_response_uncertain: boolean }; paused_since: number | null; uncertainty_first_observed_at: number | null; continuous: AdmissionMode; on_demand: AdmissionMode };
+/** Missing metadata means unknown, including responses from older servers. */
+export function providerAdmission(result: unknown): ProviderAdmission | null {
+  const response = object(result);
+  if (response._meta == null) return null;
+  const raw = object(response._meta)['openlegal/provider_admission'];
+  if (raw == null) return null;
+  if (bytes(JSON.stringify(raw)) > 8192) throw new Error('The provider diagnostic exceeds its display budget.');
+  const value = object(raw);
+  if (value.version !== 1 || value.retry_after_semantics !== 'status_recheck') throw new Error('The provider diagnostic is unsupported.');
+  const nullableTime = (v: unknown) => v == null ? null : number(v);
+  const mode = (v: unknown): AdmissionMode => { const m = object(v); return { reason: text(m.reason, 64), ready: boolean(m.ready), recheck_at: nullableTime(m.recheck_at), requires_operator_review: boolean(m.requires_operator_review) }; };
+  const flags = object(value.flags);
+  return { observed_at: number(value.observed_at), flags: { provider_recovery_hold: boolean(flags.provider_recovery_hold), operator_suspended: boolean(flags.operator_suspended), provider_response_uncertain: boolean(flags.provider_response_uncertain) }, paused_since: nullableTime(value.paused_since), uncertainty_first_observed_at: nullableTime(value.uncertainty_first_observed_at), continuous: mode(value.continuous), on_demand: mode(value.on_demand) };
+}
+export type PendingHead = { status: string; retry_after_seconds: number; reason: string | null };
+export function pendingHead(result: unknown, selector: Selector): PendingHead | null {
+  const value = data(result);
+  if (value.state !== 'pending') return null;
+  if (selector.kind !== 'head') throw new Error('An exact checkpoint cannot be pending.');
+  if (value.schema_version !== 1) throw new Error('The pending response is unsupported.');
+  const collection = object(value.collection);
+  if (collection.status !== 'pending') throw new Error('The pending collection status is inconsistent.');
+  const receipt = object(collection.receipt);
+  if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(text(receipt.request_id, 36))) throw new Error('The pending receipt identifier is invalid.');
+  if (!['queued', 'launching', 'running', 'deferred'].includes(String(receipt.status))) throw new Error('The pending receipt is inconsistent.');
+  return { status: text(receipt.status, 32), retry_after_seconds: number(receipt.retry_after_seconds), reason: optionalText(receipt.reason, 64) };
+}
 export function identity(value: unknown): ObjectId {
   const id = object(value); const dataset = text(id.dataset, 32);
   if (!isDataset(dataset)) throw new Error('Unsupported dataset.');

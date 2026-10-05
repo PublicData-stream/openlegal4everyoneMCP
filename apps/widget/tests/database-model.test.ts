@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { DATASETS, datasetLabel, hasProviderRevisions, getResult, identity, metadata, searchPage, mergeCatalog, historyPage } from '../src/database-model.ts';
+import { DATASETS, datasetLabel, hasProviderRevisions, getResult, identity, metadata, searchPage, mergeCatalog, historyPage, providerAdmission, pendingHead } from '../src/database-model.ts';
 const id = { jurisdiction: 'kr', provider: 'fixture', dataset: 'national_statute' as const, id: 'fictional' };
 const meta = { object: id, revision_id: 'r1', capture_id: 'a'.repeat(64), title: 'Fictional', source_url: 'https://fixture.example/', retrieved_at: 1, captured_at: 2, validated_at: 3, raw_sha256: 'b'.repeat(64), processor_version: 'fixture', metadata: {}, freshness: null };
 test('browser dataset and history contracts match the closed Rust domain', () => {
@@ -80,4 +80,23 @@ test('catalog paging merges only the same immutable session without gaps or dupl
 test('catalog-only history has no invented capture observation time', () => {
   const result = historyPage({ structuredContent: { entries: [{ revision_id: 'r1', capture_id: null, captured_at: null, sequence: 1, publication_date: null, effective_date: null }], next_cursor: null, inventory_complete: false } });
   assert.equal(result.entries[0].captured_at, null);
+});
+
+const admission = { version: 1, observed_at: 100, flags: { provider_recovery_hold: false, operator_suspended: false, provider_response_uncertain: true }, paused_since: null, uncertainty_first_observed_at: 80, continuous: { reason: 'provider_response_uncertain', ready: false, recheck_at: 3700, requires_operator_review: true }, on_demand: { reason: 'provider_response_uncertain', ready: false, recheck_at: 3700, requires_operator_review: true }, retry_after_semantics: 'status_recheck' };
+test('provider diagnostics preserve unknown times and refuse invalid or excessive metadata', () => {
+  assert.equal(providerAdmission({ structuredContent: {} }), null);
+  const parsed = providerAdmission({ _meta: { 'openlegal/provider_admission': admission } });
+  assert.equal(parsed?.paused_since, null);
+  assert.equal(parsed?.uncertainty_first_observed_at, 80);
+  assert.equal(parsed?.on_demand.requires_operator_review, true);
+  assert.throws(() => providerAdmission({ _meta: { 'openlegal/provider_admission': { ...admission, version: 2 } } }));
+  assert.throws(() => providerAdmission({ _meta: { 'openlegal/provider_admission': { ...admission, paused_since: -1 } } }));
+  assert.throws(() => providerAdmission({ _meta: { 'openlegal/provider_admission': { ...admission, padding: 'x'.repeat(8192) } } }));
+});
+test('pending HEAD is a collection receipt, never a substitute for an exact capture', () => {
+  const wire = { structuredContent: { schema_version: 1, state: 'pending', reason: 'not_observed', collection: { status: 'pending', receipt: { request_id: '00000000-0000-0000-0000-000000000001', status: 'deferred', retry_after_seconds: 60, reason: null } } } };
+  assert.deepEqual(pendingHead(wire, { kind: 'head' }), { status: 'deferred', retry_after_seconds: 60, reason: null });
+  assert.throws(() => pendingHead(wire, { kind: 'capture', id: 'a'.repeat(64) }));
+  assert.throws(() => pendingHead({ structuredContent: { ...wire.structuredContent, collection: { status: 'fresh' } } }, { kind: 'head' }));
+  assert.equal(pendingHead({ structuredContent: { schema_version: 1 } }, { kind: 'head' }), null);
 });

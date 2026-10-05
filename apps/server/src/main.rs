@@ -381,6 +381,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                     )?,
                 );
                 registry.register_module(openlegal_server::citation::CitationTools {
+                    admission_store: Some(runtime.store.clone()),
                     demand: Some(demand.clone()),
                     service: service.clone(),
                 })?;

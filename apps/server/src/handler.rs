@@ -458,6 +458,22 @@ impl ServerHandler for McpHandler {
         };
         match result {
             Ok(mut value) => {
+                if let Some(error) = value.error {
+                    self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                    // This is the same tool failure as the ordinary Err path.
+                    // Successful result schemas and citation projections never
+                    // apply to its diagnostic sidecars.
+                    let result = qualify_tool_error(
+                        error,
+                        value.meta,
+                        value.additional_content,
+                        self.limits.tool_result_limit(),
+                    )?;
+                    ensure_serialized_limit(&result, self.limits.max_message_bytes / 2).map_err(
+                        |_| ErrorData::internal_error("tool result exceeds limit", None),
+                    )?;
+                    return Ok(result.into());
+                }
                 if let Some(service) = &self.citations {
                     crate::citation::append_native_references(
                         request.name.as_ref(),
@@ -509,6 +525,27 @@ impl ServerHandler for McpHandler {
             }
         }
     }
+}
+
+fn qualify_tool_error(
+    error: ToolError,
+    meta: Option<rmcp::model::MetaObject>,
+    additional_content: Vec<rmcp::model::ContentBlock>,
+    result_limit: usize,
+) -> Result<CallToolResult, ErrorData> {
+    let mut result = map_tool_error(error)?;
+    if let Some(meta) = meta {
+        result
+            .meta
+            .get_or_insert_with(|| rmcp::model::MetaObject(Default::default()))
+            .0
+            .extend(meta.0);
+    }
+    result.content.extend(additional_content);
+    if ensure_serialized_limit(&result, result_limit).is_err() {
+        return map_tool_error(ToolError::ResourceLimit);
+    }
+    Ok(result)
 }
 
 fn map_tool_error(error: ToolError) -> Result<CallToolResult, ErrorData> {
@@ -646,5 +683,48 @@ mod source_tests {
         assert!(McpHandler::new(registry, limits, source.clone()).is_err());
         let registry = crate::registry::server_info_registry(source.clone()).unwrap();
         assert!(McpHandler::new(registry, Arc::new(Limits::default()), source).is_ok());
+    }
+
+    #[test]
+    fn error_diagnostics_preserve_original_collection_envelope_and_result_bounds() {
+        use crate::registry::CollectionReadFailure;
+        use rmcp::model::{ContentBlock, MetaObject};
+        let error = ToolError::CollectionUnavailable {
+            cause: CollectionReadFailure::NotObserved,
+        };
+        let original = map_tool_error(error).unwrap();
+        let meta = MetaObject(serde_json::Map::from_iter([(
+            "openlegal/provider_admission".into(),
+            serde_json::json!({"flags":{"provider_recovery_hold":true}}),
+        )]));
+        let qualified = qualify_tool_error(
+            error,
+            Some(meta.clone()),
+            vec![ContentBlock::text(
+                "Operator review required; recheck does not promise recovery.",
+            )],
+            4096,
+        )
+        .unwrap();
+        assert_eq!(qualified.is_error, original.is_error);
+        assert_eq!(qualified.structured_content, original.structured_content);
+        assert_eq!(qualified.content[0], original.content[0]);
+        assert_eq!(
+            qualified.meta.as_ref().unwrap().0["openlegal/provider_admission"]["flags"]["provider_recovery_hold"],
+            true
+        );
+        assert_eq!(qualified.content.len(), original.content.len() + 1);
+        let oversized = qualify_tool_error(
+            error,
+            Some(meta),
+            vec![ContentBlock::text("x".repeat(5000))],
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            oversized.structured_content.unwrap()["code"],
+            "resource_limit"
+        );
+        assert!(oversized.meta.is_none());
     }
 }
