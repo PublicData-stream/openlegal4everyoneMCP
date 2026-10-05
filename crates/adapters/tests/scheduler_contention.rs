@@ -18,6 +18,7 @@ async fn rejected_heartbeat_and_claim_preserve_queue_and_recover_after_contentio
     let pool = base.pool();
     let scheduler_pool = PgPoolOptions::new()
         .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(100))
         .after_connect(|connection, _| {
             Box::pin(async move {
                 sqlx::query("SET lock_timeout='100ms'")
@@ -98,11 +99,15 @@ async fn rejected_heartbeat_and_claim_preserve_queue_and_recover_after_contentio
     assert_eq!(claimed, receipt.request_id);
     assert!(store.claim_collection_request().await.unwrap().is_none());
 
-    // A closed pool supplies no server rejection and must remain fail-closed.
-    scheduler_pool.close().await;
+    // Pool admission timeout supplies no PostgreSQL rejection. Unlike a closed
+    // pool (which fails the store's health gate), it exercises the SQL error
+    // mapper's uncertain-outcome path and must never become retryable contention.
+    let occupied = scheduler_pool.acquire().await.unwrap();
     assert_eq!(
         store.heartbeat_collection_scheduler().await,
         Err(DatabaseError::StorageUnavailable)
     );
+    drop(occupied);
+    scheduler_pool.close().await;
     base.close().await.unwrap();
 }
