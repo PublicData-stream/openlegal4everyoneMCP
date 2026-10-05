@@ -41,8 +41,19 @@ pub struct PgCorpusStore {
     publication_clock: Arc<dyn openlegal_application::Clock>,
     collection_events: Arc<tokio::sync::OnceCell<crate::collection_events::CollectionEvents>>,
 }
-fn db(_: sqlx::Error) -> DatabaseError {
-    DatabaseError::StorageUnavailable
+fn db(error: sqlx::Error) -> DatabaseError {
+    // Only a server-reported rejection proves that the SQL statement failed.
+    // Connection and pool timeouts can leave the commit outcome uncertain.
+    if error.as_database_error().is_some_and(|error| {
+        matches!(
+            error.code().as_deref(),
+            Some("55P03" | "57014" | "40P01" | "40001")
+        )
+    }) {
+        DatabaseError::StorageContended
+    } else {
+        DatabaseError::StorageUnavailable
+    }
 }
 fn blob_error(error: openlegal_domain::RetrievalError) -> DatabaseError {
     match error {

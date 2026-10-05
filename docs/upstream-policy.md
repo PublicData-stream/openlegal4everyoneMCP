@@ -158,6 +158,14 @@ terminal failure, including failure before the request Pod can open storage.
 Transient storage admission contention is retried only during collection Pod
 startup, before any provider request is made. An uncertain Job creation outcome
 remains fenced until it can be reconciled or its lease expires.
+The collection scheduler retries selected database operations only after
+PostgreSQL explicitly rejects them for lock/statement timeout, deadlock or
+serialization failure. Four total attempts use 100, 200 and 400 millisecond
+backoff, interrupted by cancellation. Unknown storage outcomes and lost ownership
+are terminal for that scheduler run. Kubernetes Job creation is never retried by
+this policy; after successful creation only its exact launch acknowledgement can
+retry. This storage policy does not add provider HTTP attempts or clear admission
+evidence.
 
 LAW accepts `requests_per_second = 1..1000` instead of an explicitly selected
 `min_interval_secs`; specifying both is invalid. Start spacing is rounded up to

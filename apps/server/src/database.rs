@@ -483,7 +483,9 @@ pub(crate) fn map_error(e: DatabaseError) -> ToolError {
         DatabaseError::NotObserved => ToolError::NotObserved,
         DatabaseError::CollectionIncomplete => ToolError::CollectionIncomplete,
         DatabaseError::SourceInventoryIncomplete => ToolError::SourceInventoryIncomplete,
-        DatabaseError::StorageUnavailable => ToolError::StorageUnavailable,
+        DatabaseError::StorageUnavailable | DatabaseError::StorageContended => {
+            ToolError::StorageUnavailable
+        }
         DatabaseError::StorageCorrupt => ToolError::StorageCorrupt,
         DatabaseError::Capacity | DatabaseError::BudgetExhausted => ToolError::ResourceLimit,
         DatabaseError::AmbiguousRevision => ToolError::Ambiguous,

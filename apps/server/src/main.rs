@@ -7,6 +7,9 @@ use openlegal_server::{
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
+mod collection_scheduler_retry;
+use collection_scheduler_retry::retry_storage;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     Serve,
@@ -564,7 +567,7 @@ async fn run_collection_scheduler(
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            heartbeat_store.heartbeat_collection_scheduler().await?;
+            retry_storage(&cancel, || heartbeat_store.heartbeat_collection_scheduler()).await?;
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
@@ -578,15 +581,16 @@ async fn run_collection_scheduler(
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            store.reap_stale_collection_requests().await?;
-            reconcile_failed_collection_jobs(&store, ingestion).await?;
+            retry_storage(&cancel, || store.reap_stale_collection_requests()).await?;
+            reconcile_failed_collection_jobs(&store, ingestion, &cancel).await?;
             let policy = ingestion.provider_requests.limits()?;
-            let Some(launch) = store
-                .claim_collection_request_with_policy(
+            let Some(launch) = retry_storage(&cancel, || {
+                store.claim_collection_request_with_policy(
                     policy.on_demand_timeout_secs,
                     policy.on_demand_attempt_limit,
                 )
-                .await?
+            })
+            .await?
             else {
                 match events
                     .wait(&cancel, std::time::Duration::from_secs(5))
@@ -636,7 +640,11 @@ async fn run_collection_scheduler(
                 tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
             match outcome {
                 Ok(Ok(status)) if status.success() => {
-                    store.mark_collection_launch_running(&launch, &name).await?;
+                    // Retry only this exact-epoch marker; never recreate the Job.
+                    retry_storage(&cancel, || {
+                        store.mark_collection_launch_running(&launch, &name)
+                    })
+                    .await?;
                 }
                 _ => {
                     // Creation may have reached the API server. Keep the claim
@@ -646,7 +654,12 @@ async fn run_collection_scheduler(
             }
         }
     };
-    tokio::select! { result = heartbeat => result, result = dispatch => result }
+    let result = tokio::select! { result = heartbeat => result, result = dispatch => result };
+    if cancel.is_cancelled() {
+        Ok(())
+    } else {
+        result
+    }
 }
 
 fn render_collection_job(
@@ -708,8 +721,14 @@ fn collection_job_failed(job: &serde_json::Value, name: &str) -> bool {
 async fn reconcile_failed_collection_jobs(
     store: &openlegal_adapters::corpus::PgCorpusStore,
     ingestion: &openlegal_server::config::IngestionConfig,
+    cancel: &CancellationToken,
 ) -> Result<(), ServerError> {
-    for (id, stored_name, epoch) in store.unsettled_collection_launches().await? {
+    for (id, stored_name, epoch) in
+        retry_storage(cancel, || store.unsettled_collection_launches()).await?
+    {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         let expected = collection_job_name(&id, epoch)?;
         // Existing launched Jobs retain their stored name during upgrade.
         let legacy = format!("openlegal-request-{}", id.replace('-', ""));
@@ -758,9 +777,10 @@ async fn reconcile_failed_collection_jobs(
             continue;
         };
         if collection_job_failed(&job, &name) {
-            store
-                .fail_finished_collection_launch(&id, &name, epoch)
-                .await?;
+            retry_storage(cancel, || {
+                store.fail_finished_collection_launch(&id, &name, epoch)
+            })
+            .await?;
         }
     }
     Ok(())

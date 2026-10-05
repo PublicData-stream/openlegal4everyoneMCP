@@ -680,6 +680,9 @@ pub enum DatabaseError {
     FreshnessUnavailable,
     Withdrawn,
     StorageUnavailable,
+    /// PostgreSQL explicitly rejected the operation due to transient contention.
+    /// Transport failures with an uncertain commit outcome are excluded.
+    StorageContended,
     StorageCorrupt,
     Capacity,
     BudgetExhausted,
