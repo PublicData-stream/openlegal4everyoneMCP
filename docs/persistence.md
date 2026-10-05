@@ -324,3 +324,135 @@ changing policy never resets them. Rollback requires the coordinated pre-migrati
 snapshot and its matching binaries, not running an older executable against the
 new schema. This migration does not alter retained legal identity or rebuild the
 search index.
+
+## Offline provider recovery
+
+The administrator CLI opens PostgreSQL only. It does not initialize blob stores,
+provider clients, dictionaries, widgets, serving endpoints or collection Jobs.
+`[cache.postgres].provider_admin_url_env` defaults to
+`OPENLEGAL_PROVIDER_ADMIN_DATABASE_URL`, distinct from runtime and migration
+variables. Only administrator commands resolve this secret. TLS and URL validation
+use the existing PostgreSQL policy. No ordinary Pod should receive this secret.
+
+```sh
+openlegal-server --provider-admin inspect CONFIG.toml > inspection.json
+openlegal-server --provider-admin plan reviewed-spec.json CONFIG.toml > plan.json
+openlegal-server --provider-admin apply plan.json CONFIG.toml
+openlegal-server --provider-admin readback OPERATION_ID CONFIG.toml
+```
+
+`inspect` and `plan` are read-only. Supply an actor, review reason, exact legacy
+and parallel owner targets, stopped-writer identities, stop time, deployed
+revision and evidence reference in the specification. All request initiators and
+late response callbacks must be stopped and drained; the evidence is the
+operator's attestation, not proof furnished by the database or CLI.
+
+A synthetic specification (replace it with reviewed actual observations):
+
+```json
+{
+  "actor": "operator-label",
+  "reason": "reviewed uncertain response after all writers drained",
+  "quiescence": {
+    "writers_stopped_at": 1791200000,
+    "deployment_revision": "matching-deployed-revision",
+    "stopped_writer_ids": ["scheduler", "request-and-detail-collectors"],
+    "evidence_reference": "operator-maintenance-record"
+  },
+  "resolve_legacy": true,
+  "owners": [],
+  "resume": false,
+  "waits": []
+}
+```
+
+Version 1 plans bind storage identity, schema and the complete provider state to a
+unique operation ID and expire after 15 minutes. JSON input is limited to 256 KiB;
+plans select at most 16 parallel owners and 256 explicitly reviewed waits. Inspect
+reports whether its bounded waiting inventory was truncated. Plan reads only the
+explicitly selected IDs, including IDs outside that first inventory window; a
+cleanup-only plan does not retain unrelated waiting entries. Offline cleanup
+requires the exact full owner ledger; it cannot force-clean a live owner or
+silently ignore unreviewed uncertain owners. Plan files contain private operational
+identities and review evidence; keep them in operator-controlled storage.
+
+Default apply resolves reviewed uncertainty and atomically creates a durable
+`provider_recovery_hold`. Restarting a current collector does not release it.
+To resume globally, make a new plan with the explicit `--resume` option. This also
+supports a hold-only plan after cleanup (`resolve_legacy=false`, `owners=[]`).
+Selected waits require exact `kind`, `id` and nonempty `review_reason`; legacy NULL
+reasons are not guessed or backfilled. Only their eligible leases are advanced.
+Unselected due work can run on its original schedule after global hold release.
+Quotas, authentication suspension, Retry-After, epochs, attempts and permanent
+captures remain authoritative. A reviewed selection blocked by another policy
+may remain unadvanced; inspect the returned `advanced_waits` rather than assuming
+that resumption launched every selected item.
+
+Apply rechecks state and leases under corpus/provider row locks and the legacy
+plus all 16 slot advisory locks. Changed state or active ownership rejects the
+whole transaction. Audit insertion, fence cleanup, hold and lease updates commit
+atomically. Identical reapplication returns the recorded result; reuse of an
+operation ID with a different plan is rejected. On a lost COMMIT acknowledgement,
+do not automatically apply again: use `readback` and reconcile that operation.
+Charged usage is never refunded. Audit and observation history are retained.
+
+### Administrator role provisioning
+
+DBAs provision roles and credentials outside migrations. The migration creates
+`openlegal_admin`, revokes PUBLIC table/function access and exposes named checked
+functions. Ordinary broad grants on `openlegal` do not grant access to this schema.
+Use a separate NOLOGIN function-owner role and a LOGIN operator role; do not use
+the migration credential for routine recovery. The operator has no direct admin
+DML or audit insertion rights. These controls protect ordinary roles, not a DBA,
+migration owner or superuser capable of changing objects and grants.
+
+After migration, a DBA can provision the following role structure, with LOGIN
+credentials supplied by the site's secret-management process:
+
+```sql
+CREATE ROLE openlegal_provider_function_owner NOLOGIN;
+CREATE ROLE openlegal_provider_operator LOGIN;
+GRANT USAGE ON SCHEMA openlegal, openlegal_admin TO openlegal_provider_function_owner;
+GRANT SELECT ON public._sqlx_migrations TO openlegal_provider_function_owner;
+GRANT SELECT ON openlegal.cache_storage, openlegal.corpus_control,
+  openlegal.provider_request_budget, openlegal.provider_request_admission,
+  openlegal.collection_request, openlegal.corpus_job, openlegal.corpus_object
+  TO openlegal_provider_function_owner;
+GRANT UPDATE (singleton) ON openlegal.corpus_control TO openlegal_provider_function_owner;
+GRANT UPDATE (unresolved_response, admission_owner) ON openlegal.provider_request_budget
+  TO openlegal_provider_function_owner;
+GRANT DELETE ON openlegal.provider_request_admission TO openlegal_provider_function_owner;
+GRANT UPDATE (lease_until) ON openlegal.collection_request, openlegal.corpus_job
+  TO openlegal_provider_function_owner;
+GRANT UPDATE (version) ON openlegal.corpus_object TO openlegal_provider_function_owner;
+GRANT SELECT ON ALL TABLES IN SCHEMA openlegal_admin TO openlegal_provider_function_owner;
+GRANT UPDATE ON openlegal_admin.provider_control TO openlegal_provider_function_owner;
+GRANT INSERT, UPDATE ON openlegal_admin.uncertainty_observation TO openlegal_provider_function_owner;
+GRANT INSERT ON openlegal_admin.provider_recovery_audit TO openlegal_provider_function_owner;
+-- Temporarily permit function ownership transfer, then remove CREATE.
+GRANT CREATE ON SCHEMA openlegal_admin TO openlegal_provider_function_owner;
+DO $$ DECLARE f record; BEGIN
+  FOR f IN SELECT p.oid::regprocedure AS signature FROM pg_proc p
+    JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='openlegal_admin'
+  LOOP EXECUTE format('ALTER FUNCTION %s OWNER TO openlegal_provider_function_owner',f.signature); END LOOP;
+END $$;
+REVOKE CREATE ON SCHEMA openlegal_admin FROM openlegal_provider_function_owner;
+GRANT USAGE ON SCHEMA openlegal_admin TO runtime, openlegal_provider_operator;
+GRANT SELECT ON public._sqlx_migrations TO openlegal_provider_operator;
+GRANT EXECUTE ON FUNCTION openlegal_admin.provider_inspect(),
+  openlegal_admin.provider_inspect_selected(jsonb),
+  openlegal_admin.provider_apply(jsonb), openlegal_admin.provider_readback(uuid)
+  TO openlegal_provider_operator;
+GRANT EXECUTE ON FUNCTION openlegal_admin.provider_diagnostic(),
+  openlegal_admin.provider_held(), openlegal_admin.observe_uncertainty(),
+  openlegal_admin.provider_blocker_fingerprint() TO runtime;
+```
+
+Replace `runtime` with the deployment's actual runtime role. Verify that PUBLIC
+and runtime cannot invoke apply/readback/inspect, operator cannot invoke collector
+observation functions, and neither can update/delete/truncate audit or release
+hold via direct DML. Do not grant operator membership in the function-owner or
+migration role. Missing hold-read grants fail closed at admission; diagnostic
+reads report unknown. Upgrade all restartable collectors before applying recovery;
+old binaries do not recognize the hold. Follow the coordinated restore procedure
+for rollback rather than removing new schema or retained audit records.

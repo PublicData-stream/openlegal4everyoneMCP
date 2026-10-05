@@ -1584,3 +1584,30 @@ now requires migrated PostgreSQL, prepared storage and a provisioned dictionary.
 Phase 5 preserves production Rust behavior and the configuration contents; serving
 and administration import the same content-hashed ConfigMap from the
 [shared configuration base](../deploy/kubernetes/config/).
+
+
+### Offline provider recovery rollout
+
+For the protected recovery state migration, stop and drain all provider request
+initiators, including scheduler, request/detail collection Pods and late response
+parsing callbacks. Apply the matching migration, provision the named database
+function grants, and replace every restartable collector with a binary that
+honors `provider_recovery_hold` before any recovery or collector restart. Old
+binaries do not understand the new hold; a runtime table grant is not a guarantee
+that an old collector follows the new policy. Do not mount the provider-admin
+credential in serving, scheduler or collection Job templates.
+
+Use the [offline provider recovery commands](persistence.md#offline-provider-recovery)
+with operator evidence that writers stopped and in-flight requests drained. The
+CLI revalidates database ownership but does not scale Kubernetes or prove remote
+HTTP completion. Its default apply leaves a durable recovery hold. Explicit
+resumption releases admission globally: only reviewed IDs get earlier leases,
+but unselected work can proceed at its existing due times. Authentication pauses,
+quotas and Retry-After remain in force. Restart collectors only after examining
+the audit result and current admission diagnostics.
+
+This migration does not prune captures or archives. An old binary will reject the
+new schema; rollback requires the coordinated database/retained-storage recovery
+procedure rather than deleting the new migration or audit rows. Code, disposable
+fixture verification, production deployment and actual recovery are separate
+acceptance claims.

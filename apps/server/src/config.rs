@@ -416,6 +416,8 @@ pub struct PostgresConfig {
     pub url_env: String,
     #[serde(default = "default_migration_url_env")]
     pub migration_url_env: String,
+    #[serde(default = "default_provider_admin_url_env")]
+    pub provider_admin_url_env: String,
     #[serde(default = "default_pool_connections")]
     pub max_connections: u32,
     #[serde(default)]
@@ -461,6 +463,9 @@ fn default_url_env() -> String {
 }
 fn default_migration_url_env() -> String {
     "OPENLEGAL_MIGRATION_DATABASE_URL".into()
+}
+fn default_provider_admin_url_env() -> String {
+    "OPENLEGAL_PROVIDER_ADMIN_DATABASE_URL".into()
 }
 
 impl CacheConfig {
@@ -516,9 +521,15 @@ impl PostgresConfig {
         }
         if !valid_env(&self.url_env)
             || !valid_env(&self.migration_url_env)
+            || !valid_env(&self.provider_admin_url_env)
             || self.url_env == self.migration_url_env
+            || self.provider_admin_url_env == self.url_env
+            || self.provider_admin_url_env == self.migration_url_env
         {
-            return Err("configure distinct valid runtime and migration environment names".into());
+            return Err(
+                "configure distinct valid runtime, migration and provider-admin environment names"
+                    .into(),
+            );
         }
         if !(2..=64).contains(&self.max_connections) {
             return Err("PostgreSQL max_connections must be between 2 and 64".into());
@@ -561,6 +572,16 @@ impl PostgresConfig {
             .filter(|value| !value.is_empty() && value.len() <= 8192)
             .ok_or_else(|| {
                 "required PostgreSQL connection environment value is missing or invalid".into()
+            })
+    }
+
+    /// Administrator credentials are resolved only by the offline provider CLI.
+    pub fn provider_admin_connection_url(&self) -> Result<String, ServerError> {
+        std::env::var(&self.provider_admin_url_env)
+            .ok()
+            .filter(|value| !value.is_empty() && value.len() <= 8192)
+            .ok_or_else(|| {
+                "required provider-admin database environment value is missing or invalid".into()
             })
     }
 }

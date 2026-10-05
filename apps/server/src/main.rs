@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 mod collection_scheduler_retry;
+mod provider_admin;
 use collection_scheduler_retry::retry_storage;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +26,9 @@ fn main() -> Result<(), ServerError> {
     let first = args.next().ok_or(
         "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index|--collection-scheduler|--collection-job ID] CONFIG.toml",
     )?;
+    if first == "--provider-admin" {
+        return provider_admin::run(args.collect());
+    }
     if first == "--text-diff-worker" {
         if args.next().is_some() {
             return Err("text-diff worker takes no arguments".into());
