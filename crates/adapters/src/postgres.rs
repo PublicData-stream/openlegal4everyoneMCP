@@ -1,6 +1,7 @@
 //! PostgreSQL observation persistence. Retrieval policy remains in the application.
 mod data;
 mod maintenance;
+pub mod provider_admin;
 mod publication;
 mod request_budget;
 #[cfg(test)]
@@ -304,6 +305,13 @@ fn migrator() -> Migrator {
             "collection deferral reasons".into(),
             MigrationType::Simple,
             include_str!("../migrations/0022_collection_deferral_reasons.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            23,
+            "provider operator recovery".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0023_provider_operator_recovery.sql").into_sql_str(),
             false,
         ),
     ]);

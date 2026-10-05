@@ -261,7 +261,9 @@ def prepare_postgres(root, args, passwords, tls):
         f"CREATE ROLE runtime LOGIN PASSWORD '{passwords['runtime']}';\nCREATE DATABASE openlegal OWNER migration;\n"}, POSTGRES)
     grants = secret("postgres-grants-sql", {"run.sql": "REVOKE CREATE ON SCHEMA public FROM PUBLIC;\n"
         "GRANT USAGE ON SCHEMA openlegal TO runtime;\nGRANT SELECT ON public._sqlx_migrations TO runtime;\n"
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA openlegal TO runtime;\n"}, POSTGRES)
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA openlegal TO runtime;\n"
+        "GRANT USAGE ON SCHEMA openlegal_admin TO runtime;\n"
+        "GRANT EXECUTE ON FUNCTION openlegal_admin.provider_diagnostic(), openlegal_admin.provider_held(), openlegal_admin.observe_uncertainty(), openlegal_admin.provider_blocker_fingerprint() TO runtime;\n"}, POSTGRES)
     hba = object_("ConfigMap", "postgres-hba", POSTGRES, data={"pg_hba.conf":
         "local all all trust\nhostssl all all all scram-sha-256\nhostnossl all all all reject\n"})
     init = {"name": "tls-permissions", "image": args.postgres_image, "imagePullPolicy": "Never",

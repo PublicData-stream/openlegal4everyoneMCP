@@ -135,6 +135,23 @@ impl PgCorpusStore {
         started_at: u64,
         job_id: &str,
     ) -> Result<ObjectCompletionEta, DatabaseError> {
+        let admission = match self.provider_admission_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return Ok(ObjectCompletionEta::Unknown {
+                    reason: "provider_admission_unknown".into(),
+                });
+            }
+        };
+        if admission.recovery_hold
+            || admission.legacy_uncertain
+            || admission.abandoned_slots > 0
+            || admission.operator_suspended
+        {
+            return Ok(ObjectCompletionEta::Unknown {
+                reason: "provider_paused".into(),
+            });
+        }
         let job_id = Uuid::parse_str(job_id).map_err(corrupt)?;
         let origin: Option<String> = sqlx::query_scalar(
             "SELECT source_metadata->>'collection_origin' FROM openlegal.corpus_job WHERE id=$1",
@@ -214,5 +231,57 @@ impl PgCorpusStore {
             latest_at: now.saturating_add(p90.saturating_sub(elapsed)),
             sample_size: durations.len() as u32,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openlegal_application::persistence::PersistentStore;
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn admission_diagnostic_failure_preserves_object_status_and_removes_healthy_eta() {
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let base = fixture.open(100).await;
+        let pool = base.pool();
+        let blobs =
+            crate::blob::FsBlobStore::open(&fixture.directory.path().join("unknown-admission-eta"))
+                .await
+                .unwrap();
+        let store = PgCorpusStore::new(pool.clone(), blobs);
+        let object = ObjectId {
+            jurisdiction: "kr".into(),
+            provider: "law_go_kr".into(),
+            dataset: Dataset::NationalStatute,
+            id: "001".into(),
+        };
+        store
+            .enqueue_job(object.clone(), "r1".into(), None, true, true, 100)
+            .await
+            .unwrap();
+        store.claim_job(101).await.unwrap().unwrap();
+        for sample in 0..20 {
+            let other = ObjectId {
+                id: format!("9{sample:03}"),
+                ..object.clone()
+            };
+            store
+                .enqueue_job(other.clone(), "r1".into(), None, true, true, 80)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE openlegal.corpus_job j SET status='done',started_at=80,completed_at=$2 FROM openlegal.corpus_object o WHERE j.object_key=o.object_key AND o.identity->>'id'=$1")
+                .bind(other.id).bind(90+sample).execute(&pool).await.unwrap();
+        }
+        let healthy = store.object_status(&object, 101).await.unwrap();
+        assert!(matches!(healthy.eta, ObjectCompletionEta::Range { .. }));
+        sqlx::query("ALTER FUNCTION openlegal_admin.provider_diagnostic() RENAME TO diagnostic_unavailable_fixture")
+            .execute(&pool).await.unwrap();
+        let unknown = store.object_status(&object, 101).await.unwrap();
+        assert_eq!(unknown.state, healthy.state);
+        assert_eq!(unknown.job.unwrap().status, "running");
+        assert!(
+            matches!(unknown.eta,ObjectCompletionEta::Unknown { reason } if reason=="provider_admission_unknown")
+        );
+        base.close().await.unwrap();
     }
 }

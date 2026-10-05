@@ -448,6 +448,14 @@ impl PgCorpusStore {
             .fetch_one(&mut *tx)
             .await
             .map_err(db)?;
+        let held: bool = sqlx::query_scalar("SELECT openlegal_admin.provider_held()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+        if held {
+            return Ok(None);
+        }
+
         sqlx::query("UPDATE openlegal.corpus_job SET status='failed',error_category='attempts_exhausted',completed_at=$1::text::numeric WHERE attempts>=(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) AND (status='pending' OR (status='running' AND lease_until<=$1::text::numeric))").bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         let dataset_name: Option<String> = preferred_dataset
             .map(|dataset| serde_json::to_value(dataset).map_err(corrupt))
@@ -636,7 +644,8 @@ impl PgCorpusStore {
     /// A daily upstream cap is admission policy, not a failed processing
     /// attempt. Keep the claim leased until the next UTC day across restarts.
     pub async fn defer_budget_claim(&self, job: &Job, resume_at: u64) -> Result<(), DatabaseError> {
-        self.defer_budget_claim_inner(job, resume_at, true).await
+        self.defer_budget_claim_inner(job, resume_at, true, None)
+            .await
     }
     /// A response with Retry-After has already spent a provider attempt. Keep
     /// that execution charged while preserving the durable next-eligible lease.
@@ -646,22 +655,34 @@ impl PgCorpusStore {
         job: &Job,
         resume_at: u64,
     ) -> Result<(), DatabaseError> {
-        self.defer_budget_claim_inner(job, resume_at, false).await
+        self.defer_budget_claim_inner(job, resume_at, false, None)
+            .await
+    }
+    pub async fn defer_budget_claim_with_fingerprint(
+        &self,
+        job: &Job,
+        resume_at: u64,
+        fingerprint: Option<&openlegal_domain::provider_admin::ProviderBlockerFingerprint>,
+        reserved: bool,
+    ) -> Result<(), DatabaseError> {
+        self.defer_budget_claim_inner(job, resume_at, !reserved, fingerprint)
+            .await
     }
     async fn defer_budget_claim_inner(
         &self,
         job: &Job,
         resume_at: u64,
         refund: bool,
+        fingerprint: Option<&openlegal_domain::provider_admin::ProviderBlockerFingerprint>,
     ) -> Result<(), DatabaseError> {
         let id = Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
         if job.attempts == 0 || resume_at == 0 {
             return Err(DatabaseError::InvalidInput);
         }
-        let rows = sqlx::query("UPDATE openlegal.corpus_job j SET attempts=j.attempts-CASE WHEN $5 THEN 1 ELSE 0 END,status=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN 'failed' ELSE 'running' END,lease_until=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN NULL ELSE $1::text::numeric END,error_category=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN 'processing_failed' ELSE 'budget_wait' END,completed_at=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN floor(extract(epoch from clock_timestamp()))::bigint ELSE NULL END FROM openlegal.provider_request_budget b WHERE b.singleton AND j.id=$2 AND j.expected_version=$3 AND j.attempts=$4 AND j.status='running'")
+        let rows = sqlx::query("UPDATE openlegal.corpus_job j SET attempts=j.attempts-CASE WHEN $5 THEN 1 ELSE 0 END,status=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN 'failed' ELSE 'running' END,lease_until=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN NULL ELSE $1::text::numeric END,error_category=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN 'processing_failed' ELSE 'budget_wait' END,provider_deferral_fingerprint=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN NULL ELSE $6::jsonb END,completed_at=CASE WHEN NOT $5 AND j.attempts>=b.max_job_attempts THEN floor(extract(epoch from clock_timestamp()))::bigint ELSE NULL END FROM openlegal.provider_request_budget b WHERE b.singleton AND j.id=$2 AND j.expected_version=$3 AND j.attempts=$4 AND j.status='running'")
             .bind(resume_at.to_string()).bind(id)
             .bind(i64::try_from(job.expected_version).map_err(|_|DatabaseError::InvalidInput)?)
-            .bind(job.attempts as i32).bind(refund).execute(&self.pool).await.map_err(db)?.rows_affected();
+            .bind(job.attempts as i32).bind(refund).bind(fingerprint.map(serde_json::to_value).transpose().map_err(corrupt)?).execute(&self.pool).await.map_err(db)?.rows_affected();
         if rows != 1 {
             return Err(DatabaseError::Conflict);
         }

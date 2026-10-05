@@ -262,6 +262,8 @@ if ! docker run --name "$migration" --platform "$platform" --network "$network" 
 fi
 printf '%s\n' 'REVOKE CREATE ON SCHEMA public FROM PUBLIC;' 'GRANT USAGE ON SCHEMA openlegal TO runtime;' \
     'GRANT SELECT ON public._sqlx_migrations TO runtime;' \
+    'GRANT USAGE ON SCHEMA openlegal_admin TO runtime;' \
+    'GRANT EXECUTE ON FUNCTION openlegal_admin.provider_diagnostic(), openlegal_admin.provider_held(), openlegal_admin.observe_uncertainty(), openlegal_admin.provider_blocker_fingerprint() TO runtime;' \
     'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA openlegal TO runtime;' | \
     docker exec -i "$postgres" psql -U postgres -d openlegal -v ON_ERROR_STOP=1 >/dev/null
 # Publication uses the runtime role; the helper releases every lease before serve.

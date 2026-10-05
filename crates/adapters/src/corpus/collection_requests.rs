@@ -152,6 +152,14 @@ impl PgCorpusStore {
             .fetch_one(&mut *tx)
             .await
             .map_err(db)?;
+        let held: bool = sqlx::query_scalar("SELECT openlegal_admin.provider_held()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+        if held {
+            return Ok(None);
+        }
+
         let active: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.collection_request WHERE status IN ('launching','running')")
             .fetch_one(&mut *tx).await.map_err(db)?;
         if active >= 16 {
@@ -304,7 +312,7 @@ impl PgCorpusStore {
         }
         validate_settlement_reason(reason)?;
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
-        let changed = sqlx::query("UPDATE openlegal.collection_request SET status=$2,payload=CASE WHEN $2='deferred' THEN payload ELSE '{}'::jsonb END,lease_until=CASE WHEN $2='deferred' THEN floor(extract(epoch from clock_timestamp()))::bigint+3600 ELSE NULL END,reason=$3 WHERE id=$1 AND status IN ('launching','running')")
+        let changed = sqlx::query("UPDATE openlegal.collection_request SET status=$2,payload=CASE WHEN $2='deferred' THEN payload ELSE '{}'::jsonb END,lease_until=CASE WHEN $2='deferred' THEN floor(extract(epoch from clock_timestamp()))::bigint+3600 ELSE NULL END,reason=$3,provider_deferral_fingerprint=NULL WHERE id=$1 AND status IN ('launching','running')")
             .bind(id).bind(status).bind(reason).execute(&self.pool).await.map_err(db)?.rows_affected();
         if changed != 1 {
             return Err(DatabaseError::Conflict);
@@ -321,6 +329,17 @@ impl PgCorpusStore {
         reason: Option<&str>,
         deferred_until: Option<u64>,
     ) -> Result<(), DatabaseError> {
+        self.settle_collection_launch_with_fingerprint(launch, status, reason, deferred_until, None)
+            .await
+    }
+    pub async fn settle_collection_launch_with_fingerprint(
+        &self,
+        launch: &CollectionLaunch,
+        status: &str,
+        reason: Option<&str>,
+        deferred_until: Option<u64>,
+        fingerprint: Option<&openlegal_domain::provider_admin::ProviderBlockerFingerprint>,
+    ) -> Result<(), DatabaseError> {
         if !matches!(status, "done" | "skipped" | "deferred" | "failed")
             || (status == "deferred") != deferred_until.is_some()
         {
@@ -331,9 +350,10 @@ impl PgCorpusStore {
             return Err(DatabaseError::InvalidInput);
         }
         let id = Uuid::parse_str(&launch.id).map_err(|_| DatabaseError::InvalidInput)?;
-        let changed = sqlx::query("UPDATE openlegal.collection_request SET status=$2,payload=CASE WHEN $2='deferred' THEN payload ELSE '{}'::jsonb END,lease_until=$3::text::bigint,reason=$4 WHERE id=$1 AND status IN ('launching','running') AND launched_at=$5::text::bigint AND lease_until>floor(extract(epoch from clock_timestamp()))::bigint")
+        let changed = sqlx::query("UPDATE openlegal.collection_request SET status=$2,payload=CASE WHEN $2='deferred' THEN payload ELSE '{}'::jsonb END,lease_until=$3::text::bigint,reason=$4,provider_deferral_fingerprint=CASE WHEN $2='deferred' THEN $6::jsonb ELSE NULL END WHERE id=$1 AND status IN ('launching','running') AND launched_at=$5::text::bigint AND lease_until>floor(extract(epoch from clock_timestamp()))::bigint")
             .bind(id).bind(status).bind(deferred_until.map(|value| value.to_string()))
             .bind(reason).bind(launch.launched_at.to_string())
+            .bind(fingerprint.map(serde_json::to_value).transpose().map_err(corrupt)?)
             .execute(&self.pool).await.map_err(db)?.rows_affected();
         if changed != 1 {
             return Err(DatabaseError::Conflict);
@@ -590,6 +610,7 @@ fn validate_settlement_reason(reason: Option<&str>) -> Result<(), DatabaseError>
                 | "operation_attempt_limit"
                 | "provider_admission_wait"
                 | "capacity_wait"
+                | "provider_recovery_hold"
         )
     }) {
         return Err(DatabaseError::InvalidInput);

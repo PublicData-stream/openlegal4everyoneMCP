@@ -1096,6 +1096,20 @@ impl DatabaseStore for PgCorpusStore {
     }
 }
 
+impl PgCorpusStore {
+    /// Read-only sanitized state; never initializes provider clients or records observations.
+    pub async fn provider_admission_snapshot(
+        &self,
+    ) -> Result<openlegal_domain::provider_admin::ProviderAdmissionSnapshot, DatabaseError> {
+        self.gate().await?;
+        crate::postgres::provider_admin::runtime_snapshot(&self.pool).await
+    }
+    pub async fn provider_collection_held(&self) -> Result<bool, DatabaseError> {
+        self.gate().await?;
+        crate::postgres::provider_admin::held(&self.pool).await
+    }
+}
+
 #[cfg(test)]
 mod archive_hash_tests {
     use super::*;

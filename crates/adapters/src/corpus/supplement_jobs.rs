@@ -132,6 +132,17 @@ impl PgCorpusStore {
         self.gate().await?;
         let until = now.checked_add(600).ok_or(DatabaseError::Capacity)?;
         let mut tx = self.pool.begin().await.map_err(db)?;
+        sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+        let held: bool = sqlx::query_scalar("SELECT openlegal_admin.provider_held()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+        if held {
+            return Ok(None);
+        }
         let control=sqlx::query("SELECT last_global_source,last_seed_source,last_global FROM openlegal.provider_supplement_control WHERE singleton FOR UPDATE").fetch_one(&mut *tx).await.map_err(db)?;
         let row=sqlx::query("SELECT j.*,j.requested_at::text AS requested_at_text FROM openlegal.provider_supplement_job j WHERE (j.status='pending' OR (j.status='incomplete' AND j.retry_at<=$1::text::numeric) OR (j.status='running' AND j.lease_until<=$1::text::numeric)) AND (j.predecessor_key IS NULL OR EXISTS(SELECT 1 FROM openlegal.provider_supplement_job predecessor WHERE predecessor.job_key=j.predecessor_key AND predecessor.status='done')) ORDER BY (j.is_global<>$2) DESC,(j.source>CASE WHEN j.is_global THEN $3 ELSE $4 END) DESC,j.source,j.created_at,j.job_key LIMIT 1 FOR UPDATE OF j SKIP LOCKED")
             .bind(now.to_string()).bind(control.try_get::<bool,_>("last_global").map_err(db)?).bind(control.try_get::<String,_>("last_global_source").map_err(db)?).bind(control.try_get::<String,_>("last_seed_source").map_err(db)?).fetch_optional(&mut *tx).await.map_err(db)?;

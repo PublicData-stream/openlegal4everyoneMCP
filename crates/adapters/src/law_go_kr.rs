@@ -272,9 +272,14 @@ impl LawClient {
         };
         let wake_continuous = newly_available(old_continuous, continuous, continuous_used);
         let wake_on_demand = newly_available(old_on_demand, on_demand, on_demand_used);
-        let paused = row
-            .try_get::<bool, _>("operator_suspended")
-            .map_err(|_| DatabaseError::StorageUnavailable)?
+        let held: bool = sqlx::query_scalar("SELECT openlegal_admin.provider_held()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        let paused = held
+            || row
+                .try_get::<bool, _>("operator_suspended")
+                .map_err(|_| DatabaseError::StorageUnavailable)?
             || row
                 .try_get::<bool, _>("unresolved_response")
                 .map_err(|_| DatabaseError::StorageUnavailable)?
@@ -572,6 +577,8 @@ impl LawClient {
         admission::idle(pool, *mode).await
     }
     /// Read one consistent provider snapshot without spending an attempt. The
+    /// Collector refusals commit first-observation evidence. Public reads use
+    /// the separate read-only corpus diagnostic projection. The
     /// returned time is a recheck time; suspended/uncertain evidence still needs
     /// operator review and is never cleared by this observation.
     pub async fn admission_deferral(&self) -> Result<ProviderDeferral, DatabaseError> {

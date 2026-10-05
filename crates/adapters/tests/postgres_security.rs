@@ -110,6 +110,10 @@ async fn restricted_migration_and_runtime_roles_keep_ddl_out_of_serving() {
     let mut admin = PgConnection::connect(&fixture.url)
         .await
         .expect("isolated admin connection");
+    sqlx::query("DROP SCHEMA openlegal_admin CASCADE")
+        .execute(&mut admin)
+        .await
+        .unwrap();
     sqlx::query("DROP SCHEMA openlegal CASCADE")
         .execute(&mut admin)
         .await
@@ -147,6 +151,14 @@ async fn restricted_migration_and_runtime_roles_keep_ddl_out_of_serving() {
         .unwrap();
     sqlx::query("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA openlegal TO openlegal_security_runtime").execute(&mut admin).await.unwrap();
     sqlx::query("GRANT SELECT ON public._sqlx_migrations TO openlegal_security_runtime")
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    sqlx::query("GRANT USAGE ON SCHEMA openlegal_admin TO openlegal_security_runtime")
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    sqlx::query("GRANT EXECUTE ON FUNCTION openlegal_admin.provider_diagnostic(),openlegal_admin.provider_held(),openlegal_admin.observe_uncertainty(),openlegal_admin.provider_blocker_fingerprint() TO openlegal_security_runtime")
         .execute(&mut admin)
         .await
         .unwrap();
@@ -201,6 +213,9 @@ async fn restricted_migration_and_runtime_roles_keep_ddl_out_of_serving() {
         "UPDATE public._sqlx_migrations SET success=false",
         "TRUNCATE openlegal.cache_head",
         "UPDATE openlegal.cache_snapshot SET source_reference='https://example.test/changed'",
+        "SELECT openlegal_admin.provider_apply('{}'::jsonb)",
+        "UPDATE openlegal_admin.provider_control SET recovery_hold=false",
+        "TRUNCATE openlegal_admin.provider_recovery_audit",
     ] {
         assert!(sqlx::query(statement).execute(&mut runtime).await.is_err());
     }

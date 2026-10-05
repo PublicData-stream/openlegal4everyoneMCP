@@ -175,10 +175,11 @@ pub(super) async fn uncertain_in_transaction(
 
 /// Sanitized admission diagnostics from one locked provider snapshot. A recheck
 /// time does not promise recovery from operator suspension or uncertain evidence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ProviderDeferral {
     pub reason: &'static str,
     pub recheck_at: u64,
+    pub fingerprint: Option<openlegal_domain::provider_admin::ProviderBlockerFingerprint>,
 }
 
 pub(super) async fn deferral_snapshot(
@@ -201,6 +202,10 @@ pub(super) async fn deferral_snapshot(
             .await
             .map_err(storage)?;
     let number = |name| row.try_get::<i64, _>(name).map_err(storage);
+    let held: bool = sqlx::query_scalar("SELECT openlegal_admin.provider_held()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
     let uncertain = row
         .try_get::<bool, _>("unresolved_response")
         .map_err(storage)?
@@ -229,7 +234,9 @@ pub(super) async fn deferral_snapshot(
     let spacing = number("next_request_at_ms")?;
     let spacing = spacing / 1000 + i64::from(spacing % 1000 != 0);
     let earliest = pause.max(spacing).max(now.saturating_add(10));
-    let (reason, recheck) = if uncertain {
+    let (reason, recheck) = if held {
+        ("provider_recovery_hold", now.saturating_add(3600))
+    } else if uncertain {
         ("provider_response_uncertain", now.saturating_add(3600))
     } else if suspended {
         ("provider_suspended", now.saturating_add(3600))
@@ -244,8 +251,26 @@ pub(super) async fn deferral_snapshot(
         // can be exhausted. Do not invent a provider failure in either case.
         ("provider_admission_wait", earliest)
     };
+    let fingerprint = if uncertain || held {
+        // This is a collector deferral decision, not the public diagnostic read.
+        // Commit first-observation evidence before returning its refusal.
+        sqlx::query("SELECT openlegal_admin.observe_uncertainty()")
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let value: serde_json::Value =
+            sqlx::query_scalar("SELECT openlegal_admin.provider_blocker_fingerprint()")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage)?;
+        Some(serde_json::from_value(value).map_err(|_| DatabaseError::StorageCorrupt)?)
+    } else {
+        None
+    };
+    tx.commit().await.map_err(storage)?;
     Ok(ProviderDeferral {
         reason,
+        fingerprint,
         recheck_at: u64::try_from(recheck).map_err(|_| DatabaseError::StorageCorrupt)?,
     })
 }
@@ -271,15 +296,19 @@ pub(super) async fn idle(pool: &PgPool, mode: RequestBudgetMode) -> Result<bool,
         Ok(!current || limit.is_none_or(|limit| used < i64::from(limit)))
     };
     let capacity: i32 = row.try_get("max_in_flight").map_err(storage)?;
-    if row
-        .try_get::<bool, _>("operator_suspended")
-        .map_err(storage)?
+    let active = live_owner_count(&mut tx).await?;
+    let held: bool = sqlx::query_scalar("SELECT openlegal_admin.provider_held()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
+    if held
+        || row
+            .try_get::<bool, _>("operator_suspended")
+            .map_err(storage)?
         || row
             .try_get::<bool, _>("unresolved_response")
             .map_err(storage)?
-        || live_owner_count(&mut tx)
-            .await?
-            .is_none_or(|count| count >= capacity as usize)
+        || active.is_none_or(|count| count >= capacity as usize)
         || row
             .try_get::<i64, _>("next_allowed_at")
             .map_err(storage)?
@@ -302,6 +331,11 @@ pub(super) async fn idle(pool: &PgPool, mode: RequestBudgetMode) -> Result<bool,
             },
         )?
     {
+        sqlx::query("SELECT openlegal_admin.observe_uncertainty()")
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
         return Ok(false);
     }
     let last: Option<String> = row.try_get("last_admission_mode").map_err(storage)?;
@@ -593,9 +627,14 @@ async fn reserve_locked(
         .try_get::<Option<i64>, _>("pilot_duration_secs")
         .map_err(storage)?
         .unwrap_or(number("pilot_timeout_secs")?);
-    if row
-        .try_get::<bool, _>("operator_suspended")
-        .map_err(storage)?
+    let held: bool = sqlx::query_scalar("SELECT openlegal_admin.provider_held()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
+    if held
+        || row
+            .try_get::<bool, _>("operator_suspended")
+            .map_err(storage)?
         || row
             .try_get::<bool, _>("unresolved_response")
             .map_err(storage)?
@@ -605,12 +644,22 @@ async fn reserve_locked(
                 || pilot_started
                     .is_some_and(|started| now.saturating_sub(started) >= pilot_duration)))
     {
+        sqlx::query("SELECT openlegal_admin.observe_uncertainty()")
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
         return Err(DatabaseError::BudgetExhausted);
     }
     let capacity: i32 = row.try_get("max_in_flight").map_err(storage)?;
-    let active = live_owner_count(&mut tx)
-        .await?
-        .ok_or(DatabaseError::BudgetExhausted)?;
+    let Some(active) = live_owner_count(&mut tx).await? else {
+        sqlx::query("SELECT openlegal_admin.observe_uncertainty()")
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        return Err(DatabaseError::BudgetExhausted);
+    };
     if active >= capacity as usize {
         return Ok(Decision::Wait(Duration::from_secs(5)));
     }
@@ -760,6 +809,70 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn public_diagnostic_waits_for_normal_settlement_and_never_reports_deleted_owner_uncertain()
+     {
+        use openlegal_domain::provider_admin::ProviderAdmissionSnapshot;
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let store = fixture.open(100).await;
+        let pool = store.pool();
+        unrestricted(&pool).await;
+        let mut guard = start(&pool).await;
+        let owner = guard.owner();
+        // Exercise the exact DELETE/COMMIT then session-unlock phases of normal
+        // guard settlement while another statement has already begun reading.
+        let mut settlement = guard.connection.as_mut().unwrap().begin().await.unwrap();
+        sqlx::query(
+            "SELECT singleton FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE",
+        )
+        .fetch_one(&mut *settlement)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM openlegal.provider_request_admission WHERE owner=$1")
+            .bind(owner)
+            .execute(&mut *settlement)
+            .await
+            .unwrap();
+        let mut reader = PgConnection::connect_with(&pool.connect_options())
+            .await
+            .unwrap();
+        sqlx::query("SET lock_timeout='0'")
+            .execute(&mut reader)
+            .await
+            .unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut reader)
+            .await
+            .unwrap();
+        let reading = tokio::spawn(async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT openlegal_admin.provider_diagnostic()",
+            )
+            .fetch_one(&mut reader)
+            .await
+            .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT COALESCE(wait_event_type='Lock',false) FROM pg_stat_activity WHERE pid=$1")
+                    .bind(pid).fetch_one(&pool).await.unwrap();
+                if blocked { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        settlement.commit().await.unwrap();
+        guard.release().await.unwrap();
+        let snapshot: ProviderAdmissionSnapshot =
+            serde_json::from_value(reading.await.unwrap()).unwrap();
+        assert_eq!(snapshot.active_slots, 0);
+        assert_eq!(snapshot.abandoned_slots, 0);
+        assert!(!snapshot.legacy_uncertain);
+        assert!(!snapshot.continuous.requires_operator_review);
+        assert_ne!(snapshot.continuous.reason, "provider_response_uncertain");
+        store.close().await.unwrap();
     }
 
     #[tokio::test]
