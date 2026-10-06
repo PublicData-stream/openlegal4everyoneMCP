@@ -49,6 +49,59 @@ async fn pilot_watchdog(duration: Duration, cancel: CancellationToken) {
     }
 }
 
+fn log_runtime_failure(stage: &'static str, error: DatabaseError) {
+    tracing::error!(stage, error = ?error, "corpus runtime stage failed");
+}
+
+fn spawn_runtime_task(
+    tasks: &mut tokio::task::JoinSet<Result<(), DatabaseError>>,
+    stage: &'static str,
+    cancel: CancellationToken,
+    work: impl std::future::Future<Output = Result<(), DatabaseError>> + Send + 'static,
+) {
+    tasks.spawn(async move {
+        let result = work.await;
+        if let Err(error) = result
+            && !(cancel.is_cancelled() && error == DatabaseError::Cancelled)
+        {
+            log_runtime_failure(stage, error);
+        }
+        result
+    });
+}
+
+/// The supervisor has cancelled its children before calling this function.
+/// Drain every task so cleanup completes, retaining the original failure over
+/// secondary failures and expected cancellation during that cleanup.
+async fn drain_runtime_tasks(
+    tasks: &mut tokio::task::JoinSet<Result<(), DatabaseError>>,
+    initial: Result<(), DatabaseError>,
+) -> Result<(), ServerError> {
+    let mut result = initial.map_err(ServerError::from);
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(()) | Err(DatabaseError::Cancelled)) => {}
+            Ok(Err(error)) if result.is_ok() => result = Err(error.into()),
+            Err(error) => {
+                tracing::error!(
+                    stage = "child_task",
+                    error = if error.is_panic() {
+                        "task_panicked"
+                    } else {
+                        "task_cancelled"
+                    },
+                    "corpus runtime task join failed"
+                );
+                if result.is_ok() {
+                    result = Err(error.into());
+                }
+            }
+            Ok(Err(_)) => {}
+        }
+    }
+    result
+}
+
 fn now() -> u64 {
     SystemClock::default().now()
 }
@@ -1166,7 +1219,8 @@ impl CorpusRuntime {
                     .as_ref()
                     .ok_or(DatabaseError::InvalidInput)?
                     .begin_pilot()
-                    .await?;
+                    .await
+                    .inspect_err(|error| log_runtime_failure("ingestion", *error))?;
                 let watchdog = ingestion.clone();
                 tasks.spawn(async move {
                     pilot_watchdog(duration, watchdog).await;
@@ -1175,7 +1229,7 @@ impl CorpusRuntime {
             }
             let runtime = self.clone();
             let token = ingestion.clone();
-            tasks.spawn(async move {
+            spawn_runtime_task(&mut tasks, "ingestion", token.clone(), async move {
                 let provider = runtime
                     .provider
                     .as_ref()
@@ -1196,12 +1250,16 @@ impl CorpusRuntime {
             if self.ingestion_mode == Some(IngestionMode::Continuous) {
                 let runtime = self.clone();
                 let token = ingestion.clone();
-                tasks.spawn(async move { runtime.process_supplements(token).await });
+                spawn_runtime_task(&mut tasks, "supplements", token.clone(), async move {
+                    runtime.process_supplements(token).await
+                });
             }
             for slot in 0..self.detail_job_workers {
                 let runtime = self.clone();
                 let token = ingestion.clone();
-                tasks.spawn(async move { runtime.process_jobs(slot, token).await });
+                spawn_runtime_task(&mut tasks, "detail", token.clone(), async move {
+                    runtime.process_jobs(slot, token).await
+                });
             }
         }
         let mut maintenance = tokio::time::Instant::now();
@@ -1211,22 +1269,35 @@ impl CorpusRuntime {
                 result = tasks.join_next(), if !tasks.is_empty() => break match result {
                     Some(Ok(Ok(()))) if cancel.is_cancelled() => Ok(()),
                     Some(Ok(Ok(()))) if self.ingestion_mode == Some(IngestionMode::Pilot) => continue,
+                    Some(Ok(Err(DatabaseError::Cancelled))) if cancel.is_cancelled() => Ok(()),
                     Some(Ok(Err(e))) => Err(e),
-                    _ => Err(DatabaseError::StorageUnavailable),
+                    _ => {
+                        log_runtime_failure("child_task", DatabaseError::StorageUnavailable);
+                        Err(DatabaseError::StorageUnavailable)
+                    },
                 },
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
                     if let Some(lease) = &self.lease {
-                        if let Err(e) = lease.check().await { break Err(e); }
-                        if let Err(e) = self.index_events(&child).await { break Err(e); }
+                        if let Err(e) = lease.check().await {
+                            log_runtime_failure("lease", e);
+                            break Err(e);
+                        }
+                        if let Err(e) = self.index_events(&child).await {
+                            log_runtime_failure("index", e);
+                            break Err(e);
+                        }
                     }
                     if let Err(e) = self.store.health().await {
+                        log_runtime_failure("health", e);
                         break Err(e);
                     }
                     if self.lease.is_some() && maintenance.elapsed() >= Duration::from_secs(60) {
                         if let Err(e) = self.store.maintain(now(), 0).await {
+                            log_runtime_failure("maintenance", e);
                             break Err(e);
                         }
                         if let Err(e) = self.store.prune_collection_requests().await {
+                            log_runtime_failure("request_prune", e);
                             break Err(e);
                         }
                         maintenance = tokio::time::Instant::now();
@@ -1235,11 +1306,7 @@ impl CorpusRuntime {
             }
         };
         child.cancel();
-        while let Some(joined) = tasks.join_next().await {
-            joined??;
-        }
-        result?;
-        Ok(())
+        drain_runtime_tasks(&mut tasks, result).await
     }
     async fn index_events(&self, cancel: &CancellationToken) -> Result<(), DatabaseError> {
         let mut generation = self.index.snapshot()?.generation;
@@ -2511,5 +2578,107 @@ mod manual_pilot_tests {
         .await
         .unwrap();
         assert!(load_pilot_candidates(&config).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod runtime_shutdown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn child(
+        tasks: &mut tokio::task::JoinSet<Result<(), DatabaseError>>,
+        cancel: &CancellationToken,
+        drained: &Arc<AtomicUsize>,
+        result: Result<(), DatabaseError>,
+    ) {
+        let cancel = cancel.clone();
+        let drained = drained.clone();
+        tasks.spawn(async move {
+            cancel.cancelled().await;
+            tokio::task::yield_now().await;
+            drained.fetch_add(1, Ordering::SeqCst);
+            result
+        });
+    }
+
+    #[tokio::test]
+    async fn original_failure_survives_cancellation_and_every_child_is_drained() {
+        let cancel = CancellationToken::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        child(&mut tasks, &cancel, &drained, Err(DatabaseError::Cancelled));
+        child(
+            &mut tasks,
+            &cancel,
+            &drained,
+            Err(DatabaseError::StorageUnavailable),
+        );
+        child(&mut tasks, &cancel, &drained, Ok(()));
+        cancel.cancel();
+        let error = drain_runtime_tasks(&mut tasks, Err(DatabaseError::SourceDataInvalid))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<DatabaseError>(),
+            Some(&DatabaseError::SourceDataInvalid)
+        );
+        assert_eq!(drained.load(Ordering::SeqCst), 3);
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn intentional_shutdown_accepts_expected_child_cancellation() {
+        let cancel = CancellationToken::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        child(&mut tasks, &cancel, &drained, Err(DatabaseError::Cancelled));
+        child(&mut tasks, &cancel, &drained, Ok(()));
+        cancel.cancel();
+        drain_runtime_tasks(&mut tasks, Ok(())).await.unwrap();
+        assert_eq!(drained.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn meaningful_drain_failure_is_retained_after_success_and_all_children_finish() {
+        let cancel = CancellationToken::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        child(&mut tasks, &cancel, &drained, Err(DatabaseError::Cancelled));
+        child(
+            &mut tasks,
+            &cancel,
+            &drained,
+            Err(DatabaseError::StorageCorrupt),
+        );
+        child(&mut tasks, &cancel, &drained, Ok(()));
+        cancel.cancel();
+        let error = drain_runtime_tasks(&mut tasks, Ok(())).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<DatabaseError>(),
+            Some(&DatabaseError::StorageCorrupt)
+        );
+        assert_eq!(drained.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn task_panic_cannot_replace_original_failure_or_skip_remaining_cleanup() {
+        let cancel = CancellationToken::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+        let mut tasks: tokio::task::JoinSet<Result<(), DatabaseError>> =
+            tokio::task::JoinSet::new();
+        tasks.spawn(async { panic!("fictional child failure") });
+        child(&mut tasks, &cancel, &drained, Err(DatabaseError::Cancelled));
+        child(&mut tasks, &cancel, &drained, Ok(()));
+        cancel.cancel();
+        let error = drain_runtime_tasks(&mut tasks, Err(DatabaseError::StorageContended))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<DatabaseError>(),
+            Some(&DatabaseError::StorageContended)
+        );
+        assert_eq!(drained.load(Ordering::SeqCst), 2);
+        assert!(tasks.is_empty());
     }
 }
