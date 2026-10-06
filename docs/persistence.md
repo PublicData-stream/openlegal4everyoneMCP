@@ -412,6 +412,10 @@ credentials supplied by the site's secret-management process:
 ```sql
 CREATE ROLE openlegal_provider_function_owner NOLOGIN;
 CREATE ROLE openlegal_provider_operator LOGIN;
+-- Required even when a hardened deployment revokes PUBLIC schema usage.
+-- This permits schema lookup, not CREATE or access to unrelated tables.
+GRANT USAGE ON SCHEMA public
+  TO openlegal_provider_function_owner, openlegal_provider_operator;
 GRANT USAGE ON SCHEMA openlegal, openlegal_admin TO openlegal_provider_function_owner;
 GRANT SELECT ON public._sqlx_migrations TO openlegal_provider_function_owner;
 GRANT SELECT ON openlegal.cache_storage, openlegal.corpus_control,
