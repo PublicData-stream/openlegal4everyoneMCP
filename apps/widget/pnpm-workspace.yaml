@@ -2,3 +2,6 @@ packages:
   - .
 allowBuilds:
   esbuild: true
+overrides:
+  '@modelcontextprotocol/client@^2.0.0': 2.2.0
+  '@modelcontextprotocol/core@^2.0.0': 2.2.0

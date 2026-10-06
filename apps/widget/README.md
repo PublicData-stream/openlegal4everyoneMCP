@@ -98,6 +98,19 @@ and enforces the reviewed license set. Advisory-network failure fails the check;
 it is not interpreted as a clean audit. The lockfile is the reproducible baseline,
 not evidence that future advisories cannot arise.
 
+The 2026-10-06 maintenance update pins the SDK's `client` and `core` peers to
+2.2.0, the first patched release for
+[GHSA-6qxp-vccf-f47h](https://github.com/modelcontextprotocol/typescript-sdk/security/advisories/GHSA-6qxp-vccf-f47h).
+Range-scoped pnpm overrides preserve the existing Apps SDK and other dependency
+versions instead of upgrading the entire peer graph. Sources remain the official
+npm SDK packages; package manifests still declare MIT, and `THIRD_PARTY_NOTICES.md`
+preserves their complete upstream license and transition text. No new dependencies
+or install scripts are enabled. The widget uses the SDK's host-mediated postMessage protocol and does not
+configure OAuth providers, HTTP authorization, or stored OAuth credentials. The
+upstream OAuth-provider migration instructions therefore do not apply to its
+current callers. Existing type, model, build, browser, advisory and license checks
+cover admission of the changed protocol packages.
+
 
 ## Supplied-text comparison
 
