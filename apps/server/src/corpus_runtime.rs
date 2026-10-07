@@ -70,6 +70,113 @@ fn spawn_runtime_task(
     });
 }
 
+/// Restart only the local worker at its durable checkpoint after the adapter
+/// exhausts a known DB-contention retry. This is a new collection cycle/claim,
+/// never a retry around a provider request or publication payload.
+async fn run_storage_isolated<F, Fut>(
+    stage: &'static str,
+    cancel: &CancellationToken,
+    mut work: F,
+) -> Result<(), DatabaseError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), DatabaseError>>,
+{
+    loop {
+        match work().await {
+            Err(DatabaseError::StorageContended) => {
+                pause_storage_contention(stage, cancel).await;
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn pause_storage_contention(stage: &'static str, cancel: &CancellationToken) {
+    tracing::warn!(stage, error = ?DatabaseError::StorageContended,
+        "corpus worker yielded at its durable checkpoint");
+    tokio::select! {
+        _ = cancel.cancelled() => {},
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+    }
+}
+
+/// Known contention yields one supervisor tick; lease failures are handled
+/// separately and must never pass through this recovery decision.
+fn storage_stage_completed(
+    stage: &'static str,
+    result: Result<(), DatabaseError>,
+) -> Result<bool, DatabaseError> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(DatabaseError::StorageContended) => {
+            tracing::warn!(stage, error = ?DatabaseError::StorageContended,
+                "corpus storage stage yielded until the next tick");
+            Ok(false)
+        }
+        Err(error) => {
+            log_runtime_failure(stage, error);
+            Err(error)
+        }
+    }
+}
+
+/// Dropping work that can write storage at its outer deadline cannot establish
+/// whether PostgreSQL accepted its COMMIT. Fail closed instead of requeueing it
+/// as a known capacity rejection.
+async fn storage_work_with_deadline<T>(
+    duration: Duration,
+    cancel: &CancellationToken,
+    work: impl std::future::Future<Output = Result<T, DatabaseError>>,
+) -> Result<T, DatabaseError> {
+    tokio::time::timeout(duration, work)
+        .await
+        .unwrap_or_else(|_| {
+            cancel.cancel();
+            Err(DatabaseError::StorageUnavailable)
+        })
+}
+
+/// A cleanup rejection must not replace a primary uncertain or corrupt-storage
+/// failure with recoverable contention. Other cleanup failures still fail closed.
+fn claim_error_after_cleanup(
+    primary: DatabaseError,
+    cleanup: Result<(), DatabaseError>,
+) -> DatabaseError {
+    if let Err(error) = cleanup {
+        tracing::error!(stage = "claim_cleanup", error = ?error, primary_error = ?primary,
+            "claim cleanup failed");
+        if !matches!(
+            primary,
+            DatabaseError::StorageUnavailable | DatabaseError::StorageCorrupt
+        ) {
+            return error;
+        }
+    }
+    primary
+}
+
+/// A successfully applied event must be acknowledged before another event is
+/// applied. Keep this state even when no additional outbox event is available.
+struct PendingIndexAck(Option<u64>);
+
+impl PendingIndexAck {
+    async fn complete<F, Fut>(&mut self, acknowledge: F) -> Result<(), DatabaseError>
+    where
+        F: FnOnce(u64) -> Fut,
+        Fut: std::future::Future<Output = Result<(), DatabaseError>>,
+    {
+        if let Some(sequence) = self.0 {
+            acknowledge(sequence).await?;
+            self.0 = None;
+        }
+        Ok(())
+    }
+}
+
 /// The supervisor has cancelled its children before calling this function.
 /// Drain every task so cleanup completes, retaining the original failure over
 /// secondary failures and expected cancellation during that cleanup.
@@ -524,7 +631,8 @@ impl CorpusRuntime {
             }
             _ => None,
         };
-        self.store
+        let settlement = self
+            .store
             .settle_collection_launch_with_fingerprint(
                 launch,
                 status,
@@ -532,7 +640,13 @@ impl CorpusRuntime {
                 deferred_until,
                 blocker_fingerprint.as_ref(),
             )
-            .await?;
+            .await;
+        if let Err(primary @ (DatabaseError::StorageUnavailable | DatabaseError::StorageCorrupt)) =
+            result
+        {
+            return Err(claim_error_after_cleanup(primary, settlement));
+        }
+        settlement?;
         match result {
             Ok(_)
             | Err(
@@ -815,96 +929,114 @@ impl CorpusRuntime {
                 .await?;
             return Err(DatabaseError::Capacity);
         };
-        let attempt = cancel.child_token();
-        let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let detail_provider = provider.clone().with_reservation_observer(reserved.clone());
-        let detail = tokio::time::timeout(
-            Duration::from_secs(self.detail_timeout_secs),
-            detail_provider.detail(&item, attempt.clone()),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            attempt.cancel();
-            Err(DatabaseError::Capacity)
-        });
-        let detail = match detail {
-            Ok(detail) => detail,
-            Err(
-                error @ (DatabaseError::Capacity
-                | DatabaseError::Cancelled
-                | DatabaseError::BudgetExhausted),
-            ) if !reserved.load(std::sync::atomic::Ordering::Acquire) => {
-                match self.store.release_admission_wait(&job).await {
-                    Ok(()) | Err(DatabaseError::Conflict) => {}
-                    Err(error) => return Err(error),
-                }
-                return Err(error);
-            }
-            Err(
-                error @ (DatabaseError::SourceUnavailable
-                | DatabaseError::SourceDataInvalid
-                | DatabaseError::SourceDownloadFailed),
-            ) => {
-                let reason = match error {
-                    DatabaseError::SourceUnavailable => "source_unavailable",
-                    DatabaseError::SourceDataInvalid => "source_data_invalid",
-                    _ => "download_failed",
-                };
-                self.store.skip_claim(&job, reason, now()).await?;
-                return Err(error);
-            }
-            Err(error) => {
-                self.store.fail_claim(&job, false).await?;
-                return Err(error);
-            }
-        };
-        let index = self.index.clone();
-        let record = detail.record.clone();
-        let worker_cancel = cancel.clone();
-        let validation = tokio::task::spawn_blocking(move || {
-            index.validate_record_with_budget(
-                &record,
-                std::time::Instant::now() + Duration::from_secs(10),
-                &worker_cancel,
-            )
-        })
-        .await
-        .map_err(|_| DatabaseError::Capacity)
-        .and_then(|result| result);
-        if let Err(error) = validation {
-            self.store.fail_claim(&job, false).await?;
-            return Err(error);
-        }
-        match self
-            .store
-            .publish(
-                Publication {
-                    record: detail.record,
-                    raw: detail.raw,
-                    additional_evidence: detail.additional_evidence,
-                    processor_version: detail.processor_version,
-                    retrieved_at: detail.retrieved_at,
-                    now: now(),
-                    expected_version: job.expected_version,
-                    install_head: true,
-                    job_id: Some(job.id.clone()),
-                },
-                cancel,
+        let processed = async {
+            let attempt = cancel.child_token();
+            let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let detail_provider = provider.clone().with_reservation_observer(reserved.clone());
+            let detail = tokio::time::timeout(
+                Duration::from_secs(self.detail_timeout_secs),
+                detail_provider.detail(&item, attempt.clone()),
             )
             .await
-        {
-            Ok(_) => Ok(CollectionItemOutcome::Published),
-            Err(DatabaseError::Conflict) => {
-                self.store.fail_claim(&job, false).await?;
-                Ok(CollectionItemOutcome::Skipped(
-                    CollectionSkipReason::PublicationSuperseded,
-                ))
+            .unwrap_or_else(|_| {
+                attempt.cancel();
+                Err(DatabaseError::Capacity)
+            });
+            let detail = match detail {
+                Ok(detail) => detail,
+                Err(
+                    error @ (DatabaseError::Capacity
+                    | DatabaseError::Cancelled
+                    | DatabaseError::BudgetExhausted),
+                ) if !reserved.load(std::sync::atomic::Ordering::Acquire) => {
+                    match self.store.release_admission_wait(&job).await {
+                        Ok(()) | Err(DatabaseError::Conflict) => {}
+                        Err(error) => return Err(error),
+                    }
+                    return Err(error);
+                }
+                Err(
+                    error @ (DatabaseError::SourceUnavailable
+                    | DatabaseError::SourceDataInvalid
+                    | DatabaseError::SourceDownloadFailed),
+                ) => {
+                    let reason = match error {
+                        DatabaseError::SourceUnavailable => "source_unavailable",
+                        DatabaseError::SourceDataInvalid => "source_data_invalid",
+                        _ => "download_failed",
+                    };
+                    self.store.skip_claim(&job, reason, now()).await?;
+                    return Err(error);
+                }
+                Err(DatabaseError::StorageContended) => {
+                    return Err(DatabaseError::StorageContended);
+                }
+                Err(error) => {
+                    return Err(claim_error_after_cleanup(
+                        error,
+                        self.store.fail_claim(&job, false).await,
+                    ));
+                }
+            };
+            let index = self.index.clone();
+            let record = detail.record.clone();
+            let worker_cancel = cancel.clone();
+            let validation = tokio::task::spawn_blocking(move || {
+                index.validate_record_with_budget(
+                    &record,
+                    std::time::Instant::now() + Duration::from_secs(10),
+                    &worker_cancel,
+                )
+            })
+            .await
+            .map_err(|_| DatabaseError::Capacity)
+            .and_then(|result| result);
+            if let Err(error) = validation {
+                return Err(claim_error_after_cleanup(
+                    error,
+                    self.store.fail_claim(&job, false).await,
+                ));
             }
-            Err(error) => {
-                self.store.fail_claim(&job, false).await?;
-                Err(error)
+            match self
+                .store
+                .publish(
+                    Publication {
+                        record: detail.record,
+                        raw: detail.raw,
+                        additional_evidence: detail.additional_evidence,
+                        processor_version: detail.processor_version,
+                        retrieved_at: detail.retrieved_at,
+                        now: now(),
+                        expected_version: job.expected_version,
+                        install_head: true,
+                        job_id: Some(job.id.clone()),
+                    },
+                    cancel,
+                )
+                .await
+            {
+                Ok(_) => Ok(CollectionItemOutcome::Published),
+                Err(DatabaseError::Conflict) => {
+                    self.store.fail_claim(&job, false).await?;
+                    Ok(CollectionItemOutcome::Skipped(
+                        CollectionSkipReason::PublicationSuperseded,
+                    ))
+                }
+                Err(DatabaseError::StorageContended) => Err(DatabaseError::StorageContended),
+                Err(error) => Err(claim_error_after_cleanup(
+                    error,
+                    self.store.fail_claim(&job, false).await,
+                )),
             }
         }
+        .await;
+        if matches!(&processed, Err(DatabaseError::StorageContended)) {
+            match self.store.defer_storage_claim(&job).await {
+                Ok(()) | Err(DatabaseError::Conflict | DatabaseError::StorageContended) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        processed
     }
     async fn observed_page(
         &self,
@@ -1209,6 +1341,13 @@ impl CorpusRuntime {
         Ok(())
     }
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<(), ServerError> {
+        // A prior process may have committed its index generation but failed
+        // to acknowledge it. Reconcile that durable prefix even with no new event.
+        let mut pending_index_ack = PendingIndexAck(if self.lease.is_some() {
+            Some(self.index.snapshot()?.generation)
+        } else {
+            None
+        });
         let child = cancel.child_token();
         let mut tasks = tokio::task::JoinSet::new();
         if self.provider.is_some() {
@@ -1243,7 +1382,12 @@ impl CorpusRuntime {
                             result
                         }
                     }
-                    Some(IngestionMode::Continuous) => runtime.ingest(provider, token).await,
+                    Some(IngestionMode::Continuous) => {
+                        run_storage_isolated("ingestion", &token, || {
+                            runtime.ingest(provider, token.clone())
+                        })
+                        .await
+                    }
                     None => Err(DatabaseError::InvalidInput),
                 }
             });
@@ -1251,14 +1395,20 @@ impl CorpusRuntime {
                 let runtime = self.clone();
                 let token = ingestion.clone();
                 spawn_runtime_task(&mut tasks, "supplements", token.clone(), async move {
-                    runtime.process_supplements(token).await
+                    run_storage_isolated("supplements", &token, || {
+                        runtime.process_supplements(token.clone())
+                    })
+                    .await
                 });
             }
             for slot in 0..self.detail_job_workers {
                 let runtime = self.clone();
                 let token = ingestion.clone();
                 spawn_runtime_task(&mut tasks, "detail", token.clone(), async move {
-                    runtime.process_jobs(slot, token).await
+                    run_storage_isolated("detail", &token, || {
+                        runtime.process_jobs(slot, token.clone())
+                    })
+                    .await
                 });
             }
         }
@@ -1282,23 +1432,27 @@ impl CorpusRuntime {
                             log_runtime_failure("lease", e);
                             break Err(e);
                         }
-                        if let Err(e) = self.index_events(&child).await {
-                            log_runtime_failure("index", e);
-                            break Err(e);
+                        match storage_stage_completed("index", self.index_events(&child, &mut pending_index_ack).await) {
+                            Ok(true) => {},
+                            Ok(false) => continue,
+                            Err(error) => break Err(error),
                         }
                     }
-                    if let Err(e) = self.store.health().await {
-                        log_runtime_failure("health", e);
-                        break Err(e);
+                    match storage_stage_completed("health", self.store.health().await) {
+                        Ok(true) => {},
+                        Ok(false) => continue,
+                        Err(error) => break Err(error),
                     }
                     if self.lease.is_some() && maintenance.elapsed() >= Duration::from_secs(60) {
-                        if let Err(e) = self.store.maintain(now(), 0).await {
-                            log_runtime_failure("maintenance", e);
-                            break Err(e);
+                        match storage_stage_completed("maintenance", self.store.maintain(now(), 0).await.map(|_| ())) {
+                            Ok(true) => {},
+                            Ok(false) => continue,
+                            Err(error) => break Err(error),
                         }
-                        if let Err(e) = self.store.prune_collection_requests().await {
-                            log_runtime_failure("request_prune", e);
-                            break Err(e);
+                        match storage_stage_completed("request_prune", self.store.prune_collection_requests().await) {
+                            Ok(true) => {},
+                            Ok(false) => continue,
+                            Err(error) => break Err(error),
                         }
                         maintenance = tokio::time::Instant::now();
                     }
@@ -1308,7 +1462,14 @@ impl CorpusRuntime {
         child.cancel();
         drain_runtime_tasks(&mut tasks, result).await
     }
-    async fn index_events(&self, cancel: &CancellationToken) -> Result<(), DatabaseError> {
+    async fn index_events(
+        &self,
+        cancel: &CancellationToken,
+        pending_ack: &mut PendingIndexAck,
+    ) -> Result<(), DatabaseError> {
+        pending_ack
+            .complete(|sequence| self.store.acknowledge_index(sequence))
+            .await?;
         let mut generation = self.index.snapshot()?.generation;
         for event in self.store.outbox(generation, 100).await? {
             if cancel.is_cancelled() {
@@ -1321,11 +1482,21 @@ impl CorpusRuntime {
                 .as_ref()
                 .ok_or(DatabaseError::StorageUnavailable)?
                 .check()
-                .await?;
+                .await
+                .map_err(|error| {
+                    if error == DatabaseError::StorageContended {
+                        DatabaseError::StorageUnavailable
+                    } else {
+                        error
+                    }
+                })?;
             let sequence = event.sequence;
             apply_index_event(&self.index, &self.store, event, cancel).await?;
             generation = sequence;
-            self.store.acknowledge_index(generation).await?;
+            pending_ack.0 = Some(generation);
+            pending_ack
+                .complete(|sequence| self.store.acknowledge_index(sequence))
+                .await?;
         }
         Ok(())
     }
@@ -1388,38 +1559,57 @@ impl CorpusRuntime {
                     offset = offset.min(missing);
                 }
                 while offset < result.items.len() {
-                    let item = &result.items[offset];
-                    if view.historical {
-                        self.store
-                            .record_revision_catalog(
-                                &item.object,
-                                &item.revision_id,
-                                item.publication_date.as_deref(),
-                                item.effective_date.as_deref(),
-                                now(),
-                            )
-                            .await?;
-                    }
-                    if (!view.historical || self.retain_history_bodies)
-                        && !self
-                            .refresh_with_fair_capacity(
-                                provider,
-                                item.clone(),
-                                !view.historical,
-                                cancel.clone(),
-                            )
-                            .await?
-                    {
-                        break;
-                    }
-                    if item.object.provider == "law_go_kr" {
-                        for request in
-                            openlegal_adapters::law_go_kr::supplements::record_requests(item, 1)?
-                        {
-                            self.store.enqueue_supplement(&request, now()).await?;
+                    let scheduled = async {
+                        let item = &result.items[offset];
+                        if view.historical {
+                            self.store
+                                .record_revision_catalog(
+                                    &item.object,
+                                    &item.revision_id,
+                                    item.publication_date.as_deref(),
+                                    item.effective_date.as_deref(),
+                                    now(),
+                                )
+                                .await?;
                         }
+                        if (!view.historical || self.retain_history_bodies)
+                            && !self
+                                .refresh_with_fair_capacity(
+                                    provider,
+                                    item.clone(),
+                                    !view.historical,
+                                    cancel.clone(),
+                                )
+                                .await?
+                        {
+                            return Ok(false);
+                        }
+                        if item.object.provider == "law_go_kr" {
+                            for request in
+                                openlegal_adapters::law_go_kr::supplements::record_requests(
+                                    item, 1,
+                                )?
+                            {
+                                self.store.enqueue_supplement(&request, now()).await?;
+                            }
+                        }
+                        Ok::<bool, DatabaseError>(true)
                     }
-                    offset += 1;
+                    .await;
+                    match scheduled {
+                        Ok(true) => offset += 1,
+                        Ok(false) => break,
+                        Err(DatabaseError::StorageContended) => {
+                            // Only items whose required writes completed are
+                            // checkpointed. A failed checkpoint keeps the prior
+                            // durable offset; a later cycle rechecks idempotent work.
+                            self.store
+                                .clone_page_scheduled(view, page, offset, &result, now(), &cancel)
+                                .await?;
+                            return Err(DatabaseError::StorageContended);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 self.store
                     .clone_page_scheduled(view, page, offset, &result, now(), &cancel)
@@ -1464,7 +1654,7 @@ impl CorpusRuntime {
             let attempt = cancel.child_token();
             let _guard = attempt.clone().drop_guard();
             // Finish within the 600-second fenced lease, including parsing and storage.
-            let outcome = tokio::time::timeout(Duration::from_secs(480), async {
+            let outcome = storage_work_with_deadline(Duration::from_secs(480), &attempt, async {
             let fetched = if let Some(id) = &job.observation_id {
                 let raw = self
                     .store
@@ -1615,25 +1805,11 @@ impl CorpusRuntime {
                 Ok::<(), DatabaseError>(())
             }).await;
             match outcome {
-                Ok(Ok(())) | Ok(Err(DatabaseError::Conflict)) => {}
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    attempt.cancel();
-                    match self
-                        .store
-                        .settle_supplement(
-                            &job,
-                            SupplementJobStatus::Incomplete,
-                            job.observation_id.as_deref(),
-                            0,
-                            now(),
-                        )
-                        .await
-                    {
-                        Ok(()) | Err(DatabaseError::Conflict) => {}
-                        Err(error) => return Err(error),
-                    }
+                Ok(()) | Err(DatabaseError::Conflict) => {}
+                Err(DatabaseError::StorageContended) => {
+                    pause_storage_contention("supplements", &cancel).await;
                 }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1998,209 +2174,238 @@ impl CorpusRuntime {
                 }
                 continue;
             };
-            let item = InventoryItem {
-                object: job.object.clone(),
-                revision_id: job.revision_id.clone(),
-                effective_date: job.effective_date.clone(),
-                title: job
-                    .source_metadata
-                    .get("title")
-                    .cloned()
-                    .unwrap_or_default(),
-                data_source: job.source_metadata.get("data_source").cloned(),
-                case_number: job.source_metadata.get("case_number").cloned(),
-                publication_date: None,
-                treaty_class_code: job.source_metadata.get("treaty_class_code").cloned(),
-                amendment_type: job.source_metadata.get("amendment_type").cloned(),
-            };
-            let attempt = cancel.child_token();
-            let _attempt_guard = attempt.clone().drop_guard();
-            let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let detail_provider = provider.clone().with_reservation_observer(reserved.clone());
-            let detail = match tokio::time::timeout(
-                Duration::from_secs(self.detail_timeout_secs),
-                detail_provider.detail(&item, attempt.clone()),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    attempt.cancel();
-                    Err(DatabaseError::Capacity)
-                }
-            };
-            match detail {
-                Ok(mut detail) => {
-                    for observation in std::mem::take(&mut detail.source_observations) {
-                        let retained = self
-                            .store
-                            .retain_source_observation(observation, attempt.clone())
-                            .await?;
-                        detail
-                            .record
-                            .metadata
-                            .insert("original_observation_id".into(), retained.observation_id);
-                    }
-                    let candidate = detail.record.clone();
-                    let index = self.index.clone();
-                    let admission_cancel = attempt.child_token();
-                    let _admission_guard = admission_cancel.clone().drop_guard();
-                    let worker_cancel = admission_cancel.clone();
-                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                    let admission = tokio::time::timeout(
-                        Duration::from_secs(10),
-                        tokio::task::spawn_blocking(move || {
-                            index.validate_record_with_budget(&candidate, deadline, &worker_cancel)
-                        }),
-                    )
-                    .await;
-                    if !matches!(admission, Ok(Ok(Ok(())))) {
-                        admission_cancel.cancel();
-                        self.store.fail_claim(&job, false).await?;
-                        continue;
-                    }
-                    if item.object.dataset == Dataset::NationalStatute {
-                        let numbers: Vec<String> = detail
-                            .record
-                            .metadata
-                            .get("provider_provisions_json")
-                            .map(|value| {
-                                serde_json::from_str(value)
-                                    .map_err(|_| DatabaseError::StorageCorrupt)
-                            })
-                            .transpose()?
-                            .unwrap_or_default();
-                        for number in numbers {
-                            let seed = openlegal_adapters::law_go_kr::supplements::SupplementSeed::Provision { object: item.object.clone(), number };
-                            for request in
-                                openlegal_adapters::law_go_kr::supplements::seeded_requests(
-                                    seed, 1,
-                                )?
-                            {
-                                self.store.enqueue_supplement(&request, now()).await?;
-                            }
-                        }
-                    }
-                    let publication = tokio::time::timeout(
-                        Duration::from_secs(40),
-                        self.store.publish(
-                            Publication {
-                                record: detail.record,
-                                raw: detail.raw,
-                                additional_evidence: detail.additional_evidence,
-                                processor_version: detail.processor_version,
-                                retrieved_at: detail.retrieved_at,
-                                now: now(),
-                                expected_version: job.expected_version,
-                                install_head: job.install_head,
-                                job_id: Some(job.id.clone()),
-                            },
-                            attempt.clone(),
-                        ),
-                    )
-                    .await
-                    .unwrap_or_else(|_| {
+            let processed = async {
+                let item = InventoryItem {
+                    object: job.object.clone(),
+                    revision_id: job.revision_id.clone(),
+                    effective_date: job.effective_date.clone(),
+                    title: job
+                        .source_metadata
+                        .get("title")
+                        .cloned()
+                        .unwrap_or_default(),
+                    data_source: job.source_metadata.get("data_source").cloned(),
+                    case_number: job.source_metadata.get("case_number").cloned(),
+                    publication_date: None,
+                    treaty_class_code: job.source_metadata.get("treaty_class_code").cloned(),
+                    amendment_type: job.source_metadata.get("amendment_type").cloned(),
+                };
+                let attempt = cancel.child_token();
+                let _attempt_guard = attempt.clone().drop_guard();
+                let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let detail_provider = provider.clone().with_reservation_observer(reserved.clone());
+                let detail = match tokio::time::timeout(
+                    Duration::from_secs(self.detail_timeout_secs),
+                    detail_provider.detail(&item, attempt.clone()),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
                         attempt.cancel();
                         Err(DatabaseError::Capacity)
-                    });
-                    match publication {
-                        Ok(_) => {}
-                        Err(DatabaseError::Conflict | DatabaseError::Withdrawn) => {
-                            self.store.fail_claim(&job, false).await?;
-                        }
-                        Err(DatabaseError::Capacity) => {
-                            self.store.fail_claim(&job, true).await?;
-                        }
-                        Err(e) => return Err(e),
                     }
-                }
-                Err(DatabaseError::Cancelled) => {
-                    if reserved.load(std::sync::atomic::Ordering::Acquire) {
-                        self.store.fail_claim(&job, true).await?;
-                    } else {
+                };
+                match detail {
+                    Ok(mut detail) => {
+                        for observation in std::mem::take(&mut detail.source_observations) {
+                            let retained = self
+                                .store
+                                .retain_source_observation(observation, attempt.clone())
+                                .await?;
+                            detail
+                                .record
+                                .metadata
+                                .insert("original_observation_id".into(), retained.observation_id);
+                        }
+                        let candidate = detail.record.clone();
+                        let index = self.index.clone();
+                        let admission_cancel = attempt.child_token();
+                        let _admission_guard = admission_cancel.clone().drop_guard();
+                        let worker_cancel = admission_cancel.clone();
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        let admission = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            tokio::task::spawn_blocking(move || {
+                                index.validate_record_with_budget(&candidate, deadline, &worker_cancel)
+                            }),
+                        )
+                        .await;
+                        let validation = admission
+                            .map_err(|_| DatabaseError::Capacity)
+                            .and_then(|joined| joined.map_err(|_| DatabaseError::Capacity))
+                            .and_then(|result| result);
+                        if let Err(error) = validation {
+                            admission_cancel.cancel();
+                            let cleanup = self.store.fail_claim(&job, false).await;
+                            if matches!(error, DatabaseError::StorageUnavailable | DatabaseError::StorageCorrupt) {
+                                return Err(claim_error_after_cleanup(error, cleanup));
+                            }
+                            cleanup?;
+                            return Ok(());
+                        }
+                        if item.object.dataset == Dataset::NationalStatute {
+                            let numbers: Vec<String> = detail
+                                .record
+                                .metadata
+                                .get("provider_provisions_json")
+                                .map(|value| {
+                                    serde_json::from_str(value)
+                                        .map_err(|_| DatabaseError::StorageCorrupt)
+                                })
+                                .transpose()?
+                                .unwrap_or_default();
+                            for number in numbers {
+                                let seed = openlegal_adapters::law_go_kr::supplements::SupplementSeed::Provision { object: item.object.clone(), number };
+                                for request in
+                                    openlegal_adapters::law_go_kr::supplements::seeded_requests(
+                                        seed, 1,
+                                    )?
+                                {
+                                    self.store.enqueue_supplement(&request, now()).await?;
+                                }
+                            }
+                        }
+                        let publication = storage_work_with_deadline(
+                            Duration::from_secs(40),
+                            &attempt,
+                            self.store.publish(
+                                Publication {
+                                    record: detail.record,
+                                    raw: detail.raw,
+                                    additional_evidence: detail.additional_evidence,
+                                    processor_version: detail.processor_version,
+                                    retrieved_at: detail.retrieved_at,
+                                    now: now(),
+                                    expected_version: job.expected_version,
+                                    install_head: job.install_head,
+                                    job_id: Some(job.id.clone()),
+                                },
+                                attempt.clone(),
+                            ),
+                        )
+                        .await;
+                        match publication {
+                            Ok(_) => {}
+                            Err(DatabaseError::Conflict | DatabaseError::Withdrawn) => {
+                                self.store.fail_claim(&job, false).await?;
+                            }
+                            Err(DatabaseError::Capacity) => {
+                                self.store.fail_claim(&job, true).await?;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Err(DatabaseError::Cancelled) => {
+                        if reserved.load(std::sync::atomic::Ordering::Acquire) {
+                            self.store.fail_claim(&job, true).await?;
+                        } else {
+                            match self.store.release_admission_wait(&job).await {
+                                Ok(()) | Err(DatabaseError::Conflict) => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        return Ok(());
+                    }
+                    Err(DatabaseError::BudgetExhausted) => {
+                        let deferral = provider.admission_deferral().await?;
+                        let resume_at = deferral.recheck_at;
+                        let deferred = self
+                            .store
+                            .defer_budget_claim_with_fingerprint(
+                                &job,
+                                resume_at,
+                                deferral.fingerprint.as_ref(),
+                                reserved.load(std::sync::atomic::Ordering::Acquire),
+                            )
+                            .await;
+                        match deferred {
+                            Ok(()) | Err(DatabaseError::Conflict) => {}
+                            Err(error) => return Err(error),
+                        }
+                        if self.ingestion_mode == Some(IngestionMode::Pilot) {
+                            cancel.cancel();
+                            return Ok(());
+                        }
+                        let wait = Duration::from_secs(resume_at.saturating_sub(now()).clamp(1, 60));
+                        match events.wait(&cancel, wait).await {
+                            Ok(()) => {}
+                            Err(DatabaseError::Cancelled) => return Ok(()),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(DatabaseError::Capacity)
+                        if !reserved.load(std::sync::atomic::Ordering::Acquire) =>
+                    {
                         match self.store.release_admission_wait(&job).await {
                             Ok(()) | Err(DatabaseError::Conflict) => {}
                             Err(error) => return Err(error),
                         }
+                        // Our own pending transition emits a wakeup; a bounded
+                        // pause avoids immediately reclaiming a ticket-full job.
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                        }
                     }
-                    return Ok(());
-                }
-                Err(DatabaseError::BudgetExhausted) => {
-                    let deferral = provider.admission_deferral().await?;
-                    let resume_at = deferral.recheck_at;
-                    let deferred = self
-                        .store
-                        .defer_budget_claim_with_fingerprint(
-                            &job,
-                            resume_at,
-                            deferral.fingerprint.as_ref(),
-                            reserved.load(std::sync::atomic::Ordering::Acquire),
-                        )
-                        .await;
-                    match deferred {
-                        Ok(()) | Err(DatabaseError::Conflict) => {}
-                        Err(error) => return Err(error),
+                    Err(
+                        error @ (DatabaseError::SourceUnavailable
+                        | DatabaseError::SourceDataInvalid
+                        | DatabaseError::SourceDownloadFailed),
+                    ) => {
+                        let reason = match error {
+                            DatabaseError::SourceUnavailable => "source_unavailable",
+                            DatabaseError::SourceDataInvalid => "source_data_invalid",
+                            DatabaseError::SourceDownloadFailed => "download_failed",
+                            _ => unreachable!(),
+                        };
+                        self.store.skip_claim(&job, reason, now()).await?;
                     }
-                    if self.ingestion_mode == Some(IngestionMode::Pilot) {
+                    Err(DatabaseError::SourceRejected | DatabaseError::SourceUnauthorized) => {
+                        self.store.fail_claim(&job, false).await?;
+                        eprintln!(
+                            "law provider: detail source rejected for {:?}; suspending provider requests; queued HEAD may remain pending",
+                            job.object.dataset
+                        );
                         cancel.cancel();
                         return Ok(());
                     }
-                    let wait = Duration::from_secs(resume_at.saturating_sub(now()).clamp(1, 60));
-                    match events.wait(&cancel, wait).await {
-                        Ok(()) => {}
-                        Err(DatabaseError::Cancelled) => return Ok(()),
+                    Err(
+                        DatabaseError::InvalidInput
+                        | DatabaseError::NotFound
+                        | DatabaseError::UnsupportedHistory
+                        | DatabaseError::HistoryIncomplete,
+                    ) => {
+                        self.store.fail_claim(&job, false).await?;
+                    }
+                    Err(error @ (DatabaseError::StorageUnavailable | DatabaseError::StorageCorrupt)) => {
+                        if let Err(cleanup) = self.store.fail_claim(&job, true).await {
+                            tracing::error!(stage = "detail_cleanup", error = ?cleanup,
+                                primary_error = ?error, "claim cleanup failed after fatal storage failure");
+                        }
+                        return Err(error);
+                    }
+                    Err(DatabaseError::StorageContended) => return Err(DatabaseError::StorageContended),
+                    Err(_) => {
+                        self.store.fail_claim(&job, true).await?;
+                        tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(5u64.saturating_pow(job.attempts.min(3))))=>{}}
+                    }
+                }
+                Ok::<(), DatabaseError>(())
+            }.await;
+            match processed {
+                Ok(()) => {}
+                Err(DatabaseError::StorageContended) => {
+                    // This does not refund a charged provider attempt. If even
+                    // cleanup contends, leave the original fenced lease to expire.
+                    match self.store.defer_storage_claim(&job).await {
+                        Ok(()) | Err(DatabaseError::Conflict | DatabaseError::StorageContended) => {
+                        }
                         Err(error) => return Err(error),
                     }
+                    pause_storage_contention("detail", &cancel).await;
                 }
-                Err(DatabaseError::Capacity)
-                    if !reserved.load(std::sync::atomic::Ordering::Acquire) =>
-                {
-                    match self.store.release_admission_wait(&job).await {
-                        Ok(()) | Err(DatabaseError::Conflict) => {}
-                        Err(error) => return Err(error),
-                    }
-                    // Our own pending transition emits a wakeup; a bounded
-                    // pause avoids immediately reclaiming a ticket-full job.
-                    tokio::select! {
-                        _ = cancel.cancelled() => return Ok(()),
-                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                    }
-                }
-                Err(
-                    error @ (DatabaseError::SourceUnavailable
-                    | DatabaseError::SourceDataInvalid
-                    | DatabaseError::SourceDownloadFailed),
-                ) => {
-                    let reason = match error {
-                        DatabaseError::SourceUnavailable => "source_unavailable",
-                        DatabaseError::SourceDataInvalid => "source_data_invalid",
-                        DatabaseError::SourceDownloadFailed => "download_failed",
-                        _ => unreachable!(),
-                    };
-                    self.store.skip_claim(&job, reason, now()).await?;
-                }
-                Err(DatabaseError::SourceRejected | DatabaseError::SourceUnauthorized) => {
-                    self.store.fail_claim(&job, false).await?;
-                    eprintln!(
-                        "law provider: detail source rejected for {:?}; suspending provider requests; queued HEAD may remain pending",
-                        job.object.dataset
-                    );
-                    cancel.cancel();
-                    return Ok(());
-                }
-                Err(
-                    DatabaseError::InvalidInput
-                    | DatabaseError::StorageCorrupt
-                    | DatabaseError::NotFound
-                    | DatabaseError::UnsupportedHistory
-                    | DatabaseError::HistoryIncomplete,
-                ) => {
-                    self.store.fail_claim(&job, false).await?;
-                }
-                Err(_) => {
-                    self.store.fail_claim(&job, true).await?;
-                    tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(5u64.saturating_pow(job.attempts.min(3))))=>{}}
-                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -2599,6 +2804,199 @@ mod runtime_shutdown_tests {
             drained.fetch_add(1, Ordering::SeqCst);
             result
         });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contended_worker_yields_without_cancelling_an_inflight_sibling() {
+        let cancel = CancellationToken::new();
+        let sibling_token = cancel.child_token();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let settled = completed.clone();
+        let sibling = tokio::spawn(async move {
+            tokio::select! {
+                _ = sibling_token.cancelled() => Err(DatabaseError::Cancelled),
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    settled.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let worker_token = cancel.child_token();
+        let worker = tokio::spawn(async move {
+            run_storage_isolated("fixture_detail", &worker_token, || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Err(DatabaseError::StorageContended)
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        sibling.await.unwrap().unwrap();
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!cancel.is_cancelled());
+        tokio::time::advance(Duration::from_secs(3)).await;
+        worker.await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_contention_pause_does_not_start_another_attempt() {
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let worker = tokio::spawn(async move {
+            run_storage_isolated("fixture_inventory", &token, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(DatabaseError::StorageContended) }
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        worker.await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fatal_storage_failure_still_reaches_the_supervisor_without_worker_restart() {
+        for failure in [
+            DatabaseError::StorageUnavailable,
+            DatabaseError::StorageCorrupt,
+        ] {
+            let cancel = CancellationToken::new();
+            let drained = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut tasks = tokio::task::JoinSet::new();
+            child(&mut tasks, &cancel, &drained, Err(DatabaseError::Cancelled));
+            let attempts = calls.clone();
+            let worker_token = cancel.child_token();
+            spawn_runtime_task(
+                &mut tasks,
+                "fixture_detail",
+                worker_token.clone(),
+                async move {
+                    run_storage_isolated("fixture_detail", &worker_token, || {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        async move { Err(failure) }
+                    })
+                    .await
+                },
+            );
+            let original = tasks.join_next().await.unwrap().unwrap();
+            assert_eq!(original, Err(failure));
+            cancel.cancel();
+            let error = drain_runtime_tasks(&mut tasks, original).await.unwrap_err();
+            assert_eq!(error.downcast_ref::<DatabaseError>(), Some(&failure));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(drained.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_deadline_keeps_unknown_commit_fatal_to_the_supervisor() {
+        let cancel = CancellationToken::new();
+        let publication_token = cancel.child_token();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let calls = attempts.clone();
+        let worker_token = cancel.child_token();
+        let publish_token = publication_token.clone();
+        let worker = tokio::spawn(async move {
+            run_storage_isolated("fixture_detail", &worker_token, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let publish_token = publish_token.clone();
+                async move {
+                    storage_work_with_deadline(
+                        Duration::from_secs(1),
+                        &publish_token,
+                        std::future::pending::<Result<(), DatabaseError>>(),
+                    )
+                    .await
+                }
+            })
+            .await
+        });
+        let result = worker.await.unwrap();
+        assert_eq!(result, Err(DatabaseError::StorageUnavailable));
+        assert!(publication_token.is_cancelled());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        // Even known cleanup contention cannot classify this timeout as safe
+        // replay. The supervisor still cancels and drains its other children.
+        let primary =
+            claim_error_after_cleanup(result.unwrap_err(), Err(DatabaseError::StorageContended));
+        let drained = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        child(&mut tasks, &cancel, &drained, Err(DatabaseError::Cancelled));
+        cancel.cancel();
+        let error = drain_runtime_tasks(&mut tasks, Err(primary))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<DatabaseError>(),
+            Some(&DatabaseError::StorageUnavailable)
+        );
+        assert_eq!(drained.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cleanup_contention_does_not_replace_the_original_uncertain_storage_failure() {
+        for primary in [
+            DatabaseError::StorageUnavailable,
+            DatabaseError::StorageCorrupt,
+        ] {
+            assert_eq!(
+                claim_error_after_cleanup(primary, Err(DatabaseError::StorageContended)),
+                primary
+            );
+        }
+        assert_eq!(
+            claim_error_after_cleanup(
+                DatabaseError::SourceDataInvalid,
+                Err(DatabaseError::StorageUnavailable)
+            ),
+            DatabaseError::StorageUnavailable,
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_event_ack_recovers_without_another_outbox_event_or_reapplication() {
+        let mut pending = PendingIndexAck(Some(17));
+        let acknowledged = Arc::new(AtomicUsize::new(0));
+        let attempts = acknowledged.clone();
+        let failed = pending
+            .complete(|sequence| async move {
+                assert_eq!(sequence, 17);
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(DatabaseError::StorageContended)
+            })
+            .await;
+        assert_eq!(failed, Err(DatabaseError::StorageContended));
+        assert_eq!(pending.0, Some(17));
+        // A later tick completes the pending ack before it asks for new events.
+        let attempts = acknowledged.clone();
+        pending
+            .complete(|sequence| async move {
+                assert_eq!(sequence, 17);
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(pending.0, None);
+        pending
+            .complete(|_| async { panic!("a completed event must not be acknowledged again") })
+            .await
+            .unwrap();
+        assert_eq!(acknowledged.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
