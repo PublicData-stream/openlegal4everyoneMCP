@@ -205,6 +205,13 @@ graph; do not force semver-incompatible replacements merely to erase a warning.
 
 ## Required check tooling
 
+The corpus adapter directly uses the already-admitted `tracing` 0.1 dependency
+for bounded storage-phase diagnostics. It adds no new package or version to the
+graph. Static operation spans associate SQLSTATE and attempt number without
+logging SQL text, bound values, source payloads or credentials; the alternative
+of unstructured stderr would lose that correlation. The existing server tracing
+configuration remains responsible for filtering. Source: crates.io; MIT.
+
 ```sh
 cargo install cargo-audit --version 0.22.2 --locked
 cargo install cargo-deny --version 0.20.2 --locked

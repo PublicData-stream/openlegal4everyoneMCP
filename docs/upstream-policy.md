@@ -146,6 +146,30 @@ fence; new per-request evidence lives in `provider_request_admission`.
 Processing claims released before any durable reservation are refunded with an
 owner fence. Retry-After, failure retries and finite operation deadlines still apply.
 
+Collection storage retries are separate from provider retries. Selected corpus
+SQL phases retry only PostgreSQL-reported rejection (`55P03`, `57014`, `40P01`,
+or `40001`), with four total attempts, 100/200/400 ms delays and a ten-second
+phase deadline. Publication retains its forty-second outer deadline. A connection
+failure, lost COMMIT acknowledgement or locally interrupted SQL operation has an
+unknown outcome and remains a storage failure; it is never treated as a proven
+rollback. Cancellation interrupts retry backoff and is checked before commits.
+
+Publication and original-observation retries preserve prepared inputs and physical
+staging generations. A retry does not repeat completed HTTP or blob writes.
+Exhausted known contention yields the affected worker at its durable checkpoint
+instead of cancelling sibling provider requests. Detail cooldown preserves charged
+attempts and fences the ended execution; failed cleanup leaves its lease for normal
+expiry and recovery. A later claim or process restart can make a new charged HTTP
+attempt under the existing policy. Uncertain responses still require operator
+review, and a lost runtime advisory session remains fatal.
+
+Index application and durable acknowledgement are distinct stages. A failed
+acknowledgement is retried before reading further events, including when no new
+event exists; local index application is not repeated as part of that retry.
+Maintenance retries SQL cleanup separately from physical blob deletion. Internal
+diagnostics associate static operation names, attempts and SQLSTATEs without
+logging SQL text, bound values, source bodies or credentials.
+
 Automatic national-statute HEAD collection rechecks authoritative one-hour
 freshness before enqueueing. Successful discovery is reused for one hour per
 normalized term, datasets and mode; failed/partial attempts cool down for one hour.

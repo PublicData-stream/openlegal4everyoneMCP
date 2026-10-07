@@ -396,6 +396,23 @@ operation ID with a different plan is rejected. On a lost COMMIT acknowledgement
 do not automatically apply again: use `readback` and reconcile that operation.
 Charged usage is never refunded. Audit and observation history are retained.
 
+For collection contention incidents, deploy the matching storage/runtime fix
+before resuming admission. Do not clear an abandoned slot merely because the
+serving endpoint is healthy: correlate runtime failure, provider diagnostics and
+the reviewed owner ledger. Stop and drain scheduler, request/detail collectors and
+late callbacks, preserve a coordinated database/archive snapshot, then use the
+inspection, plan, apply and readback sequence above. Cleanup retains the recovery
+hold; global resume is a separate reviewed operation. Never replay an ambiguous
+apply in place of reading its operation result.
+
+After resumption, observe serving and scheduler restart counts, abandoned slots,
+publication progress and index acknowledgement continuously for at least two
+hours. Record the actual elapsed interval and any failures; a short passing window
+does not establish longer stability. Verify the requested statute by exact object
+identity, published capture and capture-fixed body retrieval, rather than a related
+title hit or a completed job alone. Full corpus completion and native ChatGPT UI
+acceptance remain separate checks.
+
 ### Administrator role provisioning
 
 DBAs provision roles and credentials outside migrations. The migration creates
