@@ -101,10 +101,7 @@ async fn enqueue(
         let row=sqlx::query("SELECT job_key,source,descriptor,page,predecessor_key,is_global FROM openlegal.provider_supplement_job WHERE job_key=$1")
             .bind(&d.key).fetch_one(&mut **tx).await.map_err(db)?;
         let existing = decode(&row)?;
-        if existing.source() != request.source()
-            || existing.seed() != request.seed()
-            || existing.page() != request.page()
-        {
+        if !existing.same_work_as(request) {
             return Err(DatabaseError::StorageCorrupt);
         }
     }
@@ -320,5 +317,270 @@ impl PgCorpusStore {
         Ok(
             json!({"complete":complete,"completed_global_roots":completed_global_roots,"required_global_roots":required_keys.len(),"pending_or_running":pending,"done":done,"deferred":deferred,"incomplete":incomplete,"sources":sources}),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob::FsBlobStore;
+    use openlegal_application::{document::DocumentNode, persistence::PersistentStore};
+    use openlegal_domain::rights::SourceRights;
+    use std::collections::BTreeMap;
+
+    fn record(source: SupplementSource, object_id: &str, record_number: &str) -> SupplementRequest {
+        supplements::request(
+            source,
+            SupplementSeed::Record {
+                object: ObjectId {
+                    jurisdiction: "kr".into(),
+                    provider: "law_go_kr".into(),
+                    dataset: Dataset::NationalStatute,
+                    id: object_id.into(),
+                },
+                record_number: record_number.into(),
+            },
+            1,
+        )
+        .unwrap()
+    }
+    async fn setup() -> (
+        crate::test_support::TestDatabase,
+        Arc<crate::postgres::PostgresStore>,
+        PgCorpusStore,
+    ) {
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let base = fixture.open(100).await;
+        let blobs = FsBlobStore::open(&fixture.directory.path().join("supplement-regression"))
+            .await
+            .unwrap();
+        let store = PgCorpusStore::new(base.pool(), blobs);
+        (fixture, base, store)
+    }
+    async fn descriptor_value(pool: &PgPool, key: &str) -> Value {
+        sqlx::query_scalar(
+            "SELECT descriptor FROM openlegal.provider_supplement_job WHERE job_key=$1",
+        )
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+    async fn retain(store: &PgCorpusStore, request: &SupplementRequest, at: u64) -> String {
+        store
+            .retain_source_observation(
+                SourceObservationInput {
+                    source_key: request.observation_key().unwrap(),
+                    raw: Some(b"<list>unchanged exact evidence</list>".to_vec()),
+                    media_type: "application/xml".into(),
+                    rights: SourceRights::legal_information(),
+                    metadata: BTreeMap::new(),
+                    observed_at: at,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .observation_id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn related_statutes_alias_preserves_legacy_descriptor_claim_retry_and_daily_refresh() {
+        let (fixture, base, store) = setup().await;
+        let pool = base.pool();
+        let budget: Value = sqlx::query_scalar(
+            "SELECT to_jsonb(b) FROM openlegal.provider_request_budget b WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let old = record(SupplementSource::RelatedStatutes, "123", "100");
+        let new = record(SupplementSource::RelatedStatutes, "123", "101");
+        let key = old.observation_key().unwrap();
+        assert!(store.enqueue_supplement(&old, 100).await.unwrap());
+        let legacy = descriptor_value(&pool, &key).await;
+        let claim = store.claim_supplement(100).await.unwrap().unwrap();
+        assert!(!store.enqueue_supplement(&new, 101).await.unwrap());
+        let unchanged_owner: String = sqlx::query_scalar(
+            "SELECT owner::text FROM openlegal.provider_supplement_job WHERE job_key=$1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged_owner, claim.lease_owner);
+        assert_eq!(descriptor_value(&pool, &key).await, legacy);
+        let id = retain(&store, &old, 102).await;
+        let observation = store
+            .source_observation(&id, CancellationToken::new())
+            .await
+            .unwrap();
+        store
+            .settle_supplement(&claim, SupplementJobStatus::Incomplete, Some(&id), 0, 200)
+            .await
+            .unwrap();
+
+        // Reopen the persistent queue and bytes rather than retaining an in-memory claim.
+        let blobs = FsBlobStore::open(&fixture.directory.path().join("supplement-regression"))
+            .await
+            .unwrap();
+        let restarted = PgCorpusStore::new(pool.clone(), blobs);
+        let retry = restarted.claim_supplement(3800).await.unwrap().unwrap();
+        assert_eq!(retry.observation_id.as_deref(), Some(id.as_str()));
+        assert_eq!(retry.request.seed(), old.seed());
+        assert_eq!(
+            restarted
+                .settle_supplement(&claim, SupplementJobStatus::Done, Some(&id), 1, 3801)
+                .await,
+            Err(DatabaseError::Conflict)
+        );
+        restarted
+            .settle_supplement(&retry, SupplementJobStatus::Done, Some(&id), 1, 3801)
+            .await
+            .unwrap();
+        assert!(!restarted.enqueue_supplement(&new, 90200).await.unwrap());
+        assert!(restarted.enqueue_supplement(&new, 90201).await.unwrap());
+        assert_eq!(descriptor_value(&pool, &key).await, legacy);
+        let fresh = restarted.claim_supplement(90201).await.unwrap().unwrap();
+        assert!(fresh.observation_id.is_none());
+        assert_eq!(fresh.request.seed(), old.seed());
+        assert_eq!(
+            restarted
+                .settle_supplement(&fresh, SupplementJobStatus::Done, Some(&id), 1, 90202)
+                .await,
+            Err(DatabaseError::InvalidInput)
+        );
+        assert_eq!(retain(&restarted, &new, 90202).await, id);
+        let reclaimed = restarted.claim_supplement(90801).await.unwrap().unwrap();
+        assert_eq!(reclaimed.observation_id.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            restarted
+                .settle_supplement(&fresh, SupplementJobStatus::Done, Some(&id), 1, 90802)
+                .await,
+            Err(DatabaseError::Conflict)
+        );
+        restarted
+            .settle_supplement(&reclaimed, SupplementJobStatus::Done, Some(&id), 1, 90802)
+            .await
+            .unwrap();
+        let revalidated = restarted
+            .source_observation(&id, CancellationToken::new())
+            .await
+            .unwrap();
+        let mut expected_observation = observation;
+        expected_observation.validated_at = 90202;
+        assert_eq!(revalidated, expected_observation);
+        assert_eq!(
+            restarted
+                .source_observation_bytes(&id, CancellationToken::new())
+                .await
+                .unwrap(),
+            b"<list>unchanged exact evidence</list>"
+        );
+        assert_eq!(descriptor_value(&pool, &key).await, legacy);
+        let counts: (i64, i64, i64) = sqlx::query_as("SELECT raw_bytes,staged_bytes,(SELECT count(*) FROM openlegal.corpus_source_observation) FROM openlegal.corpus_control WHERE singleton")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            counts,
+            (b"<list>unchanged exact evidence</list>".len() as i64, 0, 1)
+        );
+        let after_budget: Value = sqlx::query_scalar(
+            "SELECT to_jsonb(b) FROM openlegal.provider_request_budget b WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after_budget, budget);
+        let admissions: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM openlegal.provider_request_admission")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(admissions, 0);
+        base.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn equal_mst_wire_identity_cannot_merge_distinct_parent_objects() {
+        let (_fixture, base, store) = setup().await;
+        let first = record(SupplementSource::StatuteHierarchy, "123", "100");
+        let other = record(SupplementSource::StatuteHierarchy, "124", "100");
+        assert_eq!(
+            first.observation_key().unwrap(),
+            other.observation_key().unwrap()
+        );
+        store.enqueue_supplement(&first, 100).await.unwrap();
+        let before = descriptor_value(&base.pool(), &first.observation_key().unwrap()).await;
+        assert_eq!(
+            store.enqueue_supplement(&other, 101).await,
+            Err(DatabaseError::StorageCorrupt)
+        );
+        assert_eq!(
+            descriptor_value(&base.pool(), &first.observation_key().unwrap()).await,
+            before
+        );
+        base.close().await.unwrap();
+    }
+
+    fn field(name: &str, value: &str) -> DocumentNode {
+        DocumentNode::Element {
+            name: name.into(),
+            attributes: vec![],
+            children: vec![DocumentNode::Text {
+                value: value.into(),
+            }],
+        }
+    }
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn hierarchy_page_seeds_with_multiple_record_versions_enqueue_and_retry_without_corruption()
+     {
+        let (_fixture, base, store) = setup().await;
+        let request = supplements::request(
+            SupplementSource::StatuteHierarchyInventory,
+            SupplementSeed::Global,
+            1,
+        )
+        .unwrap();
+        let tree = DocumentNode::Element {
+            name: "LawSearch".into(),
+            attributes: vec![],
+            children: vec![
+                field("totalCnt", "2"),
+                DocumentNode::Element {
+                    name: "law".into(),
+                    attributes: vec![],
+                    children: vec![field("법령ID", "123"), field("법령일련번호", "100")],
+                },
+                DocumentNode::Element {
+                    name: "law".into(),
+                    attributes: vec![],
+                    children: vec![field("법령ID", "123"), field("법령일련번호", "101")],
+                },
+            ],
+        };
+        let page = supplements::inspect_page(&request, &tree, 0).unwrap();
+        assert_eq!(page.seeds.len(), 2);
+        assert!(!page.incomplete);
+        assert_eq!(page.done, Some(true));
+        for at in [100, 101] {
+            for seed in &page.seeds {
+                for next in supplements::seeded_requests(seed.clone(), 1).unwrap() {
+                    store.enqueue_supplement(&next, at).await.unwrap();
+                }
+            }
+        }
+        let related_count: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.provider_supplement_job WHERE source='related_statutes'")
+            .fetch_one(&base.pool()).await.unwrap();
+        assert_eq!(related_count, 1);
+        let jobs: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM openlegal.provider_supplement_job")
+                .fetch_one(&base.pool())
+                .await
+                .unwrap();
+        assert_eq!(jobs, 13);
+        base.close().await.unwrap();
     }
 }

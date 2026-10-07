@@ -232,6 +232,22 @@ impl SupplementRequest {
     pub fn page(&self) -> u32 {
         self.page
     }
+    /// Compare validated descriptors without changing their stored provenance.
+    /// Related-statute work uses the statute ID, so its parent record number
+    /// does not distinguish an execution. Other sources retain exact seed identity.
+    pub(crate) fn same_work_as(&self, other: &Self) -> bool {
+        if self.source != other.source || self.page != other.page {
+            return false;
+        }
+        if self.source == SupplementSource::RelatedStatutes {
+            return matches!(
+                (&self.seed, &other.seed),
+                (SupplementSeed::Record { object: left, .. },
+                 SupplementSeed::Record { object: right, .. }) if left == right
+            );
+        }
+        self.seed == other.seed
+    }
     pub fn parameters(&self) -> &BTreeMap<String, String> {
         &self.parameters
     }
@@ -890,6 +906,95 @@ mod tests {
             dataset: Dataset::NationalStatute,
             id: "000123".into(),
         }
+    }
+    fn record_request(source: SupplementSource, record_number: &str) -> SupplementRequest {
+        request(
+            source,
+            SupplementSeed::Record {
+                object: object(),
+                record_number: record_number.into(),
+            },
+            1,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn related_statutes_record_versions_share_one_wire_identity() {
+        let old = record_request(SupplementSource::RelatedStatutes, "100");
+        let new = record_request(SupplementSource::RelatedStatutes, "101");
+        assert_ne!(old.seed(), new.seed());
+        assert_eq!(old.source_url().unwrap(), new.source_url().unwrap());
+        assert_eq!(
+            old.observation_key().unwrap(),
+            new.observation_key().unwrap()
+        );
+        assert!(old.same_work_as(&new));
+        assert!(new.same_work_as(&old));
+    }
+    #[test]
+    fn semantic_work_equivalence_preserves_other_identity_boundaries() {
+        let related = record_request(SupplementSource::RelatedStatutes, "100");
+        let mut different_object = object();
+        different_object.id = "000124".into();
+        for source in [
+            SupplementSource::RelatedStatutes,
+            SupplementSource::StatuteHierarchy,
+        ] {
+            let first = record_request(source, "100");
+            let different = request(
+                source,
+                SupplementSeed::Record {
+                    object: different_object.clone(),
+                    record_number: "100".into(),
+                },
+                1,
+            )
+            .unwrap();
+            assert!(!first.same_work_as(&different));
+            if source == SupplementSource::StatuteHierarchy {
+                // Equal MST-based wire requests cannot erase parent-object identity.
+                assert_eq!(
+                    first.observation_key().unwrap(),
+                    different.observation_key().unwrap()
+                );
+            }
+        }
+        for contract in SUPPLEMENT_CONTRACTS.iter().filter(|c| {
+            c.seed_kind == SeedKind::NationalRecord && c.source != SupplementSource::RelatedStatutes
+        }) {
+            let old = record_request(contract.source, "100");
+            let new = record_request(contract.source, "101");
+            assert!(!old.same_work_as(&new));
+            assert_ne!(
+                old.observation_key().unwrap(),
+                new.observation_key().unwrap()
+            );
+            assert!(!related.same_work_as(&old));
+        }
+        let first = request(
+            SupplementSource::StatuteAnnexInventory,
+            SupplementSeed::Global,
+            1,
+        )
+        .unwrap();
+        let second = request(
+            SupplementSource::StatuteAnnexInventory,
+            SupplementSeed::Global,
+            2,
+        )
+        .unwrap();
+        assert!(!first.same_work_as(&second));
+        assert!(
+            request(
+                SupplementSource::RelatedStatutes,
+                SupplementSeed::Record {
+                    object: object(),
+                    record_number: "0".into()
+                },
+                1
+            )
+            .is_err()
+        );
     }
     #[test]
     fn finite_globals_and_parent_views_are_canonical_and_credential_free() {
