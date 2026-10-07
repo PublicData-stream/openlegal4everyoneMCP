@@ -2958,6 +2958,48 @@ fn catalog_sections(node: &DocumentNode, fields: &[&str], out: &mut Vec<LegalSec
         }
     }
 }
+/// A provider article key can repeat within one response. Preserve every source
+/// unit and its order, distinguishing every colliding occurrence by its projected
+/// position. The `article:` prefix retains article/heading consumer semantics;
+/// the suffix is a capture-local locator, not an inferred legal identifier.
+/// Final record validation still rejects generated collisions and oversized IDs.
+fn disambiguate_article_sections(
+    sections: &mut [LegalSection],
+    metadata: &mut BTreeMap<String, String>,
+    projection_version: &'static str,
+) {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for section in sections
+        .iter()
+        .filter(|section| section.id.starts_with("article:"))
+    {
+        *counts.entry(section.id.clone()).or_default() += 1;
+    }
+    let groups = counts.values().filter(|count| **count > 1).count();
+    if groups == 0 {
+        return;
+    }
+    let occurrences = counts.values().filter(|count| **count > 1).sum::<usize>();
+    for (position, section) in sections.iter_mut().enumerate() {
+        if counts.get(&section.id).is_some_and(|count| *count > 1) {
+            section.id = format!("{}:source_ordinal:{}", section.id, position + 1);
+        }
+    }
+    metadata.insert("projection_version".into(), projection_version.into());
+    metadata.insert(
+        "section_locator_semantics".into(),
+        "source_article_key_or_source_ordinal_with_duplicate_key_suffix".into(),
+    );
+    metadata.insert(
+        "section_locator_diagnostic".into(),
+        "duplicate_source_article_keys".into(),
+    );
+    metadata.insert("duplicate_article_key_groups".into(), groups.to_string());
+    metadata.insert(
+        "duplicate_article_key_sections".into(),
+        occurrences.to_string(),
+    );
+}
 fn html_identity(node: &DocumentNode, id: &str) -> bool {
     if let DocumentNode::Element {
         name,
@@ -3180,6 +3222,7 @@ pub fn project(
     if effective.is_some() && returned_effective != effective {
         return Err(DatabaseError::StorageCorrupt);
     }
+    disambiguate_article_sections(&mut source_sections, &mut metadata, "law_go_kr_text_v3");
     let record = LegalRecord {
         object: item.object.clone(),
         revision_id: item.revision_id.clone(),
@@ -3365,6 +3408,11 @@ fn project_additional(
     if item.object.dataset == Dataset::Treaty {
         source.query_pairs_mut().append_pair("chrClsCd", "010202");
     }
+    disambiguate_article_sections(
+        &mut source_sections,
+        &mut metadata,
+        "law_go_kr_additional_v2",
+    );
     let body = source_sections
         .iter()
         .map(|s| s.text.as_str())
@@ -4276,6 +4324,269 @@ mod tests {
             ocr_pages: vec![],
             diagnostics: vec![],
         }
+    }
+    fn source_article(key: Option<&str>, title: &str, body: &str) -> DocumentNode {
+        DocumentNode::Element {
+            name: "조문단위".into(),
+            attributes: key
+                .map(|key| vec![("조문키".into(), key.into())])
+                .unwrap_or_default(),
+            children: vec![field("조문제목", title), field("조문내용", body)],
+        }
+    }
+    fn statute_sections_fixture(units: Vec<DocumentNode>) -> DocumentOutput {
+        let mut children = vec![
+            field("법령ID", "1"),
+            field("법령명_한글", "Fictional statute"),
+            field("시행일자", "20260101"),
+        ];
+        children.extend(units);
+        output(branch("법령", children))
+    }
+    #[test]
+    fn duplicate_article_keys_preserve_text_outline_and_capture_section_citations() {
+        use openlegal_domain::citation::{CitationId, CitationProjection};
+        use openlegal_normalization::kr_legal_reference::{self as kr, ArticleLookup, OutlineUnit};
+
+        let mut units = vec![
+            source_article(Some("0000000"), "", "제1장 총칙"),
+            source_article(Some("0001001"), "목적", "제1조(목적) 첫째 원문"),
+            source_article(Some("0000000"), "", "제2장 규정"),
+            source_article(Some("0002001"), "둘째", "제2조(둘째) 둘째 원문"),
+            source_article(None, "", "키 없는 원문"),
+            source_article(Some("0000000"), "", "제3장 벌칙"),
+            source_article(Some("0002001"), "넷째", "제4조(넷째) 넷째 원문"),
+            field("부칙내용", "부칙 원문"),
+            source_article(Some("0001001"), "", ""),
+            branch(
+                "별표",
+                vec![source_article(Some("0001001"), "", "미확인 별표 원문")],
+            ),
+        ];
+        for (position, number) in [(3, "2"), (6, "4")] {
+            if let DocumentNode::Element { children, .. } = &mut units[position] {
+                children.extend([field("조문번호", number), field("조문가지번호", "0")]);
+            }
+        }
+        let data = statute_sections_fixture(units);
+        let record = project(&item(), &data).unwrap();
+        assert_eq!(
+            record.body,
+            "제1장 총칙\n제1조(목적) 첫째 원문\n제2장 규정\n제2조(둘째) 둘째 원문\n키 없는 원문\n제3장 벌칙\n제4조(넷째) 넷째 원문\n부칙 원문"
+        );
+        assert_eq!(
+            record
+                .sections
+                .iter()
+                .map(|unit| unit.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "article:0000000:source_ordinal:1",
+                "article:0001001",
+                "article:0000000:source_ordinal:3",
+                "article:0002001:source_ordinal:4",
+                "source_ordinal:5",
+                "article:0000000:source_ordinal:6",
+                "article:0002001:source_ordinal:7",
+                "source_ordinal:8",
+            ]
+        );
+        assert_eq!(record.sections[1].title, "목적");
+        assert_eq!(record.metadata["projection_version"], "law_go_kr_text_v3");
+        assert_eq!(record.metadata["duplicate_article_key_groups"], "2");
+        assert_eq!(record.metadata["duplicate_article_key_sections"], "5");
+        assert_eq!(
+            record.metadata["section_locator_diagnostic"],
+            "duplicate_source_article_keys"
+        );
+        assert_eq!(
+            provision_numbers(data.tree.as_ref().unwrap()),
+            vec!["000200", "000400"]
+        );
+        let outline = kr::outline(&record.sections);
+        assert_eq!(outline.len(), 6);
+        assert_eq!(
+            outline
+                .iter()
+                .filter(|unit| matches!(unit, OutlineUnit::Heading { .. }))
+                .count(),
+            3
+        );
+        let ArticleLookup::Found(article) =
+            kr::locate_article(&record.sections, kr::parse_article_number("제4조").unwrap())
+        else {
+            panic!("the duplicate-key article must remain available");
+        };
+        assert_eq!(article.section_id, "article:0002001:source_ordinal:7");
+        assert_eq!(article.text, "제4조(넷째) 넷째 원문");
+        let capture = Capture {
+            capture_id: "c".repeat(64),
+            sequence: 1,
+            record,
+            retrieved_at: 1,
+            captured_at: 1,
+            validated_at: 1,
+            processor_version: data.processor_version,
+            raw_sha256: data.source_sha256,
+        };
+        for (section, expected) in [
+            ("article:0002001:source_ordinal:4", "제2조(둘째) 둘째 원문"),
+            ("article:0002001:source_ordinal:7", "제4조(넷째) 넷째 원문"),
+        ] {
+            let citation = CitationId {
+                object: capture.record.object.clone(),
+                capture_id: capture.capture_id.clone(),
+                projection: CitationProjection::Section {
+                    section: section.into(),
+                },
+            };
+            let decoded = CitationId::decode(&citation.encode().unwrap()).unwrap();
+            assert_eq!(decoded, citation);
+            assert_eq!(
+                openlegal_application::citation::project_text(&capture, &decoded).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            openlegal_application::citation::section_text(&capture, "article:0002001"),
+            Err(DatabaseError::NotFound)
+        );
+        let mut wrong = item();
+        wrong.object.id = "2".into();
+        assert!(
+            project(
+                &wrong,
+                &statute_sections_fixture(vec![
+                    source_article(Some("a"), "", "제1조 첫째"),
+                    source_article(Some("a"), "", "제2조 둘째"),
+                ])
+            )
+            .is_err()
+        );
+        wrong = item();
+        wrong.revision_id = "100:20260102".into();
+        wrong.effective_date = Some("20260102".into());
+        assert!(
+            project(
+                &wrong,
+                &statute_sections_fixture(vec![
+                    source_article(Some("a"), "", "제1조 첫째"),
+                    source_article(Some("a"), "", "제2조 둘째"),
+                ])
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn empty_and_pruned_article_keys_leave_existing_projection_unchanged() {
+        let data = statute_sections_fixture(vec![
+            source_article(Some("0001001"), "목적", "제1조(목적) 원문"),
+            source_article(Some("0001001"), "", ""),
+            branch(
+                "별표",
+                vec![source_article(Some("0001001"), "", "미확인 별표 원문")],
+            ),
+        ]);
+        let record = project(&item(), &data).unwrap();
+        assert_eq!(record.sections.len(), 1);
+        assert_eq!(record.sections[0].id, "article:0001001");
+        assert_eq!(record.body, "제1조(목적) 원문");
+        assert_eq!(record.metadata["projection_version"], "law_go_kr_text_v2");
+        assert_eq!(
+            record.metadata["section_locator_semantics"],
+            "source_article_key_or_source_ordinal"
+        );
+        assert!(!record.metadata.contains_key("section_locator_diagnostic"));
+        assert!(!record.metadata.contains_key("duplicate_article_key_groups"));
+    }
+    #[test]
+    fn generated_article_locator_collisions_and_length_limits_remain_rejected() {
+        let collision = statute_sections_fixture(vec![
+            source_article(Some("a"), "", "First fictional unit"),
+            source_article(Some("a"), "", "Second fictional unit"),
+            source_article(Some("a:source_ordinal:1"), "", "Third fictional unit"),
+        ]);
+        assert_eq!(
+            project(&item(), &collision),
+            Err(DatabaseError::StorageCorrupt)
+        );
+        let long_key = "a".repeat(248);
+        let oversized = statute_sections_fixture(vec![
+            source_article(Some(&long_key), "", "First fictional unit"),
+            source_article(Some(&long_key), "", "Second fictional unit"),
+        ]);
+        assert_eq!(
+            project(&item(), &oversized),
+            Err(DatabaseError::StorageCorrupt)
+        );
+    }
+    #[test]
+    fn additional_rule_projection_disambiguates_every_repeated_article_key() {
+        let mut candidate = item();
+        candidate.object.dataset = Dataset::AdministrativeRule;
+        candidate.revision_id = "100".into();
+        let data = output(branch(
+            "행정규칙",
+            vec![
+                field("행정규칙ID", "1"),
+                field("행정규칙일련번호", "100"),
+                field("행정규칙명", "Fictional administrative rule"),
+                field("시행일자", "20260101"),
+                source_article(Some("0001001"), "첫째", "제1조(첫째) 첫째 원문"),
+                source_article(Some("0001001"), "둘째", "제2조(둘째) 둘째 원문"),
+            ],
+        ));
+        let record = project(&candidate, &data).unwrap();
+        assert_eq!(record.body, "제1조(첫째) 첫째 원문\n제2조(둘째) 둘째 원문");
+        assert_eq!(record.sections[0].id, "article:0001001:source_ordinal:1");
+        assert_eq!(record.sections[1].id, "article:0001001:source_ordinal:2");
+        assert_eq!(
+            record.metadata["projection_version"],
+            "law_go_kr_additional_v2"
+        );
+        assert_eq!(record.metadata["duplicate_article_key_groups"], "1");
+        assert_eq!(record.metadata["duplicate_article_key_sections"], "2");
+        candidate.object.id = "2".into();
+        assert_eq!(
+            project(&candidate, &data),
+            Err(DatabaseError::StorageCorrupt)
+        );
+        candidate.object.id = "1".into();
+        candidate.effective_date = Some("20260102".into());
+        assert_eq!(
+            project(&candidate, &data),
+            Err(DatabaseError::StorageCorrupt)
+        );
+    }
+    #[test]
+    fn catalog_projection_preserves_distinct_units_with_a_repeated_article_key() {
+        let mut candidate = item();
+        candidate.object.dataset = Dataset::FtcDecision;
+        candidate.object.id = "100".into();
+        candidate.revision_id = "100".into();
+        candidate.effective_date = None;
+        let units = ["First fictional order", "Second fictional order"]
+            .into_iter()
+            .map(|body| DocumentNode::Element {
+                name: "조문단위".into(),
+                attributes: vec![("조문키".into(), "repeated".into())],
+                children: vec![field("주문", body)],
+            });
+        let mut children = vec![
+            field("결정문일련번호", "100"),
+            field("사건명", "Fictional decision"),
+        ];
+        children.extend(units);
+        let record = project(&candidate, &output(branch("FtcService", children))).unwrap();
+        assert_eq!(record.body, "First fictional order\nSecond fictional order");
+        assert_eq!(record.sections[0].id, "article:repeated:source_ordinal:1");
+        assert_eq!(record.sections[1].id, "article:repeated:source_ordinal:2");
+        assert_eq!(
+            record.metadata["projection_version"],
+            "law_go_kr_additional_v2"
+        );
+        assert_eq!(record.metadata["duplicate_article_key_groups"], "1");
+        assert_eq!(record.metadata["duplicate_article_key_sections"], "2");
     }
     #[test]
     fn undocumented_ministry_row_names_use_direct_serial_fields() {

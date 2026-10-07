@@ -157,8 +157,22 @@ field.
 Ordered XML fields retain article, paragraph, subparagraph, item and supplementary
 text. Explicit sections distinguish provider text, extracted attachment text and
 OCR. Source article keys or clearly named source ordinals identify sections;
-ordinals are not legal citations. Embedded HTML within XML text remains literal
-provider-field text. OCR never replaces provider text.
+ordinals are not legal citations. When a source article key repeats among the
+projected sections, every occurrence uses
+`article:{key}:source_ordinal:{position}` with its one-based projected position.
+Unique source keys keep `article:{key}`. This suffix distinguishes source units
+within a capture; it does not infer an article number, legal identity or revision.
+Text, titles and order are preserved, including repeated headings. Empty units and
+excluded supplementary subtrees do not create projected-key collisions.
+
+Duplicate-key projections record `duplicate_source_article_keys` and bounded group
+and section counts in metadata. Their provenance uses `law_go_kr_text_v3` or
+`law_go_kr_additional_v2`; unaffected projections keep their prior version.
+Generated locator collisions and oversized locators still fail validation.
+Previously retained captures, sections and capture-fixed citations remain
+immutable; changed future projections produce a new capture through normal
+publication. Embedded HTML within XML text remains literal provider-field text.
+OCR never replaces provider text.
 
 The adapter downloads documented national PDF/HWP attachment-link fields through
 an exact host/path allowlist. Ordinance attachment filenames alone do not justify
