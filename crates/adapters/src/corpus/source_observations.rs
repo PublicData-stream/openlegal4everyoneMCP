@@ -247,11 +247,14 @@ impl PgCorpusStore {
             validated_at: input.observed_at,
         };
         observation.observation_id = observation.content_id()?;
-        if let Some(row) = sqlx::query(SELECT_OBSERVATION)
-            .bind(&observation.observation_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db)?
+        if let Some(row) = retry_storage(&cancel, "observation_existing", || async {
+            sqlx::query(SELECT_OBSERVATION)
+                .bind(&observation.observation_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)
+        })
+        .await?
         {
             let mut prior = decode(&row).inspect_err(|error| {
                 if *error == DatabaseError::StorageCorrupt {
@@ -263,24 +266,30 @@ impl PgCorpusStore {
                     .await?;
             }
             check(&cancel)?;
-            sqlx::query("UPDATE openlegal.corpus_source_observation SET validated_at=GREATEST(validated_at,$2::text::numeric) WHERE id=$1")
-                .bind(&prior.observation_id).bind(input.observed_at.to_string()).execute(&self.pool).await.map_err(db)?;
+            retry_storage(&cancel, "observation_revalidate", || async {
+                sqlx::query("UPDATE openlegal.corpus_source_observation SET validated_at=GREATEST(validated_at,$2::text::numeric) WHERE id=$1")
+                    .bind(&prior.observation_id).bind(input.observed_at.to_string()).execute(&self.pool).await.map_err(db)
+            }).await?;
             prior.validated_at = prior.validated_at.max(input.observed_at);
             check(&cancel)?;
             return Ok(prior);
         }
         let digest = input.raw.as_ref().map(|raw| bytes_hash(raw));
         let location = if let Some(digest) = &digest {
-            let generation: Uuid = sqlx::query_scalar("SELECT pg_catalog.uuidv7()")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(db)?;
+            let generation: Uuid = retry_storage(&cancel, "observation_generation", || async {
+                sqlx::query_scalar("SELECT pg_catalog.uuidv7()")
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(db)
+            })
+            .await?;
             let hex = hex(digest);
             Some(format!("{}/{}-{generation}", &hex[..2], hex))
         } else {
             None
         };
         if let Some(location) = &location {
+            retry_storage(&cancel, "observation_reserve", || async {
             let mut tx = self.pool.begin().await.map_err(db)?;
             let counts = sqlx::query("SELECT raw_bytes,staged_bytes,max_raw_bytes::text,(SELECT count(*) FROM openlegal.corpus_staging) AS stages FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
                 .fetch_one(&mut *tx).await.map_err(db)?;
@@ -312,6 +321,8 @@ impl PgCorpusStore {
                 .map_err(db)?;
             check(&cancel)?;
             tx.commit().await.map_err(db)?;
+            Ok(())
+            }).await?;
             self.blobs
                 .put_if_absent(
                     BlobLocation {
@@ -330,6 +341,7 @@ impl PgCorpusStore {
                 .map_err(blob_error)?;
         }
         check(&cancel)?;
+        retry_storage(&cancel, "observation_commit", || async {
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
@@ -383,9 +395,13 @@ impl PgCorpusStore {
         }
         check(&cancel)?;
         tx.commit().await.map_err(db)?;
-        let retained = self
-            .source_observation(&observation.observation_id, cancel.clone())
-            .await?;
+        Ok(())
+        }).await?;
+        // A committed observation is never re-inserted to retry its readback.
+        let retained = retry_storage(&cancel, "observation_readback", || {
+            self.source_observation(&observation.observation_id, cancel.clone())
+        })
+        .await?;
         if retained.retained() {
             self.source_observation_bytes(&retained.observation_id, cancel)
                 .await?;

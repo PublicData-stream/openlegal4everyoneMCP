@@ -113,6 +113,10 @@ impl PgCorpusStore {
         request: &SupplementRequest,
         now: u64,
     ) -> Result<bool, DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "enqueue_supplement", || {
+            async {
+
         self.gate().await?;
         let mut tx = self.pool.begin().await.map_err(db)?;
         // Keep the same control-before-job lock order as claim and settlement.
@@ -122,10 +126,19 @@ impl PgCorpusStore {
         let changed = enqueue(&mut tx, request, now).await?;
         tx.commit().await.map_err(db)?;
         Ok(changed)
+
+            }
+        }).await
     }
     /// One execution lease; global work and identified seeds alternate, then
     /// source names rotate. Expired workers are fenced by a fresh UUID owner.
     pub async fn claim_supplement(&self, now: u64) -> Result<Option<SupplementJob>, DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        let retry_started = tokio::time::Instant::now();
+        retry_storage(&retry_cancel, "claim_supplement", || {
+            async {
+                let now = now.saturating_add(retry_started.elapsed().as_secs());
+
         self.gate().await?;
         let until = now.checked_add(600).ok_or(DatabaseError::Capacity)?;
         let mut tx = self.pool.begin().await.map_err(db)?;
@@ -187,6 +200,9 @@ impl PgCorpusStore {
             lease_owner: owner.to_string(),
             lease_until: until,
         }))
+
+            }
+        }).await
     }
     pub async fn settle_supplement(
         &self,
@@ -211,6 +227,12 @@ impl PgCorpusStore {
         now: u64,
         successor: Option<&SupplementRequest>,
     ) -> Result<(), DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        let retry_started = tokio::time::Instant::now();
+        retry_storage(&retry_cancel, "settle_supplement_with_successor", || {
+            async {
+                let now = now.saturating_add(retry_started.elapsed().as_secs());
+
         self.gate().await?;
         let owner = Uuid::parse_str(&job.lease_owner).map_err(|_| DatabaseError::InvalidInput)?;
         if descriptor(&job.request)?.key != job.key {
@@ -263,6 +285,9 @@ impl PgCorpusStore {
             enqueue(&mut tx, next, now).await?;
         }
         tx.commit().await.map_err(db)
+
+            }
+        }).await
     }
     pub async fn supplement_progress(&self) -> Result<Value, DatabaseError> {
         self.gate().await?;

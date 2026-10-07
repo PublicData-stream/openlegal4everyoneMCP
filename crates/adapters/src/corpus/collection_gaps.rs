@@ -129,6 +129,10 @@ impl PgCorpusStore {
             .transpose()
     }
     pub async fn skip_claim(&self, job: &Job, reason: &str, now: u64) -> Result<(), DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "skip_claim", || {
+            async {
+
         let object_key = key(&job.object)?;
         let dataset = dataset_name(job.object.dataset)?;
         let gap = detail_key(&object_key, &job.revision_id);
@@ -147,6 +151,9 @@ impl PgCorpusStore {
             .execute(&mut *tx).await.map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok(())
+
+            }
+        }).await
     }
     pub async fn resolve_detail_gap(
         &self,
@@ -169,6 +176,10 @@ impl PgCorpusStore {
             .bind(detail_key(&object_key, revision)).fetch_one(&self.pool).await.map_err(db)
     }
     pub async fn requeue_due_details(&self, now: u64) -> Result<u64, DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "requeue_due_details", || {
+            async {
+
         self.gate().await?;
         let mut tx = self.pool.begin().await.map_err(db)?;
         // Match enqueue/adoption/claim lock order before touching any job or gap.
@@ -209,6 +220,9 @@ impl PgCorpusStore {
         }
         tx.commit().await.map_err(db)?;
         Ok(rows.len() as u64)
+
+            }
+        }).await
     }
     pub async fn collection_notices(
         &self,
@@ -249,3 +263,5 @@ impl PgCorpusStore {
             .collect()
     }
 }
+use super::storage_retry::retry_storage;
+use tokio_util::sync::CancellationToken;

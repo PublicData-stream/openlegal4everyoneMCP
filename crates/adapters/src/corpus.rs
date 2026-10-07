@@ -15,6 +15,12 @@ use std::sync::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+pub(super) mod storage_retry;
+use storage_retry::retry_storage;
+
+#[cfg(test)]
+mod contention_regressions;
+
 mod citation;
 mod clone_progress;
 pub use clone_progress::CloneView;
@@ -50,6 +56,9 @@ fn db(error: sqlx::Error) -> DatabaseError {
             Some("55P03" | "57014" | "40P01" | "40001")
         )
     }) {
+        if let Some(code) = error.as_database_error().and_then(|error| error.code()) {
+            tracing::warn!(operation = "corpus_sql", sqlstate = %code, "corpus SQL rejected by server");
+        }
         DatabaseError::StorageContended
     } else {
         DatabaseError::StorageUnavailable
@@ -320,10 +329,13 @@ impl PgCorpusStore {
         if !self.healthy() {
             return Err(DatabaseError::StorageCorrupt);
         }
-        sqlx::query("SELECT singleton FROM openlegal.corpus_control")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db)?;
+        retry_storage(&CancellationToken::new(), "corpus_health", || async {
+            sqlx::query("SELECT singleton FROM openlegal.corpus_control")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db)
+        })
+        .await?;
         self.blobs
             .health(CancellationToken::new())
             .await
@@ -694,21 +706,34 @@ impl PgCorpusStore {
             == Some("incomplete");
         if update_job_gap && attachment_incomplete {
             let object_key = key(&p.record.object)?;
-            self.ensure_gap_capacity(&collection_gaps::detail_key(
-                &object_key,
-                &p.record.revision_id,
-            ))
+            retry_storage(&cancel, "publication_gap_capacity", || async {
+                self.ensure_gap_capacity(&collection_gaps::detail_key(
+                    &object_key,
+                    &p.record.revision_id,
+                ))
+                .await
+            })
             .await?;
         }
         let k = key(&p.record.object)?;
         let previous_id = if p.install_head {
-            self.state(&p.record.object).await?.head_capture
+            retry_storage(&cancel, "publication_previous_head", || {
+                self.state(&p.record.object)
+            })
+            .await?
+            .head_capture
         } else {
-            sqlx::query_scalar::<_, Option<String>>("SELECT latest_capture FROM openlegal.corpus_revision WHERE object_key=$1 AND revision_id=$2")
-                .bind(&k).bind(&p.record.revision_id).fetch_optional(&self.pool).await.map_err(db)?.flatten()
+            retry_storage(&cancel, "publication_previous_revision", || async {
+                sqlx::query_scalar::<_, Option<String>>("SELECT latest_capture FROM openlegal.corpus_revision WHERE object_key=$1 AND revision_id=$2")
+                    .bind(&k).bind(&p.record.revision_id).fetch_optional(&self.pool).await.map_err(db)
+            }).await?.flatten()
         };
         let previous = match previous_id {
-            Some(id) => match self.capture(&id, p.now, cancel.clone()).await {
+            Some(id) => match retry_storage(&cancel, "publication_previous_capture", || {
+                self.capture(&id, p.now, cancel.clone())
+            })
+            .await
+            {
                 Ok(capture) => Some(capture),
                 Err(DatabaseError::RevisionUnavailable) if !p.install_head => None,
                 Err(error) => return Err(error),
@@ -717,10 +742,13 @@ impl PgCorpusStore {
         };
         let digest = bytes_hash(&p.raw);
         let size = p.raw.len() as i64;
-        let generation: Uuid = sqlx::query_scalar("SELECT pg_catalog.uuidv7()")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db)?;
+        let generation: Uuid = retry_storage(&cancel, "publication_generation", || async {
+            sqlx::query_scalar("SELECT pg_catalog.uuidv7()")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db)
+        })
+        .await?;
         let digest_hex = hex(&digest);
         let storage_key = format!("{}/{}-{generation}", &digest_hex[..2], digest_hex);
         let mut inputs = vec![std::mem::take(&mut p.raw)];
@@ -736,14 +764,18 @@ impl PgCorpusStore {
                     "{}/{}-{}",
                     &h[..2],
                     h,
-                    sqlx::query_scalar::<_, Uuid>("SELECT pg_catalog.uuidv7()")
-                        .fetch_one(&self.pool)
-                        .await
-                        .map_err(db)?
+                    retry_storage(&cancel, "publication_evidence_generation", || async {
+                        sqlx::query_scalar::<_, Uuid>("SELECT pg_catalog.uuidv7()")
+                            .fetch_one(&self.pool)
+                            .await
+                            .map_err(db)
+                    })
+                    .await?
                 )
             };
             staged_blobs.push((location, d, raw.len() as i64));
         }
+        retry_storage(&cancel, "publication_reserve", || async {
         let mut reserve = self.pool.begin().await.map_err(db)?;
         let counts=sqlx::query("SELECT raw_bytes,staged_bytes,max_raw_bytes::text,(SELECT count(*) FROM openlegal.corpus_staging) AS stages FROM openlegal.corpus_control WHERE singleton FOR UPDATE").fetch_one(&mut *reserve).await.map_err(db)?;
         let staged_bytes = counts.try_get::<i64, _>("staged_bytes").map_err(db)?;
@@ -781,7 +813,10 @@ impl PgCorpusStore {
             .execute(&mut *reserve)
             .await
             .map_err(db)?;
+        check(&cancel)?;
         reserve.commit().await.map_err(db)?;
+        Ok(())
+        }).await?;
         for ((location, d, n), raw) in staged_blobs.iter().zip(inputs) {
             self.blobs
                 .put_if_absent(
@@ -797,6 +832,9 @@ impl PgCorpusStore {
                 .map_err(blob_error)?;
         }
         check(&cancel)?;
+        // Retry only the rejected metadata transaction. Prepared evidence and
+        // physical generations survive each rollback; HTTP and blobs are not replayed.
+        retry_storage(&cancel, "publication_commit", || async {
         let mut tx = self.pool.begin().await.map_err(db)?;
         // This shared short lock makes event sequence order commit order, avoiding
         // gaps being mistaken for a complete index watermark.
@@ -819,7 +857,7 @@ impl PgCorpusStore {
         }
         // Stamp the publication transaction after durable blob staging and lock
         // admission. Returned captures are visible only after this transaction commits.
-        p.now = p.now.max(self.publication_clock.now());
+        let now = p.now.max(self.publication_clock.now());
         let version: i64 = object.try_get("version").map_err(db)?;
         if p.install_head
             && object
@@ -828,13 +866,13 @@ impl PgCorpusStore {
                 .map(|v| v.parse::<u64>())
                 .transpose()
                 .map_err(corrupt)?
-                .is_some_and(|old| p.now < old)
+                .is_some_and(|old| now < old)
         {
             return Err(DatabaseError::InvalidInput);
         }
 
         if let Some(job) = &p.job_id {
-            let authorized:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_job WHERE id=$1 AND object_key=$2 AND revision_id=$3 AND expected_version=$4 AND status='running' AND install_head=$5 AND lease_until>$6::text::numeric)").bind(Uuid::parse_str(job).map_err(|_|DatabaseError::InvalidInput)?).bind(&k).bind(&p.record.revision_id).bind(version).bind(p.install_head).bind(p.now.to_string()).fetch_one(&mut *tx).await.map_err(db)?;
+            let authorized:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_job WHERE id=$1 AND object_key=$2 AND revision_id=$3 AND expected_version=$4 AND status='running' AND error_category IS NULL AND install_head=$5 AND lease_until>$6::text::numeric)").bind(Uuid::parse_str(job).map_err(|_|DatabaseError::InvalidInput)?).bind(&k).bind(&p.record.revision_id).bind(version).bind(p.install_head).bind(now.to_string()).fetch_one(&mut *tx).await.map_err(db)?;
             if !authorized {
                 return Err(DatabaseError::Conflict);
             }
@@ -899,19 +937,20 @@ impl PgCorpusStore {
         } else {
             false
         };
-        if let Some(mut old) = previous
+        if let Some(old) = &previous
             && previous_evidence_matches
             && old.record == p.record
             && old.processor_version == p.processor_version
             && old.raw_sha256 == hex(&digest)
             && previous_still_current
         {
+            let mut old = old.clone();
             if p.install_head && !attachment_incomplete {
-                sqlx::query("UPDATE openlegal.corpus_object SET validated_at=$2::text::numeric,pending=false,version=version+1,desired_head_revision=$3 WHERE object_key=$1").bind(&k).bind(p.now.to_string()).bind(&p.record.revision_id).execute(&mut *tx).await.map_err(db)?;
+                sqlx::query("UPDATE openlegal.corpus_object SET validated_at=$2::text::numeric,pending=false,version=version+1,desired_head_revision=$3 WHERE object_key=$1").bind(&k).bind(now.to_string()).bind(&p.record.revision_id).execute(&mut *tx).await.map_err(db)?;
             }
             if !attachment_incomplete {
                 sqlx::query("UPDATE openlegal.corpus_revision SET last_validated_at=$3::text::numeric WHERE object_key=$1 AND revision_id=$2 AND latest_capture=$4")
-                    .bind(&k).bind(&p.record.revision_id).bind(p.now.to_string()).bind(&old.capture_id).execute(&mut *tx).await.map_err(db)?;
+                    .bind(&k).bind(&p.record.revision_id).bind(now.to_string()).bind(&old.capture_id).execute(&mut *tx).await.map_err(db)?;
             }
             for (location, d, n) in &staged_blobs {
                 sqlx::query("INSERT INTO openlegal.corpus_blob_deletion VALUES($1,$2,$3)")
@@ -932,8 +971,8 @@ impl PgCorpusStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(db)?;
-            if let Some(job) = p.job_id {
-                sqlx::query("UPDATE openlegal.corpus_job SET status='done',lease_until=NULL,completed_at=$4::text::numeric WHERE id=$1 AND object_key=$2 AND expected_version=$3").bind(Uuid::parse_str(&job).map_err(|_|DatabaseError::InvalidInput)?).bind(&k).bind(version).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
+            if let Some(job) = &p.job_id {
+                sqlx::query("UPDATE openlegal.corpus_job SET status='done',lease_until=NULL,completed_at=$4::text::numeric WHERE id=$1 AND object_key=$2 AND expected_version=$3").bind(Uuid::parse_str(job).map_err(|_|DatabaseError::InvalidInput)?).bind(&k).bind(version).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
             }
             if update_job_gap {
                 self.update_published_detail_gap(
@@ -941,14 +980,14 @@ impl PgCorpusStore {
                     &p.record.object,
                     &p.record.revision_id,
                     attachment_incomplete,
-                    p.now,
+                    now,
                 )
                 .await?;
             }
             check(&cancel)?;
             tx.commit().await.map_err(db)?;
             if !attachment_incomplete {
-                old.validated_at = p.now;
+                old.validated_at = now;
             }
             return Ok(old);
         }
@@ -974,22 +1013,22 @@ impl PgCorpusStore {
         let capture = Capture {
             capture_id: capture_id.clone(),
             sequence: sequence.try_into().map_err(corrupt)?,
-            record: p.record,
+            record: p.record.clone(),
             retrieved_at: p.retrieved_at,
-            captured_at: p.now,
-            validated_at: p.now,
-            processor_version: p.processor_version,
+            captured_at: now,
+            validated_at: now,
+            processor_version: p.processor_version.clone(),
             raw_sha256: hex(&digest),
         };
         let value = serde_json::to_value(&capture).map_err(corrupt)?;
         let checksum = bytes_hash(&serde_json::to_vec(&value).map_err(corrupt)?);
-        sqlx::query("INSERT INTO openlegal.corpus_capture(id,object_key,revision_id,sequence,captured_at,publication_date,effective_date,payload,payload_sha256,raw_sha256,raw_size,storage_key,event_sequence) VALUES($1,$2,$3,$4,$5::text::numeric,$6,$7,$8,$9,$10,$11,$12,$13)").bind(&capture_id).bind(&k).bind(&capture.record.revision_id).bind(sequence).bind(p.now.to_string()).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(value).bind(checksum).bind(&digest).bind(size).bind(&storage_key).bind(event).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("INSERT INTO openlegal.corpus_capture(id,object_key,revision_id,sequence,captured_at,publication_date,effective_date,payload,payload_sha256,raw_sha256,raw_size,storage_key,event_sequence) VALUES($1,$2,$3,$4,$5::text::numeric,$6,$7,$8,$9,$10,$11,$12,$13)").bind(&capture_id).bind(&k).bind(&capture.record.revision_id).bind(sequence).bind(now.to_string()).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(value).bind(checksum).bind(&digest).bind(size).bind(&storage_key).bind(event).execute(&mut *tx).await.map_err(db)?;
         let mut metadata_capture = capture.clone();
         metadata_capture.record.body.clear();
         metadata_capture.record.sections.clear();
         let metadata = serde_json::to_value(metadata_capture).map_err(corrupt)?;
         let metadata_checksum = bytes_hash(&serde_json::to_vec(&metadata).map_err(corrupt)?);
-        sqlx::query("INSERT INTO openlegal.corpus_capture_catalog VALUES($1,$2,$3,$4,$5::text::numeric,$6,$7,$8,$9)").bind(&capture_id).bind(&k).bind(&capture.record.revision_id).bind(sequence).bind(p.now.to_string()).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(metadata).bind(metadata_checksum).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("INSERT INTO openlegal.corpus_capture_catalog VALUES($1,$2,$3,$4,$5::text::numeric,$6,$7,$8,$9)").bind(&capture_id).bind(&k).bind(&capture.record.revision_id).bind(sequence).bind(now.to_string()).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(metadata).bind(metadata_checksum).execute(&mut *tx).await.map_err(db)?;
         for (ordinal, (location, d, n)) in staged_blobs.iter().enumerate().skip(1) {
             sqlx::query("INSERT INTO openlegal.corpus_capture_blob VALUES($1,$2,$3,$4,$5)")
                 .bind(&capture_id)
@@ -1002,12 +1041,12 @@ impl PgCorpusStore {
                 .map_err(db)?;
         }
         if !preserve_revision {
-            sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,publication_date,effective_date,last_sequence,captured_at,last_validated_at) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$7::text::numeric) ON CONFLICT(object_key,revision_id) DO UPDATE SET latest_capture=EXCLUDED.latest_capture,publication_date=EXCLUDED.publication_date,effective_date=EXCLUDED.effective_date,last_sequence=EXCLUDED.last_sequence,captured_at=EXCLUDED.captured_at,last_validated_at=EXCLUDED.last_validated_at").bind(&k).bind(&capture.record.revision_id).bind(&capture_id).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(sequence).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
+            sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,publication_date,effective_date,last_sequence,captured_at,last_validated_at) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$7::text::numeric) ON CONFLICT(object_key,revision_id) DO UPDATE SET latest_capture=EXCLUDED.latest_capture,publication_date=EXCLUDED.publication_date,effective_date=EXCLUDED.effective_date,last_sequence=EXCLUDED.last_sequence,captured_at=EXCLUDED.captured_at,last_validated_at=EXCLUDED.last_validated_at").bind(&k).bind(&capture.record.revision_id).bind(&capture_id).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(sequence).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         }
         // A different desired revision keeps HEAD pending, so the old capture
         // cannot be served with a fresh claim after its replacement was seen.
         let clear_pending = publish_head || preserve_revision;
-        sqlx::query("UPDATE openlegal.corpus_object SET version=version+1,next_capture=next_capture+1,head_capture=CASE WHEN $2 THEN $3 ELSE head_capture END,validated_at=CASE WHEN $2 THEN $4::text::numeric ELSE validated_at END,pending=CASE WHEN $5 THEN false ELSE pending END,desired_head_revision=CASE WHEN $2 THEN $6 ELSE desired_head_revision END WHERE object_key=$1").bind(&k).bind(publish_head).bind(&capture_id).bind(p.now.to_string()).bind(clear_pending).bind(&capture.record.revision_id).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_object SET version=version+1,next_capture=next_capture+1,head_capture=CASE WHEN $2 THEN $3 ELSE head_capture END,validated_at=CASE WHEN $2 THEN $4::text::numeric ELSE validated_at END,pending=CASE WHEN $5 THEN false ELSE pending END,desired_head_revision=CASE WHEN $2 THEN $6 ELSE desired_head_revision END WHERE object_key=$1").bind(&k).bind(publish_head).bind(&capture_id).bind(now.to_string()).bind(clear_pending).bind(&capture.record.revision_id).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("INSERT INTO openlegal.corpus_outbox SELECT next_event,$1,$2,$3,false,$4,false FROM openlegal.corpus_control").bind(&k).bind(version+1).bind(&capture_id).bind(publish_head).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_control SET next_event=next_event+1,raw_bytes=raw_bytes+$1,staged_bytes=staged_bytes-$1").bind(total_size as i64).execute(&mut *tx).await.map_err(db)?;
         for (location, _, _) in &staged_blobs {
@@ -1017,9 +1056,9 @@ impl PgCorpusStore {
                 .await
                 .map_err(db)?;
         }
-        if let Some(job) = p.job_id {
-            let job = Uuid::parse_str(&job).map_err(|_| DatabaseError::InvalidInput)?;
-            sqlx::query("UPDATE openlegal.corpus_job SET status='done',lease_until=NULL,completed_at=$4::text::numeric WHERE id=$1 AND object_key=$2 AND expected_version=$3").bind(job).bind(&k).bind(version).bind(p.now.to_string()).execute(&mut *tx).await.map_err(db)?;
+        if let Some(job) = &p.job_id {
+            let job = Uuid::parse_str(job).map_err(|_| DatabaseError::InvalidInput)?;
+            sqlx::query("UPDATE openlegal.corpus_job SET status='done',lease_until=NULL,completed_at=$4::text::numeric WHERE id=$1 AND object_key=$2 AND expected_version=$3").bind(job).bind(&k).bind(version).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         }
         if update_job_gap {
             self.update_published_detail_gap(
@@ -1027,13 +1066,14 @@ impl PgCorpusStore {
                 &capture.record.object,
                 &capture.record.revision_id,
                 attachment_incomplete,
-                p.now,
+                now,
             )
             .await?;
         }
         check(&cancel)?;
         tx.commit().await.map_err(db)?;
         Ok(capture)
+        }).await
     }
 }
 
@@ -1120,5 +1160,199 @@ mod archive_hash_tests {
             json_hash(&value).unwrap(),
             bytes_hash(&serde_json::to_vec(&value).unwrap())
         );
+    }
+}
+
+#[cfg(test)]
+mod contention_tests {
+    use super::*;
+    use openlegal_application::{blob::*, persistence::PersistentStore};
+    use openlegal_domain::{RetrievalError, rights::SourceRights};
+    use std::sync::atomic::AtomicUsize;
+
+    struct FixedClock;
+    impl openlegal_application::Clock for FixedClock {
+        fn now(&self) -> u64 {
+            100
+        }
+    }
+
+    /// Block final SQL only after the durable put succeeds. A repeated put would
+    /// count and reacquire the lock, so this also detects accidental whole-operation retries.
+    struct LockAfterPut {
+        inner: Arc<dyn BlobStore>,
+        pool: PgPool,
+        puts: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    }
+    impl BlobStore for LockAfterPut {
+        fn put_if_absent(
+            &self,
+            location: BlobLocation,
+            bytes: Vec<u8>,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'static, Result<BlobPutResult, RetrievalError>> {
+            let inner = self.inner.clone();
+            let pool = self.pool.clone();
+            let puts = self.puts.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                puts.fetch_add(1, Ordering::SeqCst);
+                let result = inner.put_if_absent(location, bytes, cancel).await?;
+                let mut tx = pool.begin().await.unwrap();
+                sqlx::query(
+                    "SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE",
+                )
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+                *release.lock().await = Some(tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+                    tx.commit().await.unwrap();
+                }));
+                Ok(result)
+            })
+        }
+        fn get(
+            &self,
+            location: BlobLocation,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'static, Result<Option<Vec<u8>>, RetrievalError>> {
+            self.inner.get(location, cancel)
+        }
+        fn delete_if_present(
+            &self,
+            location: BlobLocation,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'static, Result<(), RetrievalError>> {
+            self.inner.delete_if_present(location, cancel)
+        }
+        fn enumerate(
+            &self,
+            cursor: Option<String>,
+            limit: usize,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'static, Result<BlobPage, RetrievalError>> {
+            self.inner.enumerate(cursor, limit, cancel)
+        }
+        fn cleanup_staging(
+            &self,
+            now: u64,
+            limit: usize,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'static, Result<usize, RetrievalError>> {
+            self.inner.cleanup_staging(now, limit, cancel)
+        }
+        fn health(
+            &self,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'static, Result<(), RetrievalError>> {
+            self.inner.health(cancel)
+        }
+        fn close(&self) -> BoxFuture<'static, Result<(), RetrievalError>> {
+            self.inner.close()
+        }
+        fn metrics(&self) -> BlobMetrics {
+            self.inner.metrics()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn final_publication_and_observation_contention_preserve_staging_and_put_once() {
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let base = fixture.open(100).await;
+        let inner =
+            crate::blob::FsBlobStore::open(&fixture.directory.path().join("sql-phase-retry"))
+                .await
+                .unwrap();
+        let puts = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Mutex::new(None));
+        let blobs = Arc::new(LockAfterPut {
+            inner,
+            pool: base.pool(),
+            puts: puts.clone(),
+            release: release.clone(),
+        });
+        let store =
+            PgCorpusStore::with_publication_clock(base.pool(), blobs.clone(), Arc::new(FixedClock));
+        let raw = b"Fictional fixture body".to_vec();
+        // Independently reject the reservation phase before any blob is written.
+        let mut reservation_lock = base.pool().begin().await.unwrap();
+        sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
+            .fetch_one(&mut *reservation_lock)
+            .await
+            .unwrap();
+        let reservation_release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+            reservation_lock.commit().await.unwrap();
+        });
+        let capture = store
+            .publish(
+                Publication {
+                    record: LegalRecord {
+                        object: ObjectId {
+                            jurisdiction: "kr".into(),
+                            provider: "fictional_test".into(),
+                            dataset: Dataset::NationalStatute,
+                            id: "contention".into(),
+                        },
+                        revision_id: "r1".into(),
+                        title: "Fictional contention fixture".into(),
+                        body: "Fictional fixture body".into(),
+                        metadata: Default::default(),
+                        publication_date: None,
+                        effective_date: None,
+                        source_url: "https://example.test/fixture".into(),
+                        representation: "provider_text_v1".into(),
+                        sections: vec![],
+                    },
+                    raw: raw.clone(),
+                    additional_evidence: vec![],
+                    processor_version: "fixture_v1".into(),
+                    retrieved_at: 100,
+                    now: 100,
+                    expected_version: 0,
+                    install_head: true,
+                    job_id: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        reservation_release.await.unwrap();
+        release.lock().await.take().unwrap().await.unwrap();
+        assert_eq!(puts.load(Ordering::SeqCst), 1);
+        assert_eq!(capture.sequence, 1);
+        let input = SourceObservationInput {
+            source_key: "law_go_kr:lsEfYdInfoGuide:contention_fixture".into(),
+            raw: Some(raw.clone()),
+            media_type: "application/xml".into(),
+            rights: SourceRights::legal_information(),
+            metadata: Default::default(),
+            observed_at: 100,
+        };
+        let observation = store
+            .retain_source_observation(input, CancellationToken::new())
+            .await
+            .unwrap();
+        release.lock().await.take().unwrap().await.unwrap();
+        assert_eq!(puts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store
+                .source_observation_bytes(&observation.observation_id, CancellationToken::new())
+                .await
+                .unwrap(),
+            raw
+        );
+        let row = sqlx::query("SELECT raw_bytes,staged_bytes,next_event,(SELECT count(*) FROM openlegal.corpus_staging) stages,(SELECT count(*) FROM openlegal.corpus_capture) captures,(SELECT count(*) FROM openlegal.corpus_outbox) events,(SELECT count(*) FROM openlegal.corpus_source_observation) observations FROM openlegal.corpus_control").fetch_one(&base.pool()).await.unwrap();
+        assert_eq!(row.get::<i64, _>("raw_bytes"), (raw.len() * 2) as i64);
+        assert_eq!(row.get::<i64, _>("staged_bytes"), 0);
+        assert_eq!(row.get::<i64, _>("stages"), 0);
+        assert_eq!(row.get::<i64, _>("captures"), 1);
+        assert_eq!(row.get::<i64, _>("events"), 1);
+        assert_eq!(row.get::<i64, _>("observations"), 1);
+        assert_eq!(row.get::<i64, _>("next_event"), 2);
+        base.close().await.unwrap();
     }
 }

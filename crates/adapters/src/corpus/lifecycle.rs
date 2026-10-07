@@ -4,12 +4,19 @@ impl PgCorpusStore {
     /// Acknowledge only after the durable index generation has incorporated every
     /// event through this sequence. Gaps are not valid acknowledgements.
     pub async fn acknowledge_index(&self, generation: u64) -> Result<(), DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "acknowledge_index", || {
+            async {
+
         let generation = i64::try_from(generation).map_err(|_| DatabaseError::InvalidInput)?;
         let count=sqlx::query("UPDATE openlegal.corpus_control SET index_ack=$1 WHERE index_ack<=$1 AND next_event>$1").bind(generation).execute(&self.pool).await.map_err(db)?.rows_affected();
         if count == 0 {
             return Err(DatabaseError::Conflict);
         }
         Ok(())
+
+            }
+        }).await
     }
     pub async fn enqueue(
         &self,
@@ -235,6 +242,14 @@ impl PgCorpusStore {
         observed_version: Option<u64>,
         launch: Option<&CollectionLaunch>,
     ) -> Result<Job, DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "enqueue_job_with_owner", || {
+            let object = object.clone();
+            let revision_id = revision_id.clone();
+            let effective_date = effective_date.clone();
+            let source_metadata = source_metadata.clone();
+            async move {
+
         let owner = launch
             .map(|value| Uuid::parse_str(&value.id).map_err(|_| DatabaseError::InvalidInput))
             .transpose()?;
@@ -348,6 +363,9 @@ impl PgCorpusStore {
             expected_version: version.try_into().map_err(corrupt)?,
             attempts: 0,
         })
+
+            }
+        }).await
     }
     /// A dead worker is retried at most three times. The lease must cover the
     /// configured detail deadline plus validation and publication.
@@ -439,6 +457,12 @@ impl PgCorpusStore {
         preferred_dataset: Option<Dataset>,
         explicit_owner: Option<Uuid>,
     ) -> Result<Option<Job>, DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        let retry_started = tokio::time::Instant::now();
+        retry_storage(&retry_cancel, "claim_job_inner", || {
+            async {
+                let now = now.saturating_add(retry_started.elapsed().as_secs());
+
         if !(SESSION_SECONDS..=7320).contains(&lease_seconds) {
             return Err(DatabaseError::InvalidInput);
         }
@@ -498,6 +522,9 @@ impl PgCorpusStore {
         };
         tx.commit().await.map_err(db)?;
         Ok(Some(job))
+
+            }
+        }).await
     }
     pub async fn fail_job(&self, id: &str, retry: bool) -> Result<(), DatabaseError> {
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
@@ -514,6 +541,10 @@ impl PgCorpusStore {
         effective_date: Option<&str>,
         _observed_at: u64,
     ) -> Result<(), DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "record_revision_catalog", || {
+            async {
+
         self.gate().await?;
         let k = key(object)?;
         RevisionSelector::Revision {
@@ -552,6 +583,9 @@ impl PgCorpusStore {
         }
         tx.commit().await.map_err(db)?;
         Ok(())
+
+            }
+        }).await
     }
     /// Replays an exact publication, including expired bytes protected by the
     /// index acknowledgment fence. Missing bytes require durable retirement proof.
@@ -608,6 +642,10 @@ impl PgCorpusStore {
         dataset: Dataset,
         complete: bool,
     ) -> Result<(), DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "mark_dataset_inventory_complete", || {
+            async {
+
         self.gate().await?;
         if !dataset.has_provider_revisions() {
             return Err(DatabaseError::UnsupportedHistory);
@@ -619,16 +657,52 @@ impl PgCorpusStore {
             .to_owned();
         sqlx::query("UPDATE openlegal.corpus_object SET inventory_complete=$1,catalog_version=catalog_version+1 WHERE identity->>'jurisdiction'='kr' AND identity->>'provider'='law_go_kr' AND identity->>'dataset'=$2 AND inventory_complete IS DISTINCT FROM $1").bind(complete).bind(dataset).execute(&self.pool).await.map_err(db)?;
         Ok(())
+
+            }
+        }).await
+    }
+    /// End only this active execution after a proven database rejection. Keep
+    /// charged attempts and object ownership intact until the cooldown expires.
+    pub async fn defer_storage_claim(&self, job: &Job) -> Result<(), DatabaseError> {
+        let id = Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
+        let version =
+            i64::try_from(job.expected_version).map_err(|_| DatabaseError::InvalidInput)?;
+        let attempts = i32::try_from(job.attempts).map_err(|_| DatabaseError::InvalidInput)?;
+        let cooldown = 5_i64.pow(job.attempts.min(3));
+        retry_storage(&CancellationToken::new(), "detail.storage_cooldown", || async {
+            self.gate().await?;
+            let mut tx = self.pool.begin().await.map_err(db)?;
+            sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
+                .fetch_one(&mut *tx).await.map_err(db)?;
+            let changed = sqlx::query("UPDATE openlegal.corpus_job j SET status=CASE WHEN j.attempts>=b.max_job_attempts THEN 'failed' ELSE 'running' END,lease_until=CASE WHEN j.attempts>=b.max_job_attempts THEN NULL ELSE floor(extract(epoch from clock_timestamp()))::bigint+$4 END,error_category='processing_failed',completed_at=CASE WHEN j.attempts>=b.max_job_attempts THEN floor(extract(epoch from clock_timestamp()))::bigint ELSE NULL END FROM openlegal.provider_request_budget b WHERE b.singleton AND j.id=$1 AND j.expected_version=$2 AND j.attempts=$3 AND j.status='running' AND j.error_category IS NULL AND j.lease_until>floor(extract(epoch from clock_timestamp()))::bigint AND EXISTS(SELECT 1 FROM openlegal.corpus_object o WHERE o.object_key=j.object_key AND o.version=j.expected_version AND NOT o.withdrawn)")
+                .bind(id).bind(version).bind(attempts).bind(cooldown)
+                .execute(&mut *tx).await.map_err(db)?.rows_affected();
+            if changed != 1 {
+                return Err(DatabaseError::Conflict);
+            }
+            tx.commit().await.map_err(db)
+        }).await
     }
     pub async fn fail_claim(&self, job: &Job, retry: bool) -> Result<(), DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "fail_claim", || {
+            async {
+
         let id = Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
         sqlx::query("UPDATE openlegal.corpus_job SET status=CASE WHEN $2 AND attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) THEN 'pending' ELSE 'failed' END,lease_until=NULL,error_category='processing_failed',completed_at=CASE WHEN $2 AND attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) THEN NULL ELSE floor(extract(epoch from clock_timestamp()))::bigint END WHERE id=$1 AND expected_version=$3 AND attempts=$4 AND status='running'").bind(id).bind(retry).bind(i64::try_from(job.expected_version).map_err(|_|DatabaseError::InvalidInput)?).bind(job.attempts as i32).execute(&self.pool).await.map_err(db)?;
         Ok(())
+
+            }
+        }).await
     }
     /// A claim that never reserved an upstream attempt does not spend a
     /// processing execution. A later claim has a new object version, so an old
     /// claimant cannot refund a newly reclaimed job with the same attempt count.
     pub async fn release_admission_wait(&self, job: &Job) -> Result<(), DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "release_admission_wait", || {
+            async {
+
         let id = Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
         if job.attempts == 0 {
             return Err(DatabaseError::InvalidInput);
@@ -640,6 +714,9 @@ impl PgCorpusStore {
             return Err(DatabaseError::Conflict);
         }
         Ok(())
+
+            }
+        }).await
     }
     /// A daily upstream cap is admission policy, not a failed processing
     /// attempt. Keep the claim leased until the next UTC day across restarts.
@@ -675,6 +752,10 @@ impl PgCorpusStore {
         refund: bool,
         fingerprint: Option<&openlegal_domain::provider_admin::ProviderBlockerFingerprint>,
     ) -> Result<(), DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "defer_budget_claim_inner", || {
+            async {
+
         let id = Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
         if job.attempts == 0 || resume_at == 0 {
             return Err(DatabaseError::InvalidInput);
@@ -687,12 +768,19 @@ impl PgCorpusStore {
             return Err(DatabaseError::Conflict);
         }
         Ok(())
+
+            }
+        }).await
     }
     pub async fn mark_inventory_complete(
         &self,
         object: &ObjectId,
         complete: bool,
     ) -> Result<(), DatabaseError> {
+        let retry_cancel = CancellationToken::new();
+        retry_storage(&retry_cancel, "mark_inventory_complete", || {
+            async {
+
         self.gate().await?;
         let k = key(object)?;
         sqlx::query("UPDATE openlegal.corpus_object SET inventory_complete=$2,catalog_version=catalog_version+1 WHERE object_key=$1 AND inventory_complete IS DISTINCT FROM $2")
@@ -702,6 +790,9 @@ impl PgCorpusStore {
             .await
             .map_err(db)?;
         Ok(())
+
+            }
+        }).await
     }
     pub async fn revalidate(
         &self,
@@ -1100,6 +1191,7 @@ impl PgCorpusStore {
         _historical_before: u64,
     ) -> Result<usize, DatabaseError> {
         self.gate().await?;
+        retry_storage(&CancellationToken::new(), "maintenance.cleanup", || async {
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
@@ -1132,10 +1224,14 @@ impl PgCorpusStore {
                 .map_err(db)?;
         }
         tx.commit().await.map_err(db)?;
-        let deletions = sqlx::query("SELECT * FROM openlegal.corpus_blob_deletion d WHERE NOT EXISTS(SELECT 1 FROM openlegal.corpus_capture c WHERE c.storage_key=d.storage_key) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_capture_blob b WHERE b.storage_key=d.storage_key) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_source_observation s WHERE s.storage_key=d.storage_key) LIMIT 128")
+            Ok(())
+        }).await?;
+        let deletions = retry_storage(&CancellationToken::new(), "maintenance.deletion_queue", || async {
+ sqlx::query("SELECT * FROM openlegal.corpus_blob_deletion d WHERE NOT EXISTS(SELECT 1 FROM openlegal.corpus_capture c WHERE c.storage_key=d.storage_key) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_capture_blob b WHERE b.storage_key=d.storage_key) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_source_observation s WHERE s.storage_key=d.storage_key) LIMIT 128")
             .fetch_all(&self.pool)
             .await
-            .map_err(db)?;
+            .map_err(db)
+        }).await?;
         for row in deletions {
             let location = BlobLocation {
                 digest: row
@@ -1154,11 +1250,19 @@ impl PgCorpusStore {
                 .delete_if_present(location.clone(), CancellationToken::new())
                 .await
                 .map_err(corrupt)?;
-            sqlx::query("DELETE FROM openlegal.corpus_blob_deletion WHERE storage_key=$1")
-                .bind(location.storage_key)
-                .execute(&self.pool)
-                .await
-                .map_err(db)?;
+            retry_storage(
+                &CancellationToken::new(),
+                "maintenance.remove_deleted",
+                || async {
+                    sqlx::query("DELETE FROM openlegal.corpus_blob_deletion WHERE storage_key=$1")
+                        .bind(&location.storage_key)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(db)?;
+                    Ok(())
+                },
+            )
+            .await?;
         }
         Ok(0)
     }

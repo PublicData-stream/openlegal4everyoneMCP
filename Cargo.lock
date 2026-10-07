@@ -2601,6 +2601,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
  "unicode-normalization",
  "url",
  "uuid",
