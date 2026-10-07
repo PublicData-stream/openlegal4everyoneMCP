@@ -1548,71 +1548,7 @@ impl CorpusRuntime {
                     Err(DatabaseError::BudgetExhausted | DatabaseError::Capacity) => break,
                     Err(error) => return Err(error),
                 };
-                let mut offset = self.store.clone_page_offset(view, page, &result).await?;
-                if offset > result.items.len() {
-                    offset = 0;
-                }
-                if let Some(missing) = self
-                    .first_unscheduled_item(&result.items, !view.historical, &cancel)
-                    .await?
-                {
-                    offset = offset.min(missing);
-                }
-                while offset < result.items.len() {
-                    let scheduled = async {
-                        let item = &result.items[offset];
-                        if view.historical {
-                            self.store
-                                .record_revision_catalog(
-                                    &item.object,
-                                    &item.revision_id,
-                                    item.publication_date.as_deref(),
-                                    item.effective_date.as_deref(),
-                                    now(),
-                                )
-                                .await?;
-                        }
-                        if (!view.historical || self.retain_history_bodies)
-                            && !self
-                                .refresh_with_fair_capacity(
-                                    provider,
-                                    item.clone(),
-                                    !view.historical,
-                                    cancel.clone(),
-                                )
-                                .await?
-                        {
-                            return Ok(false);
-                        }
-                        if item.object.provider == "law_go_kr" {
-                            for request in
-                                openlegal_adapters::law_go_kr::supplements::record_requests(
-                                    item, 1,
-                                )?
-                            {
-                                self.store.enqueue_supplement(&request, now()).await?;
-                            }
-                        }
-                        Ok::<bool, DatabaseError>(true)
-                    }
-                    .await;
-                    match scheduled {
-                        Ok(true) => offset += 1,
-                        Ok(false) => break,
-                        Err(DatabaseError::StorageContended) => {
-                            // Only items whose required writes completed are
-                            // checkpointed. A failed checkpoint keeps the prior
-                            // durable offset; a later cycle rechecks idempotent work.
-                            self.store
-                                .clone_page_scheduled(view, page, offset, &result, now(), &cancel)
-                                .await?;
-                            return Err(DatabaseError::StorageContended);
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                self.store
-                    .clone_page_scheduled(view, page, offset, &result, now(), &cancel)
+                self.schedule_inventory_page(view, page, &result, &cancel)
                     .await?;
             }
             if let Some(events) = &mut events {
@@ -1630,6 +1566,85 @@ impl CorpusRuntime {
                 tokio::select! {_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(self.scan_interval_secs))=>{}}
             }
         }
+    }
+    /// Replay missing work without regressing the scheduling watermark for the
+    /// same inventory bytes. The watermark records queued work, not publication;
+    /// retained bodies and failed jobs still determine clone coverage.
+    async fn schedule_inventory_page(
+        &self,
+        view: CloneView,
+        page: u32,
+        result: &InventoryPage,
+        cancel: &CancellationToken,
+    ) -> Result<(), DatabaseError> {
+        let saved_offset = self.store.clone_page_offset(view, page, result).await?;
+        let mut offset = saved_offset;
+        if saved_offset > result.items.len() {
+            return Err(DatabaseError::StorageCorrupt);
+        }
+        if let Some(missing) = self
+            .first_unscheduled_item(&result.items, !view.historical, cancel)
+            .await?
+        {
+            offset = offset.min(missing);
+        }
+        while offset < result.items.len() {
+            let scheduled = async {
+                let item = &result.items[offset];
+                if view.historical {
+                    self.store
+                        .record_revision_catalog(
+                            &item.object,
+                            &item.revision_id,
+                            item.publication_date.as_deref(),
+                            item.effective_date.as_deref(),
+                            now(),
+                        )
+                        .await?;
+                }
+                if (!view.historical || self.retain_history_bodies)
+                    && !self
+                        .refresh_with_fair_capacity(item.clone(), !view.historical, cancel.clone())
+                        .await?
+                {
+                    return Ok(false);
+                }
+                if item.object.provider == "law_go_kr" {
+                    for request in
+                        openlegal_adapters::law_go_kr::supplements::record_requests(item, 1)?
+                    {
+                        self.store.enqueue_supplement(&request, now()).await?;
+                    }
+                }
+                Ok::<bool, DatabaseError>(true)
+            }
+            .await;
+            match scheduled {
+                Ok(true) => offset += 1,
+                Ok(false) => break,
+                Err(DatabaseError::StorageContended) => {
+                    // Replay may stop before the prior watermark. Preserve
+                    // work already scheduled for these bytes, then recheck
+                    // missing bodies on the next cycle.
+                    self.store
+                        .clone_page_scheduled(
+                            view,
+                            page,
+                            saved_offset.max(offset),
+                            result,
+                            now(),
+                            cancel,
+                        )
+                        .await?;
+                    return Err(DatabaseError::StorageContended);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.store
+            .clone_page_scheduled(view, page, saved_offset.max(offset), result, now(), cancel)
+            .await?;
+        Ok(())
     }
     /// Each lease is durable and UUID fenced. Raw observations survive parser
     /// retries, which never spend another upstream request for unchanged bytes.
@@ -1897,7 +1912,7 @@ impl CorpusRuntime {
                 hint.amendment_type = None;
                 match tokio::time::timeout_at(
                     deadline,
-                    self.refresh_with_backpressure(provider, hint, false, cancel.clone()),
+                    self.refresh_with_backpressure(hint, false, cancel.clone()),
                 )
                 .await
                 {
@@ -1971,7 +1986,7 @@ impl CorpusRuntime {
                     }
                     match tokio::time::timeout_at(
                         deadline,
-                        self.refresh_with_backpressure(provider, item, true, cancel.clone()),
+                        self.refresh_with_backpressure(item, true, cancel.clone()),
                     )
                     .await
                     {
@@ -2014,7 +2029,6 @@ impl CorpusRuntime {
     }
     async fn refresh_with_fair_capacity(
         &self,
-        provider: &LawClient,
         item: InventoryItem,
         install_head: bool,
         cancel: CancellationToken,
@@ -2027,7 +2041,7 @@ impl CorpusRuntime {
         {
             return Ok(false);
         }
-        match self.refresh(provider, item, install_head, cancel).await {
+        match self.refresh(item, install_head, cancel).await {
             Ok(()) => Ok(true),
             Err(DatabaseError::Capacity) => Ok(false),
             Err(error) => Err(error),
@@ -2035,14 +2049,13 @@ impl CorpusRuntime {
     }
     async fn refresh_with_backpressure(
         &self,
-        provider: &LawClient,
         item: InventoryItem,
         install_head: bool,
         cancel: CancellationToken,
     ) -> Result<(), DatabaseError> {
         loop {
             match self
-                .refresh(provider, item.clone(), install_head, cancel.clone())
+                .refresh(item.clone(), install_head, cancel.clone())
                 .await
             {
                 Err(DatabaseError::Capacity) => {
@@ -2057,7 +2070,6 @@ impl CorpusRuntime {
     }
     async fn refresh(
         &self,
-        _provider: &LawClient,
         item: InventoryItem,
         install_head: bool,
         cancel: CancellationToken,
@@ -2076,6 +2088,10 @@ impl CorpusRuntime {
                     | DatabaseError::ProcessingPending
                     | DatabaseError::RevisionUnavailable,
                 ) => true,
+                // HEAD can change while its retained capture is read. Yield
+                // this scheduling item before enqueueing; other ownership and
+                // storage conflicts remain terminal at their own call sites.
+                Err(DatabaseError::Conflict) => return Err(DatabaseError::Capacity),
                 Err(e) => return Err(*e),
             };
             if old.as_ref().is_ok_and(|c| {
@@ -3079,3 +3095,7 @@ mod runtime_shutdown_tests {
         assert!(tasks.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "corpus_inventory_tests.rs"]
+mod inventory_tests;

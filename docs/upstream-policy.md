@@ -156,6 +156,12 @@ rollback. Cancellation interrupts retry backoff and is checked before commits.
 
 Publication and original-observation retries preserve prepared inputs and physical
 staging generations. A retry does not repeat completed HTTP or blob writes.
+Finite inventory replay keeps its scheduling watermark separate from the earlier
+missing item being retried. Backpressure or known SQL contention preserves the
+prior watermark for unchanged page bytes; changed bytes restart scheduling at
+zero. Queued work does not establish retained-body coverage. A HEAD changed during
+its capture read yields that item before enqueueing, while checkpoint and provider
+ownership conflicts remain terminal.
 Exhausted known contention yields the affected worker at its durable checkpoint
 instead of cancelling sibling provider requests. Detail cooldown preserves charged
 attempts and fences the ended execution; failed cleanup leaves its lease for normal
