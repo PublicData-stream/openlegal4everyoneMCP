@@ -436,6 +436,21 @@ pub fn global_requests(page: u32) -> Result<Vec<SupplementRequest>, DatabaseErro
         .map(|contract| request(contract.source, SupplementSeed::Global, page))
         .collect()
 }
+/// Derive record views only for datasets with supplemental record contracts.
+/// Other inventory records never become record seeds or undergo hint validation.
+pub fn record_requests(
+    item: &InventoryItem,
+    page: u32,
+) -> Result<Vec<SupplementRequest>, DatabaseError> {
+    if !matches!(
+        item.object.dataset,
+        Dataset::NationalStatute | Dataset::AdministrativeRule
+    ) {
+        return Ok(Vec::new());
+    }
+    seeded_requests(record_seed(item)?, page)
+}
+
 /// Derive every eligible view from a verified canonical record/provision seed.
 pub fn seeded_requests(
     seed: SupplementSeed,
@@ -917,6 +932,94 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+    fn inventory_item(dataset: Dataset) -> InventoryItem {
+        InventoryItem {
+            object: ObjectId {
+                dataset,
+                ..object()
+            },
+            revision_id: if dataset == Dataset::NationalStatute {
+                "000999:20260101".into()
+            } else if dataset == Dataset::AdministrativeRule {
+                "000999".into()
+            } else {
+                "000123".into()
+            },
+            effective_date: (dataset == Dataset::NationalStatute).then(|| "20260101".into()),
+            publication_date: None,
+            title: "Synthetic record".into(),
+            data_source: None,
+            case_number: None,
+            treaty_class_code: None,
+            amendment_type: None,
+        }
+    }
+    #[test]
+    fn record_requests_skip_unsupported_long_titles_before_hint_validation() {
+        for dataset in Dataset::ALL.iter().copied().filter(|dataset| {
+            !matches!(
+                dataset,
+                Dataset::NationalStatute | Dataset::AdministrativeRule
+            )
+        }) {
+            let mut item = inventory_item(dataset);
+            item.title = format!("{}x", "가".repeat(256));
+            assert_eq!(item.title.len(), 769);
+            assert_eq!(item.validate_for_detail(), Err(DatabaseError::InvalidInput));
+            assert!(matches!(
+                record_seed(&item),
+                Err(DatabaseError::InvalidInput)
+            ));
+            assert!(record_requests(&item, 1).unwrap().is_empty(), "{dataset:?}");
+        }
+    }
+    #[test]
+    fn record_requests_preserve_supported_descriptors_and_validation() {
+        for dataset in [Dataset::NationalStatute, Dataset::AdministrativeRule] {
+            let item = inventory_item(dataset);
+            for page in [1, 2] {
+                let expected = seeded_requests(record_seed(&item).unwrap(), page).unwrap();
+                let actual = record_requests(&item, page).unwrap();
+                if page == 1 {
+                    assert!(!actual.is_empty());
+                }
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(actual.source(), expected.source());
+                    assert_eq!(actual.seed(), expected.seed());
+                    assert_eq!(actual.page(), expected.page());
+                    assert_eq!(actual.parameters(), expected.parameters());
+                    assert_eq!(
+                        actual.observation_key().unwrap(),
+                        expected.observation_key().unwrap()
+                    );
+                    assert_eq!(actual.source_url().unwrap(), expected.source_url().unwrap());
+                }
+            }
+            assert_eq!(
+                record_requests(&item, 0).err(),
+                seeded_requests(record_seed(&item).unwrap(), 0).err()
+            );
+            let mut invalid = item.clone();
+            invalid.revision_id = "not-a-record-number".into();
+            assert!(matches!(
+                record_requests(&invalid, 1),
+                Err(DatabaseError::InvalidInput)
+            ));
+            invalid = item.clone();
+            invalid.title = format!("{}x", "가".repeat(256));
+            assert!(matches!(
+                record_requests(&invalid, 1),
+                Err(DatabaseError::InvalidInput)
+            ));
+            invalid = item;
+            invalid.object.provider = "other".into();
+            assert!(matches!(
+                record_requests(&invalid, 1),
+                Err(DatabaseError::InvalidInput)
+            ));
+        }
     }
     #[test]
     fn related_statutes_record_versions_share_one_wire_identity() {

@@ -1413,10 +1413,9 @@ impl CorpusRuntime {
                         break;
                     }
                     if item.object.provider == "law_go_kr" {
-                        for request in openlegal_adapters::law_go_kr::supplements::seeded_requests(
-                            openlegal_adapters::law_go_kr::supplements::record_seed(item)?,
-                            1,
-                        )? {
+                        for request in
+                            openlegal_adapters::law_go_kr::supplements::record_requests(item, 1)?
+                        {
                             self.store.enqueue_supplement(&request, now()).await?;
                         }
                     }
