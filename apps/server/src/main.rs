@@ -9,7 +9,7 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 
 mod collection_scheduler_retry;
 mod provider_admin;
-use collection_scheduler_retry::retry_storage;
+use collection_scheduler_retry::{create_and_mark_launch, dispatch_storage_result, retry_storage};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
@@ -586,17 +586,46 @@ async fn run_collection_scheduler(
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            retry_storage(&cancel, || store.reap_stale_collection_requests()).await?;
-            reconcile_failed_collection_jobs(&store, ingestion, &cancel).await?;
-            let policy = ingestion.provider_requests.limits()?;
-            let Some(launch) = retry_storage(&cancel, || {
-                store.claim_collection_request_with_policy(
-                    policy.on_demand_timeout_secs,
-                    policy.on_demand_attempt_limit,
-                )
-            })
+            if dispatch_storage_result(
+                &cancel,
+                "request_reap",
+                retry_storage(&cancel, || store.reap_stale_collection_requests())
+                    .await
+                    .map_err(ServerError::from),
+            )
             .await?
-            else {
+            .is_none()
+            {
+                continue;
+            }
+            if dispatch_storage_result(
+                &cancel,
+                "request_reconcile",
+                reconcile_failed_collection_jobs(&store, ingestion, &cancel).await,
+            )
+            .await?
+            .is_none()
+            {
+                continue;
+            }
+            let policy = ingestion.provider_requests.limits()?;
+            let claim = dispatch_storage_result(
+                &cancel,
+                "request_claim",
+                retry_storage(&cancel, || {
+                    store.claim_collection_request_with_policy(
+                        policy.on_demand_timeout_secs,
+                        policy.on_demand_attempt_limit,
+                    )
+                })
+                .await
+                .map_err(ServerError::from),
+            )
+            .await?;
+            let Some(claim) = claim else {
+                continue;
+            };
+            let Some(launch) = claim else {
                 match events
                     .wait(&cancel, std::time::Duration::from_secs(5))
                     .await
@@ -611,52 +640,54 @@ async fn run_collection_scheduler(
             let name = collection_job_name(&id, launch.launched_at)?;
             let job = render_collection_job(&template, &launch, &ingestion.collection_namespace)?;
             let bytes = serde_json::to_vec(&job)?;
-            let mut child = tokio::process::Command::new(&ingestion.kubectl)
-                .args([
-                    "--kubeconfig",
-                    ingestion
-                        .kubeconfig
-                        .to_str()
-                        .ok_or("invalid kubeconfig path")?,
-                    "--context",
-                    &ingestion.context,
-                    "-n",
-                    &ingestion.collection_namespace,
-                    "create",
-                    "-f",
-                    "-",
-                ])
-                .env_clear()
-                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-                .env("HOME", "/tmp")
-                .env("TMPDIR", "/tmp")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()?;
-            child
-                .stdin
-                .take()
-                .ok_or("kubectl stdin unavailable")?
-                .write_all(&bytes)
-                .await?;
-            let outcome =
-                tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
-            match outcome {
-                Ok(Ok(status)) if status.success() => {
-                    // Retry only this exact-epoch marker; never recreate the Job.
-                    retry_storage(&cancel, || {
-                        store.mark_collection_launch_running(&launch, &name)
-                    })
-                    .await?;
-                }
-                _ => {
-                    // Creation may have reached the API server. Keep the claim
-                    // fenced until its Job deadline and operator reconciliation.
-                    return Err("collection Job creation outcome uncertain".into());
-                }
-            }
+            create_and_mark_launch(
+                &cancel,
+                async {
+                    let mut child = tokio::process::Command::new(&ingestion.kubectl)
+                        .args([
+                            "--kubeconfig",
+                            ingestion
+                                .kubeconfig
+                                .to_str()
+                                .ok_or("invalid kubeconfig path")?,
+                            "--context",
+                            &ingestion.context,
+                            "-n",
+                            &ingestion.collection_namespace,
+                            "create",
+                            "-f",
+                            "-",
+                        ])
+                        .env_clear()
+                        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                        .env("HOME", "/tmp")
+                        .env("TMPDIR", "/tmp")
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .kill_on_drop(true)
+                        .spawn()?;
+                    child
+                        .stdin
+                        .take()
+                        .ok_or("kubectl stdin unavailable")?
+                        .write_all(&bytes)
+                        .await?;
+                    let outcome =
+                        tokio::time::timeout(std::time::Duration::from_secs(30), child.wait())
+                            .await;
+                    match outcome {
+                        Ok(Ok(status)) if status.success() => Ok(()),
+                        _ => {
+                            // Creation may have reached the API server. Keep the claim
+                            // fenced until its Job deadline and operator reconciliation.
+                            Err("collection Job creation outcome uncertain".into())
+                        }
+                    }
+                },
+                || store.mark_collection_launch_running(&launch, &name),
+            )
+            .await?;
         }
     };
     let result = tokio::select! { result = heartbeat => result, result = dispatch => result };

@@ -189,7 +189,11 @@ backoff, interrupted by cancellation. Unknown storage outcomes and lost ownershi
 are terminal for that scheduler run. Kubernetes Job creation is never retried by
 this policy; after successful creation only its exact launch acknowledgement can
 retry. This storage policy does not add provider HTTP attempts or clear admission
-evidence.
+evidence. Exhausted known contention in dispatch DB steps yields for five seconds
+without cancelling sibling collection. A Job created before marker contention
+retains its exact launching epoch and lease; its Pod may settle that fenced claim
+while reconciliation derives the same Job name. This yield never repeats Job
+creation. Scheduler heartbeat or lease failures remain fatal.
 
 LAW accepts `requests_per_second = 1..1000` instead of an explicitly selected
 `min_interval_secs`; specifying both is invalid. Start spacing is rounded up to
