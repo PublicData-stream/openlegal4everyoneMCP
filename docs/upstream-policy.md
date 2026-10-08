@@ -154,6 +154,15 @@ failure, lost COMMIT acknowledgement or locally interrupted SQL operation has an
 unknown outcome and remains a storage failure; it is never treated as a proven
 rollback. Cancellation interrupts retry backoff and is checked before commits.
 
+LAW admission retries a narrower boundary: its first provider-budget row-lock
+query may retry a PostgreSQL-confirmed lock timeout (`55P03`) only after a
+savepoint rollback succeeds. Four attempts, 100/200/400 ms delays and a ten-second
+bound apply while the original transaction and any response-owner session remain
+intact. No provider HTTP, slot reservation, allowance debit, settlement mutation
+or COMMIT is replayed. Exhaustion, rollback failure, transport failure and local
+deadline interruption remain fatal storage failures, preserving uncertain-owner
+evidence for operator review.
+
 Publication and original-observation retries preserve prepared inputs and physical
 staging generations. A retry does not repeat completed HTTP or blob writes.
 Finite inventory replay keeps its scheduling watermark separate from the earlier

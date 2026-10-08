@@ -1,7 +1,7 @@
 //! Cross-Pod LAW HTTP ownership. No database transaction spans a network fetch.
 use super::{DatabaseError, PgPool, RequestBudgetMode};
 use crate::collection_events::CollectionEvents;
-use sqlx::{Connection, PgConnection, Row};
+use sqlx::{Connection, PgConnection, Row, postgres::PgRow};
 use std::{
     sync::{
         Arc,
@@ -17,6 +17,70 @@ const PROVIDER_LOCK: (i32, i32) = (1869376611, 1818326864);
 
 fn storage(_: sqlx::Error) -> DatabaseError {
     DatabaseError::StorageUnavailable
+}
+
+/// Retry only the first budget-row lock, before this transaction changes any
+/// admission state. A savepoint rollback must be acknowledged before another
+/// SELECT; the outer transaction and an existing response's session lock stay
+/// owned. Neither reservation effects nor settlement COMMIT are replayed.
+async fn lock_budget(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    operation: &'static str,
+    cancel: Option<&CancellationToken>,
+) -> Result<PgRow, DatabaseError> {
+    const DELAYS: [Duration; 3] = [
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+        Duration::from_millis(400),
+    ];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    for (attempt, delay) in DELAYS
+        .into_iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .enumerate()
+    {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(DatabaseError::Cancelled);
+        }
+        let result = tokio::time::timeout_at(deadline, async {
+            let mut savepoint = sqlx::Acquire::begin(&mut *tx).await.map_err(storage)?;
+            match sqlx::query("SELECT *,floor(extract(epoch from clock_timestamp())*1000)::bigint AS now_ms FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
+                .fetch_one(&mut *savepoint).await
+            {
+                Ok(row) => {
+                    savepoint.commit().await.map_err(storage)?;
+                    Ok(Some(row))
+                }
+                Err(error) if error.as_database_error().is_some_and(|error| error.code().as_deref() == Some("55P03")) => {
+                    savepoint.rollback().await.map_err(storage)?;
+                    tracing::warn!(operation, attempt = attempt + 1, sqlstate = "55P03",
+                        "provider budget lock rejected; savepoint rollback acknowledged");
+                    Ok(None)
+                }
+                Err(error) => Err(storage(error)),
+            }
+        }).await.map_err(|_| DatabaseError::StorageUnavailable)??;
+        if let Some(row) = result {
+            return Ok(row);
+        }
+        let Some(delay) = delay else {
+            return Err(DatabaseError::StorageUnavailable);
+        };
+        let wake = tokio::time::Instant::now() + delay;
+        if wake >= deadline {
+            return Err(DatabaseError::StorageUnavailable);
+        }
+        if let Some(cancel) = cancel {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(DatabaseError::Cancelled),
+                _ = tokio::time::sleep_until(wake) => {}
+            }
+        } else {
+            tokio::time::sleep_until(wake).await;
+        }
+    }
+    Err(DatabaseError::StorageUnavailable)
 }
 
 /// Owns one charged attempt and its detached advisory-lock session. Dropping an
@@ -54,12 +118,7 @@ impl ProviderRequestGuard {
     async fn settle(&mut self, delay: Option<u64>) -> Result<(), DatabaseError> {
         let connection = self.connection.as_mut().ok_or(DatabaseError::Conflict)?;
         let mut tx = connection.begin().await.map_err(storage)?;
-        sqlx::query(
-            "SELECT singleton FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
+        lock_budget(&mut tx, "settle_response", None).await?;
         let changed =
             sqlx::query("DELETE FROM openlegal.provider_request_admission WHERE owner=$1")
                 .bind(self.owner)
@@ -116,12 +175,7 @@ pub(super) async fn suspend_owned_response(
     owner: Uuid,
 ) -> Result<(), DatabaseError> {
     let mut tx = pool.begin().await.map_err(storage)?;
-    sqlx::query(
-        "SELECT singleton FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE",
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(storage)?;
+    lock_budget(&mut tx, "suspend_response", None).await?;
     sqlx::query(
         "UPDATE openlegal.provider_request_budget SET operator_suspended=true WHERE singleton",
     )
@@ -189,11 +243,7 @@ pub(super) async fn deferral_snapshot(
     locally_suspended: bool,
 ) -> Result<ProviderDeferral, DatabaseError> {
     let mut tx = pool.begin().await.map_err(storage)?;
-    let row =
-        sqlx::query("SELECT * FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(storage)?;
+    let row = lock_budget(&mut tx, "admission_deferral", None).await?;
     // Read time after acquiring the row lock. Waiting for settlement must not
     // produce an ETA from a stale clock or pair it with a different policy row.
     let now: i64 =
@@ -285,8 +335,7 @@ async fn demand_waiting(
 
 pub(super) async fn idle(pool: &PgPool, mode: RequestBudgetMode) -> Result<bool, DatabaseError> {
     let mut tx = pool.begin().await.map_err(storage)?;
-    let row = sqlx::query("SELECT *,floor(extract(epoch from clock_timestamp())*1000)::bigint AS now_ms FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
-        .fetch_one(&mut *tx).await.map_err(storage)?;
+    let row = lock_budget(&mut tx, "provider_idle", None).await?;
     let now_ms: i64 = row.try_get("now_ms").map_err(storage)?;
     let now = now_ms / 1000;
     let daily_available = |name: &str, used: &str| -> Result<bool, DatabaseError> {
@@ -392,12 +441,7 @@ impl ForegroundTicket {
             .fetch_one(&mut *tx)
             .await
             .map_err(storage)?;
-        sqlx::query(
-            "SELECT singleton FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
+        lock_budget(&mut tx, "open_demand_ticket", None).await?;
         sqlx::query("DELETE FROM openlegal.provider_demand_ticket WHERE lease_until<=floor(extract(epoch from clock_timestamp()))::bigint")
             .execute(&mut *tx).await.map_err(storage)?;
         let count: i64 =
@@ -584,8 +628,7 @@ async fn reserve_locked(
     cancel: &CancellationToken,
 ) -> Result<Decision, DatabaseError> {
     let mut tx = connection.begin().await.map_err(storage)?;
-    let row = sqlx::query("SELECT *,floor(extract(epoch from clock_timestamp())*1000)::bigint AS now_ms FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
-        .fetch_one(&mut *tx).await.map_err(storage)?;
+    let row = lock_budget(&mut tx, "reserve_request", Some(cancel)).await?;
     let number = |name| row.try_get::<i64, _>(name).map_err(storage);
     let now_ms: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp())*1000)::bigint")
@@ -782,6 +825,8 @@ mod tests {
     use super::*;
     use crate::law_go_kr::{LawClient, ProviderRequestLimits};
     use openlegal_application::{persistence::PersistentStore, upstream_policy::RequestLimit};
+
+    mod lock_retry;
 
     async fn unrestricted(pool: &PgPool) {
         LawClient::configure_provider_request_limits(
