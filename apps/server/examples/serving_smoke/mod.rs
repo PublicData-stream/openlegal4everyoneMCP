@@ -43,6 +43,7 @@ struct Args<'a> {
     ca: &'a str,
     revision: &'a str,
     origin: &'a str,
+    citation_query: Option<&'a str>,
 }
 
 fn validate_url(raw: &str, origin: bool) -> Result<()> {
@@ -77,7 +78,7 @@ fn validate_url(raw: &str, origin: bool) -> Result<()> {
 }
 
 fn arguments(args: &[String]) -> Result<Args<'_>> {
-    if args.len() != 5
+    if !matches!(args.len(), 5 | 7)
         || args[4] != "--serving-smoke"
         || args[..4]
             .iter()
@@ -85,6 +86,19 @@ fn arguments(args: &[String]) -> Result<Args<'_>> {
     {
         return Err("invalid_arguments");
     }
+    let citation_query = if args.len() == 7 {
+        let query = args[6].as_str();
+        if args[5] != "--citation-query"
+            || query.trim().is_empty()
+            || query.len() > 2048
+            || query.chars().any(char::is_control)
+        {
+            return Err("invalid_arguments");
+        }
+        Some(query)
+    } else {
+        None
+    };
     validate_url(&args[0], false)?;
     validate_url(&args[3], true)?;
     if !["2025-11-25", "2026-07-28"].contains(&args[2].as_str()) {
@@ -103,6 +117,7 @@ fn arguments(args: &[String]) -> Result<Args<'_>> {
         ca: &args[1],
         revision: &args[2],
         origin: &args[3],
+        citation_query,
     })
 }
 
@@ -201,6 +216,11 @@ async fn execute(raw: &[String], report: &mut Value) -> Result<()> {
         configured.as_ref().map(|_| ()).map_err(|e| *e),
     );
     let (args, endpoint) = configured?;
+    if args.citation_query.is_some()
+        && let Some(checks) = report["checks"].as_array_mut()
+    {
+        checks.push(json!({"id":"citation","status":"not_run"}));
+    }
     let connected = timeout(OPERATION, async {
         let connection = endpoint
             .connect(
@@ -239,7 +259,7 @@ async fn execute(raw: &[String], report: &mut Value) -> Result<()> {
     // Reserve time for cleanup even when the non-mutating verification stalls.
     let positive = timeout(
         Duration::from_secs(50),
-        positive(&mut client, report, &mut owned),
+        positive(&mut client, report, &mut owned, args.citation_query),
     )
     .await
     .unwrap_or(Err("positive_timeout"));
@@ -335,7 +355,12 @@ fn handle(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-async fn positive(client: &mut Client<'_>, report: &mut Value, owned: &mut Owned) -> Result<()> {
+async fn positive(
+    client: &mut Client<'_>,
+    report: &mut Value,
+    owned: &mut Owned,
+    citation_query: Option<&str>,
+) -> Result<()> {
     let discovered = if client.revision == "2025-11-25" {
         client.rpc("initialize", json!({"protocolVersion":client.revision,"capabilities":{},"clientInfo":{"name":"openlegal-serving-smoke","version":"1"}}), false).await
     } else {
@@ -417,6 +442,11 @@ async fn positive(client: &mut Client<'_>, report: &mut Value, owned: &mut Owned
         });
     record(report, "server_info", info);
     info?;
+    if let Some(query) = citation_query {
+        let citation = citation_acceptance(client, query).await;
+        record(report, "citation", citation);
+        citation?;
+    }
     let diff = client
         .tool("text.diff", json!({"before":BEFORE,"after":AFTER}), true)
         .await
@@ -484,6 +514,109 @@ async fn positive(client: &mut Client<'_>, report: &mut Value, owned: &mut Owned
         });
     record(report, "patch_content", patch);
     patch
+}
+
+fn citation_document(id: &str, searched: &Value, document: &Value) -> Result<()> {
+    use openlegal_domain::citation::{CitationId, CitationProjection, MAX_CITATION_TEXT_BYTES};
+    let parsed = CitationId::decode(id).map_err(|_| "citation_id_invalid")?;
+    let metadata = &document["metadata"];
+    if document["id"] != id
+        || document["url"] != searched["url"]
+        || metadata["jurisdiction"] != parsed.object.jurisdiction
+        || metadata["provider"] != parsed.object.provider
+        || metadata["dataset"] != parsed.object.dataset.as_str()
+        || metadata["object_id"] != parsed.object.id
+        || metadata["capture_id"] != parsed.capture_id
+    {
+        return Err("citation_identity_mismatch");
+    }
+    let url = document["url"].as_str().ok_or("citation_url_mismatch")?;
+    let base = Url::parse(url).map_err(|_| "citation_url_mismatch")?;
+    let origin = base.origin().ascii_serialization();
+    if parsed
+        .reference_url(&origin)
+        .map_err(|_| "citation_url_mismatch")?
+        != url
+    {
+        return Err("citation_url_mismatch");
+    }
+    let text = document["text"]
+        .as_str()
+        .ok_or("citation_content_mismatch")?;
+    if text.len() > MAX_CITATION_TEXT_BYTES {
+        return Err("citation_content_mismatch");
+    }
+    match parsed.projection {
+        CitationProjection::Section { section } => {
+            if metadata["section"] != section {
+                return Err("citation_identity_mismatch");
+            }
+        }
+        CitationProjection::Passage {
+            section,
+            start,
+            end,
+        } => {
+            let expected_start = start.to_string();
+            let expected_end = end.to_string();
+            if metadata["section"] != section
+                || metadata["byte_start"] != expected_start
+                || metadata["byte_end"] != expected_end
+                || text.len() != end - start
+            {
+                return Err("citation_identity_mismatch");
+            }
+        }
+        CitationProjection::Document => {}
+        CitationProjection::Metadata => return Err("citation_content_mismatch"),
+    }
+    Ok(())
+}
+
+fn citation_resource(id: &str, document: &Value, read: &Value) -> Result<()> {
+    let parsed =
+        openlegal_domain::citation::CitationId::decode(id).map_err(|_| "citation_id_invalid")?;
+    let contents = read["contents"]
+        .as_array()
+        .ok_or("citation_resource_mismatch")?;
+    if contents.len() != 1 {
+        return Err("citation_resource_mismatch");
+    }
+    let item = &contents[0];
+    let provenance = &item["_meta"]["openlegal/provenance"];
+    let source = &item["_meta"]["openlegal/source"];
+    if item["uri"] != parsed.resource_uri().map_err(|_| "citation_id_invalid")?
+        || item["text"] != document["text"]
+        || provenance != &document["metadata"]
+        || source["id"] != id
+        || source["url"] != document["url"]
+    {
+        return Err("citation_resource_mismatch");
+    }
+    Ok(())
+}
+
+async fn citation_acceptance(client: &mut Client<'_>, query: &str) -> Result<()> {
+    let searched = client.tool("search", json!({"query":query}), false).await?;
+    let results = searched["results"].as_array().ok_or("citation_empty")?;
+    if results.is_empty() || results.len() > 20 {
+        return Err("citation_empty");
+    }
+    let first = &results[0];
+    let id = first["id"].as_str().ok_or("citation_id_invalid")?;
+    let parsed =
+        openlegal_domain::citation::CitationId::decode(id).map_err(|_| "citation_id_invalid")?;
+    let document = client.tool("fetch", json!({"id":id}), false).await?;
+    citation_document(id, first, &document)?;
+    // Only the canonical MCP resource is read; the returned browser URL is never fetched.
+    let read = client
+        .rpc(
+            "resources/read",
+            json!({"uri":parsed.resource_uri().map_err(|_| "citation_id_invalid")?}),
+            false,
+        )
+        .await?;
+    citation_resource(id, &document, &read)
 }
 
 async fn cleanup(client: &mut Client<'_>, report: &mut Value, owned: &Owned) {
@@ -647,6 +780,79 @@ mod tests {
         let mut a = args();
         a.remove(3);
         assert!(arguments(&a).is_err());
+    }
+
+    #[test]
+    fn citation_query_is_explicit_bounded_and_optional() {
+        assert!(arguments(&args()).unwrap().citation_query.is_none());
+        let mut selected = args();
+        selected.extend(["--citation-query".into(), "in:title:\"민법\"".into()]);
+        assert_eq!(
+            arguments(&selected).unwrap().citation_query,
+            Some("in:title:\"민법\"")
+        );
+        for invalid in [
+            "".to_string(),
+            " ".to_string(),
+            "a".repeat(2049),
+            "가".repeat(683),
+            "private\nquery".to_string(),
+        ] {
+            selected[6] = invalid;
+            assert!(arguments(&selected).is_err());
+        }
+        selected.truncate(6);
+        assert!(arguments(&selected).is_err());
+    }
+
+    fn citation_fixture() -> (String, Value, Value, Value) {
+        let id = format!(
+            "v1/kr/law_go_kr/acr_decision/2097/{}/section/s-title",
+            "a".repeat(64)
+        );
+        let uri = format!("openlegal://source/{id}");
+        let url = format!("https://references.example.test/source/{id}");
+        let search = json!({"id":id,"title":"Synthetic decision title","url":url});
+        let metadata = json!({"jurisdiction":"kr","provider":"law_go_kr","dataset":"acr_decision","object_id":"2097","capture_id":"a".repeat(64),"section":"title"});
+        let document =
+            json!({"id":id,"url":url,"text":"Synthetic decision title","metadata":metadata});
+        let resource = json!({"contents":[{"uri":uri,"text":"Synthetic decision title","_meta":{"openlegal/provenance":metadata,"openlegal/source":{"id":id,"url":url}}}]});
+        (id, search, document, resource)
+    }
+
+    #[test]
+    fn acr_decision_citation_keeps_identity_projection_and_resource_text() {
+        let (id, searched, document, resource) = citation_fixture();
+        assert_eq!(citation_document(&id, &searched, &document), Ok(()));
+        assert_eq!(citation_resource(&id, &document, &resource), Ok(()));
+        for field in ["capture_id", "object_id", "dataset", "section"] {
+            let mut changed = document.clone();
+            changed["metadata"][field] = json!("different");
+            assert_eq!(
+                citation_document(&id, &searched, &changed),
+                Err("citation_identity_mismatch")
+            );
+        }
+        let mut changed = resource.clone();
+        changed["contents"][0]["text"] = json!("different projection");
+        assert_eq!(
+            citation_resource(&id, &document, &changed),
+            Err("citation_resource_mismatch")
+        );
+        let mut changed = resource;
+        changed["contents"][0]["uri"] = json!("https://arbitrary.example.test");
+        assert_eq!(
+            citation_resource(&id, &document, &changed),
+            Err("citation_resource_mismatch")
+        );
+        let mut changed = document;
+        let mut changed_search = searched;
+        changed["url"] = json!("https://references.example.test/source/other");
+        changed_search["url"] = changed["url"].clone();
+        assert_eq!(
+            citation_document(&id, &changed_search, &changed),
+            Err("citation_url_mismatch")
+        );
     }
     #[test]
     fn ca_bundle_requires_only_valid_certificates() {

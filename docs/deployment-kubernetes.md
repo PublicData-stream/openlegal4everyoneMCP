@@ -1404,7 +1404,7 @@ The routine smoke command performs fixed, bounded serving operations against
 explicit endpoints. It neither deploys workloads nor runs migration, restarts,
 certificate replacements or provider ingestion. Tiny fictional text comparisons
 create transient comparison and patch handles; the client deletes only handles
-returned to its own run. No legal corpus operation is included.
+returned to its own run. Legal corpus operations are opt-in.
 
 Build the native client explicitly before running smoke:
 
@@ -1427,6 +1427,20 @@ HTTPS and must be configured as allowed. Reserve `https://smoke-denied.invalid`
 outside all allowlists. There is no proxy, redirect, ambient endpoint discovery,
 runtime download or insecure TLS option. The Python driver requires Linux/POSIX,
 Python 3.11 or later and a compatible prebuilt native client.
+
+Optional `--citation-query 'in:title:"민법"'` adds bounded retained-source checks
+to both HTTP and WebTransport revisions. It searches at most 20 results, fetches
+the first exact citation ID and reads only its canonical MCP resource, comparing
+object, capture, projection, URL, provenance and text. The query is limited to
+2048 UTF-8 bytes without control characters. Empty results fail the selected check;
+no alternate query is substituted. Browser URLs are validated but never fetched.
+With automatic demand collection enabled, the selected search can enqueue its
+normal bounded discovery; select retained-only fixtures for offline tests. Build
+the native client from the same source revision as the server and record source
+and binary hashes in deployment evidence. A stale client can reject a newly
+supported dataset even when the server accepts its citation; fixed citation reason
+codes distinguish that failure from transport failure. Reports do not retain the
+query, citation IDs, source text or raw diagnostics.
 
 The client exercises both MCP revisions: legacy initialize/initialized and
 modern discovery, tool listing, server/source information, canonical `text.diff`,

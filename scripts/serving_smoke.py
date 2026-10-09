@@ -19,17 +19,20 @@ import ssl
 import subprocess
 import sys
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 REVISIONS = ("2025-11-25", "2026-07-28")
 MAX_BODY = 16 * 1024 * 1024
 OP_SECONDS = 10
 TRANSPORT_SECONDS = 180
 READINESS_SECONDS = 360
+MAX_CITATION_QUERY_BYTES = 2048
 REASONS = {"invalid_arguments", "deadline", "tls_failure", "connection_failure",
            "invalid_response", "response_limit", "unexpected_status", "invalid_progress",
            "missing_progress", "content_mismatch", "cleanup_failed", "client_failed",
-           "invalid_client_report", "not_selected", "prior_check_failed", "io_failure"}
+           "invalid_client_report", "not_selected", "prior_check_failed", "io_failure",
+           "citation_empty", "citation_id_invalid", "citation_identity_mismatch",
+           "citation_url_mismatch", "citation_content_mismatch", "citation_resource_mismatch"}
 
 
 class Failure(Exception):
@@ -264,6 +267,85 @@ def check_diff(client, revision, cleanup_results):
                 cleanup_results.append(entry(operation, "failed", started, "cleanup_failed"))
 
 
+def citation_query(value):
+    require(isinstance(value, str) and value.strip()
+            and len(value.encode("utf-8")) <= MAX_CITATION_QUERY_BYTES
+            and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value), "invalid_arguments")
+    return value
+
+
+def citation_identity(ident):
+    # Check canonical path shape without maintaining a second dataset catalog.
+    # The release-matched Rust client uses the domain decoder for membership.
+    require(isinstance(ident, str) and len(ident.encode("utf-8")) <= 2048, "citation_id_invalid")
+    parts = ident.split("/")
+    require(len(parts) in (7, 8, 10) and parts[0] == "v1", "citation_id_invalid")
+    expected = {}
+    for field, segment, maximum in (("jurisdiction", parts[1], 32), ("provider", parts[2], 64),
+                                     ("object_id", parts[4], 128)):
+        require(len(segment) <= maximum and re.fullmatch(r"[A-Za-z0-9_-]+", segment), "citation_id_invalid")
+        expected[field] = segment
+    require(re.fullmatch(r"[a-z][a-z0-9_]*", parts[3])
+            and re.fullmatch(r"[0-9a-f]{64}", parts[5]), "citation_id_invalid")
+    expected.update(dataset=parts[3], capture_id=parts[5])
+    kind = parts[6]
+    require((kind == "doc" and len(parts) == 7)
+            or (kind == "section" and len(parts) == 8)
+            or (kind == "passage" and len(parts) == 10), "citation_id_invalid")
+    if kind in ("section", "passage"):
+        require(parts[7].startswith("s-"), "citation_id_invalid")
+        try:
+            section = unquote(parts[7][2:], encoding="utf-8", errors="strict")
+        except UnicodeError:
+            raise Failure("citation_id_invalid") from None
+        encoded = quote(section, safe="-._*").replace("~", "%7E")
+        require(section and len(section.encode("utf-8")) <= 256
+                and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in section)
+                and encoded == parts[7][2:], "citation_id_invalid")
+        expected["section"] = section
+    if kind == "passage":
+        require(all(re.fullmatch(r"0|[1-9][0-9]{0,7}", part) for part in parts[8:]), "citation_id_invalid")
+        start, end = map(int, parts[8:])
+        require(start < end <= 64 * 1024 * 1024 and end - start <= 8192, "citation_id_invalid")
+        expected.update(byte_start=str(start), byte_end=str(end))
+    return expected
+
+
+def check_citation(client, revision, query):
+    searched = client.call(revision, "search", {"query": citation_query(query)})
+    results = searched.get("results")
+    require(isinstance(results, list) and 1 <= len(results) <= 20, "citation_empty")
+    first = results[0]
+    require(isinstance(first, dict), "citation_id_invalid")
+    ident = first.get("id")
+    identity = citation_identity(ident)
+    document = client.call(revision, "fetch", {"id": ident})
+    metadata = document.get("metadata")
+    require(document.get("id") == ident and document.get("url") == first.get("url")
+            and isinstance(metadata, dict)
+            and all(metadata.get(key) == value for key, value in identity.items()), "citation_identity_mismatch")
+    try:
+        endpoint(document.get("url"), "/source/" + ident)
+    except Failure:
+        raise Failure("citation_url_mismatch") from None
+    text = document.get("text")
+    require(isinstance(text, str) and len(text.encode("utf-8")) <= 8192, "citation_content_mismatch")
+    if "byte_start" in identity:
+        require(len(text.encode("utf-8")) == int(identity["byte_end"]) - int(identity["byte_start"]), "citation_content_mismatch")
+    uri = "openlegal://source/" + ident
+    # Never follow the browser URL or an arbitrary returned URI.
+    read = client.rpc(revision, "resources/read", {"uri": uri})
+    contents = read.get("contents")
+    require(isinstance(contents, list) and len(contents) == 1 and isinstance(contents[0], dict), "citation_resource_mismatch")
+    item = contents[0]
+    meta = item.get("_meta", {})
+    require(isinstance(meta, dict), "citation_resource_mismatch")
+    source = meta.get("openlegal/source", {})
+    require(isinstance(source, dict) and item.get("uri") == uri and item.get("text") == text
+            and meta.get("openlegal/provenance") == metadata
+            and source.get("id") == ident and source.get("url") == document["url"], "citation_resource_mismatch")
+
+
 def entry(ident, status, started, reason=None):
     result = {"id": ident, "status": status, "duration_ms": round((time.monotonic() - started) * 1000)}
     if reason:
@@ -329,8 +411,12 @@ def subprocess_output(command, seconds, limit=MAX_BODY, allow_failure=False):
 
 
 def webtransport(args, revision, end, details):
-    code, raw = subprocess_output([args.wt_client, args.webtransport_url, args.ca_file,
-                             revision, args.origin, "--serving-smoke"], end - time.monotonic(),
+    command = [args.wt_client, args.webtransport_url, args.ca_file,
+               revision, args.origin, "--serving-smoke"]
+    query = getattr(args, "citation_query", None)
+    if query is not None:
+        command.extend(["--citation-query", citation_query(query)])
+    code, raw = subprocess_output(command, end - time.monotonic(),
                              allow_failure=True)
     value = decode_json(raw)
     require(isinstance(value, dict) and value.get("schema_version") == 1, "invalid_client_report")
@@ -339,6 +425,8 @@ def webtransport(args, revision, end, details):
     required = {"configuration", "connect", "discovery", "tools_list", "server_info",
                 "text_diff", "comparison_content", "patch_content", "comparison_cleanup",
                 "attachment_cleanup", "invalid_origin"}
+    if query is not None:
+        required.add("citation")
     seen = set()
     for check in checks:
         require(isinstance(check, dict) and isinstance(check.get("id"), str)
@@ -393,7 +481,10 @@ def arguments(argv):
         parser.add_argument("--" + name, required=True)
     for name in ("report", "live-url", "ready-url", "kubeconfig", "context", "namespace", "pod", "kubectl"):
         parser.add_argument("--" + name)
+    parser.add_argument("--citation-query")
     args = parser.parse_args(argv)
+    if args.citation_query is not None:
+        citation_query(args.citation_query)
     args.http = endpoint(args.http_url, "/mcp")
     endpoint(args.webtransport_url, "/mcp-wt/v1")
     endpoint(args.origin, origin=True)
@@ -501,6 +592,11 @@ def run(args):
                 record(checks, prefix + name, operation)
             else:
                 checks.append(entry(prefix + name, "not_run", time.monotonic(), "prior_check_failed"))
+        if args.citation_query is not None:
+            if connected:
+                record(checks, prefix + "citation", lambda: check_citation(client, revision, args.citation_query))
+            else:
+                checks.append(entry(prefix + "citation", "not_run", time.monotonic(), "prior_check_failed"))
         cleanup = []
         if connected:
             record(checks, prefix + "text_diff", lambda: check_diff(client, revision, cleanup))

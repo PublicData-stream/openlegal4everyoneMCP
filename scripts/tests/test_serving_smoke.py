@@ -171,6 +171,93 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(client.calls[-1], ("text.diff.delete", {"comparison_id": "a" * 64}))
 
 
+class CitationClient:
+    def __init__(self):
+        self.calls = []
+        self.ident = "v1/kr/law_go_kr/acr_decision/2097/" + "a" * 64 + "/section/s-title"
+        self.url = "https://references.example.test/source/" + self.ident
+        self.metadata = {"jurisdiction": "kr", "provider": "law_go_kr", "dataset": "acr_decision",
+                         "object_id": "2097", "capture_id": "a" * 64, "section": "title"}
+        self.search = {"results": [{"id": self.ident, "url": self.url, "title": "Synthetic decision"}]}
+        self.document = {"id": self.ident, "url": self.url, "text": "Synthetic decision", "metadata": self.metadata}
+        self.resource = {"contents": [{"uri": "openlegal://source/" + self.ident, "text": "Synthetic decision",
+                        "_meta": {"openlegal/provenance": dict(self.metadata),
+                                  "openlegal/source": {"id": self.ident, "url": self.url}}}]}
+
+    def call(self, revision, name, arguments):
+        self.calls.append((revision, name, arguments))
+        return self.search if name == "search" else self.document
+
+    def rpc(self, revision, method, params):
+        self.calls.append((revision, method, params))
+        return self.resource
+
+
+class CitationTests(unittest.TestCase):
+    def test_same_id_acr_projection_capture_and_resource_on_both_revisions(self):
+        for revision in smoke.REVISIONS:
+            client = CitationClient()
+            smoke.check_citation(client, revision, 'in:title:"법"')
+            self.assertEqual(client.calls, [(revision, "search", {"query": 'in:title:"법"'}),
+                             (revision, "fetch", {"id": client.ident}),
+                             (revision, "resources/read", {"uri": "openlegal://source/" + client.ident})])
+
+    def test_identity_mismatch_never_reads_a_resource(self):
+        for field in ("capture_id", "dataset", "object_id", "section"):
+            client = CitationClient()
+            client.metadata[field] = "different"
+            with self.assertRaises(smoke.Failure) as caught:
+                smoke.check_citation(client, smoke.REVISIONS[0], "query")
+            self.assertEqual(caught.exception.reason, "citation_identity_mismatch")
+            self.assertEqual(len(client.calls), 2)
+
+    def test_exact_resource_content_and_provenance_are_required(self):
+        for field in ("text", "uri"):
+            client = CitationClient()
+            client.resource["contents"][0][field] = "private diagnostic"
+            with self.assertRaises(smoke.Failure) as caught:
+                smoke.check_citation(client, smoke.REVISIONS[1], "query")
+            self.assertEqual(caught.exception.reason, "citation_resource_mismatch")
+            self.assertNotIn("private", str(caught.exception))
+        client = CitationClient()
+        client.resource["contents"][0]["_meta"]["openlegal/provenance"]["capture_id"] = "b" * 64
+        with self.assertRaises(smoke.Failure) as caught:
+            smoke.check_citation(client, smoke.REVISIONS[0], "query")
+        self.assertEqual(caught.exception.reason, "citation_resource_mismatch")
+
+    def test_browser_url_is_checked_and_never_followed(self):
+        for url in ("https://references.example.test/source/different", "https://secret@references.example.test/source/",
+                    "file:///etc/passwd", "http://127.0.0.1/private", "https://references.example.test/source/?token=private"):
+            client = CitationClient()
+            client.search["results"][0]["url"] = client.document["url"] = url
+            with self.assertRaises(smoke.Failure) as caught:
+                smoke.check_citation(client, smoke.REVISIONS[0], "query")
+            self.assertEqual(caught.exception.reason, "citation_url_mismatch")
+            self.assertEqual(len(client.calls), 2)
+
+    def test_query_and_result_count_are_bounded(self):
+        for query in ("", " ", "private\nquery", "a" * 2049, "가" * 683):
+            with self.assertRaises(smoke.Failure) as caught:
+                smoke.citation_query(query)
+            self.assertEqual(caught.exception.reason, "invalid_arguments")
+        for results in ([], [CitationClient().search["results"][0]] * 21):
+            client = CitationClient()
+            client.search = {"results": results}
+            with self.assertRaises(smoke.Failure) as caught:
+                smoke.check_citation(client, smoke.REVISIONS[0], "query")
+            self.assertEqual(caught.exception.reason, "citation_empty")
+
+    def test_canonical_projection_shapes_and_utf8_bounds(self):
+        prefix = "v1/kr/law_go_kr/acr_decision/2097/" + "a" * 64
+        self.assertEqual(smoke.citation_identity(prefix + "/section/s-%EB%B3%B8%EB%AC%B8%20%2F%7E")["section"], "본문 /~")
+        self.assertEqual(smoke.citation_identity(prefix + "/passage/s-body/0/6")["byte_end"], "6")
+        for tail in ("/section/s-%eb%B3%B8", "/section/s-../bad", "/section/s-", "/passage/s-body/00/6",
+                     "/passage/s-body/6/6", "/passage/s-body/0/8193", "/metadata"):
+            with self.assertRaises(smoke.Failure) as caught:
+                smoke.citation_identity(prefix + tail)
+            self.assertEqual(caught.exception.reason, "citation_id_invalid")
+
+
 class ProcessTests(unittest.TestCase):
     def test_output_cap_and_failure_redaction(self):
         with self.assertRaises(smoke.Failure) as caught:
@@ -208,6 +295,23 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(next(c for c in details if c["id"].endswith("comparison_cleanup"))["status"], "failed")
         self.assertNotIn("private-diagnostic", json.dumps(details))
         self.assertNotIn("never-copy-this", json.dumps(details))
+
+    def test_opt_in_citation_reason_survives_and_query_is_an_explicit_argument(self):
+        args = types.SimpleNamespace(wt_client="/unused", webtransport_url="https://example.test/mcp-wt/v1",
+                                     ca_file="/unused", origin="https://client.test", citation_query='in:title:"법"')
+        ids = ("configuration", "connect", "discovery", "tools_list", "server_info", "text_diff",
+               "comparison_content", "patch_content", "comparison_cleanup", "attachment_cleanup", "invalid_origin", "citation")
+        value = {"schema_version": 1, "private": "never-copy-this", "checks": [
+            {"id": name, "status": "failed" if name == "citation" else "passed",
+             "reason_code": "citation_id_invalid" if name == "citation" else "private"} for name in ids]}
+        details = []
+        with patch.object(smoke, "subprocess_output", return_value=(1, json.dumps(value).encode())) as called:
+            with self.assertRaises(smoke.Failure):
+                smoke.webtransport(args, smoke.REVISIONS[0], time.monotonic() + 1, details)
+        self.assertEqual(called.call_args.args[0][-2:], ["--citation-query", 'in:title:"법"'])
+        self.assertEqual(details[-1]["reason_code"], "citation_id_invalid")
+        self.assertNotIn("never-copy-this", json.dumps(details))
+        self.assertNotIn('in:title', json.dumps(details))
 
     def test_report_exclusive_creation_and_safe_output(self):
         report = {"schema_version": 1, "status": "passed", "evidence_scope": "configured_endpoint", "checks": []}

@@ -299,6 +299,56 @@ mod tests {
         assert!(CitationId::decode(&encoded.replace("%2F", "%2f")).is_err());
         assert!(CitationId::decode(&encoded.replace("0001", "1")).unwrap() != expected);
     }
+
+    #[test]
+    fn all_supported_datasets_round_trip_every_citation_projection() {
+        for dataset in Dataset::ALL {
+            for projection in [
+                CitationProjection::Document,
+                CitationProjection::Metadata,
+                CitationProjection::Section {
+                    section: "article:0001000:source_ordinal:2".into(),
+                },
+                CitationProjection::Passage {
+                    section: "본문 /~".into(),
+                    start: 0,
+                    end: 12,
+                },
+            ] {
+                let mut expected = id();
+                expected.object.dataset = *dataset;
+                expected.projection = projection;
+                let encoded = expected.encode().unwrap();
+                assert_eq!(
+                    CitationId::decode(&encoded).unwrap(),
+                    expected,
+                    "{dataset:?}"
+                );
+                assert_eq!(
+                    expected.resource_uri().unwrap(),
+                    format!("openlegal://source/{encoded}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn acr_decision_title_citation_uses_the_registered_dataset() {
+        let encoded = format!(
+            "v1/kr/law_go_kr/acr_decision/2097/{}/section/s-title",
+            "a".repeat(64)
+        );
+        let parsed = CitationId::decode(&encoded).unwrap();
+        assert_eq!(parsed.object.dataset, Dataset::AcrDecision);
+        assert_eq!(parsed.object.id, "2097");
+        assert_eq!(
+            parsed.projection,
+            CitationProjection::Section {
+                section: "title".into()
+            }
+        );
+        assert_eq!(parsed.encode().unwrap(), encoded);
+    }
     #[test]
     fn rejects_noncanonical_ranges_and_origin_inputs() {
         let mut value = id();
