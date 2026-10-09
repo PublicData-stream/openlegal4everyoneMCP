@@ -290,7 +290,7 @@ impl PgCorpusStore {
         };
         if let Some(location) = &location {
             retry_storage(&cancel, "observation_reserve", || async {
-            let mut tx = self.pool.begin().await.map_err(db)?;
+            let mut tx = begin_storage(&self.pool, "retain_source_observation").await?;
             let counts = sqlx::query("SELECT raw_bytes,staged_bytes,max_raw_bytes::text,(SELECT count(*) FROM openlegal.corpus_staging) AS stages FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
                 .fetch_one(&mut *tx).await.map_err(db)?;
             let staged: i64 = counts.try_get("staged_bytes").map_err(db)?;
@@ -320,7 +320,7 @@ impl PgCorpusStore {
                 .await
                 .map_err(db)?;
             check(&cancel)?;
-            tx.commit().await.map_err(db)?;
+            commit_storage(tx, "retain_source_observation").await?;
             Ok(())
             }).await?;
             self.blobs
@@ -342,7 +342,7 @@ impl PgCorpusStore {
         }
         check(&cancel)?;
         retry_storage(&cancel, "observation_commit", || async {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "retain_source_observation").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
@@ -394,7 +394,7 @@ impl PgCorpusStore {
                 .bind(observation.raw_size as i64).execute(&mut *tx).await.map_err(db)?;
         }
         check(&cancel)?;
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "retain_source_observation").await?;
         Ok(())
         }).await?;
         // A committed observation is never re-inserted to retry its readback.

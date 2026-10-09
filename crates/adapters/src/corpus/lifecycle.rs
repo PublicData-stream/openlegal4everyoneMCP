@@ -190,7 +190,7 @@ impl PgCorpusStore {
             i64::try_from(launch.recovery_at()).map_err(|_| DatabaseError::InvalidInput)?;
         let launched_at =
             i64::try_from(launch.launched_at).map_err(|_| DatabaseError::InvalidInput)?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "adopt_background_budget_wait").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
@@ -217,7 +217,7 @@ impl PgCorpusStore {
         sqlx::query("UPDATE openlegal.corpus_job SET status='pending',expected_version=$2,source_metadata=$3,explicit_request_id=$4,explicit_recovery_at=$5,lease_until=NULL,error_category=NULL,started_at=NULL,completed_at=NULL WHERE id=$1")
             .bind(id).bind(next_version).bind(serde_json::to_value(&source_metadata).map_err(corrupt)?)
             .bind(owner).bind(recovery).execute(&mut *tx).await.map_err(db)?;
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "adopt_background_budget_wait").await?;
         Ok(Some(Job {
             id: id.to_string(),
             object,
@@ -277,7 +277,7 @@ impl PgCorpusStore {
             return Err(DatabaseError::InvalidInput);
         }
         let date = effective_date.as_deref().unwrap_or("");
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "enqueue_job_with_owner").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
@@ -331,12 +331,12 @@ impl PgCorpusStore {
                 // HEAD job with the current observation's metadata.
                 sqlx::query("UPDATE openlegal.corpus_job SET install_head=true,source_metadata=CASE WHEN explicit_request_id IS NOT NULL THEN jsonb_set($2::jsonb,'{collection_origin}','\"explicit\"'::jsonb) ELSE $2 END,expected_version=$3,status='pending',attempts=0,created_at=$4::text::numeric,lease_until=NULL,error_category=NULL,started_at=NULL,completed_at=NULL WHERE id=$1")
                     .bind(id).bind(serde_json::to_value(&source_metadata).map_err(corrupt)?).bind(version).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
-                tx.commit().await.map_err(db)?;
+                commit_storage(tx, "enqueue_job_with_owner").await?;
                 return Ok(Job{source_metadata,id:id.to_string(),object,revision_id,effective_date,install_head:true,expected_version:version.try_into().map_err(corrupt)?,attempts:0});
             }
             let head=install_head||old_head;
             sqlx::query("UPDATE openlegal.corpus_object SET pending=pending OR $2 WHERE object_key=$1").bind(&k).bind(mark_head_pending).execute(&mut *tx).await.map_err(db)?;
-            tx.commit().await.map_err(db)?;
+            commit_storage(tx, "enqueue_job_with_owner").await?;
             return Ok(Job{source_metadata:serde_json::from_value(job.try_get("source_metadata").map_err(db)?).map_err(corrupt)?,id:id.to_string(),object,revision_id,effective_date,install_head:head,expected_version:job.try_get::<i64,_>("expected_version").map_err(db)?.try_into().map_err(corrupt)?,attempts:job.try_get::<i32,_>("attempts").map_err(db)?.try_into().map_err(corrupt)?});
         }
         let queued: i64 = sqlx::query_scalar(
@@ -348,11 +348,11 @@ impl PgCorpusStore {
         if queued >= 128 {
             // A saturated work queue cannot erase an already observed replacement.
             // Persist the HEAD fence and supersession even though no job fits.
-            tx.commit().await.map_err(db)?;
+            commit_storage(tx, "enqueue_job_with_owner").await?;
             return Err(DatabaseError::Capacity);
         }
         let job:Uuid=sqlx::query_scalar("INSERT INTO openlegal.corpus_job(object_key,revision_id,effective_date,install_head,expected_version,status,created_at,source_metadata,explicit_request_id,explicit_recovery_at) VALUES($1,$2,$3,$4,$5,'pending',$6::text::numeric,$7,$8,$9) ON CONFLICT(object_key,revision_id,effective_date) DO UPDATE SET source_metadata=EXCLUDED.source_metadata,expected_version=EXCLUDED.expected_version,install_head=EXCLUDED.install_head,status='pending',attempts=0,created_at=EXCLUDED.created_at,lease_until=NULL,error_category=NULL,started_at=NULL,completed_at=NULL,explicit_request_id=EXCLUDED.explicit_request_id,explicit_recovery_at=EXCLUDED.explicit_recovery_at RETURNING id").bind(&k).bind(&revision_id).bind(date).bind(install_head).bind(version).bind(now.to_string()).bind(serde_json::to_value(&source_metadata).map_err(corrupt)?).bind(owner).bind(recovery_at).fetch_one(&mut *tx).await.map_err(db)?;
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "enqueue_job_with_owner").await?;
         Ok(Job {
             source_metadata,
             id: job.to_string(),
@@ -410,14 +410,14 @@ impl PgCorpusStore {
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
         let owner = Uuid::parse_str(request_id).map_err(|_| DatabaseError::InvalidInput)?;
         let recovery_at = i64::try_from(recovery_at).map_err(|_| DatabaseError::InvalidInput)?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "adopt_explicit_job").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
             .map_err(db)?;
         let changed = sqlx::query("UPDATE openlegal.corpus_job j SET explicit_request_id=$2,explicit_recovery_at=CASE WHEN explicit_request_id=$2 THEN explicit_recovery_at ELSE $3 END,source_metadata=jsonb_set(source_metadata,'{collection_origin}','\"explicit\"'::jsonb) WHERE j.id=$1 AND (j.status='pending' OR (j.status='running' AND j.lease_until<=$4::text::numeric)) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>$4::text::numeric) AND EXISTS(SELECT 1 FROM openlegal.collection_request r WHERE r.id=$2 AND r.status IN ('launching','running') AND r.lease_until>$4::bigint) AND (j.explicit_request_id=$2 OR (j.explicit_request_id IS NULL AND (j.explicit_recovery_at IS NULL OR j.explicit_recovery_at<=$4::bigint)) OR (j.explicit_request_id IS NOT NULL AND j.explicit_recovery_at<=$4::bigint AND NOT EXISTS(SELECT 1 FROM openlegal.collection_request r WHERE r.id=j.explicit_request_id AND r.status IN ('launching','running') AND r.lease_until>$4::bigint)))")
             .bind(id).bind(owner).bind(recovery_at).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?.rows_affected();
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "adopt_explicit_job").await?;
         Ok(changed == 1)
     }
     pub async fn claim_explicit_job_for_request(
@@ -467,7 +467,7 @@ impl PgCorpusStore {
             return Err(DatabaseError::InvalidInput);
         }
         self.gate().await?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "claim_job_inner").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
@@ -480,7 +480,7 @@ impl PgCorpusStore {
             return Ok(None);
         }
 
-        sqlx::query("UPDATE openlegal.corpus_job SET status='failed',error_category='attempts_exhausted',completed_at=$1::text::numeric WHERE attempts>=(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) AND (status='pending' OR (status='running' AND lease_until<=$1::text::numeric))").bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
+        // Exhausted jobs are excluded below and retired by bounded maintenance.
         let dataset_name: Option<String> = preferred_dataset
             .map(|dataset| serde_json::to_value(dataset).map_err(corrupt))
             .transpose()?
@@ -493,7 +493,7 @@ impl PgCorpusStore {
             .transpose()?;
         let row=sqlx::query("SELECT j.id,j.revision_id,j.expected_version,j.attempts,j.effective_date,j.install_head,j.source_metadata,o.identity,o.version AS object_version,j.object_key FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE NOT o.withdrawn AND (NOT j.install_head OR j.revision_id=o.desired_head_revision) AND (($2::uuid IS NULL AND j.explicit_request_id IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit') OR (j.id=$2 AND j.source_metadata->>'collection_origin'='explicit')) AND ($3::text IS NULL OR o.identity->>'dataset'=$3) AND (($4::uuid IS NULL AND j.explicit_request_id IS NULL) OR (j.explicit_request_id=$4 AND EXISTS(SELECT 1 FROM openlegal.collection_request owner WHERE owner.id=$4 AND owner.status IN ('launching','running') AND owner.lease_until>$1::bigint))) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>$1::text::numeric) AND j.attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) AND (j.status='pending' OR (j.status='running' AND j.lease_until<=$1::text::numeric)) ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED").bind(now.to_string()).bind(explicit_id).bind(dataset_name).bind(explicit_owner).fetch_optional(&mut *tx).await.map_err(db)?;
         let Some(row) = row else {
-            tx.commit().await.map_err(db)?;
+            commit_storage(tx, "claim_job_inner").await?;
             return Ok(None);
         };
         let id: Uuid = row.try_get("id").map_err(db)?;
@@ -520,7 +520,7 @@ impl PgCorpusStore {
                 .try_into()
                 .map_err(corrupt)?,
         };
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "claim_job_inner").await?;
         Ok(Some(job))
 
             }
@@ -561,7 +561,7 @@ impl PgCorpusStore {
         if !object.dataset.has_provider_revisions() {
             return Err(DatabaseError::UnsupportedHistory);
         }
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "record_revision_catalog").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
@@ -581,7 +581,7 @@ impl PgCorpusStore {
             sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,publication_date,effective_date,last_sequence,captured_at) SELECT $1,$2,$3,$4,next_capture,NULL FROM openlegal.corpus_object WHERE object_key=$1 ON CONFLICT(object_key,revision_id) DO UPDATE SET publication_date=COALESCE(EXCLUDED.publication_date,openlegal.corpus_revision.publication_date),effective_date=COALESCE(EXCLUDED.effective_date,openlegal.corpus_revision.effective_date)").bind(&k).bind(revision_id).bind(publication_date).bind(effective_date).execute(&mut *tx).await.map_err(db)?;
             sqlx::query("UPDATE openlegal.corpus_object SET catalog_version=catalog_version+1,next_capture=next_capture+$2 WHERE object_key=$1").bind(k).bind(i64::from(inserted)).execute(&mut *tx).await.map_err(db)?;
         }
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "record_revision_catalog").await?;
         Ok(())
 
             }
@@ -671,7 +671,7 @@ impl PgCorpusStore {
         let cooldown = 5_i64.pow(job.attempts.min(3));
         retry_storage(&CancellationToken::new(), "detail.storage_cooldown", || async {
             self.gate().await?;
-            let mut tx = self.pool.begin().await.map_err(db)?;
+            let mut tx = begin_storage(&self.pool, "defer_storage_claim").await?;
             sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
                 .fetch_one(&mut *tx).await.map_err(db)?;
             let changed = sqlx::query("UPDATE openlegal.corpus_job j SET status=CASE WHEN j.attempts>=b.max_job_attempts THEN 'failed' ELSE 'running' END,lease_until=CASE WHEN j.attempts>=b.max_job_attempts THEN NULL ELSE floor(extract(epoch from clock_timestamp()))::bigint+$4 END,error_category='processing_failed',completed_at=CASE WHEN j.attempts>=b.max_job_attempts THEN floor(extract(epoch from clock_timestamp()))::bigint ELSE NULL END FROM openlegal.provider_request_budget b WHERE b.singleton AND j.id=$1 AND j.expected_version=$2 AND j.attempts=$3 AND j.status='running' AND j.error_category IS NULL AND j.lease_until>floor(extract(epoch from clock_timestamp()))::bigint AND EXISTS(SELECT 1 FROM openlegal.corpus_object o WHERE o.object_key=j.object_key AND o.version=j.expected_version AND NOT o.withdrawn)")
@@ -817,7 +817,7 @@ impl PgCorpusStore {
     ) -> Result<(), DatabaseError> {
         self.gate().await?;
         let k = key(object)?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "withdraw").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
@@ -838,7 +838,7 @@ impl PgCorpusStore {
             .execute(&mut *tx)
             .await
             .map_err(db)?;
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "withdraw").await?;
         Ok(())
     }
     pub async fn watermark(&self) -> Result<u64, DatabaseError> {
@@ -1089,7 +1089,7 @@ impl PgCorpusStore {
         {
             return Err(DatabaseError::InvalidInput);
         }
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "pin_session").await?;
         let watermark: i64 = sqlx::query_scalar(
             "SELECT next_event-1 FROM openlegal.corpus_control WHERE singleton FOR UPDATE",
         )
@@ -1154,7 +1154,7 @@ impl PgCorpusStore {
                 .await
                 .map_err(db)?;
         }
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "pin_session").await?;
         Ok(())
     }
     pub async fn check_session(&self, id: &str, now: u64) -> Result<(), DatabaseError> {
@@ -1192,38 +1192,49 @@ impl PgCorpusStore {
     ) -> Result<usize, DatabaseError> {
         self.gate().await?;
         retry_storage(&CancellationToken::new(), "maintenance.cleanup", || async {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "maintain").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
             .map_err(db)?;
-        sqlx::query("DELETE FROM openlegal.corpus_session WHERE expires_at<=$1::text::numeric OR invalidated").bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
-        sqlx::query("DELETE FROM openlegal.corpus_citation_lease l WHERE l.expires_at<=$1::text::numeric OR EXISTS(SELECT 1 FROM openlegal.corpus_capture c JOIN openlegal.corpus_object o USING(object_key) WHERE c.id=l.capture_id AND o.withdrawn)")
-            .bind(now.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
-        // A pending deletion must never remove still-referenced archive bytes,
-        // including queues left by a previous release.
-        sqlx::query("DELETE FROM openlegal.corpus_blob_deletion d WHERE EXISTS(SELECT 1 FROM openlegal.corpus_capture c WHERE c.storage_key=d.storage_key) OR EXISTS(SELECT 1 FROM openlegal.corpus_capture_blob b WHERE b.storage_key=d.storage_key) OR EXISTS(SELECT 1 FROM openlegal.corpus_source_observation s WHERE s.storage_key=d.storage_key)")
+        // Each category is bounded separately. The shared control lock stays
+        // first; row locks and expiry/reference checks retain their fences.
+        let expired_sessions = sqlx::query("WITH candidates AS MATERIALIZED (SELECT id FROM openlegal.corpus_session WHERE expires_at<=$1::text::numeric ORDER BY expires_at,id LIMIT 128 FOR UPDATE SKIP LOCKED) DELETE FROM openlegal.corpus_session s USING candidates c WHERE s.id=c.id AND s.expires_at<=$1::text::numeric")
+            .bind(now.to_string()).execute(&mut *tx).await.map_err(db)?.rows_affected();
+        sqlx::query("WITH candidates AS MATERIALIZED (SELECT id FROM openlegal.corpus_session WHERE invalidated ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED) DELETE FROM openlegal.corpus_session s USING candidates c WHERE s.id=c.id AND s.invalidated")
+            .bind(128_u64.saturating_sub(expired_sessions) as i64).execute(&mut *tx).await.map_err(db)?;
+        let expired_citations = sqlx::query("WITH candidates AS MATERIALIZED (SELECT capture_id FROM openlegal.corpus_citation_lease WHERE expires_at<=$1::text::numeric ORDER BY expires_at,capture_id LIMIT 128 FOR UPDATE SKIP LOCKED) DELETE FROM openlegal.corpus_citation_lease l USING candidates c WHERE l.capture_id=c.capture_id AND l.expires_at<=$1::text::numeric")
+            .bind(now.to_string()).execute(&mut *tx).await.map_err(db)?.rows_affected();
+        sqlx::query("WITH candidates AS MATERIALIZED (SELECT l.capture_id FROM openlegal.corpus_citation_lease l JOIN openlegal.corpus_capture c ON c.id=l.capture_id JOIN openlegal.corpus_object o USING(object_key) WHERE o.withdrawn ORDER BY l.capture_id LIMIT $1 FOR UPDATE OF l SKIP LOCKED) DELETE FROM openlegal.corpus_citation_lease l USING candidates c WHERE l.capture_id=c.capture_id AND EXISTS(SELECT 1 FROM openlegal.corpus_capture v JOIN openlegal.corpus_object o USING(object_key) WHERE v.id=l.capture_id AND o.withdrawn)")
+            .bind(128_u64.saturating_sub(expired_citations) as i64).execute(&mut *tx).await.map_err(db)?;
+        // Remove stale deletion intents only after proving archive references.
+        sqlx::query("WITH candidates AS MATERIALIZED (SELECT d.storage_key FROM openlegal.corpus_blob_deletion d WHERE EXISTS(SELECT 1 FROM openlegal.corpus_capture c WHERE c.storage_key=d.storage_key) OR EXISTS(SELECT 1 FROM openlegal.corpus_capture_blob b WHERE b.storage_key=d.storage_key) OR EXISTS(SELECT 1 FROM openlegal.corpus_source_observation s WHERE s.storage_key=d.storage_key) ORDER BY d.storage_key LIMIT 128 FOR UPDATE OF d SKIP LOCKED) DELETE FROM openlegal.corpus_blob_deletion d USING candidates c WHERE d.storage_key=c.storage_key AND (EXISTS(SELECT 1 FROM openlegal.corpus_capture v WHERE v.storage_key=d.storage_key) OR EXISTS(SELECT 1 FROM openlegal.corpus_capture_blob b WHERE b.storage_key=d.storage_key) OR EXISTS(SELECT 1 FROM openlegal.corpus_source_observation s WHERE s.storage_key=d.storage_key))")
             .execute(&mut *tx).await.map_err(db)?;
-        let stages=sqlx::query("SELECT * FROM openlegal.corpus_staging WHERE created_at<$1::text::numeric ORDER BY created_at LIMIT 128 FOR UPDATE").bind(now.saturating_sub(3600).to_string()).fetch_all(&mut *tx).await.map_err(db)?;
-        for row in stages {
-            let location: String = row.try_get("storage_key").map_err(db)?;
-            let size: i64 = row.try_get("raw_size").map_err(db)?;
-            sqlx::query("INSERT INTO openlegal.corpus_blob_deletion VALUES($1,$2,$3) ON CONFLICT DO NOTHING").bind(&location).bind(row.try_get::<Vec<u8>,_>("raw_sha256").map_err(db)?).bind(row.try_get::<i64,_>("raw_size").map_err(db)?).execute(&mut *tx).await.map_err(db)?;
-            sqlx::query("DELETE FROM openlegal.corpus_staging WHERE storage_key=$1")
-                .bind(&location)
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
-            sqlx::query("UPDATE openlegal.corpus_control SET staged_bytes=staged_bytes-$1")
-                .bind(size)
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
+        let held: bool = sqlx::query_scalar("SELECT openlegal_admin.provider_held()")
+            .fetch_one(&mut *tx).await.map_err(db)?;
+        if !held {
+        sqlx::query("WITH candidates AS MATERIALIZED (SELECT id FROM openlegal.corpus_job WHERE attempts>=(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) AND (status='pending' OR (status='running' AND lease_until<=$1::text::numeric)) ORDER BY created_at,id LIMIT 128 FOR UPDATE SKIP LOCKED) UPDATE openlegal.corpus_job j SET status='failed',error_category='attempts_exhausted',completed_at=$1::text::numeric FROM candidates c WHERE j.id=c.id AND j.attempts>=(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) AND (j.status='pending' OR (j.status='running' AND j.lease_until<=$1::text::numeric))")
+            .bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         }
-        tx.commit().await.map_err(db)?;
+        let stages=sqlx::query("SELECT storage_key,raw_size FROM openlegal.corpus_staging WHERE created_at<$1::text::numeric ORDER BY created_at,storage_key LIMIT 128 FOR UPDATE SKIP LOCKED")
+            .bind(now.saturating_sub(3600).to_string()).fetch_all(&mut *tx).await.map_err(db)?;
+        let mut locations = Vec::with_capacity(stages.len());
+        let mut staged_size = 0_i64;
+        for row in stages {
+            locations.push(row.try_get::<String,_>("storage_key").map_err(db)?);
+            let size: i64 = row.try_get("raw_size").map_err(db)?;
+            if size < 0 { return Err(DatabaseError::StorageCorrupt); }
+            staged_size = staged_size.checked_add(size).ok_or(DatabaseError::StorageCorrupt)?;
+        }
+        if !locations.is_empty() {
+            sqlx::query("INSERT INTO openlegal.corpus_blob_deletion(storage_key,raw_sha256,raw_size) SELECT storage_key,raw_sha256,raw_size FROM openlegal.corpus_staging WHERE storage_key=ANY($1::text[]) ON CONFLICT DO NOTHING")
+                .bind(&locations).execute(&mut *tx).await.map_err(db)?;
+            sqlx::query("DELETE FROM openlegal.corpus_staging WHERE storage_key=ANY($1::text[])")
+                .bind(&locations).execute(&mut *tx).await.map_err(db)?;
+            sqlx::query("UPDATE openlegal.corpus_control SET staged_bytes=staged_bytes-$1")
+                .bind(staged_size).execute(&mut *tx).await.map_err(db)?;
+        }
+        commit_storage(tx, "maintain").await?;
             Ok(())
         }).await?;
         let deletions = retry_storage(&CancellationToken::new(), "maintenance.deletion_queue", || async {

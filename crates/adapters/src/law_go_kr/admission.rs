@@ -15,25 +15,80 @@ use uuid::Uuid;
 // Distinct from the corpus runtime and cache maintenance advisory-lock keys.
 const PROVIDER_LOCK: (i32, i32) = (1869376611, 1818326864);
 
-fn storage(_: sqlx::Error) -> DatabaseError {
+fn storage(error: sqlx::Error) -> DatabaseError {
+    let sqlstate = error.as_database_error().and_then(|error| error.code());
+    let error_kind = if sqlstate.is_some() {
+        "database"
+    } else if matches!(error, sqlx::Error::PoolTimedOut) {
+        "pool_timeout"
+    } else {
+        "connection_or_protocol"
+    };
+    tracing::warn!(
+        sqlstate = sqlstate.as_deref().unwrap_or(""),
+        error_kind,
+        "LAW storage operation failed; outcome is not replayable"
+    );
     DatabaseError::StorageUnavailable
 }
 
-/// Retry only the first budget-row lock, before this transaction changes any
-/// admission state. A savepoint rollback must be acknowledged before another
-/// SELECT; the outer transaction and an existing response's session lock stay
-/// owned. Neither reservation effects nor settlement COMMIT are replayed.
+/// No statement or provider request has been submitted on this acquisition.
+fn acquire_error(error: sqlx::Error) -> DatabaseError {
+    if matches!(error, sqlx::Error::PoolTimedOut) {
+        tracing::warn!(
+            phase = "pool_acquire",
+            error_kind = "pool_timeout",
+            commit_started = false,
+            "LAW admission yielded before SQL submission"
+        );
+        DatabaseError::StorageContended
+    } else {
+        storage(error)
+    }
+}
+
+async fn commit_budget(
+    tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    operation: &'static str,
+) -> Result<(), DatabaseError> {
+    let started = tokio::time::Instant::now();
+    tracing::debug!(
+        operation,
+        phase = "commit",
+        commit_started = true,
+        "LAW admission COMMIT started"
+    );
+    tx.commit().await.map_err(|error| {
+        tracing::warn!(
+            operation,
+            phase = "commit",
+            commit_started = true,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "LAW admission COMMIT was not acknowledged"
+        );
+        storage(error)
+    })
+}
+
+/// Retry only the first budget-row lock, before any admission mutation.
+/// PostgreSQL ROLLBACK AND CHAIN acknowledges the entire failed transaction and
+/// starts a fresh one on the same session. The SQLx wrapper still owns depth one;
+/// its commit/rollback/drop finishes the newly chained transaction. Session-level
+/// response ownership survives the chain, while transaction_timeout starts afresh.
+/// No reservation effects, settlement mutation or COMMIT are replayed.
 async fn lock_budget(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     operation: &'static str,
     cancel: Option<&CancellationToken>,
+    before_http: bool,
 ) -> Result<PgRow, DatabaseError> {
     const DELAYS: [Duration; 3] = [
         Duration::from_millis(100),
         Duration::from_millis(200),
         Duration::from_millis(400),
     ];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(10);
     for (attempt, delay) in DELAYS
         .into_iter()
         .map(Some)
@@ -44,32 +99,47 @@ async fn lock_budget(
             return Err(DatabaseError::Cancelled);
         }
         let result = tokio::time::timeout_at(deadline, async {
-            let mut savepoint = sqlx::Acquire::begin(&mut *tx).await.map_err(storage)?;
             match sqlx::query("SELECT *,floor(extract(epoch from clock_timestamp())*1000)::bigint AS now_ms FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE")
-                .fetch_one(&mut *savepoint).await
+                .fetch_one(&mut **tx).await
             {
-                Ok(row) => {
-                    savepoint.commit().await.map_err(storage)?;
-                    Ok(Some(row))
-                }
+                Ok(row) => Ok(Some(row)),
                 Err(error) if error.as_database_error().is_some_and(|error| error.code().as_deref() == Some("55P03")) => {
-                    savepoint.rollback().await.map_err(storage)?;
-                    tracing::warn!(operation, attempt = attempt + 1, sqlstate = "55P03",
-                        "provider budget lock rejected; savepoint rollback acknowledged");
+                    sqlx::query("ROLLBACK AND CHAIN").execute(&mut **tx).await.map_err(|error| {
+                        tracing::warn!(operation, phase = "rollback_chain", attempt = attempt + 1,
+                            commit_started = false, elapsed_ms = started.elapsed().as_millis() as u64,
+                            "LAW first-lock outer rollback was not acknowledged");
+                        storage(error)
+                    })?;
+                    tracing::warn!(operation, phase = "first_budget_lock", attempt = attempt + 1,
+                        sqlstate = "55P03", error_kind = "lock_rejected", commit_started = false,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "provider budget lock rejected; outer rollback and fresh transaction acknowledged");
                     Ok(None)
                 }
                 Err(error) => Err(storage(error)),
             }
-        }).await.map_err(|_| DatabaseError::StorageUnavailable)??;
+        }).await.map_err(|_| {
+            tracing::warn!(operation, phase = "first_budget_lock", error_kind = "local_deadline",
+                commit_started = false, elapsed_ms = started.elapsed().as_millis() as u64,
+                "LAW first-lock outcome was interrupted locally");
+            DatabaseError::StorageUnavailable
+        })??;
         if let Some(row) = result {
             return Ok(row);
         }
+        let exhausted = || {
+            if before_http {
+                DatabaseError::StorageContended
+            } else {
+                DatabaseError::StorageUnavailable
+            }
+        };
         let Some(delay) = delay else {
-            return Err(DatabaseError::StorageUnavailable);
+            return Err(exhausted());
         };
         let wake = tokio::time::Instant::now() + delay;
         if wake >= deadline {
-            return Err(DatabaseError::StorageUnavailable);
+            return Err(exhausted());
         }
         if let Some(cancel) = cancel {
             tokio::select! {
@@ -115,10 +185,11 @@ impl ProviderRequestGuard {
         self.settle(Some(delay)).await?;
         self.release().await
     }
+    #[tracing::instrument(skip_all, fields(operation = "settle_response"))]
     async fn settle(&mut self, delay: Option<u64>) -> Result<(), DatabaseError> {
         let connection = self.connection.as_mut().ok_or(DatabaseError::Conflict)?;
         let mut tx = connection.begin().await.map_err(storage)?;
-        lock_budget(&mut tx, "settle_response", None).await?;
+        lock_budget(&mut tx, "settle_response", None, false).await?;
         let changed =
             sqlx::query("DELETE FROM openlegal.provider_request_admission WHERE owner=$1")
                 .bind(self.owner)
@@ -136,7 +207,7 @@ impl ProviderRequestGuard {
             sqlx::query("UPDATE openlegal.provider_request_budget SET next_allowed_at=GREATEST(next_allowed_at,floor(extract(epoch from clock_timestamp()))::bigint+$1),operator_suspended=operator_suspended OR $2 WHERE singleton")
                 .bind(delay).bind(delay > 7 * 86400).execute(&mut *tx).await.map_err(storage)?;
         }
-        tx.commit().await.map_err(storage)
+        commit_budget(tx, "settle_response").await
     }
     /// Rejection can be discovered after HTTP settlement, during parsing. Its
     /// original owner token cannot clear another concurrent request's evidence.
@@ -170,12 +241,13 @@ impl ProviderRequestGuard {
     }
 }
 
+#[tracing::instrument(skip_all, fields(operation = "suspend_response"))]
 pub(super) async fn suspend_owned_response(
     pool: &PgPool,
     owner: Uuid,
 ) -> Result<(), DatabaseError> {
     let mut tx = pool.begin().await.map_err(storage)?;
-    lock_budget(&mut tx, "suspend_response", None).await?;
+    lock_budget(&mut tx, "suspend_response", None, false).await?;
     sqlx::query(
         "UPDATE openlegal.provider_request_budget SET operator_suspended=true WHERE singleton",
     )
@@ -191,7 +263,7 @@ pub(super) async fn suspend_owned_response(
         .execute(&mut *tx)
         .await
         .map_err(storage)?;
-    tx.commit().await.map_err(storage)
+    commit_budget(tx, "suspend_response").await
 }
 
 /// Detect every abandoned slot, including slots above a newly lowered limit.
@@ -236,14 +308,16 @@ pub struct ProviderDeferral {
     pub fingerprint: Option<openlegal_domain::provider_admin::ProviderBlockerFingerprint>,
 }
 
+#[tracing::instrument(skip_all, fields(operation = "admission_deferral"))]
 pub(super) async fn deferral_snapshot(
     pool: &PgPool,
     mode: RequestBudgetMode,
     operation_exhausted: bool,
     locally_suspended: bool,
 ) -> Result<ProviderDeferral, DatabaseError> {
-    let mut tx = pool.begin().await.map_err(storage)?;
-    let row = lock_budget(&mut tx, "admission_deferral", None).await?;
+    let mut connection = pool.acquire().await.map_err(acquire_error)?;
+    let mut tx = connection.begin().await.map_err(storage)?;
+    let row = lock_budget(&mut tx, "admission_deferral", None, true).await?;
     // Read time after acquiring the row lock. Waiting for settlement must not
     // produce an ETA from a stale clock or pair it with a different policy row.
     let now: i64 =
@@ -317,7 +391,7 @@ pub(super) async fn deferral_snapshot(
     } else {
         None
     };
-    tx.commit().await.map_err(storage)?;
+    commit_budget(tx, "admission_deferral").await?;
     Ok(ProviderDeferral {
         reason,
         fingerprint,
@@ -333,9 +407,11 @@ async fn demand_waiting(
         .bind(now).fetch_one(&mut **tx).await.map_err(storage)
 }
 
+#[tracing::instrument(skip_all, fields(operation = "provider_idle"))]
 pub(super) async fn idle(pool: &PgPool, mode: RequestBudgetMode) -> Result<bool, DatabaseError> {
-    let mut tx = pool.begin().await.map_err(storage)?;
-    let row = lock_budget(&mut tx, "provider_idle", None).await?;
+    let mut connection = pool.acquire().await.map_err(acquire_error)?;
+    let mut tx = connection.begin().await.map_err(storage)?;
+    let row = lock_budget(&mut tx, "provider_idle", None, true).await?;
     let now_ms: i64 = row.try_get("now_ms").map_err(storage)?;
     let now = now_ms / 1000;
     let daily_available = |name: &str, used: &str| -> Result<bool, DatabaseError> {
@@ -384,7 +460,7 @@ pub(super) async fn idle(pool: &PgPool, mode: RequestBudgetMode) -> Result<bool,
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
-        tx.commit().await.map_err(storage)?;
+        commit_budget(tx, "provider_idle").await?;
         return Ok(false);
     }
     let last: Option<String> = row.try_get("last_admission_mode").map_err(storage)?;
@@ -435,13 +511,15 @@ impl ForegroundTicket {
     pub(super) async fn open(pool: &PgPool) -> Result<Self, DatabaseError> {
         Self::open_mode(pool, "on_demand").await
     }
+    #[tracing::instrument(skip_all, fields(operation = "open_demand_ticket"))]
     async fn open_mode(pool: &PgPool, mode: &str) -> Result<Self, DatabaseError> {
-        let mut tx = pool.begin().await.map_err(storage)?;
+        let mut connection = pool.acquire().await.map_err(acquire_error)?;
+        let mut tx = connection.begin().await.map_err(storage)?;
+        lock_budget(&mut tx, "open_demand_ticket", None, true).await?;
         let owner: Uuid = sqlx::query_scalar("SELECT pg_catalog.uuidv7()")
             .fetch_one(&mut *tx)
             .await
             .map_err(storage)?;
-        lock_budget(&mut tx, "open_demand_ticket", None).await?;
         sqlx::query("DELETE FROM openlegal.provider_demand_ticket WHERE lease_until<=floor(extract(epoch from clock_timestamp()))::bigint")
             .execute(&mut *tx).await.map_err(storage)?;
         let count: i64 =
@@ -458,7 +536,7 @@ impl ForegroundTicket {
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
-        tx.commit().await.map_err(storage)?;
+        commit_budget(tx, "open_demand_ticket").await?;
         let stop = CancellationToken::new();
         let failed = CancellationToken::new();
         let token = stop.clone();
@@ -550,7 +628,7 @@ pub(super) async fn reserve(
         }
         let connection = tokio::select! {
             _ = cancel.cancelled() => return Err(DatabaseError::Cancelled),
-            result = pool.acquire() => result.map_err(storage)?,
+            result = pool.acquire() => result.map_err(acquire_error)?,
         };
         // Detach before acquiring any session lock: a cancelled query may have
         // acquired its lock, so this connection must never return to the pool.
@@ -618,6 +696,7 @@ async fn wait_change(
     }
 }
 
+#[tracing::instrument(skip_all, fields(operation = "reserve_request"))]
 async fn reserve_locked(
     connection: &mut PgConnection,
     mode: RequestBudgetMode,
@@ -628,7 +707,7 @@ async fn reserve_locked(
     cancel: &CancellationToken,
 ) -> Result<Decision, DatabaseError> {
     let mut tx = connection.begin().await.map_err(storage)?;
-    let row = lock_budget(&mut tx, "reserve_request", Some(cancel)).await?;
+    let row = lock_budget(&mut tx, "reserve_request", Some(cancel), true).await?;
     let number = |name| row.try_get::<i64, _>(name).map_err(storage);
     let now_ms: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp())*1000)::bigint")
@@ -691,7 +770,7 @@ async fn reserve_locked(
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
-        tx.commit().await.map_err(storage)?;
+        commit_budget(tx, "reserve_request").await?;
         return Err(DatabaseError::BudgetExhausted);
     }
     let capacity: i32 = row.try_get("max_in_flight").map_err(storage)?;
@@ -700,7 +779,7 @@ async fn reserve_locked(
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
-        tx.commit().await.map_err(storage)?;
+        commit_budget(tx, "reserve_request").await?;
         return Err(DatabaseError::BudgetExhausted);
     };
     if active >= capacity as usize {
@@ -812,7 +891,7 @@ async fn reserve_locked(
         if let Some(observer) = reservation_observer {
             observer.store(true, Ordering::Release);
         }
-        tx.commit().await.map_err(storage)
+        commit_budget(tx, "reserve_request").await
     }.await;
     // A failed acknowledgement is uncertain, so do not refund an attempt
     // that may have committed. Fail-closed durable evidence remains the fence.

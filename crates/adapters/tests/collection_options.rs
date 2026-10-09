@@ -484,6 +484,15 @@ async fn lower_retry_limit_exhausts_pending_work_without_truncating_active_claim
             .fetch_all(&pool)
             .await
             .unwrap();
+    assert_eq!(statuses, vec!["running", "pending"]);
+    // Claims exclude exhausted work; bounded maintenance retires it while
+    // preserving the active claim's original lease and attempt.
+    store.maintain(103, 0).await.unwrap();
+    let statuses: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM openlegal.corpus_job ORDER BY created_at")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(statuses, vec!["running", "failed"]);
     store.fail_claim(&active, true).await.unwrap();
     sqlx::query("UPDATE openlegal.provider_request_budget SET max_job_attempts=10 WHERE singleton")

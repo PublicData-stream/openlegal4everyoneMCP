@@ -34,7 +34,7 @@ impl PgCorpusStore {
             return Ok(());
         }
         self.gate().await?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "renew_citation_leases").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await

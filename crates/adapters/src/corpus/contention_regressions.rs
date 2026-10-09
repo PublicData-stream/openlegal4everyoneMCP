@@ -768,3 +768,120 @@ async fn retained_observation_commit_ack_loss_preserves_one_blob_and_one_observa
     drop(proxy);
     base.close().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn maintenance_batches_exhausted_jobs_and_temporary_rows_without_touching_archive() {
+    let (_fixture, base, store) = setup().await;
+    let obj = object("bounded-maintenance");
+    let capture = store
+        .publish(
+            publication(obj.clone(), 0, None, 1),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let object_key = key(&obj).unwrap();
+    let pool = base.pool();
+    sqlx::query("INSERT INTO openlegal.corpus_job(object_key,revision_id,expected_version,status,created_at,install_head,attempts) SELECT $1,'done-'||g,0,'done',1,false,0 FROM generate_series(1,20000) g")
+        .bind(&object_key).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO openlegal.corpus_job(object_key,revision_id,expected_version,status,created_at,install_head,attempts) SELECT $1,'exhausted-'||g,0,'pending',2,false,(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) FROM generate_series(1,300) g")
+        .bind(&object_key).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO openlegal.corpus_session(id,generation,expires_at,invalidated) SELECT md5('expired-'||g)||md5('expired-'||g),0,1,false FROM generate_series(1,300) g")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO openlegal.corpus_session(id,generation,expires_at,invalidated) SELECT md5('invalid-'||g)||md5('invalid-'||g),0,10000,true FROM generate_series(1,300) g")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO openlegal.corpus_staging(storage_key,raw_sha256,raw_size,created_at) SELECT 'aa/'||repeat('a',64)||'-00000000-0000-0000-0000-'||lpad(g::text,12,'0'),decode(repeat('a',64),'hex'),1,1 FROM generate_series(1,300) g")
+        .execute(&pool).await.unwrap();
+    sqlx::query("UPDATE openlegal.corpus_control SET staged_bytes=300 WHERE singleton")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(store.claim_job(5000).await.unwrap().is_none());
+    let pending: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_job WHERE status='pending'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        pending, 300,
+        "claim does not update the entire exhausted backlog"
+    );
+    // Operator recovery holds preserve the candidate job set.
+    sqlx::query("UPDATE openlegal_admin.provider_control SET recovery_hold=true WHERE singleton")
+        .execute(&pool)
+        .await
+        .unwrap();
+    store.maintain(100, 0).await.unwrap();
+    let held_pending: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_job WHERE status='pending'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(held_pending, 300);
+    sqlx::query("UPDATE openlegal_admin.provider_control SET recovery_hold=false WHERE singleton")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The held cleanup removed the first 128 expired sessions, leaving a total
+    // session limit of 128 per call across expiry and invalidation categories.
+    for (expected, expired, invalidated) in [
+        (172_i64, 44_i64, 300_i64),
+        (44, 0, 216),
+        (0, 0, 88),
+        (0, 0, 0),
+    ] {
+        store.maintain(5000, 0).await.unwrap();
+        let counts: (i64,i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM openlegal.corpus_job WHERE status='pending'),(SELECT count(*) FROM openlegal.corpus_session WHERE NOT invalidated),(SELECT count(*) FROM openlegal.corpus_session WHERE invalidated),(SELECT count(*) FROM openlegal.corpus_staging)")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(counts, (expected, expired, invalidated, expected));
+        let accounting: i64 =
+            sqlx::query_scalar("SELECT staged_bytes FROM openlegal.corpus_control WHERE singleton")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(accounting, expected);
+        let retained = store
+            .capture(&capture.capture_id, 5000, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&retained).unwrap(),
+            serde_json::to_value(&capture).unwrap()
+        );
+    }
+    let done: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_job WHERE status='done'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(done, 20000);
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn pool_acquisition_timeout_before_begin_yields_without_sql_or_commit() {
+    let (_fixture, base, _) = setup().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(50))
+        .connect_with((*base.pool().connect_options()).clone())
+        .await
+        .unwrap();
+    let owner = pool.acquire().await.unwrap();
+    assert!(matches!(
+        begin_storage(&pool, "fixture_acquire").await,
+        Err(DatabaseError::StorageContended)
+    ));
+    drop(owner);
+    let mut tx = begin_storage(&pool, "fixture_acquire").await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_job")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    tx.commit().await.unwrap();
+    pool.close().await;
+    base.close().await.unwrap();
+}

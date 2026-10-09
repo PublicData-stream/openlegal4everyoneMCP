@@ -155,13 +155,28 @@ unknown outcome and remains a storage failure; it is never treated as a proven
 rollback. Cancellation interrupts retry backoff and is checked before commits.
 
 LAW admission retries a narrower boundary: its first provider-budget row-lock
-query may retry a PostgreSQL-confirmed lock timeout (`55P03`) only after a
-savepoint rollback succeeds. Four attempts, 100/200/400 ms delays and a ten-second
-bound apply while the original transaction and any response-owner session remain
-intact. No provider HTTP, slot reservation, allowance debit, settlement mutation
-or COMMIT is replayed. Exhaustion, rollback failure, transport failure and local
+query may retry a PostgreSQL-confirmed lock timeout (`55P03`) only after
+`ROLLBACK AND CHAIN` acknowledges the entire transaction rollback and starts a
+fresh outer transaction on the same session. Four attempts, 100/200/400 ms delays
+and a ten-second bound apply; each new transaction receives the configured
+transaction timeout afresh. The SQLx transaction wrapper continues owning the
+same depth-one session, including any response-owner advisory lock. No provider
+HTTP, slot reservation, allowance debit, uncertainty observation, settlement
+mutation or COMMIT is replayed. Before HTTP, confirmed lock-rejection exhaustion
+or a pool-acquisition timeout before SQL submission yields storage contention.
+Settlement/suspension exhaustion, rollback failure, transport failure and local
 deadline interruption remain fatal storage failures, preserving uncertain-owner
-evidence for operator review.
+evidence for operator review. Sanitized phase diagnostics distinguish acquisition,
+first-lock rollback and COMMIT without logging query arguments or response bodies.
+
+Corpus transaction acquisition yields on a pool timeout only before BEGIN is
+submitted. Shared control ownership remains first for claims, publication and
+maintenance. Exhausted jobs are retired by maintenance in batches of at most 128,
+with no job retirement during an operator recovery hold. Sessions, citation leases,
+staging and referenced deletion intents are also cleaned in bounded batches;
+expiry and invalidation share each category's 128-row limit. Immutable publication
+payload preparation precedes the control lock; publication timestamps, sequence,
+checksums and event/commit ordering retain their existing meaning.
 
 Publication and original-observation retries preserve prepared inputs and physical
 staging generations. A retry does not repeat completed HTTP or blob writes.

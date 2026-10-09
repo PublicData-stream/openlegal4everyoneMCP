@@ -12,6 +12,54 @@ const DELAYS: [Duration; 3] = [
 ];
 const DEADLINE: Duration = Duration::from_secs(10);
 
+/// SQLx Pool::begin reports PoolTimedOut only from acquiring a connection,
+/// before BEGIN is sent. Keep this classification local to that boundary;
+/// connection errors or an interrupted BEGIN still have uncertain outcomes.
+pub(super) async fn begin_storage(
+    pool: &sqlx::PgPool,
+    operation: &'static str,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, DatabaseError> {
+    let started = Instant::now();
+    pool.begin().await.map_err(|error| {
+        if matches!(error, sqlx::Error::PoolTimedOut) {
+            tracing::warn!(
+                operation,
+                subphase = "pool_acquire",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                pool_size = pool.size(),
+                pool_idle = pool.num_idle(),
+                "storage connection acquisition timed out before BEGIN"
+            );
+            DatabaseError::StorageContended
+        } else {
+            super::db(error)
+        }
+    })
+}
+
+pub(super) async fn commit_storage(
+    tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    operation: &'static str,
+) -> Result<(), DatabaseError> {
+    let started = Instant::now();
+    tracing::debug!(
+        operation,
+        subphase = "commit",
+        commit_started = true,
+        "corpus COMMIT started"
+    );
+    tx.commit().await.map_err(|error| {
+        tracing::warn!(
+            operation,
+            subphase = "commit",
+            commit_started = true,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "corpus COMMIT was not acknowledged"
+        );
+        super::db(error)
+    })
+}
+
 /// Call only for a complete SQL transaction or an independently replayable SQL
 /// statement. `StorageContended` means an explicit server rejection; transport
 /// errors and a locally interrupted in-flight SQL operation have unknown outcome.
@@ -38,7 +86,15 @@ where
         let result = match timeout_at(deadline, work().instrument(span)).await {
             Ok(result) => result,
             // Do not label a dropped COMMIT as a proven rollback or retry it.
-            Err(_) => return Err(DatabaseError::StorageUnavailable),
+            Err(_) => {
+                tracing::warn!(
+                    operation,
+                    attempt = attempt + 1,
+                    error_category = "local_deadline",
+                    "corpus SQL phase interrupted; outcome remains uncertain"
+                );
+                return Err(DatabaseError::StorageUnavailable);
+            }
         };
         match (result, delay) {
             (Err(DatabaseError::StorageContended), Some(delay)) => {

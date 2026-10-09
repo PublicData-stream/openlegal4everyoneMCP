@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub(super) mod storage_retry;
-use storage_retry::retry_storage;
+use storage_retry::{begin_storage, commit_storage, retry_storage};
 
 #[cfg(test)]
 mod contention_regressions;
@@ -61,6 +61,20 @@ fn db(error: sqlx::Error) -> DatabaseError {
         }
         DatabaseError::StorageContended
     } else {
+        let sqlstate = error.as_database_error().and_then(|error| error.code());
+        let error_category = if matches!(error, sqlx::Error::PoolTimedOut) {
+            "pool_timeout"
+        } else if sqlstate.is_some() {
+            "database"
+        } else {
+            "connection_or_protocol"
+        };
+        tracing::warn!(
+            operation = "corpus_sql",
+            sqlstate = sqlstate.as_deref().unwrap_or(""),
+            error_category,
+            "corpus storage failure; outcome is not replayable"
+        );
         DatabaseError::StorageUnavailable
     }
 }
@@ -776,7 +790,7 @@ impl PgCorpusStore {
             staged_blobs.push((location, d, raw.len() as i64));
         }
         retry_storage(&cancel, "publication_reserve", || async {
-        let mut reserve = self.pool.begin().await.map_err(db)?;
+        let mut reserve = begin_storage(&self.pool, "publish").await?;
         let counts=sqlx::query("SELECT raw_bytes,staged_bytes,max_raw_bytes::text,(SELECT count(*) FROM openlegal.corpus_staging) AS stages FROM openlegal.corpus_control WHERE singleton FOR UPDATE").fetch_one(&mut *reserve).await.map_err(db)?;
         let staged_bytes = counts.try_get::<i64, _>("staged_bytes").map_err(db)?;
         let reserved_bytes = counts
@@ -814,7 +828,7 @@ impl PgCorpusStore {
             .await
             .map_err(db)?;
         check(&cancel)?;
-        reserve.commit().await.map_err(db)?;
+        commit_storage(reserve, "publish").await?;
         Ok(())
         }).await?;
         for ((location, d, n), raw) in staged_blobs.iter().zip(inputs) {
@@ -832,10 +846,32 @@ impl PgCorpusStore {
                 .map_err(blob_error)?;
         }
         check(&cancel)?;
+        // Build immutable source and catalog payloads before taking the shared
+        // publication lock. Only database-assigned sequence and publication
+        // timestamps are stamped inside it; checksums keep the existing format.
+        let capture_id = hex(&bytes_hash(generation.as_bytes()));
+        let template = Capture {
+            capture_id: capture_id.clone(),
+            sequence: 0,
+            record: p.record.clone(),
+            retrieved_at: p.retrieved_at,
+            captured_at: 0,
+            validated_at: 0,
+            processor_version: p.processor_version.clone(),
+            raw_sha256: hex(&digest),
+        };
+        let prepared_capture = serde_json::to_value(&template).map_err(corrupt)?;
+        let mut metadata_template = template;
+        metadata_template.record.body.clear();
+        metadata_template.record.sections.clear();
+        let prepared_metadata = serde_json::to_value(&metadata_template).map_err(corrupt)?;
+        let prepared_identity = serde_json::to_value(&p.record.object).map_err(corrupt)?;
         // Retry only the rejected metadata transaction. Prepared evidence and
         // physical generations survive each rollback; HTTP and blobs are not replayed.
         retry_storage(&cancel, "publication_commit", || async {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut value = prepared_capture.clone();
+        let mut metadata = prepared_metadata.clone();
+        let mut tx = begin_storage(&self.pool, "publish").await?;
         // This shared short lock makes event sequence order commit order, avoiding
         // gaps being mistaken for a complete index watermark.
         let event: i64 = sqlx::query_scalar(
@@ -844,7 +880,7 @@ impl PgCorpusStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(db)?;
-        sqlx::query("INSERT INTO openlegal.corpus_object(object_key,identity) VALUES($1,$2) ON CONFLICT DO NOTHING").bind(&k).bind(serde_json::to_value(&p.record.object).map_err(corrupt)?).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("INSERT INTO openlegal.corpus_object(object_key,identity) VALUES($1,$2) ON CONFLICT DO NOTHING").bind(&k).bind(&prepared_identity).execute(&mut *tx).await.map_err(db)?;
         let object=sqlx::query("SELECT identity,version,next_capture,withdrawn,head_capture,validated_at::text FROM openlegal.corpus_object WHERE object_key=$1 FOR UPDATE").bind(&k).fetch_one(&mut *tx).await.map_err(db)?;
         if serde_json::from_value::<ObjectId>(object.try_get("identity").map_err(db)?)
             .map_err(corrupt)?
@@ -985,7 +1021,7 @@ impl PgCorpusStore {
                 .await?;
             }
             check(&cancel)?;
-            tx.commit().await.map_err(db)?;
+            commit_storage(tx, "publish").await?;
             if !attachment_incomplete {
                 old.validated_at = now;
             }
@@ -1009,26 +1045,16 @@ impl PgCorpusStore {
             .await
             .map_err(db)?;
         let sequence: i64 = object.try_get("next_capture").map_err(db)?;
-        let capture_id = hex(&bytes_hash(generation.as_bytes()));
-        let capture = Capture {
-            capture_id: capture_id.clone(),
-            sequence: sequence.try_into().map_err(corrupt)?,
-            record: p.record.clone(),
-            retrieved_at: p.retrieved_at,
-            captured_at: now,
-            validated_at: now,
-            processor_version: p.processor_version.clone(),
-            raw_sha256: hex(&digest),
-        };
-        let value = serde_json::to_value(&capture).map_err(corrupt)?;
-        let checksum = bytes_hash(&serde_json::to_vec(&value).map_err(corrupt)?);
-        sqlx::query("INSERT INTO openlegal.corpus_capture(id,object_key,revision_id,sequence,captured_at,publication_date,effective_date,payload,payload_sha256,raw_sha256,raw_size,storage_key,event_sequence) VALUES($1,$2,$3,$4,$5::text::numeric,$6,$7,$8,$9,$10,$11,$12,$13)").bind(&capture_id).bind(&k).bind(&capture.record.revision_id).bind(sequence).bind(now.to_string()).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(value).bind(checksum).bind(&digest).bind(size).bind(&storage_key).bind(event).execute(&mut *tx).await.map_err(db)?;
-        let mut metadata_capture = capture.clone();
-        metadata_capture.record.body.clear();
-        metadata_capture.record.sections.clear();
-        let metadata = serde_json::to_value(metadata_capture).map_err(corrupt)?;
-        let metadata_checksum = bytes_hash(&serde_json::to_vec(&metadata).map_err(corrupt)?);
-        sqlx::query("INSERT INTO openlegal.corpus_capture_catalog VALUES($1,$2,$3,$4,$5::text::numeric,$6,$7,$8,$9)").bind(&capture_id).bind(&k).bind(&capture.record.revision_id).bind(sequence).bind(now.to_string()).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(metadata).bind(metadata_checksum).execute(&mut *tx).await.map_err(db)?;
+        let sequence_number: u64 = sequence.try_into().map_err(corrupt)?;
+        for payload in [&mut value, &mut metadata] {
+            payload["sequence"] = sequence_number.into();
+            payload["captured_at"] = now.into();
+            payload["validated_at"] = now.into();
+        }
+        let checksum = json_hash(&value)?;
+        sqlx::query("INSERT INTO openlegal.corpus_capture(id,object_key,revision_id,sequence,captured_at,publication_date,effective_date,payload,payload_sha256,raw_sha256,raw_size,storage_key,event_sequence) VALUES($1,$2,$3,$4,$5::text::numeric,$6,$7,$8,$9,$10,$11,$12,$13)").bind(&capture_id).bind(&k).bind(&p.record.revision_id).bind(sequence).bind(now.to_string()).bind(&p.record.publication_date).bind(&p.record.effective_date).bind(value).bind(checksum).bind(&digest).bind(size).bind(&storage_key).bind(event).execute(&mut *tx).await.map_err(db)?;
+        let metadata_checksum = json_hash(&metadata)?;
+        sqlx::query("INSERT INTO openlegal.corpus_capture_catalog VALUES($1,$2,$3,$4,$5::text::numeric,$6,$7,$8,$9)").bind(&capture_id).bind(&k).bind(&p.record.revision_id).bind(sequence).bind(now.to_string()).bind(&p.record.publication_date).bind(&p.record.effective_date).bind(metadata).bind(metadata_checksum).execute(&mut *tx).await.map_err(db)?;
         for (ordinal, (location, d, n)) in staged_blobs.iter().enumerate().skip(1) {
             sqlx::query("INSERT INTO openlegal.corpus_capture_blob VALUES($1,$2,$3,$4,$5)")
                 .bind(&capture_id)
@@ -1041,12 +1067,12 @@ impl PgCorpusStore {
                 .map_err(db)?;
         }
         if !preserve_revision {
-            sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,publication_date,effective_date,last_sequence,captured_at,last_validated_at) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$7::text::numeric) ON CONFLICT(object_key,revision_id) DO UPDATE SET latest_capture=EXCLUDED.latest_capture,publication_date=EXCLUDED.publication_date,effective_date=EXCLUDED.effective_date,last_sequence=EXCLUDED.last_sequence,captured_at=EXCLUDED.captured_at,last_validated_at=EXCLUDED.last_validated_at").bind(&k).bind(&capture.record.revision_id).bind(&capture_id).bind(&capture.record.publication_date).bind(&capture.record.effective_date).bind(sequence).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
+            sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,publication_date,effective_date,last_sequence,captured_at,last_validated_at) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$7::text::numeric) ON CONFLICT(object_key,revision_id) DO UPDATE SET latest_capture=EXCLUDED.latest_capture,publication_date=EXCLUDED.publication_date,effective_date=EXCLUDED.effective_date,last_sequence=EXCLUDED.last_sequence,captured_at=EXCLUDED.captured_at,last_validated_at=EXCLUDED.last_validated_at").bind(&k).bind(&p.record.revision_id).bind(&capture_id).bind(&p.record.publication_date).bind(&p.record.effective_date).bind(sequence).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         }
         // A different desired revision keeps HEAD pending, so the old capture
         // cannot be served with a fresh claim after its replacement was seen.
         let clear_pending = publish_head || preserve_revision;
-        sqlx::query("UPDATE openlegal.corpus_object SET version=version+1,next_capture=next_capture+1,head_capture=CASE WHEN $2 THEN $3 ELSE head_capture END,validated_at=CASE WHEN $2 THEN $4::text::numeric ELSE validated_at END,pending=CASE WHEN $5 THEN false ELSE pending END,desired_head_revision=CASE WHEN $2 THEN $6 ELSE desired_head_revision END WHERE object_key=$1").bind(&k).bind(publish_head).bind(&capture_id).bind(now.to_string()).bind(clear_pending).bind(&capture.record.revision_id).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("UPDATE openlegal.corpus_object SET version=version+1,next_capture=next_capture+1,head_capture=CASE WHEN $2 THEN $3 ELSE head_capture END,validated_at=CASE WHEN $2 THEN $4::text::numeric ELSE validated_at END,pending=CASE WHEN $5 THEN false ELSE pending END,desired_head_revision=CASE WHEN $2 THEN $6 ELSE desired_head_revision END WHERE object_key=$1").bind(&k).bind(publish_head).bind(&capture_id).bind(now.to_string()).bind(clear_pending).bind(&p.record.revision_id).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("INSERT INTO openlegal.corpus_outbox SELECT next_event,$1,$2,$3,false,$4,false FROM openlegal.corpus_control").bind(&k).bind(version+1).bind(&capture_id).bind(publish_head).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_control SET next_event=next_event+1,raw_bytes=raw_bytes+$1,staged_bytes=staged_bytes-$1").bind(total_size as i64).execute(&mut *tx).await.map_err(db)?;
         for (location, _, _) in &staged_blobs {
@@ -1063,16 +1089,20 @@ impl PgCorpusStore {
         if update_job_gap {
             self.update_published_detail_gap(
                 &mut tx,
-                &capture.record.object,
-                &capture.record.revision_id,
+                &p.record.object,
+                &p.record.revision_id,
                 attachment_incomplete,
                 now,
             )
             .await?;
         }
         check(&cancel)?;
-        tx.commit().await.map_err(db)?;
-        Ok(capture)
+        commit_storage(tx, "publish").await?;
+        Ok(Capture {
+            capture_id: capture_id.clone(), sequence: sequence_number, record: p.record.clone(),
+            retrieved_at: p.retrieved_at, captured_at: now, validated_at: now,
+            processor_version: p.processor_version.clone(), raw_sha256: hex(&digest),
+        })
         }).await
     }
 }

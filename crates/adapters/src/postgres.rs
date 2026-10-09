@@ -314,6 +314,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0023_provider_operator_recovery.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            24,
+            "corpus work indexes".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0024_corpus_work_indexes.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

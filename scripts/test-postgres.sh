@@ -8,6 +8,14 @@ unsupported_container="${container}-unsupported"
 unsupported_image=postgres@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
 network="openlegal-postgres-network-$$"
 prebuilt_directory=""
+contention_soak_seconds=""
+if [[ ${1:-} == --contention-soak-seconds ]]; then
+    if ! [[ $# == 2 && $2 =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#$2 > 86400 )); then
+        echo 'usage: test-postgres.sh --contention-soak-seconds SECONDS (1..86400)' >&2; exit 2;
+    fi
+    contention_soak_seconds=$2
+    shift 2
+fi
 if [[ ${1:-} == --prebuilt-directory ]]; then
     [[ $# == 2 && -n $2 ]] || { echo 'usage: test-postgres.sh --prebuilt-directory DIR' >&2; exit 2; }
     prebuilt_directory=$2
@@ -108,7 +116,10 @@ export OPENLEGAL_TEST_POSTGRES_CONTAINER="$container"
 export OPENLEGAL_TEST_DATABASE_URL="postgresql://postgres:$password@$endpoint/postgres"
 cd "$repo"
 # All ignored tests are explicitly invoked here, never silently skipped for missing fixtures.
-if [[ -n $prebuilt_directory ]]; then
+if [[ -n $contention_soak_seconds ]]; then
+    cargo run --locked -p openlegal-adapters --example corpus_contention_soak -- \
+        --duration-secs "$contention_soak_seconds"
+elif [[ -n $prebuilt_directory ]]; then
     python3 "$repo/scripts/run-prebuilt-postgres-tests.py" "$prebuilt_directory"
 elif (( $# )); then
     cargo test --locked "$@" -- --ignored --test-threads=1

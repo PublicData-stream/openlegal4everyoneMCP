@@ -104,6 +104,26 @@ async fn pause_storage_contention(stage: &'static str, cancel: &CancellationToke
     }
 }
 
+/// Refund only a claim that provably never reached provider reservation COMMIT.
+/// A true observer includes ambiguous COMMIT acknowledgements, so that branch
+/// preserves charged attempts. Both cleanup calls fence the exact old claimant;
+/// contention leaves its lease intact rather than trying a different cleanup.
+async fn release_detail_contention(
+    store: &PgCorpusStore,
+    job: &openlegal_application::database::Job,
+    reserved: bool,
+) -> Result<(), DatabaseError> {
+    let cleanup = if reserved {
+        store.defer_storage_claim(job).await
+    } else {
+        store.release_admission_wait(job).await
+    };
+    match cleanup {
+        Ok(()) | Err(DatabaseError::Conflict | DatabaseError::StorageContended) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Known contention yields one supervisor tick; lease failures are handled
 /// separately and must never pass through this recovery decision.
 fn storage_stage_completed(
@@ -929,9 +949,9 @@ impl CorpusRuntime {
                 .await?;
             return Err(DatabaseError::Capacity);
         };
+        let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let processed = async {
             let attempt = cancel.child_token();
-            let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let detail_provider = provider.clone().with_reservation_observer(reserved.clone());
             let detail = tokio::time::timeout(
                 Duration::from_secs(self.detail_timeout_secs),
@@ -1011,7 +1031,7 @@ impl CorpusRuntime {
                         install_head: true,
                         job_id: Some(job.id.clone()),
                     },
-                    cancel,
+                    cancel.clone(),
                 )
                 .await
             {
@@ -1031,10 +1051,13 @@ impl CorpusRuntime {
         }
         .await;
         if matches!(&processed, Err(DatabaseError::StorageContended)) {
-            match self.store.defer_storage_claim(&job).await {
-                Ok(()) | Err(DatabaseError::Conflict | DatabaseError::StorageContended) => {}
-                Err(error) => return Err(error),
-            }
+            release_detail_contention(
+                &self.store,
+                &job,
+                reserved.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .await?;
+            pause_storage_contention("explicit_detail", &cancel).await;
         }
         processed
     }
@@ -2190,6 +2213,7 @@ impl CorpusRuntime {
                 }
                 continue;
             };
+            let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let processed = async {
                 let item = InventoryItem {
                     object: job.object.clone(),
@@ -2208,7 +2232,6 @@ impl CorpusRuntime {
                 };
                 let attempt = cancel.child_token();
                 let _attempt_guard = attempt.clone().drop_guard();
-                let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let detail_provider = provider.clone().with_reservation_observer(reserved.clone());
                 let detail = match tokio::time::timeout(
                     Duration::from_secs(self.detail_timeout_secs),
@@ -2412,13 +2435,12 @@ impl CorpusRuntime {
             match processed {
                 Ok(()) => {}
                 Err(DatabaseError::StorageContended) => {
-                    // This does not refund a charged provider attempt. If even
-                    // cleanup contends, leave the original fenced lease to expire.
-                    match self.store.defer_storage_claim(&job).await {
-                        Ok(()) | Err(DatabaseError::Conflict | DatabaseError::StorageContended) => {
-                        }
-                        Err(error) => return Err(error),
-                    }
+                    release_detail_contention(
+                        &self.store,
+                        &job,
+                        reserved.load(std::sync::atomic::Ordering::Acquire),
+                    )
+                    .await?;
                     pause_storage_contention("detail", &cancel).await;
                 }
                 Err(error) => return Err(error),

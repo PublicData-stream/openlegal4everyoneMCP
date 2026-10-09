@@ -147,7 +147,7 @@ impl PgCorpusStore {
             .validate()
             .map_err(|_| DatabaseError::InvalidInput)?;
         self.gate().await?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "claim_collection_request_with_policy").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
@@ -383,7 +383,7 @@ impl PgCorpusStore {
         let payload = serde_json::to_value(&request).map_err(corrupt)?;
         let canonical = hex(&bytes_hash(&serde_json::to_vec(&payload).map_err(corrupt)?));
         self.gate().await?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "request_collection_shared").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
@@ -423,7 +423,7 @@ impl PgCorpusStore {
                     .execute(&mut *tx).await.map_err(db)?;
             }
             check(cancel)?;
-            tx.commit().await.map_err(db)?;
+            commit_storage(tx, "request_collection_shared").await?;
             return Ok(DemandCollectionStatus {
                 status: DemandState::Pending,
                 receipt: Some(receipt),
@@ -470,7 +470,7 @@ impl PgCorpusStore {
                     DemandState::Unavailable
                 };
                 check(cancel)?;
-                tx.commit().await.map_err(db)?;
+                commit_storage(tx, "request_collection_shared").await?;
                 return Ok(DemandCollectionStatus {
                     status,
                     reason: receipt.reason.clone(),
@@ -515,7 +515,7 @@ impl PgCorpusStore {
             .bind(&canonical).bind(payload).bind(now).bind(now+86400)
             .bind((!demand).then_some(now+86400)).fetch_one(&mut *tx).await.map_err(db)?;
         check(cancel)?;
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "request_collection_shared").await?;
         Ok(DemandCollectionStatus {
             status: DemandState::Pending,
             receipt: Some(CollectionReceipt {

@@ -21,13 +21,17 @@ impl Rejections {
     }
     async fn wait(&self, count: usize) {
         let mut receiver = self.attempts.subscribe();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let reached = tokio::time::timeout(Duration::from_secs(10), async {
             while *receiver.borrow_and_update() < count {
                 receiver.changed().await.unwrap();
             }
         })
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            reached.is_ok(),
+            "expected {count} acknowledged rejections, observed {}",
+            self.count()
+        );
     }
 }
 impl Subscriber for Rejections {
@@ -75,7 +79,7 @@ async fn retry_pool(pool: &PgPool) -> PgPool {
         .max_connections(4)
         .after_connect(|connection, _| {
             Box::pin(async move {
-                sqlx::query("SET lock_timeout='100ms'")
+                sqlx::raw_sql("SET lock_timeout='1s'; SET statement_timeout='2s'; SET transaction_timeout='5s'")
                     .execute(connection)
                     .await?;
                 Ok(())
@@ -86,8 +90,23 @@ async fn retry_pool(pool: &PgPool) -> PgPool {
         .unwrap()
 }
 
-async fn block_budget(pool: &PgPool) -> sqlx::Transaction<'_, sqlx::Postgres> {
-    let mut tx = pool.begin().await.unwrap();
+async fn block_budget(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut connection = pool.acquire().await.unwrap();
+    // The blocker idles while the subject retries, exceeding both the fixture's
+    // five-second transaction and idle-in-transaction deadlines. Disable ONLY
+    // these barrier-session deadlines before BEGIN and verify both settings.
+    // Close the session afterwards so zero never escapes into the runtime pool.
+    connection.close_on_drop();
+    sqlx::raw_sql("SET transaction_timeout='0'; SET idle_in_transaction_session_timeout='0'")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    let configured: (String, String) = sqlx::query_as("SELECT current_setting('transaction_timeout'),current_setting('idle_in_transaction_session_timeout')")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(configured, ("0".into(), "0".into()));
+    let mut tx = sqlx::Transaction::begin(connection, None).await.unwrap();
     sqlx::query(
         "SELECT singleton FROM openlegal.provider_request_budget WHERE singleton FOR UPDATE",
     )
@@ -215,7 +234,7 @@ async fn reservation_lock_retry_charges_once_and_exhaustion_has_no_effects() {
     )
     .with_subscriber(rejections.clone())
     .await;
-    assert!(matches!(result, Err(DatabaseError::StorageUnavailable)));
+    assert!(matches!(result, Err(DatabaseError::StorageContended)));
     assert_eq!(rejections.count(), 4);
     assert_eq!(cap.load(Ordering::Acquire), 2);
     assert!(!reserved.load(Ordering::Acquire));
@@ -381,6 +400,200 @@ async fn settlement_transport_loss_is_fatal_without_lock_retry() {
         Err(DatabaseError::StorageUnavailable)
     );
     assert_eq!(rejections.count(), 0);
+    assert_eq!(usage(&pool).await, before);
+    let owners: Vec<Uuid> =
+        sqlx::query_scalar("SELECT owner FROM openlegal.provider_request_admission")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(owners, vec![guard.owner()]);
+    drop(guard);
+    store.close().await.unwrap();
+}
+
+/// Spend three seconds in the original transaction before the known first-lock
+/// rejections. Without a fresh outer transaction the five-second server timer
+/// terminates this session before attempt three/four can succeed.
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn chained_first_lock_resets_outer_transaction_and_preserves_sqlx_lifecycle() {
+    let fixture = crate::test_support::TestDatabase::new().await;
+    let store = fixture.open(100).await;
+    let pool = store.pool();
+    unrestricted(&pool).await;
+    let retry_pool = retry_pool(&pool).await;
+    for rejected_attempts in [2, 3] {
+        let mut connection = retry_pool.acquire().await.unwrap().detach();
+        let settings: (String, String, String) = sqlx::query_as("SELECT current_setting('lock_timeout'),current_setting('statement_timeout'),current_setting('transaction_timeout')")
+            .fetch_one(&mut connection).await.unwrap();
+        assert_eq!(settings, ("1s".into(), "2s".into(), "5s".into()));
+        let session: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_advisory_lock($1,$2)")
+            .bind(PROVIDER_LOCK.0)
+            .bind(PROVIDER_LOCK.1 + 200)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let blocker = block_budget(&pool).await;
+        let rejections = Rejections::new();
+        let seen = rejections.clone();
+        let worker = tokio::spawn(async move {
+            let mut tx = connection.begin().await.unwrap();
+            let original: (i64, String) = sqlx::query_as("SELECT floor(extract(epoch from transaction_timestamp())*1000)::bigint,pg_current_xact_id()::text")
+                .fetch_one(&mut *tx).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let row = lock_budget(&mut tx, "fresh_outer_fixture", None, false).await.unwrap();
+            assert!(row.try_get::<bool, _>("singleton").unwrap());
+            let current: (i64, String, i32) = sqlx::query_as("SELECT floor(extract(epoch from transaction_timestamp())*1000)::bigint,pg_current_xact_id()::text,pg_backend_pid()")
+                .fetch_one(&mut *tx).await.unwrap();
+            assert!(current.0 >= original.0 + 3000);
+            assert_ne!(current.1, original.1);
+            assert_eq!(current.2, session);
+            tx.commit().await.unwrap();
+            // A fresh SQLx transaction after COMMIT must be top level: nesting
+            // would keep this INSERT invisible to another database connection.
+            let mut next = connection.begin().await.unwrap();
+            sqlx::query("INSERT INTO openlegal.provider_demand_ticket(owner,lease_until,mode) VALUES(pg_catalog.uuidv7(),1,'continuous')")
+                .execute(&mut *next).await.unwrap();
+            next.commit().await.unwrap();
+            connection
+        }.with_subscriber(seen));
+        rejections.wait(rejected_attempts).await;
+        let owned: bool = sqlx::query_scalar("SELECT NOT pg_try_advisory_xact_lock($1,$2)")
+            .bind(PROVIDER_LOCK.0)
+            .bind(PROVIDER_LOCK.1 + 200)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            owned,
+            "outer rollback must retain session advisory ownership"
+        );
+        blocker.rollback().await.unwrap();
+        let connection = worker.await.unwrap();
+        assert_eq!(rejections.count(), rejected_attempts);
+        let visible: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openlegal.provider_demand_ticket WHERE lease_until=1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(visible, rejected_attempts as i64 - 1);
+        connection.close().await.unwrap();
+    }
+    retry_pool.close().await;
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn chained_retry_cancellation_and_drop_leave_pool_connection_reusable() {
+    let fixture = crate::test_support::TestDatabase::new().await;
+    let store = fixture.open(100).await;
+    let pool = store.pool();
+    unrestricted(&pool).await;
+    let retry_pool = retry_pool(&pool).await;
+    let blocker = block_budget(&pool).await;
+    let cancel = CancellationToken::new();
+    let next_cancel = cancel.clone();
+    let rejections = Rejections::new();
+    let seen = rejections.clone();
+    let worker_pool = retry_pool.clone();
+    let worker = tokio::spawn(async move {
+        let mut connection = worker_pool.acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        assert!(matches!(lock_budget(&mut tx, "cancel_chain_fixture", Some(&next_cancel), true).await,
+            Err(DatabaseError::Cancelled)));
+        // Drop queues the rollback for the newly chained outer transaction.
+        drop(tx);
+        let mut next = connection.begin().await.unwrap();
+        sqlx::query("INSERT INTO openlegal.provider_demand_ticket(owner,lease_until,mode) VALUES(pg_catalog.uuidv7(),2,'continuous')")
+            .execute(&mut *next).await.unwrap();
+        next.commit().await.unwrap();
+    }.with_subscriber(seen));
+    rejections.wait(1).await;
+    cancel.cancel();
+    worker.await.unwrap();
+    blocker.rollback().await.unwrap();
+    let visible: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openlegal.provider_demand_ticket WHERE lease_until=2",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(visible, 1);
+    let mut explicit = retry_pool.begin().await.unwrap();
+    lock_budget(&mut explicit, "explicit_rollback_fixture", None, true)
+        .await
+        .unwrap();
+    explicit.rollback().await.unwrap();
+    assert!(
+        idle(&retry_pool, RequestBudgetMode::Continuous)
+            .await
+            .unwrap()
+    );
+    retry_pool.close().await;
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn pool_exhaustion_before_sql_yields_but_response_suspension_remains_fatal() {
+    let fixture = crate::test_support::TestDatabase::new().await;
+    let store = fixture.open(100).await;
+    let pool = store.pool();
+    unrestricted(&pool).await;
+    let exhausted = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(100))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let held = exhausted.acquire().await.unwrap();
+    assert_eq!(
+        idle(&exhausted, RequestBudgetMode::Continuous).await,
+        Err(DatabaseError::StorageContended)
+    );
+    assert!(matches!(
+        ForegroundTicket::open(&exhausted).await,
+        Err(DatabaseError::StorageContended)
+    ));
+    assert_eq!(
+        suspend_owned_response(&exhausted, Uuid::nil()).await,
+        Err(DatabaseError::StorageUnavailable)
+    );
+    assert_eq!(usage(&pool).await, (0, 0));
+    drop(held);
+    exhausted.close().await;
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn settlement_commit_connection_loss_preserves_owner_and_never_replays_delete() {
+    let fixture = crate::test_support::TestDatabase::new().await;
+    let store = fixture.open(100).await;
+    let pool = store.pool();
+    unrestricted(&pool).await;
+    let mut guard = start(&pool).await;
+    let before = usage(&pool).await;
+    sqlx::raw_sql("CREATE SEQUENCE public.commit_attempt; CREATE FUNCTION public.lose_settlement_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('public.commit_attempt'); PERFORM pg_terminate_backend(pg_backend_pid()); RETURN OLD; END $$; CREATE CONSTRAINT TRIGGER lose_settlement_commit AFTER DELETE ON openlegal.provider_request_admission DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.lose_settlement_commit()")
+        .execute(&pool).await.unwrap();
+    let rejections = Rejections::new();
+    assert_eq!(
+        guard.complete().with_subscriber(rejections.clone()).await,
+        Err(DatabaseError::StorageUnavailable)
+    );
+    assert_eq!(rejections.count(), 0);
+    let attempts: (i64, bool) =
+        sqlx::query_as("SELECT last_value,is_called FROM public.commit_attempt")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(attempts, (1, true));
     assert_eq!(usage(&pool).await, before);
     let owners: Vec<Uuid> =
         sqlx::query_scalar("SELECT owner FROM openlegal.provider_request_admission")

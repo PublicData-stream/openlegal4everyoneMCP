@@ -527,3 +527,69 @@ async fn concurrent_corrected_head_publication_yields_only_stale_read_before_enq
     runtime.close().await.unwrap();
     persistent.close().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh and pinned MeCab-Ko dictionary"]
+async fn pre_reservation_contention_refunds_repeated_claims_and_fences_stale_owners() {
+    let (fixture, persistent, runtime) = setup().await;
+    let original_budget = budget(&fixture).await;
+    let candidate = item("pre-reservation-contention");
+    queue(&runtime, &candidate).await;
+    let mut previous = None;
+    // More yields than max_job_attempts must not exhaust a never-reserved job.
+    for _ in 0..5 {
+        let claim = runtime.store.claim_job(now()).await.unwrap().unwrap();
+        assert_eq!(claim.attempts, 1);
+        if let Some(old) = previous.take() {
+            release_detail_contention(&runtime.store, &old, false)
+                .await
+                .unwrap();
+            let still_running = fixture_json(&fixture,
+                "SELECT jsonb_build_array(status,attempts,expected_version) FROM openlegal.corpus_job;").await;
+            assert_eq!(still_running, json!(["running", 1, claim.expected_version]));
+        }
+        release_detail_contention(&runtime.store, &claim, false)
+            .await
+            .unwrap();
+        assert_eq!(fixture_json(&fixture,
+            "SELECT jsonb_build_array(status,attempts,lease_until,error_category) FROM openlegal.corpus_job;").await,
+            json!(["pending",0,null,null]));
+        assert_eq!(budget(&fixture).await, original_budget);
+        previous = Some(claim);
+    }
+    let reserved = runtime.store.claim_job(now()).await.unwrap().unwrap();
+    // Model the observer set before transmitting reservation COMMIT, including
+    // a lost acknowledgement: never refund this potentially charged execution.
+    release_detail_contention(&runtime.store, &reserved, true)
+        .await
+        .unwrap();
+    assert_eq!(fixture_json(&fixture,
+        "SELECT jsonb_build_array(status,attempts,error_category,lease_until IS NOT NULL) FROM openlegal.corpus_job;").await,
+        json!(["running",1,"processing_failed",true]));
+    assert!(runtime.store.claim_job(now()).await.unwrap().is_none());
+    assert_eq!(budget(&fixture).await, original_budget);
+    runtime.close().await.unwrap();
+    persistent.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh and pinned MeCab-Ko dictionary"]
+async fn post_reservation_contention_preserves_the_last_charged_execution() {
+    let (fixture, persistent, runtime) = setup().await;
+    let candidate = item("charged-contention");
+    queue(&runtime, &candidate).await;
+    fixture_sql(&fixture,
+        "UPDATE openlegal.provider_request_budget SET max_job_attempts=3; UPDATE openlegal.corpus_job SET attempts=2;").await;
+    let original_budget = budget(&fixture).await;
+    let claim = runtime.store.claim_job(now()).await.unwrap().unwrap();
+    assert_eq!(claim.attempts, 3);
+    release_detail_contention(&runtime.store, &claim, true)
+        .await
+        .unwrap();
+    assert_eq!(fixture_json(&fixture,
+        "SELECT jsonb_build_array(status,attempts,error_category,lease_until) FROM openlegal.corpus_job;").await,
+        json!(["failed",3,"processing_failed",null]));
+    assert_eq!(budget(&fixture).await, original_budget);
+    runtime.close().await.unwrap();
+    persistent.close().await.unwrap();
+}

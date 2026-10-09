@@ -138,7 +138,7 @@ impl PgCorpusStore {
         let gap = detail_key(&object_key, &job.revision_id);
         self.ensure_gap_capacity(&gap).await?;
         let id = uuid::Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "skip_claim").await?;
         let rows = sqlx::query("UPDATE openlegal.corpus_job SET status='failed',lease_until=NULL,error_category=$2,completed_at=$5::text::numeric WHERE id=$1 AND expected_version=$3 AND attempts=$4 AND status='running'")
             .bind(id).bind(reason).bind(job.expected_version as i64).bind(job.attempts as i32)
             .bind(now.to_string())
@@ -149,7 +149,7 @@ impl PgCorpusStore {
         sqlx::query("INSERT INTO openlegal.provider_collection_gap(gap_key,dataset,scope,object_key,revision_id,reason,first_seen_at,last_seen_at,retry_at) VALUES($1,$2,'detail',$3,$4,$5,$6,$6,$7) ON CONFLICT(gap_key) DO UPDATE SET reason=EXCLUDED.reason,last_seen_at=EXCLUDED.last_seen_at,retry_at=EXCLUDED.retry_at,resolved_at=NULL")
             .bind(gap).bind(dataset).bind(object_key).bind(&job.revision_id).bind(reason).bind(now as i64).bind(now.saturating_add(3600) as i64)
             .execute(&mut *tx).await.map_err(db)?;
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "skip_claim").await?;
         Ok(())
 
             }
@@ -181,7 +181,7 @@ impl PgCorpusStore {
             async {
 
         self.gate().await?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "requeue_due_details").await?;
         // Match enqueue/adoption/claim lock order before touching any job or gap.
         // This also keeps queue-capacity accounting serialized with new work.
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
@@ -218,7 +218,7 @@ impl PgCorpusStore {
             .await
             .map_err(db)?;
         }
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "requeue_due_details").await?;
         Ok(rows.len() as u64)
 
             }
@@ -264,4 +264,5 @@ impl PgCorpusStore {
     }
 }
 use super::storage_retry::retry_storage;
+use super::storage_retry::{begin_storage, commit_storage};
 use tokio_util::sync::CancellationToken;

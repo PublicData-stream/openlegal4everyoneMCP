@@ -118,13 +118,13 @@ impl PgCorpusStore {
             async {
 
         self.gate().await?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "enqueue_supplement").await?;
         // Keep the same control-before-job lock order as claim and settlement.
         // A daily parent refresh cannot race a child's predecessor admission.
         sqlx::query("SELECT singleton FROM openlegal.provider_supplement_control WHERE singleton FOR UPDATE")
             .execute(&mut *tx).await.map_err(db)?;
         let changed = enqueue(&mut tx, request, now).await?;
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "enqueue_supplement").await?;
         Ok(changed)
 
             }
@@ -141,7 +141,7 @@ impl PgCorpusStore {
 
         self.gate().await?;
         let until = now.checked_add(600).ok_or(DatabaseError::Capacity)?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "claim_supplement").await?;
         sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await
@@ -191,7 +191,7 @@ impl PgCorpusStore {
             .bind(&key).bind(owner).bind(until.to_string()).bind(observed_before.to_string()).bind(&observation_id).bind(refresh_incomplete).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.provider_supplement_control SET last_global_source=CASE WHEN $2 THEN $1 ELSE last_global_source END,last_seed_source=CASE WHEN $2 THEN last_seed_source ELSE $1 END,last_global=$2 WHERE singleton")
             .bind(row.try_get::<String,_>("source").map_err(db)?).bind(row.try_get::<bool,_>("is_global").map_err(db)?).execute(&mut *tx).await.map_err(db)?;
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "claim_supplement").await?;
         Ok(Some(SupplementJob {
             key,
             request,
@@ -263,7 +263,7 @@ impl PgCorpusStore {
             SupplementJobStatus::Done | SupplementJobStatus::Deferred
         )
         .then(|| now.to_string());
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "settle_supplement_with_successor").await?;
         sqlx::query("SELECT singleton FROM openlegal.provider_supplement_control WHERE singleton FOR UPDATE")
             .execute(&mut *tx).await.map_err(db)?;
         let row=sqlx::query("SELECT * FROM openlegal.provider_supplement_job WHERE job_key=$1 AND status='running' AND owner=$2 AND lease_until>$3::text::numeric FOR UPDATE")
