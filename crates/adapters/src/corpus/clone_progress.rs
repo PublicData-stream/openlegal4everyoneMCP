@@ -388,6 +388,9 @@ fn supplement_progress_value(
 
 // Each required object/revision body is examined once across current/history
 // views. DISTINCT failed pairs preserve EXISTS semantics with multiple jobs.
+// Capture lookup follows the required revision IDs. Materialize only their small
+// metadata projection once: ->record would copy a large body, and repeating the
+// expression for each status flag would also detoast the payload twice.
 // All aggregates share PostgreSQL's single statement MVCC snapshot, including
 // the control watermark and supplementary roots. No payload leaves PostgreSQL.
 const PROGRESS_SQL: &str = r#"
@@ -397,13 +400,22 @@ WITH members AS MATERIALIZED (
     WHERE m.seen_cycle >= v.cycle - 1
 ), required_pairs AS MATERIALIZED (
     SELECT DISTINCT object_key, revision_id FROM members WHERE required_body
-), valid_bodies AS MATERIALIZED (
-    SELECT p.object_key, p.revision_id
+), required_captures AS MATERIALIZED (
+    SELECT p.object_key, p.revision_id, r.latest_capture
     FROM required_pairs p
     JOIN openlegal.corpus_revision r USING(object_key, revision_id)
-    JOIN openlegal.corpus_capture c ON c.id = r.latest_capture
-    WHERE COALESCE(c.payload->'record'->'metadata'->>'attachment_status', '') <> 'incomplete'
-      AND COALESCE(c.payload->'record'->'metadata'->>'body_status', '') <> 'response_identity_unverified_metadata_only'
+), body_metadata AS MATERIALIZED (
+    SELECT p.object_key, p.revision_id, c.metadata
+    FROM required_captures p
+    CROSS JOIN LATERAL (
+        SELECT c.payload #> '{record,metadata}' AS metadata
+        FROM openlegal.corpus_capture c WHERE c.id = p.latest_capture
+        OFFSET 0
+    ) c
+), valid_bodies AS MATERIALIZED (
+    SELECT object_key, revision_id FROM body_metadata
+    WHERE COALESCE(metadata->>'attachment_status', '') <> 'incomplete'
+      AND COALESCE(metadata->>'body_status', '') <> 'response_identity_unverified_metadata_only'
 ), failed_pairs AS MATERIALIZED (
     SELECT DISTINCT j.object_key, j.revision_id
     FROM openlegal.corpus_job j JOIN required_pairs p USING(object_key, revision_id)

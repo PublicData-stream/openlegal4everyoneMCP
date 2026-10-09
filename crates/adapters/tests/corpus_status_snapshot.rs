@@ -12,7 +12,8 @@ use openlegal_domain::{
     legal::{DatabaseError, Dataset, ObjectId},
     rights::SourceRights,
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, fmt::Write as _, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 async fn setup() -> (support::TestDatabase, Arc<PostgresStore>, PgCorpusStore) {
@@ -115,6 +116,183 @@ async fn status_counts_twenty_thousand_bodies_without_job_or_history_join_duplic
         false,
         "a missing expected view never establishes completion"
     );
+    base.close().await.unwrap();
+}
+
+fn status_body(bytes: usize, copies_per_block: usize) -> String {
+    let mut body = String::with_capacity(bytes + 256);
+    let mut block = 0_u64;
+    while body.len() < bytes {
+        let mut fragment = String::with_capacity(64);
+        for byte in Sha256::digest(block.to_be_bytes()) {
+            write!(fragment, "{byte:02x}").unwrap();
+        }
+        for _ in 0..copies_per_block {
+            body.push_str(&fragment);
+        }
+        body.push('\n');
+        block += 1;
+    }
+    body.truncate(bytes); // ASCII fixture text keeps this a UTF-8 boundary.
+    body
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn status_reads_sixteen_thousand_toasted_bodies_without_copying_record_payloads() {
+    const MATCHED: u32 = 16_000;
+    const UNRELATED_HISTORY: u32 = 256;
+    const LARGE_MATCHED: u32 = 32;
+    let (_fixture, base, store) = setup().await;
+    let pool = base.pool();
+    empty_stable_views(&store, &pool).await;
+    // Warm the real prepared read before corpus growth. Repeat after ANALYZE
+    // below so both existing prepared plans and current statistics are exercised.
+    for _ in 0..6 {
+        store.clone_progress().await.unwrap();
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SHOW statement_timeout")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "2s"
+    );
+    // Repeated high-entropy blocks model ~32 KiB logical / ~8 KiB compressed
+    // provider records. Large records are deliberately poorly compressible.
+    // These are synthetic status rows, not provider captures or archive proof.
+    let body = status_body(32 * 1024, 4);
+    let large_body = status_body(128 * 1024, 1);
+    sqlx::query("INSERT INTO openlegal.corpus_object(object_key,identity) SELECT repeat(md5('toast-object:'||n),2),'{}'::jsonb FROM generate_series(1,$1::integer) n")
+        .bind((MATCHED + 3) as i32).execute(&pool).await.unwrap();
+    let mut first = 1;
+    while first <= MATCHED + UNRELATED_HISTORY {
+        // Keep setup itself under the unchanged 2s statement limit, including
+        // the larger required and unrelated permanent-history payloads.
+        let batch = if first <= LARGE_MATCHED || first > MATCHED {
+            16
+        } else {
+            128
+        };
+        let last = (first + batch - 1).min(if first <= LARGE_MATCHED {
+            LARGE_MATCHED
+        } else if first <= MATCHED {
+            MATCHED
+        } else {
+            MATCHED + UNRELATED_HISTORY
+        });
+        sqlx::query(r#"INSERT INTO openlegal.corpus_capture(id,object_key,revision_id,sequence,captured_at,event_sequence,payload,payload_sha256,raw_sha256,raw_size,storage_key)
+            SELECT repeat(md5('toast-capture:'||n),2),repeat(md5('toast-object:'||(1+(n-1)%$5)),2),
+            CASE WHEN n<=$5 THEN 'r1' ELSE 'unobserved-'||n END,n,100,n,
+            jsonb_build_object('record',jsonb_build_object(
+                'body','fixture:'||n||E'\n'||CASE WHEN n<=$6 OR n>$5 THEN $4 ELSE $3 END,
+                'sections',jsonb_build_array(jsonb_build_object('text',left($3,1024))),
+                'metadata',CASE WHEN n=1 THEN '{}'::jsonb WHEN n=2 THEN jsonb_build_object('attachment_status',NULL,'body_status',NULL) WHEN n=3 THEN 'null'::jsonb
+                ELSE jsonb_build_object('attachment_status',CASE WHEN n%5=0 THEN 'incomplete' ELSE 'complete' END,
+                    'body_status',CASE WHEN n%7=0 THEN 'response_identity_unverified_metadata_only' ELSE 'complete' END) END)),
+            decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),0,'toast-fixture:'||n
+            FROM generate_series($1::integer,$2::integer) n"#)
+            .bind(first as i32).bind(last as i32).bind(&body).bind(&large_body)
+            .bind(MATCHED as i32).bind(LARGE_MATCHED as i32)
+            .execute(&pool).await.unwrap();
+        first = last + 1;
+    }
+    sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,last_sequence,captured_at) SELECT object_key,revision_id,id,sequence,captured_at FROM openlegal.corpus_capture")
+        .execute(&pool).await.unwrap();
+    // One missing revision and one revision without an accepted capture must
+    // remain missing; an obsolete cycle member must not affect either count.
+    sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,last_sequence) VALUES(repeat(md5('toast-object:'||$1::text),2),'r1',1)")
+        .bind((MATCHED + 2) as i32).execute(&pool).await.unwrap();
+    for historical in [false, true] {
+        sqlx::query("INSERT INTO openlegal.provider_clone_member(view_key,object_key,revision_id,seen_cycle,required_body) SELECT $1,repeat(md5('toast-object:'||n),2),'r1',CASE WHEN n=$3 THEN 1 ELSE 2 END,true FROM generate_series(1,$3::integer) n WHERE NOT $2 OR n%2=0")
+            .bind(statute_view(historical).key().unwrap()).bind(historical)
+            .bind((MATCHED + 3) as i32).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO openlegal.corpus_job(object_key,revision_id,effective_date,expected_version,status,created_at) SELECT repeat(md5('toast-object:'||n),2),'r1',d,0,'failed',100 FROM generate_series(1,$1::integer) n CROSS JOIN (VALUES('date-a'),('date-b')) dates(d) WHERE n%11=0")
+        .bind(MATCHED as i32).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO openlegal.corpus_job(object_key,revision_id,expected_version,status,created_at) VALUES(repeat(md5('toast-object:1'),2),$1,0,'failed',100)")
+        .bind(format!("unobserved-{}", MATCHED + 1))
+        .execute(&pool).await.unwrap();
+    let toast_bytes: i64 = sqlx::query_scalar("SELECT pg_relation_size(reltoastrelid) FROM pg_class WHERE oid='openlegal.corpus_capture'::regclass")
+        .fetch_one(&pool).await.unwrap();
+    assert!(
+        toast_bytes > 64 * 1024 * 1024,
+        "fixture must exercise external TOAST, got {toast_bytes} bytes"
+    );
+    let logical_body_bytes: i32 = sqlx::query_scalar("SELECT octet_length(payload#>>'{record,body}') FROM openlegal.corpus_capture WHERE id=repeat(md5('toast-capture:100'),2)")
+        .fetch_one(&pool).await.unwrap();
+    assert!(logical_body_bytes >= 32 * 1024);
+    let compressed_payload_bytes: i64 = sqlx::query_scalar(
+        "SELECT avg(pg_column_size(payload))::bigint FROM openlegal.corpus_capture",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    eprintln!(
+        "synthetic status fixture: TOAST={toast_bytes} bytes, average stored payload={compressed_payload_bytes} bytes, ordinary body={logical_body_bytes} bytes"
+    );
+    for fresh_statistics in [false, true] {
+        if fresh_statistics {
+            // Disposable dev database only; no production ANALYZE or tuning.
+            for statement in [
+                "ANALYZE openlegal.provider_clone_view",
+                "ANALYZE openlegal.provider_clone_member",
+                "ANALYZE openlegal.corpus_revision",
+                "ANALYZE openlegal.corpus_capture",
+                "ANALYZE openlegal.corpus_job",
+            ] {
+                sqlx::query(statement).execute(&pool).await.unwrap();
+            }
+        }
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let progress = store.clone_progress().await.unwrap();
+            let elapsed = started.elapsed();
+            eprintln!(
+                "synthetic clone progress: fresh_statistics={fresh_statistics}, elapsed_ms={}",
+                elapsed.as_millis()
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "status read must finish within one statement deadline without hiding a retry: {elapsed:?}"
+            );
+            for historical in [false, true] {
+                let key = statute_view(historical).key().unwrap();
+                let result = progress["views"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["view"] == key)
+                    .unwrap();
+                let relevant = |n: &u32| !historical || n.is_multiple_of(2);
+                let observed = (1..=MATCHED + 2).filter(relevant).count();
+                let missing = (1..=MATCHED + 2)
+                    .filter(relevant)
+                    .filter(|n| {
+                        *n > MATCHED
+                            || n.is_multiple_of(5)
+                            || n.is_multiple_of(7)
+                            || n.is_multiple_of(11)
+                    })
+                    .count();
+                assert_eq!(result["observed"], observed);
+                assert_eq!(result["missing_bodies"], missing);
+            }
+            assert_eq!(progress["active_jobs"], 0);
+            assert_eq!(progress["index_ready"], true);
+            assert_eq!(progress["initial_canonical_clone_complete"], false);
+            assert_eq!(progress["full_available_clone_complete"], false);
+            assert_eq!(progress["atomic_upstream_snapshot"], false);
+        }
+    }
+    let captures: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.corpus_capture")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(captures, i64::from(MATCHED + UNRELATED_HISTORY));
+    let retained: String = sqlx::query_scalar("SELECT payload#>>'{record,body}' FROM openlegal.corpus_capture WHERE id=repeat(md5('toast-capture:1'),2)")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(retained, format!("fixture:1\n{large_body}"));
     base.close().await.unwrap();
 }
 
