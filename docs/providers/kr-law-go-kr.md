@@ -174,6 +174,16 @@ immutable; changed future projections produce a new capture through normal
 publication. Embedded HTML within XML text remains literal provider-field text.
 OCR never replaces provider text.
 
+Read-time Korean article references accept `제`/`第` and `조`/`條` markers with
+the existing Arabic-number, hyphen and `의` branch grammar. Structural headings
+also accept `編`/`章`/`節`/`款` as the corresponding `편`/`장`/`절`/`관` levels.
+Requests use the same locators against already retained original-character text;
+this does not convert Chinese numerals, translate source wording, reprocess a
+capture or change its section IDs, citation IDs, revision or hashes. Returned
+article labels keep the existing Hangul format; source heading labels, paths and
+article text remain unchanged. Synthetic fixture tests cover these marker forms;
+they do not establish new provider identity or full-corpus acceptance.
+
 The adapter downloads documented national PDF/HWP attachment-link fields through
 an exact host/path allowlist. Ordinance attachment filenames alone do not justify
 inventing a download URL. Retained primary and attachment bytes are immutable

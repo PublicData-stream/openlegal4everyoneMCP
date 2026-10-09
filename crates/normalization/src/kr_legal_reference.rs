@@ -314,13 +314,16 @@ fn skip_spaces(text: &str, mut at: usize, max: usize) -> usize {
     at
 }
 
-/// Parse `제{n}{unit}` at `at`, allowing single spaces around the number.
+fn locator_prefix(text: &str) -> Option<char> {
+    text.chars().next().filter(|c| matches!(c, '제' | '第'))
+}
+
+/// Parse `제{n}{unit}` or `第{n}{unit}` at `at`, allowing single spaces around
+/// the number. The unit itself remains the caller's exact marker.
 fn unit_number(text: &str, at: usize, unit: char) -> Option<(u32, usize)> {
     let rest = text.get(at..)?;
-    if !rest.starts_with('제') {
-        return None;
-    }
-    let at = skip_spaces(text, at + '제'.len_utf8(), 1);
+    let prefix = locator_prefix(rest)?;
+    let at = skip_spaces(text, at + prefix.len_utf8(), 1);
     let (n, end) = digits(text, at, 5)?;
     let end = skip_spaces(text, end, 1);
     if n == 0 || !text[end..].starts_with(unit) {
@@ -330,12 +333,11 @@ fn unit_number(text: &str, at: usize, unit: char) -> Option<(u32, usize)> {
 }
 
 /// Parse a leading `제{n}조`, `제{n}-{p}조` or either form followed by `의{m}`, and
-/// return the byte after it.
+/// return the byte after it. Original-character `第` and `條` markers may be
+/// mixed with their Hangul equivalents; numbers and `의` keep the same grammar.
 fn article_at(text: &str, at: usize) -> Option<(ArticleNumber, usize)> {
-    if !text.get(at..)?.starts_with('제') {
-        return None;
-    }
-    let start = skip_spaces(text, at + '제'.len_utf8(), 1);
+    let prefix = locator_prefix(text.get(at..)?)?;
+    let start = skip_spaces(text, at + prefix.len_utf8(), 1);
     let (number, mut end) = digits(text, start, 5)?;
     let mut part = None;
     if text[end..].starts_with('-')
@@ -346,10 +348,11 @@ fn article_at(text: &str, at: usize) -> Option<(ArticleNumber, usize)> {
         end = after;
     }
     end = skip_spaces(text, end, 1);
-    if number == 0 || !text[end..].starts_with('조') {
+    let unit = text[end..].chars().next()?;
+    if number == 0 || !matches!(unit, '조' | '條') {
         return None;
     }
-    end += '조'.len_utf8();
+    end += unit.len_utf8();
     let mut branch = None;
     if text[end..].starts_with('의')
         && let Some((m, after)) = digits(text, end + '의'.len_utf8(), 3)
@@ -372,7 +375,7 @@ fn article_at(text: &str, at: usize) -> Option<(ArticleNumber, usize)> {
 /// A locator directly preceded by a Hangul syllable (as in `동제3조`) is skipped.
 pub fn article_mentions(text: &str) -> Vec<(ArticleNumber, usize, usize)> {
     let mut found = Vec::new();
-    for (at, _) in text.match_indices('제') {
+    for (at, _) in text.match_indices(['제', '第']) {
         if found.last().is_some_and(|(_, _, end)| at < *end)
             || text[..at]
                 .chars()
@@ -390,9 +393,14 @@ pub fn article_mentions(text: &str) -> Vec<(ArticleNumber, usize, usize)> {
 
 /// Accepts `제44조의2`, `44조의2`, `44의2`, `제9-5조`, `9-5` and `44`. A hyphenated
 /// form is `제9-5조`; [`locate_article`] falls back to `제9조의5` when it is absent.
+/// `第` and `條` are accepted as equivalent locator markers without rewriting
+/// any supplied source text or converting Chinese numerals.
 pub fn parse_article_number(value: &str) -> Option<ArticleNumber> {
     let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
-    let body = compact.strip_prefix('제').unwrap_or(&compact);
+    let body = compact
+        .strip_prefix('제')
+        .or_else(|| compact.strip_prefix('第'))
+        .unwrap_or(&compact);
     let (number, end) = digits(body, 0, 5)?;
     let mut rest = &body[end..];
     let mut part = None;
@@ -404,7 +412,10 @@ pub fn parse_article_number(value: &str) -> Option<ArticleNumber> {
         part = Some(p);
         rest = &tail[end..];
     }
-    rest = rest.strip_prefix('조').unwrap_or(rest);
+    rest = rest
+        .strip_prefix('조')
+        .or_else(|| rest.strip_prefix('條'))
+        .unwrap_or(rest);
     let branch = if rest.is_empty() {
         None
     } else {
@@ -502,13 +513,23 @@ pub fn heading_rank(level: char) -> u8 {
     }
 }
 
-/// Parse a leading `제{n}편|장|절|관` heading.
+/// Parse a leading `제{n}편|장|절|관` heading, also accepting the original-character
+/// `第` prefix and `編|章|節|款` units. Returns the Hangul structural level while
+/// outline entries continue to borrow the unchanged source heading text.
 pub fn heading_at(text: &str) -> Option<(char, u32)> {
     let text = text.trim_start();
-    let rest = text.strip_prefix('제')?;
+    let prefix = locator_prefix(text)?;
+    let rest = &text[prefix.len_utf8()..];
     let (n, end) = digits(rest, 0, 4)?;
     let level = rest[end..].chars().next()?;
-    if !"편장절관".contains(level) || n == 0 {
+    let normalized_level = match level {
+        '편' | '編' => '편',
+        '장' | '章' => '장',
+        '절' | '節' => '절',
+        '관' | '款' => '관',
+        _ => return None,
+    };
+    if n == 0 {
         return None;
     }
     let after = &rest[end + level.len_utf8()..];
@@ -520,7 +541,7 @@ pub fn heading_at(text: &str) -> Option<(char, u32)> {
         .chars()
         .next()
         .is_none_or(|c| c.is_whitespace() || c == '<' || c == '(')
-        .then_some((level, n))
+        .then_some((normalized_level, n))
 }
 
 /// Whether a line starts a new article when articles share one text block.
@@ -954,7 +975,7 @@ pub fn extract_citations(text: &str) -> Extraction {
         let Some(c) = text[i..].chars().next() else {
             break;
         };
-        if c == '제' {
+        if matches!(c, '제' | '第') {
             match statute_at(text, i, previous_end) {
                 Some(Ok(citation)) => {
                     if out.statutes.len() == MAX_STATUTE_CITATIONS {
@@ -1273,6 +1294,148 @@ mod tests {
             assert_eq!(parse_article_number(bad), None, "{bad}");
         }
         assert_eq!(art(2, Some(3)).to_string(), "제2조의3");
+    }
+
+    #[test]
+    fn hanja_article_markers_keep_the_existing_number_grammar() {
+        for value in ["第1條", "제1條", "第1조", "1條", " 第 1 條 "] {
+            assert_eq!(parse_article_number(value), Some(art(1, None)), "{value}");
+        }
+        for value in ["第289條의2", "제289條의2", "第289조의2"] {
+            assert_eq!(parse_article_number(value), Some(art(289, Some(2))));
+        }
+        assert_eq!(
+            parse_article_number("第9-5條의2"),
+            Some(ArticleNumber {
+                number: 9,
+                part: Some(5),
+                branch: Some(2),
+            })
+        );
+        for bad in [
+            "第0條",
+            "第一條",
+            "第條",
+            "第1章",
+            "第123456條",
+            "第1條의0",
+            "第1條의",
+            "第1-0條",
+            "第1條條",
+            "第1條내용",
+        ] {
+            assert_eq!(parse_article_number(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn hanja_article_lookup_preserves_source_keys_text_and_order() {
+        let first_text = "第1條(法源) 民事에 關하여 法律에 規定이 없으면 慣習法에 依한다.";
+        let sections = vec![
+            section("article:0001000:source_ordinal:1", "", "第1編 總則"),
+            section("article:0001000:source_ordinal:2", "", "第1章 通則"),
+            section("article:0001001", "法源", first_text),
+            section("article:0289002", "", "第289條의2(區分地上權) ① 시험 본문"),
+            section("article:0290001", "", "제290조(준용규정) 시험 본문"),
+        ];
+        let original = sections.clone();
+        let ArticleLookup::Found(first) = locate_article(&sections, art(1, None)) else {
+            panic!("original-character article 1");
+        };
+        assert_eq!(first.section_id, "article:0001001");
+        assert_eq!(first.title, "法源");
+        assert_eq!(first.text, first_text);
+        let ArticleLookup::Found(branched) = locate_article(&sections, art(289, Some(2))) else {
+            panic!("original-character branched article");
+        };
+        assert_eq!(branched.title, "區分地上權");
+        assert_eq!(branched.paragraphs, [1]);
+        let units = outline(&sections);
+        assert!(matches!(
+            &units[0],
+            OutlineUnit::Heading {
+                level: '편',
+                text: "第1編 總則",
+                ..
+            }
+        ));
+        assert!(matches!(
+            &units[1],
+            OutlineUnit::Heading {
+                level: '장',
+                text: "第1章 通則",
+                ..
+            }
+        ));
+        assert_eq!(units.len(), 5);
+        assert_eq!(sections, original);
+    }
+
+    #[test]
+    fn hanja_block_outline_does_not_split_inline_references() {
+        let sections = vec![section(
+            "source_ordinal:1",
+            "조문내용",
+            "第1章 總則\n第1條(法源) 시험 본문\n第289條의2에 따른 참조\n제2節 일반\n第2條(원칙) ① 시험한다.\n② 第1條에 따른다.\n제3條 삭제",
+        )];
+        let units = outline(&sections);
+        let labels: Vec<String> = units
+            .iter()
+            .map(|unit| match unit {
+                OutlineUnit::Heading { level, number, .. } => format!("{level}{number}"),
+                OutlineUnit::Article(article) => article.number.to_string(),
+            })
+            .collect();
+        assert_eq!(labels, ["장1", "제1조", "절2", "제2조", "제3조"]);
+        let OutlineUnit::Article(first) = &units[1] else {
+            panic!("block article 1");
+        };
+        assert!(first.text.ends_with("第289條의2에 따른 참조"));
+        let OutlineUnit::Article(second) = &units[3] else {
+            panic!("block article 2");
+        };
+        assert_eq!(second.paragraphs, [1, 2]);
+        assert!(matches!(&units[4], OutlineUnit::Article(article) if article.deleted));
+    }
+
+    #[test]
+    fn hanja_heading_levels_preserve_boundary_and_number_limits() {
+        for (text, level) in [
+            ("第1編 總則", '편'),
+            ("第1章 通則", '장'),
+            ("第1節 일반", '절'),
+            ("第1款 사항", '관'),
+            ("제1編 총칙", '편'),
+            ("第1장 통칙", '장'),
+        ] {
+            assert_eq!(heading_at(text), Some((level, 1)), "{text}");
+        }
+        assert_eq!(heading_at("第3節의2 특칙"), Some(('절', 3)));
+        for bad in ["第0編", "第一章", "第12345節", "第1條", "第3章에 따른"] {
+            assert_eq!(heading_at(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn hanja_references_preserve_utf8_spans_and_named_law_context() {
+        let text = "머리말 민법 第1條(法源), 제289條의2 및 第9-5조. 동第7條";
+        let mentions = article_mentions(text);
+        let source_spans: Vec<&str> = mentions
+            .iter()
+            .map(|(_, start, end)| &text[*start..*end])
+            .collect();
+        assert_eq!(source_spans, ["第1條", "제289條의2", "第9-5조"]);
+        assert_eq!(mentions[0].0, art(1, None));
+        assert_eq!(mentions[1].0, art(289, Some(2)));
+        let extracted = extract_citations(text);
+        assert_eq!(extracted.statutes.len(), 3);
+        assert_eq!(extracted.statutes[0].cited_title.as_deref(), Some("法源"));
+        assert_eq!(extracted.statutes[1].article, art(289, Some(2)));
+        assert_eq!(
+            &text[extracted.statutes[0].article_start..extracted.statutes[0].byte_end],
+            "第1條(法源)"
+        );
+        assert!(extract_citations("민법 第一條").statutes.is_empty());
     }
 
     #[test]

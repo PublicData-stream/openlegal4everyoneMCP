@@ -813,11 +813,11 @@ async fn citing(
 /// A regular-expression fragment matching an article locator and the text after it,
 /// without matching a longer locator such as `제5조의2` for `제5조`.
 fn article_pattern(article: ArticleNumber) -> String {
-    let mut pattern = format!("제 ?{}", article.number);
+    let mut pattern = format!("[제第] ?{}", article.number);
     if let Some(part) = article.part {
         pattern.push_str(&format!("-{part}"));
     }
-    pattern.push_str(" ?조");
+    pattern.push_str(" ?[조條]");
     match article.branch {
         Some(branch) => pattern.push_str(&format!("의 ?{branch}(?:[^0-9].*)?")),
         None => pattern.push_str("(?:의[^0-9].*|[^0-9의].*)?"),
@@ -1062,10 +1062,10 @@ async fn impact(
     })
 }
 
-/// `제2장`, `2장` or `제3절` as a heading level and number.
+/// `제2장`, `2장`, `第2章` or mixed locator markers as a heading level and number.
 fn parse_heading(value: &str) -> Option<(char, u32)> {
     let compact = compact(value);
-    let compact = if compact.starts_with('제') {
+    let compact = if compact.starts_with(['제', '第']) {
         compact
     } else {
         format!("제{compact}")
@@ -2178,6 +2178,190 @@ mod tests {
 
     fn labels(result: &ArticleReadResult) -> Vec<&str> {
         result.articles.iter().map(|a| a.article.as_str()).collect()
+    }
+
+    fn hanja_corpus() -> ReferenceLookup {
+        // Fictional retained original-character sections, including repeated source
+        // keys already disambiguated by the adapter. Reading must not reproject them.
+        lookup(vec![
+            record(
+                object(Dataset::NationalStatute, "hanja"),
+                910,
+                "910:20260317",
+                "민법",
+                Some("20260317"),
+                vec![
+                    article("0001000:source_ordinal:1", "", "第1編 總則"),
+                    article("0001000:source_ordinal:2", "", "第1章 通則"),
+                    article("0001000:source_ordinal:3", "", "第1節 일반"),
+                    article("0001000:source_ordinal:4", "", "第1款 사항"),
+                    article(
+                        "0001001",
+                        "法源",
+                        "第1條(法源) 시험 본문. 第289條의2에 따른다.",
+                    ),
+                    article("0289002", "", "第289條의2(區分地上權) ① 시험 본문"),
+                    article("0290001", "", "제290조(준용규정) 시험 본문"),
+                    article("0002000", "", "제2章 기타"),
+                    article("0291001", "", "第291條(다음 장) 시험 본문"),
+                ],
+                &[],
+                true,
+            ),
+            record(
+                object(Dataset::Precedent, "hanja-citing"),
+                911,
+                "911",
+                "가상 판결",
+                None,
+                vec![body("민법 第1條에 따라 판단한다.")],
+                &[],
+                true,
+            ),
+            record(
+                object(Dataset::Precedent, "hanja-other-branch"),
+                912,
+                "912",
+                "가상 가지조문 판결",
+                None,
+                vec![body("민법 第1條의2에 따라 판단한다.")],
+                &[],
+                true,
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn reads_hanja_articles_with_capture_fixed_neighbours_and_heading_paths() {
+        let lookup = hanja_corpus();
+        for requested in ["제1조", "第1條"] {
+            let around = read_articles(
+                &lookup,
+                ArticleReadInput {
+                    object: Some(object(Dataset::NationalStatute, "hanja")),
+                    selector: Some(RevisionSelector::Capture {
+                        id: format!("{:064x}", 910),
+                    }),
+                    article: Some(requested.into()),
+                    context: 1,
+                    ..read_input("unused")
+                },
+                deadline(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(around.capture_id, format!("{:064x}", 910));
+            assert_eq!(around.revision_id, "910:20260317");
+            assert_eq!(labels(&around), ["제1조", "제289조의2"]);
+            assert_eq!(around.articles[0].title, "法源");
+            assert_eq!(
+                around.articles[0].text,
+                "第1條(法源) 시험 본문. 第289條의2에 따른다."
+            );
+            assert_eq!(
+                around.articles[0].path,
+                ["第1編 總則", "第1章 通則", "第1節 일반", "第1款 사항"]
+            );
+            assert!(around.warnings.is_empty());
+        }
+        for requested in ["제289조의2", "第289條의2"] {
+            let branched = read_articles(
+                &lookup,
+                ArticleReadInput {
+                    object: Some(object(Dataset::NationalStatute, "hanja")),
+                    article: Some(requested.into()),
+                    context: 1,
+                    ..read_input("unused")
+                },
+                deadline(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(labels(&branched), ["제1조", "제289조의2", "제290조"]);
+            assert_eq!(branched.articles[1].title, "區分地上權");
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_hanja_heading_selection_and_preserves_outline_labels() {
+        let lookup = hanja_corpus();
+        for requested in ["第1章", "제1장", "1章", " 第 1 章 "] {
+            let chapter = read_articles(
+                &lookup,
+                ArticleReadInput {
+                    object: Some(object(Dataset::NationalStatute, "hanja")),
+                    chapter: Some(requested.into()),
+                    ..read_input("unused")
+                },
+                deadline(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(labels(&chapter), ["제1조", "제289조의2", "제290조"]);
+            assert!(chapter.warnings.is_empty());
+        }
+        let outline = read_articles(
+            &lookup,
+            ArticleReadInput {
+                object: Some(object(Dataset::NationalStatute, "hanja")),
+                ..read_input("unused")
+            },
+            deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let labels: Vec<&str> = outline
+            .outline
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "第1編",
+                "第1章",
+                "第1節",
+                "第1款",
+                "제1조",
+                "제289조의2",
+                "제290조",
+                "제2章",
+                "제291조"
+            ]
+        );
+        for invalid in ["第一章", "第0章", "第1條"] {
+            assert_eq!(parse_heading(invalid), None, "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn maps_hanja_inbound_and_outbound_references_without_branch_false_positives() {
+        let result = impact(
+            &hanja_corpus(),
+            ImpactInput {
+                object: Some(object(Dataset::NationalStatute, "hanja")),
+                law_name: None,
+                article: "第1條".into(),
+            },
+            deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.article, "제1조");
+        assert_eq!(result.article_title.as_deref(), Some("法源"));
+        assert_eq!(result.inbound.len(), 1);
+        assert_eq!(result.inbound[0].dataset, Dataset::Precedent);
+        assert_eq!(result.inbound[0].object_count, 1);
+        assert_eq!(result.inbound[0].references[0].object.id, "hanja-citing");
+        assert_eq!(result.outbound.len(), 1);
+        assert_eq!(result.outbound[0].article, "제289조의2");
+        assert_eq!(result.outbound[0].text, "第289條의2");
+        assert_eq!(result.outbound[0].law_name, None);
     }
 
     #[tokio::test]
