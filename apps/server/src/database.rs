@@ -264,9 +264,12 @@ impl ToolModule for DatabaseTools {
             "database.corpus_status",
             "Read durable progress of finite canonical corpus cloning, including independent current/history/treaty views, stable traversals, missing bodies and open gaps. This does not contact the provider. Canonical clone completion is not an atomic upstream snapshot or completeness of deferred supplementary sources.",
             ToolOptions::default(),
-            move |_, _| { let store=clone_store.clone(); async move {
-                match store.clone_progress().await.map_err(map_error)? {
-                    serde_json::Value::Object(progress) => Ok(demand_result::admission_output(output(CorpusStatusOutput(progress)), &store).await),
+            move |_, ctx| { let store=clone_store.clone(); async move {
+                match store.clone_progress_cancellable(&ctx.request.cancellation).await.map_err(map_error)? {
+                    serde_json::Value::Object(progress) => await_corpus_status_sidecar(
+                        &ctx.request.cancellation,
+                        demand_result::admission_output(output(CorpusStatusOutput(progress)), &store),
+                    ).await,
                     _ => Err(ToolError::StorageCorrupt),
                 }
             } }
@@ -517,10 +520,87 @@ pub async fn load_widget(
     crate::widget::load_widget(path, source, crate::widget::WidgetKind::Database).await
 }
 
+// Provider diagnostics take a read-only FOR SHARE lock. Dropping that read
+// cannot replay an upstream operation or leave a write COMMIT ambiguous. The
+// progress query and its admission sidecar both honor the request cancellation.
+async fn await_corpus_status_sidecar(
+    cancel: &tokio_util::sync::CancellationToken,
+    sidecar: impl std::future::Future<Output = crate::registry::RichToolOutput<CorpusStatusOutput>>,
+) -> Result<crate::registry::RichToolOutput<CorpusStatusOutput>, ToolError> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(ToolError::Unavailable),
+        output = sidecar => Ok(output),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn status_cancellation_drops_a_blocked_read_only_admission_sidecar() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            await_corpus_status_sidecar(&request_cancel, async move {
+                let _guard = guard;
+                entered.send(()).unwrap();
+                std::future::pending().await
+            })
+            .await
+        });
+        waiting.await.unwrap();
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(250), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(ToolError::Unavailable)));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "cancelled sidecar must release its read future"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_sidecar_preserves_ready_output_and_does_not_poll_after_cancellation() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let fields = json!({"initial_canonical_clone_complete":false,"views":[]})
+            .as_object()
+            .unwrap()
+            .clone();
+        let expected = serde_json::Value::Object(fields.clone());
+        let result = await_corpus_status_sidecar(&cancel, async {
+            crate::registry::RichToolOutput::new(CorpusStatusOutput(fields))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(result.output.structured).unwrap(),
+            expected
+        );
+        cancel.cancel();
+        let result = await_corpus_status_sidecar(&cancel, async {
+            panic!("pre-cancelled diagnostics must not be polled")
+        })
+        .await;
+        assert!(matches!(result, Err(ToolError::Unavailable)));
+    }
 
     #[test]
     fn corpus_progress_registers_as_an_object_without_changing_wire_fields() {

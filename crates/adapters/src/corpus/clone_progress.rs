@@ -104,7 +104,7 @@ impl PgCorpusStore {
 
         self.gate().await?;
         let digest = bytes_hash(&serde_json::to_vec(&result.items).map_err(corrupt)?);
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "clone_page_offset").await?;
         let k = view.key()?;
         let row=sqlx::query("SELECT next_page,item_offset,page_digest FROM openlegal.provider_clone_view WHERE view_key=$1 FOR UPDATE").bind(&k).fetch_one(&mut *tx).await.map_err(db)?;
         if row.try_get::<i32, _>("next_page").map_err(db)? as u32 != page {
@@ -117,7 +117,7 @@ impl PgCorpusStore {
             0
         };
         sqlx::query("UPDATE openlegal.provider_clone_view SET item_offset=$2,page_digest=$3 WHERE view_key=$1").bind(k).bind(offset as i32).bind(digest).execute(&mut *tx).await.map_err(db)?;
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "clone_page_offset").await?;
         Ok(offset)
 
             }
@@ -146,7 +146,7 @@ impl PgCorpusStore {
             return Err(DatabaseError::InvalidInput);
         }
         let k = view.key()?;
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = begin_storage(&self.pool, "clone_page_scheduled").await?;
         let row =
             sqlx::query("SELECT * FROM openlegal.provider_clone_view WHERE view_key=$1 FOR UPDATE")
                 .bind(&k)
@@ -217,53 +217,83 @@ impl PgCorpusStore {
                 .bind(&k).bind(i32::try_from(next).map_err(corrupt)?).bind(if complete_page {0} else {i32::try_from(offset).map_err(corrupt)?}).bind(if page==1 {total} else {expected}).bind(invalid).bind(i64::try_from(now).map_err(corrupt)?).execute(&mut *tx).await.map_err(db)?;
         }
         check(cancel)?;
-        tx.commit().await.map_err(db)?;
+        commit_storage(tx, "clone_page_scheduled").await?;
         Ok(())
 
             }
         }).await
     }
+    /// Read all durable progress components from one statement snapshot.
     pub async fn clone_progress(&self) -> Result<serde_json::Value, DatabaseError> {
+        self.clone_progress_cancellable(&CancellationToken::new())
+            .await
+    }
+
+    /// Cancellation applies to pool waiting and this read-only statement. No
+    /// transaction is held across response serialization or supplementary work.
+    pub async fn clone_progress_cancellable(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<serde_json::Value, DatabaseError> {
         self.gate().await?;
-        let rows=sqlx::query("SELECT v.*, (SELECT count(*) FROM openlegal.provider_clone_member m WHERE m.view_key=v.view_key AND m.seen_cycle>=v.cycle-1) AS observed, (SELECT count(*) FROM openlegal.provider_clone_member m WHERE m.view_key=v.view_key AND m.seen_cycle>=v.cycle-1 AND m.required_body AND (NOT EXISTS(SELECT 1 FROM openlegal.corpus_revision r JOIN openlegal.corpus_capture c ON c.id=r.latest_capture WHERE r.object_key=m.object_key AND r.revision_id=m.revision_id AND COALESCE(c.payload->'record'->'metadata'->>'attachment_status','')<>'incomplete' AND COALESCE(c.payload->'record'->'metadata'->>'body_status','')<>'response_identity_unverified_metadata_only') OR EXISTS(SELECT 1 FROM openlegal.corpus_job j WHERE j.object_key=m.object_key AND j.revision_id=m.revision_id AND j.status='failed'))) AS missing FROM openlegal.provider_clone_view v ORDER BY view_key").fetch_all(&self.pool).await.map_err(db)?;
-        let mut views = Vec::new();
+        let required_keys: Vec<String> = crate::law_go_kr::supplements::global_requests(1)?
+            .iter()
+            .map(crate::law_go_kr::supplements::SupplementRequest::observation_key)
+            .collect::<Result<_, _>>()?;
+        let row = retry_storage(cancel, "clone_progress", || async {
+            let started = std::time::Instant::now();
+            let acquired = tokio::select! {
+                _ = cancel.cancelled() => return Err(DatabaseError::Cancelled),
+                result = self.pool.acquire() => result,
+            };
+            let mut connection = acquired.map_err(|error| {
+                self.log_progress_read_failure("pool_acquire", started, &error);
+                // No SQL was submitted. This classification is local to this
+                // read, and does not weaken uncertain writes or COMMIT errors.
+                if matches!(error, sqlx::Error::PoolTimedOut) {
+                    DatabaseError::StorageContended
+                } else {
+                    db(error)
+                }
+            })?;
+            tracing::debug!(operation = "clone_progress", phase = "pool_acquire",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                pool_size = self.pool.size(), pool_idle = self.pool.num_idle(),
+                "corpus progress read acquired connection");
+            let started = std::time::Instant::now();
+            let result = tokio::select! {
+                _ = cancel.cancelled() => return Err(DatabaseError::Cancelled),
+                result = sqlx::query(PROGRESS_SQL).bind(&required_keys).fetch_one(&mut *connection) => result,
+            };
+            result.map_err(|error| {
+                self.log_progress_read_failure("statement", started, &error);
+                db(error)
+            })
+        }).await?;
+        check(cancel)?;
+        let rows: Vec<ProgressView> =
+            serde_json::from_value(row.try_get("views").map_err(db)?).map_err(corrupt)?;
         let expected: std::collections::BTreeSet<String> = CloneView::all()
             .into_iter()
             .map(CloneView::key)
             .collect::<Result<_, _>>()?;
-        let actual: std::collections::BTreeSet<String> = rows
-            .iter()
-            .map(|r| r.try_get::<String, _>("view_key").map_err(db))
-            .collect::<Result<_, _>>()?;
+        let actual: std::collections::BTreeSet<String> =
+            rows.iter().map(|r| r.view_key.clone()).collect();
         let mut complete = expected == actual;
+        let mut views = Vec::with_capacity(rows.len());
         for row in rows {
-            let stable: i32 = row.try_get("stable_cycles").map_err(db)?;
-            let missing: i64 = row.try_get("missing").map_err(db)?;
-            complete &= stable >= 2
-                && missing == 0
-                && !row.try_get::<bool, _>("cycle_invalid").map_err(db)?;
-            views.push(serde_json::json!({"view":row.try_get::<String,_>("view_key").map_err(db)?,"next_page":row.try_get::<i32,_>("next_page").map_err(db)?,"cycle":row.try_get::<i64,_>("cycle").map_err(db)?,"stable_cycles":stable,"observed":row.try_get::<i64,_>("observed").map_err(db)?,"missing_bodies":missing,"metadata_only":catalog::source_family(Dataset::from_name(&row.try_get::<String,_>("dataset").map_err(db)?).ok_or(DatabaseError::StorageCorrupt)?).metadata_only}));
+            check(cancel)?;
+            complete &= row.stable_cycles >= 2 && row.missing == 0 && !row.cycle_invalid;
+            let dataset = Dataset::from_name(&row.dataset).ok_or(DatabaseError::StorageCorrupt)?;
+            views.push(serde_json::json!({"view":row.view_key,"next_page":row.next_page,"cycle":row.cycle,"stable_cycles":row.stable_cycles,"observed":row.observed,"missing_bodies":row.missing,"metadata_only":catalog::source_family(dataset).metadata_only}));
         }
-        let gaps: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM openlegal.provider_collection_gap WHERE resolved_at IS NULL",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db)?;
-        let jobs: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM openlegal.corpus_job WHERE status IN ('pending','running')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db)?;
-        let index_ready: bool = sqlx::query_scalar(
-            "SELECT index_ack=next_event-1 FROM openlegal.corpus_control WHERE singleton",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db)?;
+        let gaps: i64 = row.try_get("gaps").map_err(db)?;
+        let jobs: i64 = row.try_get("jobs").map_err(db)?;
+        let index_ready: bool = row.try_get("index_ready").map_err(db)?;
         complete &= gaps == 0 && jobs == 0 && index_ready;
-        let supplementary = self.supplement_progress().await?;
+        let supplement_rows: Vec<SupplementProgressRow> =
+            serde_json::from_value(row.try_get("supplementary").map_err(db)?).map_err(corrupt)?;
+        let supplementary = supplement_progress_value(supplement_rows, required_keys.len())?;
         let guide_coverage = crate::law_go_kr::supplements::guide_coverage();
         let unresolved_guides = guide_coverage
             .iter()
@@ -278,4 +308,132 @@ impl PgCorpusStore {
             serde_json::json!({"initial_canonical_clone_complete":complete,"full_available_clone_complete":complete && unresolved_guides==0 && supplementary["complete"]==true,"atomic_upstream_snapshot":false,"open_gaps":gaps,"active_jobs":jobs,"index_ready":index_ready,"views":views,"supplementary":supplementary,"unresolved_guides":unresolved_guides,"guide_coverage":guide_coverage}),
         )
     }
+
+    fn log_progress_read_failure(
+        &self,
+        phase: &'static str,
+        started: std::time::Instant,
+        error: &sqlx::Error,
+    ) {
+        let sqlstate = error.as_database_error().and_then(|e| e.code());
+        tracing::warn!(
+            operation = "clone_progress",
+            phase,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            sqlstate = sqlstate.as_deref().unwrap_or("none"),
+            error_category = if matches!(error, sqlx::Error::PoolTimedOut) {
+                "pool_timeout"
+            } else {
+                "sql_error"
+            },
+            pool_size = self.pool.size(),
+            pool_idle = self.pool.num_idle(),
+            "corpus progress read failed"
+        );
+    }
 }
+
+#[derive(serde::Deserialize)]
+struct ProgressView {
+    view_key: String,
+    dataset: String,
+    next_page: i32,
+    cycle: i64,
+    stable_cycles: i32,
+    cycle_invalid: bool,
+    observed: i64,
+    missing: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct SupplementProgressRow {
+    source: String,
+    status: String,
+    jobs: u64,
+    completed_global_roots: u64,
+}
+
+fn supplement_progress_value(
+    rows: Vec<SupplementProgressRow>,
+    required_roots: usize,
+) -> Result<serde_json::Value, DatabaseError> {
+    let mut sources = Vec::with_capacity(rows.len());
+    let mut pending = 0_u64;
+    let mut done = 0_u64;
+    let mut deferred = 0_u64;
+    let mut incomplete = 0_u64;
+    let mut completed_global_roots = 0_u64;
+    for row in rows {
+        completed_global_roots = completed_global_roots
+            .checked_add(row.completed_global_roots)
+            .ok_or(DatabaseError::Capacity)?;
+        let total = match row.status.as_str() {
+            "pending" | "running" => &mut pending,
+            "done" => &mut done,
+            "deferred" => &mut deferred,
+            "incomplete" => &mut incomplete,
+            _ => return Err(DatabaseError::StorageCorrupt),
+        };
+        *total = total.checked_add(row.jobs).ok_or(DatabaseError::Capacity)?;
+        sources.push(serde_json::json!({"source":row.source,"status":row.status,"jobs":row.jobs}));
+    }
+    let complete = completed_global_roots == required_roots as u64
+        && pending == 0
+        && deferred == 0
+        && incomplete == 0;
+    Ok(
+        serde_json::json!({"complete":complete,"completed_global_roots":completed_global_roots,"required_global_roots":required_roots,"pending_or_running":pending,"done":done,"deferred":deferred,"incomplete":incomplete,"sources":sources}),
+    )
+}
+
+// Each required object/revision body is examined once across current/history
+// views. DISTINCT failed pairs preserve EXISTS semantics with multiple jobs.
+// All aggregates share PostgreSQL's single statement MVCC snapshot, including
+// the control watermark and supplementary roots. No payload leaves PostgreSQL.
+const PROGRESS_SQL: &str = r#"
+WITH members AS MATERIALIZED (
+    SELECT m.* FROM openlegal.provider_clone_member m
+    JOIN openlegal.provider_clone_view v USING(view_key)
+    WHERE m.seen_cycle >= v.cycle - 1
+), required_pairs AS MATERIALIZED (
+    SELECT DISTINCT object_key, revision_id FROM members WHERE required_body
+), valid_bodies AS MATERIALIZED (
+    SELECT p.object_key, p.revision_id
+    FROM required_pairs p
+    JOIN openlegal.corpus_revision r USING(object_key, revision_id)
+    JOIN openlegal.corpus_capture c ON c.id = r.latest_capture
+    WHERE COALESCE(c.payload->'record'->'metadata'->>'attachment_status', '') <> 'incomplete'
+      AND COALESCE(c.payload->'record'->'metadata'->>'body_status', '') <> 'response_identity_unverified_metadata_only'
+), failed_pairs AS MATERIALIZED (
+    SELECT DISTINCT j.object_key, j.revision_id
+    FROM openlegal.corpus_job j JOIN required_pairs p USING(object_key, revision_id)
+    WHERE j.status = 'failed'
+), member_counts AS (
+    SELECT m.view_key, count(*) AS observed,
+        count(*) FILTER(WHERE m.required_body AND (b.object_key IS NULL OR f.object_key IS NOT NULL)) AS missing
+    FROM members m
+    LEFT JOIN valid_bodies b USING(object_key, revision_id)
+    LEFT JOIN failed_pairs f USING(object_key, revision_id)
+    GROUP BY m.view_key
+), view_progress AS (
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'view_key', v.view_key, 'dataset', v.dataset, 'next_page', v.next_page,
+        'cycle', v.cycle, 'stable_cycles', v.stable_cycles, 'cycle_invalid', v.cycle_invalid,
+        'observed', COALESCE(m.observed, 0), 'missing', COALESCE(m.missing, 0)
+    ) ORDER BY v.view_key), '[]'::jsonb) AS views
+    FROM openlegal.provider_clone_view v LEFT JOIN member_counts m USING(view_key)
+), supplement_counts AS (
+    SELECT source, status, count(*) AS jobs,
+        count(*) FILTER(WHERE job_key = ANY($1) AND status = 'done') AS completed_global_roots
+    FROM openlegal.provider_supplement_job GROUP BY source, status
+), supplement_progress AS (
+    SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY source, status), '[]'::jsonb) AS supplementary
+    FROM supplement_counts s
+)
+SELECT v.views, s.supplementary,
+    (SELECT count(*) FROM openlegal.provider_collection_gap WHERE resolved_at IS NULL) AS gaps,
+    (SELECT count(*) FROM openlegal.corpus_job WHERE status IN ('pending', 'running')) AS jobs,
+    c.index_ack = c.next_event - 1 AS index_ready
+FROM openlegal.corpus_control c CROSS JOIN view_progress v CROSS JOIN supplement_progress s
+WHERE c.singleton
+"#;
