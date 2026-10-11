@@ -611,6 +611,7 @@ fn validate_settlement_reason(reason: Option<&str>) -> Result<(), DatabaseError>
                 | "provider_admission_wait"
                 | "capacity_wait"
                 | "provider_recovery_hold"
+                | "index_input_limit"
         )
     }) {
         return Err(DatabaseError::InvalidInput);
@@ -782,6 +783,16 @@ mod tests {
             .await
             .is_err()
         );
+        // Migration 22 must not retroactively accept migration 25 vocabulary.
+        assert!(
+            sqlx::query(
+                "UPDATE openlegal.collection_request SET reason='index_input_limit' WHERE id=$1"
+            )
+            .bind(legacy_null)
+            .execute(&pool)
+            .await
+            .is_err()
+        );
         base.close().await.unwrap();
     }
 
@@ -811,6 +822,7 @@ mod tests {
             "operation_attempt_limit",
             "provider_admission_wait",
             "capacity_wait",
+            "index_input_limit",
         ] {
             assert_eq!(validate_settlement_reason(Some(reason)), Ok(()));
         }

@@ -120,6 +120,9 @@ operational warnings do not expose unverified legal text or establish a complete
 inventory. `download_failed` distinguishes transport and selected HTTP failures
 from `source_unavailable` (404/410) and `source_data_invalid` (bad bytes). The
 browser displays Korean and English explanations.
+`index_input_limit` means validly projected source text exceeds a local index
+input bound; it does not classify the original source as corrupt or unavailable.
+The gap remains visible and prevents a complete-corpus claim.
 
 `database.diff` resolves both selectors for one object and returns the exact capture
 metadata with a text-comparison handle. Its line and character comparison is the
@@ -190,6 +193,14 @@ unknown-word lattice expands superlinearly, so these additional limits reject
 pathological inputs before analysis rather than splitting text and changing its
 segmentation. They apply to queries and indexed or selected text alike. A source exceeding these bounds remains unprocessed; it cannot publish a
 new HEAD and then block the ordered index stream.
+Managed collection records a version-fenced failed detail job and an
+`index_input_limit` gap for these deterministic bounds, retaining the permitted
+original source observation and the previously published HEAD. No publication
+or index outbox event is created. The existing one-hour future gap cycle owns
+any later attempt; there is no inline retry or change to text segmentation,
+normalization, tokenizer identity, or limits. Busy analyzer slots, deadlines,
+cancellation, and storage failures retain their existing handling. Query and
+selected-text callers retain the existing `resource_limit` response.
 
 Each call has a ten-second deadline and 64 MiB scan budget. A page can have zero
 hits and a continuation when a scan budget is exhausted. A continuation does not
@@ -244,6 +255,12 @@ optional terminal `reason`. A new skipped attempt reports its observed cause:
 `head_observation_superseded`, `publication_superseded`, or `no_matches`.
 `multiple_skip_reasons` means different objects were skipped for different causes.
 Old receipts with no reason retain that uncertainty.
+An index input rejection reports `skipped` with `index_input_limit` when nothing
+publishes, or `done` with that partial-result reason when another item publishes.
+Like provider failures, the first observed failure reason retains precedence.
+Migration 25 only extends the constrained reason vocabulary; it neither infers
+causes for existing `processing_failed` jobs nor requeues them. Rollback must
+retain this vocabulary while any receipt or gap references the new reason.
 
 Structurally incomplete provider lists do not establish absence. Valid matching
 rows can still be collected; absent higher-priority provider failures, the receipt

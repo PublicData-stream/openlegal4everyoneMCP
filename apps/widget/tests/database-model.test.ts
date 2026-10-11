@@ -36,6 +36,12 @@ test('new source records and notices remain valid in mixed dataset search pages'
   assert.equal(hasProviderRevisions('ppc_decision'), false);
   assert.equal(hasProviderRevisions('audit_consultation'), false);
 });
+test('local index limit notices remain visible without accepting unknown reason codes', () => {
+  const notice = { dataset: 'national_statute', scope: 'detail', code: 'index_input_limit', affected_count: 1, last_seen_at: 100, retry_at: 3700 };
+  const response = (code: string) => ({ structuredContent: { schema_version: 1, hits: [], next_cursor: null, generation: 0, corpus_complete: false, index_lag: 0, collection_notices: [{ ...notice, code }] } });
+  assert.deepEqual(searchPage(response('index_input_limit')).collection_notices, [notice]);
+  assert.throws(() => searchPage(response('untrusted_detail')), /unsupported/);
+});
 test('database object and selector validation prevents checkpoint substitution', () => {
   assert.deepEqual(identity(id), id);
   assert.throws(() => identity({ ...id, provider: '../escape' }));

@@ -1,6 +1,6 @@
 //! Rebuildable Tantivy corpus generations and Korean analysis. No provider I/O.
 use crate::{
-    korean_analysis::{AnalyzedText, KoreanAnalyzer},
+    korean_analysis::{AnalysisError, AnalysisInputLimit, AnalyzedText, KoreanAnalyzer},
     korean_query::CompiledQuery,
 };
 use openlegal_domain::{
@@ -23,6 +23,39 @@ use tantivy::{
 };
 use tokio_util::sync::CancellationToken;
 const INDEX_FORMAT: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexTextField {
+    Title,
+    Body,
+}
+/// Only reproducible input bounds belong here; pool/deadline/storage failures do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexInputLimit {
+    Analysis {
+        field: IndexTextField,
+        limit: AnalysisInputLimit,
+    },
+    SerializedEnvelope,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexAdmissionError {
+    InputLimit(IndexInputLimit),
+    Operation(E),
+}
+impl From<E> for IndexAdmissionError {
+    fn from(error: E) -> Self {
+        Self::Operation(error)
+    }
+}
+impl IndexAdmissionError {
+    fn database_error(self) -> E {
+        match self {
+            Self::InputLimit(_) => E::Capacity,
+            Self::Operation(error) => error,
+        }
+    }
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IndexMetadata {
@@ -412,15 +445,38 @@ impl CorpusIndex {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<(), E> {
+        self.validate_record_classified_with_budget(record, deadline, cancel)
+            .map_err(IndexAdmissionError::database_error)
+    }
+    /// Preserve pre-publication safety bounds while separating deterministic
+    /// input rejection from operational failure. No provider or storage effects.
+    pub fn validate_record_classified_with_budget(
+        &self,
+        record: &openlegal_domain::legal::LegalRecord,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(), IndexAdmissionError> {
         record.validate()?;
-        let title = self.tokens_with_budget(&record.title, deadline, cancel)?;
-        let body = self.tokens_with_budget(&record.body, deadline, cancel)?;
+        let analyze = |text: &str, field| {
+            self.analyzer
+                .analyze_classified(text, deadline, cancel)
+                .map_err(|error| match error {
+                    AnalysisError::InputLimit(limit) => {
+                        IndexAdmissionError::InputLimit(IndexInputLimit::Analysis { field, limit })
+                    }
+                    AnalysisError::Operation(error) => IndexAdmissionError::Operation(error),
+                })
+        };
+        let title = analyze(&record.title, IndexTextField::Title)?;
+        let body = analyze(&record.body, IndexTextField::Body)?;
         let size = serde_json::to_vec(&(record, title, body))
             .map_err(err)?
             .len();
         // Leave room for immutable capture/provenance envelope and index flags.
         if size > 48 * 1024 * 1024 - 8192 {
-            return Err(E::Capacity);
+            return Err(IndexAdmissionError::InputLimit(
+                IndexInputLimit::SerializedEnvelope,
+            ));
         }
         Ok(())
     }
@@ -581,6 +637,99 @@ impl CorpusIndex {
 mod tests {
     use super::*;
     use openlegal_domain::legal::{Dataset, LegalRecord, ObjectId};
+    #[test]
+    fn classified_preflight_preserves_fields_errors_and_index_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = CorpusIndex::open(directory.path(), KoreanAnalyzer::fixture()).unwrap();
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        for (field, text, limit) in [
+            (
+                IndexTextField::Title,
+                "a".repeat(145),
+                AnalysisInputLimit::NonWhitespaceRun,
+            ),
+            (
+                IndexTextField::Body,
+                "a ".repeat(4023),
+                AnalysisInputLimit::LineScalars,
+            ),
+        ] {
+            let mut record = capture("fictional-bound", "r1", "가 ABC").record;
+            match field {
+                IndexTextField::Title => record.title = text,
+                IndexTextField::Body => record.body = text,
+            }
+            assert_eq!(
+                index.validate_record_classified_with_budget(&record, deadline, &cancel),
+                Err(IndexAdmissionError::InputLimit(IndexInputLimit::Analysis {
+                    field,
+                    limit
+                }))
+            );
+            assert_eq!(
+                index.validate_record_with_budget(&record, deadline, &cancel),
+                Err(E::Capacity)
+            );
+            assert_eq!(index.snapshot().unwrap().generation, 0);
+        }
+        let mut invalid = capture("fictional-invalid", "r1", "a").record;
+        invalid.source_url = "http://example.test/fictional".into();
+        assert_eq!(
+            index.validate_record_classified_with_budget(&invalid, deadline, &cancel),
+            Err(IndexAdmissionError::Operation(E::InvalidInput))
+        );
+        let valid = capture("fictional-valid", "r1", "가 ABC").record;
+        assert!(
+            index
+                .validate_record_classified_with_budget(&valid, deadline, &cancel)
+                .is_ok()
+        );
+        assert!(
+            index
+                .validate_record_with_budget(&valid, deadline, &cancel)
+                .is_ok()
+        );
+        assert_eq!(
+            index.validate_record_classified_with_budget(&valid, Instant::now(), &cancel),
+            Err(IndexAdmissionError::Operation(E::BudgetExhausted))
+        );
+        cancel.cancel();
+        assert_eq!(
+            index.validate_record_classified_with_budget(&valid, deadline, &cancel),
+            Err(IndexAdmissionError::Operation(E::Cancelled))
+        );
+    }
+
+    #[test]
+    fn classified_preflight_rejects_escaped_envelope_without_publishing() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = CorpusIndex::open(directory.path(), KoreanAnalyzer::fixture()).unwrap();
+        let mut record = capture("fictional-envelope", "r1", "가").record;
+        // Valid decoded sections can exceed the envelope after JSON escaping.
+        record.sections = (0..2)
+            .map(|ordinal| openlegal_domain::legal::LegalSection {
+                id: format!("fictional-{ordinal}"),
+                title: "Fictional section".into(),
+                text: "\"".repeat(13 * 1024 * 1024),
+                kind: openlegal_domain::legal::SectionKind::ProviderText,
+                source_document_sha256: None,
+                page: None,
+            })
+            .collect();
+        assert!(record.validate().is_ok());
+        assert_eq!(
+            index.validate_record_classified_with_budget(
+                &record,
+                Instant::now() + std::time::Duration::from_secs(30),
+                &CancellationToken::new()
+            ),
+            Err(IndexAdmissionError::InputLimit(
+                IndexInputLimit::SerializedEnvelope
+            ))
+        );
+        assert_eq!(index.snapshot().unwrap().generation, 0);
+    }
     #[test]
     fn metadata_fences_legacy_mismatched_and_interrupted_indexes() {
         let directory = tempfile::tempdir().unwrap();

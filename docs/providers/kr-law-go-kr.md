@@ -245,6 +245,15 @@ been validated against live provider responses.
 
 ## Local freshness and resource policy
 
+Validly projected provider text can exceed the unchanged local Korean analyzer
+or serialized index bounds. Managed collection then records `index_input_limit`
+as a visible detail gap, retaining the permitted original observation and any
+older HEAD without publishing that candidate. This is not `source_data_invalid`
+and does not prove provider absence. The existing future gap retry cycle owns
+later work; limits, segmentation, analyzer identity, charged provider usage, and
+previous `processing_failed` jobs remain unchanged. Such gaps prevent a full
+clone claim even when inventory traversal has completed.
+
 These are application choices, not claimed upstream service guarantees:
 
 - HEAD is fresh for one hour; disclosed stale serving ends at 24 hours after

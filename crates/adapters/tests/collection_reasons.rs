@@ -39,6 +39,7 @@ async fn skip_reasons_survive_coalescing_and_terminal_receipts_but_clear_on_retr
         "publication_superseded",
         "no_matches",
         "multiple_skip_reasons",
+        "index_input_limit",
     ]
     .into_iter()
     .enumerate()

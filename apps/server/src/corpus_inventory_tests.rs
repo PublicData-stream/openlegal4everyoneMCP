@@ -136,6 +136,150 @@ async fn queue(runtime: &CorpusRuntime, candidate: &InventoryItem) {
         .unwrap();
 }
 
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh and the pinned Korean dictionary"]
+async fn typed_index_limits_settle_both_claim_origins_without_publication_or_http() {
+    let (fixture, persistent, runtime) = setup().await;
+    let original_budget = budget(&fixture).await;
+    let watermark = runtime.store.watermark().await.unwrap();
+    for (explicit, body, expected) in [
+        (
+            false,
+            "a ".repeat(4023),
+            openlegal_adapters::korean_analysis::AnalysisInputLimit::LineScalars,
+        ),
+        (
+            true,
+            "a".repeat(145),
+            openlegal_adapters::korean_analysis::AnalysisInputLimit::NonWhitespaceRun,
+        ),
+    ] {
+        let candidate = item(if explicit {
+            "fictional-explicit-bound"
+        } else {
+            "fictional-background-bound"
+        });
+        let raw = format!("<fictional>{body}</fictional>").into_bytes();
+        let retained = runtime
+            .store
+            .retain_source_observation(
+                SourceObservationInput {
+                    source_key: format!("fictional:index-limit:{}", candidate.object.id),
+                    raw: Some(raw.clone()),
+                    media_type: "application/xml".into(),
+                    rights: openlegal_domain::rights::SourceRights::legal_information(),
+                    metadata: Default::default(),
+                    observed_at: now(),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let queued = runtime
+            .store
+            .enqueue_job_with_metadata(
+                candidate.object.clone(),
+                candidate.revision_id.clone(),
+                None,
+                true,
+                true,
+                now(),
+                if explicit {
+                    std::collections::BTreeMap::from([(
+                        "collection_origin".into(),
+                        "explicit".into(),
+                    )])
+                } else {
+                    Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let claim = if explicit {
+            runtime
+                .store
+                .claim_explicit_job(&queued.id, now(), 600)
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            runtime.store.claim_job(now()).await.unwrap().unwrap()
+        };
+        let record = LegalRecord {
+            object: candidate.object.clone(),
+            revision_id: candidate.revision_id,
+            title: candidate.title,
+            body,
+            metadata: Default::default(),
+            publication_date: None,
+            effective_date: None,
+            source_url: "https://example.test/fictional".into(),
+            representation: "fictional_text".into(),
+            sections: vec![],
+        };
+        let error = runtime
+            .index
+            .validate_record_classified_with_budget(
+                &record,
+                std::time::Instant::now() + Duration::from_secs(10),
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        let limit = match error {
+            IndexAdmissionError::InputLimit(limit) => limit,
+            other => panic!("expected deterministic synthetic limit, got {other:?}"),
+        };
+        assert_eq!(
+            limit,
+            IndexInputLimit::Analysis {
+                field: openlegal_adapters::search_index::IndexTextField::Body,
+                limit: expected,
+            }
+        );
+        reject_index_input_limit(&runtime.store, &claim, limit)
+            .await
+            .unwrap();
+        assert_eq!(
+            reject_index_input_limit(&runtime.store, &claim, limit).await,
+            Err(DatabaseError::Conflict)
+        );
+        let status = runtime
+            .store
+            .object_status(&candidate.object, now())
+            .await
+            .unwrap();
+        assert_eq!(
+            status.job.unwrap().error_category.as_deref(),
+            Some("index_input_limit")
+        );
+        assert!(status.head_capture_id.is_none());
+        assert_eq!(
+            runtime
+                .store
+                .source_observation_bytes(&retained.observation_id, CancellationToken::new())
+                .await
+                .unwrap(),
+            raw
+        );
+        assert_eq!(runtime.store.watermark().await.unwrap(), watermark);
+        assert!(
+            runtime
+                .store
+                .outbox(watermark, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(budget(&fixture).await, original_budget);
+    }
+    assert_eq!(
+        runtime.store.clone_progress().await.unwrap()["full_available_clone_complete"],
+        false
+    );
+    runtime.close().await.unwrap();
+    persistent.close().await.unwrap();
+}
+
 async fn prepare_partial(
     fixture: &postgres::TestDatabase,
     runtime: &CorpusRuntime,

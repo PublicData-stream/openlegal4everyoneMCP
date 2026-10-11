@@ -25,6 +25,35 @@ const SLOTS: usize = 4;
 const SEMANTICS: &str =
     "ko_lindera5.0.1_ko-dic5.3.0_mecab0.7.2_surface_nfc_ascii_union_not-veto_line4096_run128_v2";
 
+/// Deterministic text bounds, distinct from busy analyzer slots or an elapsed deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnalysisInputLimit {
+    LineBytes,
+    NormalizedLineBytes,
+    LineScalars,
+    NonWhitespaceRun,
+    FieldTokens,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnalysisError {
+    InputLimit(AnalysisInputLimit),
+    Operation(E),
+}
+impl From<E> for AnalysisError {
+    fn from(error: E) -> Self {
+        Self::Operation(error)
+    }
+}
+impl AnalysisError {
+    pub(crate) fn database_error(self) -> E {
+        match self {
+            Self::InputLimit(_) => E::Capacity,
+            Self::Operation(error) => error,
+        }
+    }
+}
+
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct AnalyzedText {
     pub lindera: Vec<String>,
@@ -62,14 +91,19 @@ fn budget(deadline: Instant, cancel: &CancellationToken) -> Result<(), E> {
 /// MeCab's grouped unknown candidates have superlinear work. Its lattice retains
 /// whitespace boundaries and the unknown handler stops groups at those boundaries.
 /// Reject large runs rather than changing segmentation by splitting the text.
-fn validate_line(text: &str) -> Result<(), E> {
+fn validate_line(text: &str) -> Result<(), AnalysisError> {
     let mut scalars = 0;
     let mut run = 0;
     for c in text.chars() {
         scalars += 1;
         run = if c.is_whitespace() { 0 } else { run + 1 };
-        if scalars > MAX_LINE_SCALARS || run > MAX_RUN_SCALARS {
-            return Err(E::Capacity);
+        if scalars > MAX_LINE_SCALARS {
+            return Err(AnalysisError::InputLimit(AnalysisInputLimit::LineScalars));
+        }
+        if run > MAX_RUN_SCALARS {
+            return Err(AnalysisError::InputLimit(
+                AnalysisInputLimit::NonWhitespaceRun,
+            ));
         }
     }
     Ok(())
@@ -107,6 +141,18 @@ impl KoreanAnalyzer {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<AnalyzedText, E> {
+        self.analyze_classified(text, deadline, cancel)
+            .map_err(AnalysisError::database_error)
+    }
+
+    /// Same analysis and admission order as `analyze`, with typed input rejection
+    /// for managed publication. Query callers retain the existing Capacity error.
+    pub fn analyze_classified(
+        &self,
+        text: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<AnalyzedText, AnalysisError> {
         budget(deadline, cancel)?;
         let mut slot = None;
         for candidate in &self.slots {
@@ -116,7 +162,7 @@ impl KoreanAnalyzer {
                     break;
                 }
                 Err(TryLockError::WouldBlock) => {}
-                Err(TryLockError::Poisoned(_)) => return Err(E::StorageCorrupt),
+                Err(TryLockError::Poisoned(_)) => return Err(E::StorageCorrupt.into()),
             }
         }
         let mut slot = slot.ok_or(E::Capacity)?;
@@ -124,11 +170,13 @@ impl KoreanAnalyzer {
         for line in text.split_inclusive('\n') {
             budget(deadline, cancel)?;
             if line.len() > MAX_LINE_BYTES {
-                return Err(E::Capacity);
+                return Err(AnalysisError::InputLimit(AnalysisInputLimit::LineBytes));
             }
             let normalized = line.nfc().collect::<String>().to_ascii_lowercase();
             if normalized.len() > MAX_LINE_BYTES {
-                return Err(E::Capacity);
+                return Err(AnalysisError::InputLimit(
+                    AnalysisInputLimit::NormalizedLineBytes,
+                ));
             }
             validate_line(&normalized)?;
             if normalized.trim().is_empty() {
@@ -152,7 +200,7 @@ impl KoreanAnalyzer {
                 Engine::Fixture => lindera.clone(),
             };
             if lindera.is_empty() || mecab.is_empty() {
-                return Err(E::StorageCorrupt);
+                return Err(E::StorageCorrupt.into());
             }
             if result
                 .lindera
@@ -162,7 +210,7 @@ impl KoreanAnalyzer {
                 .saturating_add(mecab.len())
                 > MAX_FIELD_TOKENS
             {
-                return Err(E::Capacity);
+                return Err(AnalysisError::InputLimit(AnalysisInputLimit::FieldTokens));
             }
             result.lindera.extend(lindera);
             result.mecab.extend(mecab);
@@ -316,19 +364,95 @@ mod tests {
         let text = "가\n".repeat(MAX_FIELD_TOKENS / 2 + 1);
         assert_eq!(
             analyzer
-                .analyze(
+                .analyze_classified(
                     &text,
                     Instant::now() + Duration::from_secs(60),
                     &CancellationToken::new()
                 )
                 .unwrap_err(),
-            E::Capacity
+            AnalysisError::InputLimit(AnalysisInputLimit::FieldTokens)
         );
         assert_eq!(
             analyzer
                 .analyze("가", Instant::now(), &CancellationToken::new())
                 .unwrap_err(),
             E::BudgetExhausted
+        );
+    }
+
+    #[test]
+    fn classified_bounds_preserve_legacy_errors_and_admission_precedence() {
+        let analyzer = KoreanAnalyzer::fixture();
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // Fictional equivalents of a long source line and a long unknown-word run.
+        for (text, limit) in [
+            (
+                " ".repeat(MAX_LINE_BYTES + 1),
+                AnalysisInputLimit::LineBytes,
+            ),
+            (
+                "\u{0344}".repeat(MAX_LINE_BYTES / 4 + 1),
+                AnalysisInputLimit::NormalizedLineBytes,
+            ),
+            ("a ".repeat(4023), AnalysisInputLimit::LineScalars),
+            ("a".repeat(145), AnalysisInputLimit::NonWhitespaceRun),
+        ] {
+            assert_eq!(
+                analyzer
+                    .analyze_classified(&text, deadline, &cancel)
+                    .unwrap_err(),
+                AnalysisError::InputLimit(limit)
+            );
+            assert_eq!(
+                analyzer.analyze(&text, deadline, &cancel).unwrap_err(),
+                E::Capacity
+            );
+        }
+        let invalid = "a".repeat(145);
+        let guards: Vec<_> = analyzer
+            .slots
+            .iter()
+            .map(|slot| slot.lock().unwrap())
+            .collect();
+        assert_eq!(
+            analyzer
+                .analyze_classified(&invalid, deadline, &cancel)
+                .unwrap_err(),
+            AnalysisError::Operation(E::Capacity)
+        );
+        assert_eq!(
+            analyzer
+                .analyze_classified(&invalid, Instant::now(), &cancel)
+                .unwrap_err(),
+            AnalysisError::Operation(E::BudgetExhausted)
+        );
+        cancel.cancel();
+        assert_eq!(
+            analyzer
+                .analyze_classified(&invalid, Instant::now(), &cancel)
+                .unwrap_err(),
+            AnalysisError::Operation(E::Cancelled)
+        );
+        drop(guards);
+        let text = "가 ABC 가";
+        let cancel = CancellationToken::new();
+        let classified = analyzer
+            .analyze_classified(text, deadline, &cancel)
+            .unwrap();
+        let legacy = analyzer.analyze(text, deadline, &cancel).unwrap();
+        assert_eq!(classified.lindera, legacy.lindera);
+        assert_eq!(classified.mecab, legacy.mecab);
+        // Poisoned engine admission remains a storage failure even for invalid text.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = analyzer.slots[0].lock().unwrap();
+            panic!("fictional engine poison");
+        }));
+        assert_eq!(
+            analyzer
+                .analyze_classified(&invalid, deadline, &cancel)
+                .unwrap_err(),
+            AnalysisError::Operation(E::StorageCorrupt)
         );
     }
 
@@ -366,7 +490,7 @@ mod tests {
         assert!(validate_line(&" ".repeat(MAX_LINE_SCALARS)).is_ok());
         assert_eq!(
             validate_line(&" ".repeat(MAX_LINE_SCALARS + 1)).unwrap_err(),
-            E::Capacity
+            AnalysisError::InputLimit(AnalysisInputLimit::LineScalars)
         );
     }
 }

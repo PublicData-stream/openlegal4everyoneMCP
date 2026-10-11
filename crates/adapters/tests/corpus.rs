@@ -3,7 +3,7 @@
 mod support;
 use openlegal_adapters::{
     blob::FsBlobStore,
-    corpus::{PageGapObservation, PgCorpusStore},
+    corpus::{PageGapObservation, PgCorpusStore, SourceObservationInput},
     law_go_kr::{LawClient, ProviderRequestLimits, RequestBudgetMode},
 };
 use openlegal_application::{
@@ -1475,6 +1475,141 @@ async fn publish(store: &PgCorpusStore, revision: &str, body: &str, now: u64) ->
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn index_input_limit_preserves_archive_head_outbox_charges_and_legacy_failure() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let pool = base.pool();
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("index-input-limit"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::with_publication_clock(pool.clone(), blobs, Arc::new(FixtureClock));
+    let head = publish(&store, "old", "Fictional retained head", 100).await;
+    let watermark = store.watermark().await.unwrap();
+    let raw = format!("<fictional>{}</fictional>", "a".repeat(145)).into_bytes();
+    let source = store
+        .retain_source_observation(
+            SourceObservationInput {
+                source_key: "fictional:index-input-limit:detail".into(),
+                raw: Some(raw.clone()),
+                media_type: "application/xml".into(),
+                rights: openlegal_domain::rights::SourceRights::legal_information(),
+                metadata: BTreeMap::new(),
+                observed_at: 101,
+            },
+            token(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openlegal.provider_request_budget SET daily_used=7,on_demand_used=3 WHERE singleton")
+        .execute(&pool).await.unwrap();
+    store
+        .enqueue_job(object(), "rejected".into(), None, true, true, 102)
+        .await
+        .unwrap();
+    let job = store.claim_job(103).await.unwrap().unwrap();
+    let mut stale = job.clone();
+    stale.expected_version += 1;
+    assert_eq!(
+        store.skip_claim(&stale, "index_input_limit", 104).await,
+        Err(DatabaseError::Conflict)
+    );
+    stale.expected_version = job.expected_version;
+    stale.attempts += 1;
+    assert_eq!(
+        store.skip_claim(&stale, "index_input_limit", 104).await,
+        Err(DatabaseError::Conflict)
+    );
+    assert!(
+        store
+            .collection_notices(&[Dataset::NationalStatute], Some(&object()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .skip_claim(&job, "index_input_limit", 104)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.skip_claim(&job, "index_input_limit", 105).await,
+        Err(DatabaseError::Conflict)
+    );
+    let rejected: (String, i32, Option<String>) = sqlx::query_as(
+        "SELECT status,attempts,error_category FROM openlegal.corpus_job WHERE id=$1::uuid",
+    )
+    .bind(&job.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rejected,
+        ("failed".into(), 1, Some("index_input_limit".into()))
+    );
+    let notices = store
+        .collection_notices(&[Dataset::NationalStatute], Some(&object()))
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].code, "index_input_limit");
+    assert_eq!(notices[0].retry_at, 3704);
+    let progress = store.clone_progress().await.unwrap();
+    assert_eq!(progress["open_gaps"], 1);
+    assert_eq!(progress["full_available_clone_complete"], false);
+    assert_eq!(
+        store
+            .source_observation_bytes(&source.observation_id, token())
+            .await
+            .unwrap(),
+        raw
+    );
+    assert_eq!(
+        store.state(&object()).await.unwrap().head_capture,
+        Some(head.capture_id)
+    );
+    assert_eq!(store.watermark().await.unwrap(), watermark);
+    assert!(store.outbox(watermark, 10).await.unwrap().is_empty());
+    let charged: (i64, i64) = sqlx::query_as(
+        "SELECT daily_used,on_demand_used FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(charged, (7, 3));
+
+    let mut legacy_object = object();
+    legacy_object.id = "legacy-processing-failed".into();
+    store
+        .enqueue_job(legacy_object, "old-failure".into(), None, true, true, 105)
+        .await
+        .unwrap();
+    let legacy = store.claim_job(106).await.unwrap().unwrap();
+    store.fail_claim(&legacy, false).await.unwrap();
+    // Reapplying the additive vocabulary migration cannot infer old failure causes.
+    sqlx::raw_sql(include_str!("../migrations/0025_index_input_limit.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(store.requeue_due_details(3703).await.unwrap(), 0);
+    assert_eq!(store.requeue_due_details(3704).await.unwrap(), 1);
+    let retried = store.claim_job(3705).await.unwrap().unwrap();
+    assert_eq!(retried.id, job.id);
+    assert_eq!(retried.attempts, 1);
+    let unchanged: (String, i32, Option<String>) = sqlx::query_as(
+        "SELECT status,attempts,error_category FROM openlegal.corpus_job WHERE id=$1::uuid",
+    )
+    .bind(&legacy.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unchanged,
+        ("failed".into(), 1, Some("processing_failed".into()))
+    );
+    base.close().await.unwrap();
 }
 
 #[tokio::test]

@@ -255,6 +255,11 @@ meaning is understood and a bounded lifetime is defined. Never turn authenticati
 errors, throttling, timeouts, transport failures, or parser failures into absence.
 An explicit incomplete collection gap may record one failed item for a later
 bounded retry without claiming that the legal item is absent.
+Deterministic local index input bounds use `index_input_limit`, preserving
+permitted original observations and any older HEAD without publication or an
+outbox event. They use the existing one-hour future detail-gap cycle, never an
+inline analyzer retry, a quota refund, or a blanket retry of `Capacity`.
+Busy analyzer slots and elapsed deadlines are not input-limit evidence.
 An HTTP status alone may not establish dataset-level absence. Keep temporary
 failure backoff distinct from a negative legal-data result.
 

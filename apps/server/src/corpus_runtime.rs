@@ -12,7 +12,7 @@ use openlegal_adapters::{
     corpus_search::CorpusSearch,
     korean_analysis::KoreanAnalyzer,
     law_go_kr::{InventoryItem, InventoryPage, LawClient, RequestBudgetMode},
-    search_index::CorpusIndex,
+    search_index::{CorpusIndex, IndexAdmissionError, IndexInputLimit},
 };
 use openlegal_application::{
     Clock, SystemClock,
@@ -337,12 +337,14 @@ impl CollectionSkipReason {
 enum CollectionItemOutcome {
     Published,
     Skipped(CollectionSkipReason),
+    /// Validly projected source text cannot fit the unchanged local index bounds.
+    IndexInputLimit,
 }
 
 #[derive(Default)]
 struct ExplicitCollectionSummary {
     published: usize,
-    provider_failure: Option<&'static str>,
+    first_failure: Option<&'static str>,
     inventory_incomplete: bool,
     skip_reason: Option<CollectionSkipReason>,
     multiple_skip_reasons: bool,
@@ -358,6 +360,9 @@ impl ExplicitCollectionSummary {
     fn observe_item(&mut self, outcome: CollectionItemOutcome) {
         match outcome {
             CollectionItemOutcome::Published => self.published += 1,
+            CollectionItemOutcome::IndexInputLimit => {
+                self.first_failure.get_or_insert("index_input_limit");
+            }
             CollectionItemOutcome::Skipped(reason) => {
                 if let Some(previous) = self.skip_reason {
                     self.multiple_skip_reasons |= previous != reason;
@@ -369,7 +374,7 @@ impl ExplicitCollectionSummary {
     }
 
     fn observe_provider_failure(&mut self, error: DatabaseError) {
-        self.provider_failure
+        self.first_failure
             .get_or_insert(provider_failure_reason(error));
     }
 
@@ -377,12 +382,12 @@ impl ExplicitCollectionSummary {
         if self.published > 0 {
             return (
                 "done",
-                self.provider_failure.or(self
+                self.first_failure.or(self
                     .inventory_incomplete
                     .then_some("source_inventory_incomplete")),
             );
         }
-        if let Some(reason) = self.provider_failure {
+        if let Some(reason) = self.first_failure {
             return ("skipped", Some(reason));
         }
         if self.inventory_incomplete {
@@ -397,6 +402,18 @@ impl ExplicitCollectionSummary {
         };
         ("skipped", Some(reason))
     }
+}
+
+async fn reject_index_input_limit(
+    store: &PgCorpusStore,
+    job: &openlegal_application::database::Job,
+    limit: IndexInputLimit,
+) -> Result<(), DatabaseError> {
+    // The primary source observation is already archived. Keep the old HEAD and
+    // ordered outbox untouched; the existing one-hour gap path owns future retry.
+    store.skip_claim(job, "index_input_limit", now()).await?;
+    tracing::warn!(stage = "index_admission", bound = ?limit, "source exceeds local index input bounds");
+    Ok(())
 }
 
 fn select_explicit_object(
@@ -1002,16 +1019,23 @@ impl CorpusRuntime {
             let record = detail.record.clone();
             let worker_cancel = cancel.clone();
             let validation = tokio::task::spawn_blocking(move || {
-                index.validate_record_with_budget(
+                index.validate_record_classified_with_budget(
                     &record,
                     std::time::Instant::now() + Duration::from_secs(10),
                     &worker_cancel,
                 )
             })
             .await
-            .map_err(|_| DatabaseError::Capacity)
+            .map_err(|_| IndexAdmissionError::Operation(DatabaseError::Capacity))
             .and_then(|result| result);
             if let Err(error) = validation {
+                let error = match error {
+                    IndexAdmissionError::InputLimit(limit) => {
+                        reject_index_input_limit(&self.store, &job, limit).await?;
+                        return Ok(CollectionItemOutcome::IndexInputLimit);
+                    }
+                    IndexAdmissionError::Operation(error) => error,
+                };
                 return Err(claim_error_after_cleanup(
                     error,
                     self.store.fail_claim(&job, false).await,
@@ -2266,16 +2290,23 @@ impl CorpusRuntime {
                         let admission = tokio::time::timeout(
                             Duration::from_secs(10),
                             tokio::task::spawn_blocking(move || {
-                                index.validate_record_with_budget(&candidate, deadline, &worker_cancel)
+                                index.validate_record_classified_with_budget(&candidate, deadline, &worker_cancel)
                             }),
                         )
                         .await;
                         let validation = admission
-                            .map_err(|_| DatabaseError::Capacity)
-                            .and_then(|joined| joined.map_err(|_| DatabaseError::Capacity))
+                            .map_err(|_| IndexAdmissionError::Operation(DatabaseError::Capacity))
+                            .and_then(|joined| joined.map_err(|_| IndexAdmissionError::Operation(DatabaseError::Capacity)))
                             .and_then(|result| result);
                         if let Err(error) = validation {
                             admission_cancel.cancel();
+                            let error = match error {
+                                IndexAdmissionError::InputLimit(limit) => {
+                                    reject_index_input_limit(&self.store, &job, limit).await?;
+                                    return Ok(());
+                                }
+                                IndexAdmissionError::Operation(error) => error,
+                            };
                             let cleanup = self.store.fail_claim(&job, false).await;
                             if matches!(error, DatabaseError::StorageUnavailable | DatabaseError::StorageCorrupt) {
                                 return Err(claim_error_after_cleanup(error, cleanup));
@@ -2540,6 +2571,32 @@ mod explicit_collection_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn explicit_index_limit_is_a_visible_partial_result_with_first_failure_precedence() {
+        for published in [false, true] {
+            let mut summary = ExplicitCollectionSummary::default();
+            summary.observe_item(CollectionItemOutcome::IndexInputLimit);
+            summary.observe_provider_failure(DatabaseError::SourceDownloadFailed);
+            if published {
+                summary.observe_item(CollectionItemOutcome::Published);
+            }
+            assert_eq!(
+                summary.settlement(),
+                (
+                    if published { "done" } else { "skipped" },
+                    Some("index_input_limit")
+                )
+            );
+        }
+        let mut summary = ExplicitCollectionSummary::default();
+        summary.observe_provider_failure(DatabaseError::SourceDataInvalid);
+        summary.observe_item(CollectionItemOutcome::IndexInputLimit);
+        assert_eq!(
+            summary.settlement(),
+            ("skipped", Some("source_data_invalid"))
+        );
     }
 
     #[test]

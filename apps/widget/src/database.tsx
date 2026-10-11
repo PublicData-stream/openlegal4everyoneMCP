@@ -8,7 +8,7 @@ import './style.css';
 import './text-diff.css';
 const bridge = new App({ name: 'Legal corpus browser', version: '1.0.0' }, {});
 const date = (seconds: number) => seconds <= 8_640_000_000_000 ? new Date(seconds * 1000).toISOString() : 'unrepresentable timestamp';
-function noticeText(n: CollectionNotice) { const reason = n.code === 'source_unavailable' ? '다운로드할 수 없음 / unavailable download' : n.code === 'source_data_invalid' ? '자료 손상 / invalid source data' : n.code === 'download_failed' ? '다운로드 실패 / failed download' : '첨부 누락 / incomplete attachment'; return `${n.dataset} · ${n.scope === 'page' ? '목록 / list' : '상세 / detail'} · ${reason} · ${n.affected_count}건 영향 / affected · 수집 재개 시 재시도 대상 / eligible for retry when collection resumes`; }
+function noticeText(n: CollectionNotice) { const reason = n.code === 'source_unavailable' ? '다운로드할 수 없음 / unavailable download' : n.code === 'source_data_invalid' ? '자료 손상 / invalid source data' : n.code === 'download_failed' ? '다운로드 실패 / failed download' : n.code === 'index_input_limit' ? '검색 색인 입력 한도 초과 / index input limit exceeded' : '첨부 누락 / incomplete attachment'; return `${n.dataset} · ${n.scope === 'page' ? '목록 / list' : '상세 / detail'} · ${reason} · ${n.affected_count}건 영향 / affected · 수집 재개 시 재시도 대상 / eligible for retry when collection resumes`; }
 type Content = ReturnType<typeof getResult>;
 function AdmissionStatus({ value }: { value: ProviderAdmission | null }) {
   if (!value) return <section aria-label="Provider admission"><p>공급자 상태 확인 불가 / Provider admission status unknown.</p></section>;
