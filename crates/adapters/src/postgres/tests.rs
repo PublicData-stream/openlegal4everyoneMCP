@@ -5,7 +5,39 @@ use openlegal_application::{
     persistence::{PublicationOutcome, PublicationRequest, identity_digest},
 };
 use openlegal_domain::{Provenance, Query, Record, RetrievalData};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384};
+
+#[test]
+fn compiled_migration_catalog_matches_checked_in_sql() {
+    // Detect an SQL file omitted from the explicit runtime catalog: both
+    // --migrate and startup schema verification use this compiled catalog.
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut expected = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|extension| extension == "sql") {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let version = name.split('_').next().unwrap().parse::<i64>().unwrap();
+            assert!(
+                expected
+                    .insert(
+                        version,
+                        Sha384::digest(std::fs::read(path).unwrap()).to_vec()
+                    )
+                    .is_none()
+            );
+        }
+    }
+    let actual: std::collections::BTreeMap<_, _> = migrator()
+        .iter()
+        .map(|migration| (migration.version, migration.checksum.to_vec()))
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(
+        actual, expected,
+        "all checked-in SQL must reach migration and startup checks"
+    );
+}
 
 fn key() -> PersistentKey {
     PersistentKey {

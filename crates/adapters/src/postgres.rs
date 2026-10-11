@@ -321,6 +321,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0024_corpus_work_indexes.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            25,
+            "index input limit".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0025_index_input_limit.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator

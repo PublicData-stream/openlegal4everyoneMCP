@@ -1493,7 +1493,7 @@ async fn index_input_limit_preserves_archive_head_outbox_charges_and_legacy_fail
     let source = store
         .retain_source_observation(
             SourceObservationInput {
-                source_key: "fictional:index-input-limit:detail".into(),
+                source_key: "law_go_kr:lsEfYdInfoGuide:fixture.index_input_limit.detail".into(),
                 raw: Some(raw.clone()),
                 media_type: "application/xml".into(),
                 rights: openlegal_domain::rights::SourceRights::legal_information(),

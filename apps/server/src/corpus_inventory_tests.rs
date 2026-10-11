@@ -164,7 +164,10 @@ async fn typed_index_limits_settle_both_claim_origins_without_publication_or_htt
             .store
             .retain_source_observation(
                 SourceObservationInput {
-                    source_key: format!("fictional:index-limit:{}", candidate.object.id),
+                    source_key: format!(
+                        "law_go_kr:lsEfYdInfoGuide:fixture.index_input_limit.{}",
+                        candidate.object.id
+                    ),
                     raw: Some(raw.clone()),
                     media_type: "application/xml".into(),
                     rights: openlegal_domain::rights::SourceRights::legal_information(),
