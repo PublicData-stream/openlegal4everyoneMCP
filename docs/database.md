@@ -318,6 +318,27 @@ checks the exact migration set, so an older binary cannot open an upgraded schem
 For a behavior rollback, use a revert build retaining these additive migrations;
 do not remove migration history or infer reasons for old NULL receipts.
 
+Migration 26 adds a stored generated `clone_body_complete` flag to each retained
+capture. It derives the existing clone-progress attachment/body predicates from
+the immutable payload so status aggregation need not read or decompress bodies.
+Missing/null metadata keeps its existing meaning. Public status fields, evidence,
+capture identity and index format are unchanged; no index rebuild is required.
+
+Adding this stored column rewrites the capture table and its indexes. Before an
+operational upgrade, stop serving, the scheduler and collection workers, take a
+coordinated database/blob backup, and reserve rewrite and WAL space. PostgreSQL
+documents [temporary space of up to twice the table/index size for rewrites](https://www.postgresql.org/docs/18/sql-altertable.html#SQL-ALTERTABLE-NOTES); WAL
+and backup capacity need additional headroom. Run the matching binary's `--migrate`
+with the migration credential during the maintenance window, verify success, then
+restart the matching services. Migration 26 alone uses transaction-local limits of
+30 minutes per statement and 35 minutes per transaction, retaining the one-second
+lock timeout; a timeout fails the upgrade and must be investigated before retry.
+The PostgreSQL 18 transaction timer is explicitly re-armed before the rewrite.
+Normal serving retains its two-second statement and five-second transaction limits.
+For rollback, use a revert build that retains migration 26 and its exact checksum;
+an older schema-25 binary cannot open the upgraded schema. Do not delete migration
+history, disable capture immutability, or rewrite retained source evidence.
+
 Serving retained data requires neither provider credentials nor Kubernetes.
 Coverage is reported complete only after all three current datasets have matching
 consecutive full inventory traversals, their desired HEADs are available within the

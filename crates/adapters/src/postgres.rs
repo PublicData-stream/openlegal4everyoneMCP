@@ -1,4 +1,6 @@
 //! PostgreSQL observation persistence. Retrieval policy remains in the application.
+#[cfg(test)]
+mod clone_body_tests;
 mod data;
 mod maintenance;
 pub mod provider_admin;
@@ -326,6 +328,13 @@ fn migrator() -> Migrator {
             "index input limit".into(),
             MigrationType::Simple,
             include_str!("../migrations/0025_index_input_limit.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            26,
+            "clone body complete".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0026_clone_body_complete.sql").into_sql_str(),
             false,
         ),
     ]);
