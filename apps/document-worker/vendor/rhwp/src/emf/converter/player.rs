@@ -1,0 +1,756 @@
+//! EMF Player — 레코드 시퀀스를 순회하며 DC/ObjectTable을 갱신하고 SVG 노드를 발행한다.
+//!
+//! 단계 12 범위: 드로잉(선/사각형/타원/호/패스/폴리라인16). 텍스트·비트맵은 단계 13.
+
+use std::fmt::Write;
+
+use crate::emf::parser::objects::{Header, LogBrush, LogPen, PointL, RectL, XForm};
+use crate::emf::parser::records::{ExtTextOut, Record, StretchDIBits};
+use crate::emf::Error;
+
+use super::device_context::{DcStack, GraphicsObject, ObjectTable};
+use super::svg::{colorref_to_rgb, escape_xml, SvgBuilder};
+
+use base64::Engine;
+
+pub struct Player {
+    pub dc_stack: DcStack,
+    pub objects: ObjectTable,
+    pub svg: SvgBuilder,
+    pub render_rect: (f32, f32, f32, f32),
+    pub header: Option<Header>,
+
+    // 패스 상태
+    path_active: bool,
+    path_d: String,
+    /// [#6577] 이미 방출한 `<clipPath>` 의 사각형 → id 사상.
+    clip_ids: std::collections::BTreeMap<(i32, i32, i32, i32), String>,
+}
+
+impl Player {
+    #[must_use]
+    pub fn new(render_rect: (f32, f32, f32, f32)) -> Self {
+        Self {
+            dc_stack: DcStack::new(),
+            objects: ObjectTable::new(),
+            svg: SvgBuilder::new(),
+            render_rect,
+            header: None,
+            path_active: false,
+            path_d: String::new(),
+            clip_ids: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// 레코드 시퀀스 전체 재생.
+    pub fn play(&mut self, records: &[Record]) -> Result<(), Error> {
+        // 먼저 헤더를 찾아 매핑 행렬을 세운다.
+        if let Some(Record::Header(h)) = records.iter().find(|r| matches!(r, Record::Header(_))) {
+            self.header = Some(h.clone());
+        }
+        self.open_root_group();
+
+        for rec in records {
+            self.exec(rec);
+        }
+
+        self.svg.close_group();
+        Ok(())
+    }
+
+    fn open_root_group(&mut self) {
+        // Bounds → render_rect 매핑. Bounds가 비어 있으면 identity.
+        let (rx, ry, rw, rh) = self.render_rect;
+        let m = if let Some(h) = &self.header {
+            // Bounds are attacker-controlled i32 coordinates; a naive
+            // `right - left` overflows (DoS panic under debug overflow checks)
+            // on crafted EMR_HEADER bounds. Saturate the extent computation.
+            let w = h.bounds.right.saturating_sub(h.bounds.left) as f32;
+            let hh = h.bounds.bottom.saturating_sub(h.bounds.top) as f32;
+            if w > 0.0 && hh > 0.0 {
+                let sx = rw / w;
+                let sy = rh / hh;
+                let tx = rx - h.bounds.left as f32 * sx;
+                let ty = ry - h.bounds.top as f32 * sy;
+                [sx, 0.0, 0.0, sy, tx, ty]
+            } else {
+                [1.0, 0.0, 0.0, 1.0, rx, ry]
+            }
+        } else {
+            [1.0, 0.0, 0.0, 1.0, rx, ry]
+        };
+        self.svg.open_group_matrix(m);
+    }
+
+    fn exec(&mut self, rec: &Record) {
+        match rec {
+            Record::Header(_) | Record::Eof => {}
+
+            // 객체
+            Record::CreatePen { handle, pen } => {
+                self.objects.insert(*handle, GraphicsObject::Pen(*pen))
+            }
+            Record::CreateBrushIndirect { handle, brush } => {
+                self.objects.insert(*handle, GraphicsObject::Brush(*brush))
+            }
+            Record::ExtCreateFontIndirectW { handle, font } => self
+                .objects
+                .insert(*handle, GraphicsObject::Font(font.clone())),
+            Record::SelectObject { handle } => self.select_object(*handle),
+            Record::DeleteObject { handle } => {
+                self.objects.remove(*handle);
+            }
+
+            // 상태 — DC
+            Record::SaveDC => self.dc_stack.save(),
+            Record::RestoreDC { relative } => {
+                self.dc_stack.restore(*relative);
+            }
+            Record::SetWorldTransform(x) => self.dc_stack.current_mut().world_xform = *x,
+            Record::ModifyWorldTransform { xform, mode } => {
+                let dc = self.dc_stack.current_mut();
+                // MS-EMF 2.1.29 ModifyWorldTransformMode
+                dc.world_xform = match mode {
+                    1 => XForm::identity(),                 // MWT_IDENTITY
+                    2 => mul_xform(xform, &dc.world_xform), // MWT_LEFTMULTIPLY
+                    3 => mul_xform(&dc.world_xform, xform), // MWT_RIGHTMULTIPLY
+                    _ => *xform,                            // MWT_SET
+                };
+            }
+
+            // 좌표계/색상
+            Record::SetMapMode(m) => self.dc_stack.current_mut().map_mode = *m,
+            Record::SetWindowExtEx(s) => self.dc_stack.current_mut().window_ext = (s.cx, s.cy),
+            Record::SetWindowOrgEx(p) => self.dc_stack.current_mut().window_org = (p.x, p.y),
+            Record::SetViewportExtEx(s) => self.dc_stack.current_mut().viewport_ext = (s.cx, s.cy),
+            Record::SetViewportOrgEx(p) => self.dc_stack.current_mut().viewport_org = (p.x, p.y),
+            Record::SetBkMode(v) => self.dc_stack.current_mut().bk_mode = *v,
+            Record::SetTextAlign(v) => self.dc_stack.current_mut().text_align = *v,
+            Record::SetTextColor(v) => self.dc_stack.current_mut().text_color = *v,
+            Record::SetBkColor(v) => self.dc_stack.current_mut().bk_color = *v,
+
+            // 드로잉
+            Record::MoveToEx(p) => {
+                // [#6577] 패스 모드에서는 새 서브패스의 시작점이다. 종전에는
+                // current_pos 만 갱신하고 `path_d` 를 비워 둬, 뒤이은 `FillPath` 가
+                // 빈 패스를 채우고 도형이 통째로 사라졌다.
+                if self.path_active {
+                    let _ = write!(self.path_d, " M{} {}", p.x, p.y);
+                }
+                self.dc_stack.current_mut().current_pos = (p.x, p.y);
+            }
+            Record::LineTo(p) => self.emit_line_to(p),
+            Record::Rectangle(r) => self.emit_rect(r, None),
+            Record::RoundRect {
+                rect,
+                corner_w,
+                corner_h,
+            } => self.emit_rect(rect, Some((*corner_w, *corner_h))),
+            Record::Ellipse(r) => self.emit_ellipse(r),
+            Record::Arc { rect, start, end } => self.emit_arc_like(rect, start, end, ArcKind::Arc),
+            Record::Chord { rect, start, end } => {
+                self.emit_arc_like(rect, start, end, ArcKind::Chord)
+            }
+            Record::Pie { rect, start, end } => self.emit_arc_like(rect, start, end, ArcKind::Pie),
+            Record::Polyline16 { points, .. } => self.emit_polyline16(points, false),
+            Record::Polygon16 { points, .. } => self.emit_polyline16(points, true),
+            Record::PolyBezier16 { points, .. } => self.emit_polybezier16(points),
+            Record::PolylineTo16 { points, .. } => self.emit_polyline_to16(points),
+            Record::PolyBezierTo16 { points, .. } => self.emit_polybezier_to16(points),
+
+            // [#6577] 클리핑 — 현재 클립과 교차시킨다.
+            Record::IntersectClipRect(r) => {
+                let dc = self.dc_stack.current_mut();
+                dc.clip_rect = Some(match dc.clip_rect {
+                    Some((l, t, rr, b)) => (
+                        l.max(r.left),
+                        t.max(r.top),
+                        rr.min(r.right),
+                        b.min(r.bottom),
+                    ),
+                    None => (r.left, r.top, r.right, r.bottom),
+                });
+            }
+            // `RGN_COPY`(5) + 영역 없음 = 클립 해제. 그 밖의 조합은 영역 연산이라
+            // 사각형으로 표현할 수 없으니 건드리지 않는다.
+            Record::ExtSelectClipRgn { mode, has_region } => {
+                if *mode == 5 && !*has_region {
+                    self.dc_stack.current_mut().clip_rect = None;
+                }
+            }
+
+            // 패스
+            Record::BeginPath => {
+                self.path_active = true;
+                self.path_d.clear();
+            }
+            Record::EndPath => {
+                self.path_active = false;
+            }
+            Record::CloseFigure => {
+                if !self.path_d.is_empty() {
+                    self.path_d.push_str(" Z");
+                }
+            }
+            Record::FillPath(_) => {
+                let (fill, stroke) = (self.fill_spec(), None);
+                self.emit_path(fill, stroke);
+            }
+            Record::StrokePath(_) => {
+                self.emit_path(None, Some(self.stroke_spec()));
+            }
+            Record::StrokeAndFillPath(_) => {
+                self.emit_path(self.fill_spec(), Some(self.stroke_spec()));
+            }
+
+            // 텍스트
+            Record::ExtTextOutW(t) => self.emit_text(t),
+
+            // 비트맵
+            Record::StretchDIBits(bmp) => self.emit_bitmap(bmp),
+
+            Record::Unknown { .. } => {}
+        }
+    }
+
+    fn emit_text(&mut self, t: &ExtTextOut) {
+        if t.text.is_empty() {
+            return;
+        }
+        let dc = self.dc_stack.current();
+        let color = colorref_to_rgb(dc.text_color);
+        // 폰트
+        let (family, size, weight, italic) = if let Some(f) = &dc.font {
+            let fam = if f.face_name.is_empty() {
+                "sans-serif".to_string()
+            } else {
+                f.face_name.clone()
+            };
+            // LogFontW.height: 음수=cell height, 양수=character height. |height|를 px로 사용.
+            let size = f.height.unsigned_abs().max(1) as f32;
+            let weight = if f.weight >= 700 { "bold" } else { "normal" };
+            let italic = if f.italic != 0 { "italic" } else { "normal" };
+            (fam, size, weight, italic)
+        } else {
+            ("sans-serif".to_string(), 12.0, "normal", "normal")
+        };
+        let node = format!(
+            "<text x=\"{}\" y=\"{}\" font-family=\"{}\" font-size=\"{:.2}\" font-weight=\"{}\" font-style=\"{}\" fill=\"{}\">{}</text>",
+            t.reference.x, t.reference.y,
+            escape_xml(&family), size, weight, italic, color,
+            escape_xml(&t.text),
+        );
+        self.push_clipped(&node);
+    }
+
+    fn emit_bitmap(&mut self, bmp: &StretchDIBits) {
+        // DIB(BMI+bits) → BMP 파일 포맷으로 래핑 → base64 data URL.
+        let data_url = dib_to_bmp_data_url(&bmp.bmi, &bmp.bits);
+        let node = format!(
+            "<image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\" href=\"{data_url}\"/>",
+            bmp.x_dest, bmp.y_dest, bmp.cx_dest, bmp.cy_dest,
+        );
+        self.push_clipped(&node);
+    }
+
+    /// [#6577] 스톡 오브젝트(`0x8000_0000 | index`)를 DC 에 반영한다.
+    ///
+    /// `SelectObject` 의 상당수가 스톡 핸들이다 — 156627451 내장 EMF 는 338건 중
+    /// **197건(58%)** 이 스톡인데, 종전에는 `objects` 에 없다고 **그냥 무시**해서
+    /// 직전 펜/브러시가 그대로 남았다. `NULL_PEN`/`NULL_BRUSH` 가 안 먹히니 모든
+    /// 도형이 같은 색·같은 굵기로 뭉친다.
+    ///
+    /// 인덱스는 MS-EMF 2.1.31 StockObject: 0 WHITE_BRUSH · 1 LTGRAY · 2 GRAY ·
+    /// 3 DKGRAY · 4 BLACK_BRUSH · 5 NULL_BRUSH · 6 WHITE_PEN · 7 BLACK_PEN ·
+    /// 8 NULL_PEN. 폰트류(10~13)는 이 단계에서 다루지 않는다.
+    fn stock_object(index: u32) -> Option<GraphicsObject> {
+        const BS_SOLID: u32 = 0;
+        const BS_NULL: u32 = 1;
+        const PS_SOLID: u32 = 0;
+        const PS_NULL: u32 = 5;
+        let brush = |color: u32, style: u32| {
+            Some(GraphicsObject::Brush(LogBrush {
+                style,
+                color,
+                hatch: 0,
+            }))
+        };
+        let pen = |color: u32, style: u32| {
+            Some(GraphicsObject::Pen(LogPen {
+                style,
+                width: 1,
+                _reserved: 0,
+                color,
+            }))
+        };
+        match index {
+            0 => brush(0x00FF_FFFF, BS_SOLID),
+            1 => brush(0x00C0_C0C0, BS_SOLID),
+            2 => brush(0x0080_8080, BS_SOLID),
+            3 => brush(0x0040_4040, BS_SOLID),
+            4 => brush(0x0000_0000, BS_SOLID),
+            5 => brush(0x0000_0000, BS_NULL),
+            6 => pen(0x00FF_FFFF, PS_SOLID),
+            7 => pen(0x0000_0000, PS_SOLID),
+            8 => pen(0x0000_0000, PS_NULL),
+            _ => None,
+        }
+    }
+
+    fn select_object(&mut self, handle: u32) {
+        if handle & 0x8000_0000 != 0 {
+            if let Some(obj) = Self::stock_object(handle & 0x7FFF_FFFF) {
+                match obj {
+                    GraphicsObject::Pen(p) => self.dc_stack.current_mut().pen = Some(p),
+                    GraphicsObject::Brush(b) => self.dc_stack.current_mut().brush = Some(b),
+                    GraphicsObject::Font(f) => self.dc_stack.current_mut().font = Some(f),
+                }
+            }
+            return;
+        }
+        let Some(obj) = self.objects.get(handle) else {
+            return;
+        };
+        match obj {
+            GraphicsObject::Pen(p) => self.dc_stack.current_mut().pen = Some(*p),
+            GraphicsObject::Brush(b) => self.dc_stack.current_mut().brush = Some(*b),
+            GraphicsObject::Font(f) => self.dc_stack.current_mut().font = Some(f.clone()),
+        }
+    }
+
+    fn stroke_spec(&self) -> StrokeSpec {
+        if let Some(p) = self.dc_stack.current().pen {
+            // PS_NULL(5) → 스트로크 없음
+            let is_null = (p.style & 0x0F) == 5;
+            if is_null {
+                StrokeSpec {
+                    color: None,
+                    width: 0.0,
+                }
+            } else {
+                StrokeSpec {
+                    color: Some(colorref_to_rgb(p.color)),
+                    width: p.width.max(1) as f32,
+                }
+            }
+        } else {
+            StrokeSpec {
+                color: Some("black".into()),
+                width: 1.0,
+            }
+        }
+    }
+
+    fn fill_spec(&self) -> Option<String> {
+        if let Some(b) = self.dc_stack.current().brush {
+            if b.style == 1 {
+                None
+            }
+            // BS_NULL
+            else {
+                Some(colorref_to_rgb(b.color))
+            }
+        } else {
+            Some("none".into())
+        }
+    }
+
+    fn emit_line_to(&mut self, to: &PointL) {
+        let (x1, y1) = self.dc_stack.current().current_pos;
+        let s = self.stroke_spec();
+        let color = s.color.as_deref().unwrap_or("none");
+        let node = format!(
+            "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"{color}\" stroke-width=\"{:.2}\" fill=\"none\"/>",
+            x1, y1, to.x, to.y, s.width,
+        );
+        if self.path_active {
+            if self.path_d.is_empty() {
+                let _ = write!(self.path_d, "M{x1} {y1} ");
+            }
+            let _ = write!(self.path_d, "L{} {} ", to.x, to.y);
+        } else {
+            self.push_clipped(&node);
+        }
+        self.dc_stack.current_mut().current_pos = (to.x, to.y);
+    }
+
+    fn emit_rect(&mut self, r: &RectL, corner: Option<(i32, i32)>) {
+        let stroke = self.stroke_spec();
+        let fill = self.fill_spec().unwrap_or_else(|| "none".into());
+        let stroke_color = stroke.color.as_deref().unwrap_or("none");
+        let (rx_attr, ry_attr) = match corner {
+            Some((cw, ch)) => (format!(" rx=\"{}\"", cw / 2), format!(" ry=\"{}\"", ch / 2)),
+            None => (String::new(), String::new()),
+        };
+        let node = format!(
+            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"{rx_attr}{ry_attr} fill=\"{fill}\" stroke=\"{stroke_color}\" stroke-width=\"{:.2}\"/>",
+            r.left, r.top, r.width(), r.height(), stroke.width,
+        );
+        self.push_clipped(&node);
+    }
+
+    fn emit_ellipse(&mut self, r: &RectL) {
+        let stroke = self.stroke_spec();
+        let fill = self.fill_spec().unwrap_or_else(|| "none".into());
+        let cx = (r.left + r.right) / 2;
+        let cy = (r.top + r.bottom) / 2;
+        let rx = (r.right - r.left).abs() / 2;
+        let ry = (r.bottom - r.top).abs() / 2;
+        let stroke_color = stroke.color.as_deref().unwrap_or("none");
+        let node = format!(
+            "<ellipse cx=\"{cx}\" cy=\"{cy}\" rx=\"{rx}\" ry=\"{ry}\" fill=\"{fill}\" stroke=\"{stroke_color}\" stroke-width=\"{:.2}\"/>",
+            stroke.width,
+        );
+        self.push_clipped(&node);
+    }
+
+    fn emit_arc_like(&mut self, r: &RectL, start: &PointL, end: &PointL, kind: ArcKind) {
+        // 근사: arc은 시작점→끝점 단순 선, chord는 같음, pie는 중심까지 삼각형 폐곡선.
+        // 단계 12는 SVG arc path로 표현.
+        let cx = (r.left + r.right) as f32 / 2.0;
+        let cy = (r.top + r.bottom) as f32 / 2.0;
+        let rx = (r.right - r.left).abs() as f32 / 2.0;
+        let ry = (r.bottom - r.top).abs() as f32 / 2.0;
+        let (s, e) = (start, end);
+        let stroke = self.stroke_spec();
+        let fill = match kind {
+            ArcKind::Arc => "none".to_string(),
+            ArcKind::Chord | ArcKind::Pie => self.fill_spec().unwrap_or_else(|| "none".into()),
+        };
+        let d = match kind {
+            ArcKind::Arc => format!("M {} {} A {} {} 0 0 1 {} {}", s.x, s.y, rx, ry, e.x, e.y),
+            ArcKind::Chord => format!("M {} {} A {} {} 0 0 1 {} {} Z", s.x, s.y, rx, ry, e.x, e.y),
+            ArcKind::Pie => format!(
+                "M {cx} {cy} L {} {} A {} {} 0 0 1 {} {} Z",
+                s.x, s.y, rx, ry, e.x, e.y
+            ),
+        };
+        let stroke_color = stroke.color.as_deref().unwrap_or("none");
+        let node = format!(
+            "<path d=\"{d}\" fill=\"{fill}\" stroke=\"{stroke_color}\" stroke-width=\"{:.2}\"/>",
+            stroke.width,
+        );
+        self.push_clipped(&node);
+    }
+
+    fn emit_polyline16(&mut self, points: &[(i16, i16)], close: bool) {
+        if points.is_empty() {
+            return;
+        }
+        let pts: String = points
+            .iter()
+            .map(|(x, y)| format!("{x},{y}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let stroke = self.stroke_spec();
+        let fill = if close {
+            self.fill_spec().unwrap_or_else(|| "none".into())
+        } else {
+            "none".into()
+        };
+        let tag = if close { "polygon" } else { "polyline" };
+        let stroke_color = stroke.color.as_deref().unwrap_or("none");
+        let node = format!(
+            "<{tag} points=\"{pts}\" fill=\"{fill}\" stroke=\"{stroke_color}\" stroke-width=\"{:.2}\"/>",
+            stroke.width,
+        );
+        self.push_clipped(&node);
+    }
+
+    fn emit_polybezier16(&mut self, points: &[(i16, i16)]) {
+        if points.is_empty() {
+            return;
+        }
+        let mut d = format!("M{} {}", points[0].0, points[0].1);
+        // EMF PolyBezier: 첫 점은 시작점, 이후 3점씩 제어1 제어2 끝점(C 커맨드).
+        let mut i = 1;
+        while i + 2 < points.len() + 1 && i + 2 <= points.len() {
+            let (c1x, c1y) = points[i];
+            let (c2x, c2y) = points[i + 1];
+            let (ex, ey) = points[i + 2];
+            let _ = write!(d, " C{c1x} {c1y} {c2x} {c2y} {ex} {ey}");
+            i += 3;
+        }
+        let stroke = self.stroke_spec();
+        let stroke_color = stroke.color.as_deref().unwrap_or("none");
+        let node = format!(
+            "<path d=\"{d}\" fill=\"none\" stroke=\"{stroke_color}\" stroke-width=\"{:.2}\"/>",
+            stroke.width,
+        );
+        self.push_clipped(&node);
+    }
+
+    /// [#6577] `EMR_POLYLINETO16` — 현재 위치에서 이어지는 선분열을 패스에 누적한다.
+    ///
+    /// 패스 기반 EMF(Office·Illustrator 내장본)는 도형을 거의 전부
+    /// `BeginPath → MoveTo → {PolylineTo16 | PolyBezierTo16}* → CloseFigure → FillPath`
+    /// 로 표현한다. 이 두 레코드가 없으면 패스가 비어 채움이 통째로 사라진다
+    /// (156627451 내장 EMF: POLYBEZIERTO16 758건 · POLYLINETO16 644건).
+    fn emit_polyline_to16(&mut self, points: &[(i16, i16)]) {
+        if points.is_empty() {
+            return;
+        }
+        if !self.path_active {
+            // 패스 밖의 `…To` 는 현재 위치에서 시작하는 선분열로 그린다.
+            let (cx, cy) = self.dc_stack.current().current_pos;
+            let mut all = vec![(cx as i16, cy as i16)];
+            all.extend_from_slice(points);
+            self.emit_polyline16(&all, false);
+        } else {
+            for (x, y) in points {
+                let _ = write!(self.path_d, " L{x} {y}");
+            }
+        }
+        if let Some((x, y)) = points.last() {
+            self.dc_stack.current_mut().current_pos = (i32::from(*x), i32::from(*y));
+        }
+    }
+
+    /// [#6577] `EMR_POLYBEZIERTO16` — 현재 위치에서 이어지는 3차 베지에열.
+    fn emit_polybezier_to16(&mut self, points: &[(i16, i16)]) {
+        if points.len() < 3 {
+            return;
+        }
+        let mut d = String::new();
+        let mut i = 0;
+        while i + 2 < points.len() {
+            let (c1x, c1y) = points[i];
+            let (c2x, c2y) = points[i + 1];
+            let (ex, ey) = points[i + 2];
+            let _ = write!(d, " C{c1x} {c1y} {c2x} {c2y} {ex} {ey}");
+            i += 3;
+        }
+        if self.path_active {
+            self.path_d.push_str(&d);
+        } else {
+            let (cx, cy) = self.dc_stack.current().current_pos;
+            let stroke = self.stroke_spec();
+            let stroke_color = stroke.color.as_deref().unwrap_or("none");
+            let node = format!(
+                "<path d=\"M{cx} {cy}{d}\" fill=\"none\" stroke=\"{stroke_color}\" stroke-width=\"{:.2}\"/>",
+                stroke.width,
+            );
+            self.push_clipped(&node);
+        }
+        if let Some((x, y)) = points.get(i.saturating_sub(1)).or_else(|| points.last()) {
+            self.dc_stack.current_mut().current_pos = (i32::from(*x), i32::from(*y));
+        }
+    }
+
+    /// [#6577 ④] 도형 노드 하나를 현재 DC 의 월드 변환·클립을 반영해 방출한다.
+    ///
+    /// ⚠ **퇴화 사각형(`right <= left` 또는 `bottom <= top`)은 클립을 걸지 않는다.**
+    /// 규약만 보면 빈 클립 영역은 "그리지 말라"로 읽히지만, 실측이 반대다.
+    /// 156627451 내장 EMF 는 `(0,0,0,0)` 을 4건 쓰는데 **그 안에 아이콘 4개(QPU 칩·
+    /// 알고리즘 노드·네트워크 구·센싱 호)가 들어 있다.** 한/글은 그 아이콘들을 그린다.
+    /// 억제하도록 만들었더니 넷 다 사라졌다 — 작성기가 무의미한 사각형을 no-op 로
+    /// 쓰는 것이다.
+    ///
+    /// 그 밖의 사각형은 `<g clip-path="url(#…)">` 로 감싼다. 같은 사각형은 id 를
+    /// 재사용한다(이 파일은 12건이지만 서로 다른 사각형은 5개뿐).
+    fn push_clipped(&mut self, node: &str) {
+        // 클립 사각형은 `INTERSECTCLIPRECT` 시점의 좌표계에 있고 도형은 그 뒤에 걸린
+        // 월드 변환을 받는다. 그래서 변환을 **안쪽**에 둔다.
+        let node = &self.world_wrap(node);
+        // [#7266] 클립이 없어도 페이지 변환은 걸려야 한다 — 조기 반환이 이 변환을 건너뛰면
+        //         클립 없는 EMF 만 논리 좌표 그대로 그려져 갈래마다 좌표계가 갈린다.
+        let Some((l, t, r, b)) = self.dc_stack.current().clip_rect else {
+            let wrapped = self.page_wrap(node);
+            self.svg.push(&wrapped);
+            return;
+        };
+        if r <= l || b <= t {
+            let wrapped = self.page_wrap(node);
+            self.svg.push(&wrapped);
+            return;
+        }
+        let key = (l, t, r, b);
+        if !self.clip_ids.contains_key(&key) {
+            let id = format!("emfclip{}", self.clip_ids.len());
+            let def = format!(
+                "<clipPath id=\"{id}\"><rect x=\"{l}\" y=\"{t}\" width=\"{}\" height=\"{}\"/></clipPath>",
+                r - l,
+                b - t,
+            );
+            self.svg.push(&def);
+            self.clip_ids.insert(key, id);
+        }
+        let id = self.clip_ids.get(&key).cloned().unwrap_or_default();
+        let clipped = format!("<g clip-path=\"url(#{id})\">{node}</g>");
+        let clipped = self.page_wrap(&clipped);
+        self.svg.push(&clipped);
+    }
+
+    /// [#7266] 페이지 변환(논리 → 장치)을 `<g transform="matrix(…)">` 로 감싼다.
+    ///
+    /// 종전에는 `SetMapMode`·`SetWindow*`·`SetViewport*` 를 DC 에 **담아만 두고 아무도
+    /// 쓰지 않아서**, 논리 좌표로 적힌 도형이 장치 좌표인 양 그려졌다. 156564340 의
+    /// 포스터 EMF 는 `MM_ANISOTROPIC` 에 window 37,094×52,391 / viewport 1,191×1,684 이라
+    /// `EMR_STRETCHDIBITS` 의 dest 가 31배로 커진다 — 그림의 왼쪽 위 3%만 셀에 들어와
+    /// 흰 여백만 보인다.
+    ///
+    /// 클립 사각형은 `INTERSECTCLIPRECT` 시점의 논리 좌표라, 이 변환은 클립 **바깥**이다
+    /// (안쪽의 월드 변환과 순서: 월드 → 클립 → 페이지).
+    ///
+    /// 고정 비율 map mode(`MM_LOMETRIC`..`MM_TWIPS`, 2..6)는 장치 해상도에서 비율을
+    /// 유도해야 하는데 코퍼스에 표본이 없어 종전처럼 항등으로 둔다 — 미구현이다.
+    fn page_wrap(&self, node: &str) -> String {
+        let Some(m) = page_xform(self.dc_stack.current()) else {
+            return node.to_string();
+        };
+        format!(
+            "<g transform=\"matrix({} {} {} {} {} {})\">{node}</g>",
+            fmt_f32(m[0]),
+            fmt_f32(m[1]),
+            fmt_f32(m[2]),
+            fmt_f32(m[3]),
+            fmt_f32(m[4]),
+            fmt_f32(m[5]),
+        )
+    }
+
+    /// [#6577 ④] 월드 변환이 걸려 있으면 도형을 `<g transform="matrix(…)">` 로 감싼다.
+    ///
+    /// 종전에는 `SetWorldTransform`·`ModifyWorldTransform` 을 **받고도 버렸다**. 이
+    /// 파일군의 아이콘은 원본 기하를 `0.062` 로 축소해 그리는데, 변환을 버리면 16배로
+    /// 그려져 화면 전체를 덮는 덩어리가 된다.
+    fn world_wrap(&self, node: &str) -> String {
+        let x = self.dc_stack.current().world_xform;
+        if is_identity(&x) {
+            return node.to_string();
+        }
+        format!(
+            "<g transform=\"matrix({} {} {} {} {} {})\">{node}</g>",
+            fmt_f32(x.m11),
+            fmt_f32(x.m12),
+            fmt_f32(x.m21),
+            fmt_f32(x.m22),
+            fmt_f32(x.dx),
+            fmt_f32(x.dy),
+        )
+    }
+
+    fn emit_path(&mut self, fill: Option<String>, stroke: Option<StrokeSpec>) {
+        if self.path_d.is_empty() {
+            return;
+        }
+        let fill_attr = fill.as_deref().unwrap_or("none");
+        let (stroke_color, stroke_width) = stroke.map_or(("none".into(), 0.0_f32), |s| {
+            (s.color.unwrap_or_else(|| "none".into()), s.width)
+        });
+        let node = format!(
+            "<path d=\"{}\" fill=\"{fill_attr}\" stroke=\"{stroke_color}\" stroke-width=\"{:.2}\"/>",
+            self.path_d.trim(),
+            stroke_width,
+        );
+        self.push_clipped(&node);
+        self.path_d.clear();
+    }
+}
+
+/// 행벡터 규약(GDI)에서 `p` 를 먼저, `q` 를 나중에 적용하는 합성.
+fn mul_xform(p: &XForm, q: &XForm) -> XForm {
+    XForm {
+        m11: p.m11 * q.m11 + p.m12 * q.m21,
+        m12: p.m11 * q.m12 + p.m12 * q.m22,
+        m21: p.m21 * q.m11 + p.m22 * q.m21,
+        m22: p.m21 * q.m12 + p.m22 * q.m22,
+        dx: p.dx * q.m11 + p.dy * q.m21 + q.dx,
+        dy: p.dx * q.m12 + p.dy * q.m22 + q.dy,
+    }
+}
+
+/// [#7266] DC 의 map mode + window/viewport 로 페이지 변환(논리 → 장치)을 만든다.
+///
+/// MS-EMF 2.1.21 MapMode: `MM_TEXT`(1) 은 1:1 이고, `MM_ISOTROPIC`(7)·
+/// `MM_ANISOTROPIC`(8) 만 window/viewport extent 로 비율을 정한다. `MM_ISOTROPIC` 은
+/// 두 축의 단위 크기가 같아야 하므로 절댓값이 작은 쪽 배율을 두 축에 쓰고 부호만 살린다.
+///
+/// 항등이면 `None` — 감싸는 `<g>` 를 만들지 않는다.
+fn page_xform(dc: &super::device_context::DeviceContext) -> Option<[f32; 6]> {
+    const MM_ISOTROPIC: u32 = 7;
+    const MM_ANISOTROPIC: u32 = 8;
+
+    let (mut sx, mut sy) = (1.0_f32, 1.0_f32);
+    if matches!(dc.map_mode, MM_ISOTROPIC | MM_ANISOTROPIC) {
+        if dc.window_ext.0 == 0 || dc.window_ext.1 == 0 {
+            return None;
+        }
+        sx = dc.viewport_ext.0 as f32 / dc.window_ext.0 as f32;
+        sy = dc.viewport_ext.1 as f32 / dc.window_ext.1 as f32;
+        if !sx.is_finite() || !sy.is_finite() {
+            return None;
+        }
+        if dc.map_mode == MM_ISOTROPIC {
+            let unit = sx.abs().min(sy.abs());
+            sx = unit.copysign(sx);
+            sy = unit.copysign(sy);
+        }
+    }
+    let tx = dc.viewport_org.0 as f32 - dc.window_org.0 as f32 * sx;
+    let ty = dc.viewport_org.1 as f32 - dc.window_org.1 as f32 * sy;
+
+    let identity =
+        (sx - 1.0).abs() < 1e-6 && (sy - 1.0).abs() < 1e-6 && tx.abs() < 1e-6 && ty.abs() < 1e-6;
+    if identity {
+        return None;
+    }
+    Some([sx, 0.0, 0.0, sy, tx, ty])
+}
+
+fn is_identity(x: &XForm) -> bool {
+    (x.m11 - 1.0).abs() < 1e-6
+        && x.m12.abs() < 1e-6
+        && x.m21.abs() < 1e-6
+        && (x.m22 - 1.0).abs() < 1e-6
+        && x.dx.abs() < 1e-6
+        && x.dy.abs() < 1e-6
+}
+
+fn fmt_f32(v: f32) -> String {
+    format!("{v:.6}")
+}
+
+#[derive(Copy, Clone)]
+enum ArcKind {
+    Arc,
+    Chord,
+    Pie,
+}
+
+#[derive(Debug, Clone)]
+pub struct StrokeSpec {
+    pub color: Option<String>,
+    pub width: f32,
+}
+
+/// DIB(BITMAPINFO + bits)를 BMP 파일 포맷으로 래핑한 후 PNG 로 변환하여 base64 data URL로 반환.
+///
+/// BMP 파일 헤더(14B): `"BM"` + file_size(u32) + reserved(u32)=0 + data_offset(u32)
+///
+/// [Task #860] SVG renderer (rsvg-convert, 브라우저) 가 `data:image/bmp` URI 미지원 →
+/// `data:image/png` 로 재인코딩 (svg.rs:1118 / shape_layout.rs:1063 과 동일 정책).
+/// BMP decode 실패 시 fallback 으로 BMP URI 반환 (graceful degradation).
+fn dib_to_bmp_data_url(bmi: &[u8], bits: &[u8]) -> String {
+    let bmi_size = bmi.len() as u32;
+    let bits_size = bits.len() as u32;
+    let file_size = 14 + bmi_size + bits_size;
+    let data_offset = 14 + bmi_size;
+
+    let mut bmp = Vec::with_capacity(file_size as usize);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&file_size.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&data_offset.to_le_bytes());
+    bmp.extend_from_slice(bmi);
+    bmp.extend_from_slice(bits);
+
+    if let Some(png) = crate::renderer::svg::bmp_bytes_to_png_bytes(&bmp) {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        format!("data:image/png;base64,{b64}")
+    } else {
+        // fallback: BMP (decode 실패 시)
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bmp);
+        format!("data:image/bmp;base64,{b64}")
+    }
+}

@@ -17,6 +17,7 @@ if [[ -n $release_version || $production_image != openlegal-document-worker:loca
   [[ $release_version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+|-build\.[0-9a-f]{8})?$ ]] || { echo 'Invalid release version' >&2; exit 2; }
   [[ $production_image == "ghcr.io/publicdata-stream/openlegal-document-worker:$release_version-amd64" ]] || { echo 'Output image does not match version and architecture' >&2; exit 2; }
 fi
+(cd apps/document-worker/vendor/rhwp && sha256sum -c SHA256SUMS >/dev/null)
 admission_refresh=$(date -u +%Y%m%dT%H%M%SZ)
 revision=$(git rev-parse HEAD)
 container="openlegal-document-smoke-$$"
@@ -58,6 +59,10 @@ docker run --pull never --rm --network none --read-only --cap-drop ALL \
     test -s /opt/tessdata/kor.traineddata
     test -s /opt/fonts/NotoSansCJKkr-Regular.otf
     test -s /opt/notices/OPENLEGAL-LICENSE
+    test -s /opt/notices/dependencies/rhwp/LICENSE
+    test -s /opt/notices/dependencies/rhwp/THIRD_PARTY_LICENSES.md
+    test -s /opt/notices/dependencies/rhwp/UPSTREAM.json
+    test -s /opt/notices/dependencies/rhwp/SHA256SUMS
   '
 docker run --pull never --rm --network none --read-only --cap-drop ALL \
   --security-opt no-new-privileges \

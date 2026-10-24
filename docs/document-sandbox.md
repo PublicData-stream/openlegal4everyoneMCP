@@ -149,26 +149,32 @@ Record the accepted image digest and native inventory alongside qualification
 evidence; previous image digests, not rebuilt source alone, identify rollback
 artifacts. Existing retained captures are not rewritten by this image migration.
 
-The following source/version selections were verified on 2026-09-16:
+The following source/version selections were reviewed on 2026-10-23:
 
 | Component | Selection and reason | License |
 | --- | --- | --- |
 | [roxmltree](https://github.com/RazrFalcon/roxmltree) | 0.21.1; bounded pure XML tree, DTD disabled | MIT/Apache-2.0 |
-| [scraper](https://github.com/rust-scraper/scraper) | 0.27.0; inert HTML5 tree parsing | ISC |
-| [rhwp](https://github.com/edwardkim/rhwp/tree/680111ec7bea2fe11110de18c3676ba5a1cf7847) | 0.8.6 at the linked commit; native HWP5/HWPX and page rendering, default features disabled | MIT |
-| [Xberg](https://crates.io/crates/xberg/1.2.2) | 1.2.2, default features disabled; PDF, OCR, dynamic Tesseract and Tokio only | MIT |
-| [resvg](https://github.com/linebender/resvg) | 0.47.0, text and raster images; no system font discovery | MIT/Apache-2.0 |
+| [scraper](https://github.com/rust-scraper/scraper) | 0.29.0; inert HTML5 tree parsing | ISC |
+| [rhwp](https://github.com/edwardkim/rhwp/tree/1a76570e833917d15817415a53c09ad61ab3203f) | Stable 0.8.7 at the linked commit, vendored with a ZIP 9.0.5 dependency patch; native HWP5/HWPX and page rendering, default features disabled | MIT |
+| [Xberg](https://crates.io/crates/xberg/1.3.10) | 1.3.10, default features disabled; PDF, OCR, dynamic Tesseract and Tokio only | MIT |
+| [resvg](https://github.com/linebender/resvg) | 0.48.1, text and raster images; no system font discovery | MIT/Apache-2.0 |
 | [tessdata_fast](https://github.com/tesseract-ocr/tessdata_fast/tree/65727574dfcd264acbb0c3e07860e4e9e9b22185) | 4.1.0 English/Korean model assets, SHA-256 checked | Apache-2.0 |
 | [Noto Sans CJK](https://github.com/notofonts/noto-cjk/tree/523d033d6cb47f4a80c58a35753646f5c3608a78) | 2.004 Korean regular OTF, SHA-256 checked | SIL OFL-1.1 |
 
-rhwp is unavailable as a crates.io package and its source repository includes a
-large fixture history; fresh builds need substantial temporary source-cache space.
-Provide at least **20 GiB of free build disk**. The observed rhwp Cargo Git cache
-alone occupied approximately 5.2 GiB, plus 0.9 GiB for registry sources before
-compiler artifacts and image layers. These build requirements are separate from
-the disposable worker's 2 GiB scratch and 4 GiB memory limits.
-No upstream test documents are committed here. Xberg uses its published registry
-package to avoid cloning its unrelated test-document submodule. Its optional
+rhwp has no crates.io release. Its minimal stable source closure is committed under
+`apps/document-worker/vendor/rhwp`, with original Git blob and SHA-256 inventory,
+local patch description, effective source checksums and upstream notices. This
+avoids cloning the upstream repository's multi-gigabyte fixture history. The import
+includes its required embedded blank-document template as dependency source data;
+it is not a provider capture or an independently verified synthetic fixture.
+ZIP 9.0.5 replaces rhwp's vulnerable 8.x dependency without enabling new formats.
+The worker gate and Docker build verify the effective source checksums, and the
+image explicitly packages path-dependency notices alongside registry notices.
+Provide at least **20 GiB of free build disk** for native compiler and image caches.
+These build requirements are separate from the disposable worker's 2 GiB scratch
+and 4 GiB memory limits.
+No bulk upstream regression documents are committed here. Xberg uses its published
+registry package to avoid cloning its unrelated test-document submodule. Its optional
 remote-service, server, Office, layout-model and VLM capabilities are not enabled.
 Native build scripts and transitive unsafe code run only in the build/image
 boundary; the first-party crate retains the workspace's unsafe-code deny policy.
@@ -188,15 +194,17 @@ cargo deny --manifest-path apps/document-worker/Cargo.toml --config apps/documen
 ```
 
 The isolated policy retains the root policy defaults and adds exact package license
-admission, the immutable rhwp source, and three time-limited maintenance-notice
+admission, the inventoried stable rhwp source, and three time-limited maintenance-notice
 exceptions. `paste` 1.0.15 ([RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436/))
 is a build-time macro dependency. `rustybuzz` 0.20.1
 ([RUSTSEC-2026-0206](https://rustsec.org/advisories/RUSTSEC-2026-0206/)) and `ttf-parser`
 0.25.1 ([RUSTSEC-2026-0192](https://rustsec.org/advisories/RUSTSEC-2026-0192/)) remain in
 rhwp/resvg's runtime graph, including parsing untrusted embedded font data. Sandbox
-isolation limits impact; it does not restore upstream maintenance. No safe upgrade
-exists in the selected graph. Owner PiQuark6046 must review replacement/update
-options by **2026-10-16** and whenever parser dependencies change. These exceptions
+isolation limits impact; it does not restore upstream maintenance. The stable rhwp
+graph still requires these versions; upgrading the directly used resvg does not remove those transitive consumers. The existing maintenance-only
+exceptions were renewed after reviewing that graph; no vulnerability or unsoundness
+exception is added. Owner PiQuark6046 must review replacement/update
+options by **2026-11-23** and whenever parser dependencies change. These exceptions
 require independent parser/security review and do not suppress vulnerability or
 unsoundness advisories. The root serving policy is unchanged.
 

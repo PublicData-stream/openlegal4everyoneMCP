@@ -1,0 +1,1932 @@
+//! PDF renderers.
+//!
+//! The compatibility backend converts SVG output with svg2pdf/pdf-writer. The
+//! opt-in direct backend records PageLayerTree replay into a Skia PDF canvas.
+//! Both backends support single and multiple pages and are native-only.
+
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "pdf_synthetic_bold.rs"]
+mod synthetic_bold;
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use synthetic_bold::{prepare_svg_with_synthetic_bold, PdfBoldReport};
+
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "pdf_synthetic_italic.rs"]
+mod synthetic_italic;
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use synthetic_italic::{parse_svg_with_synthetic_italic, PdfItalicReport};
+
+/// Native PDF implementation selected by callers such as `export-pdf`.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PdfBackend {
+    /// Existing PageRenderTree/layered SVG -> svg2pdf compatibility path.
+    #[default]
+    CompatibilitySvg,
+    /// PageLayerTree -> Skia PDF recording path. Requires `native-skia`.
+    DirectLayer,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PdfBackend {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "svg" | "compat" | "compat-svg" | "compatibility" => Some(Self::CompatibilitySvg),
+            "direct" | "direct-layer" | "layer" | "layer-skia" | "skia" => Some(Self::DirectLayer),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CompatibilitySvg => "svg",
+            Self::DirectLayer => "direct",
+        }
+    }
+}
+
+/// Options specific to direct PageLayerTree PDF recording.
+#[cfg(not(target_arch = "wasm32"))]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectPdfExportOptions {
+    /// Font directories loaded into the native Skia font manager.
+    pub font_paths: Vec<std::path::PathBuf>,
+    /// Raster resolution for effects that the PDF canvas cannot record as vectors.
+    pub raster_dpi: f32,
+    /// Optional deterministic document metadata. Dates are intentionally omitted.
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub subject: Option<String>,
+    pub keywords: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for DirectPdfExportOptions {
+    fn default() -> Self {
+        Self {
+            font_paths: Vec::new(),
+            raster_dpi: 144.0,
+            title: None,
+            author: None,
+            subject: None,
+            keywords: None,
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+fn validate_direct_pdf_tree(
+    tree: &crate::paint::PageLayerTree,
+    page_index: usize,
+) -> Result<(), String> {
+    use crate::model::image::ImageEffect;
+    use crate::paint::{LayerNode, LayerNodeKind, PaintOp};
+    use crate::renderer::render_tree::{BoundingBox, ShapeTransform};
+    use crate::renderer::{ArrowStyle, LineRenderType, PathCommand, ShapeStyle};
+
+    fn is_valid_skia_scalar(value: f64) -> bool {
+        value.is_finite() && value.abs() <= f32::MAX as f64
+    }
+
+    fn validate_bbox(bbox: BoundingBox, page_index: usize, context: &str) -> Result<(), String> {
+        if [bbox.x, bbox.y, bbox.width, bbox.height]
+            .iter()
+            .any(|value| !is_valid_skia_scalar(*value))
+            || bbox.width < 0.0
+            || bbox.height < 0.0
+        {
+            return Err(format!(
+                "direct PDF page {} has invalid {context} bounds",
+                page_index + 1
+            ));
+        }
+        Ok(())
+    }
+
+    fn unsupported(page_index: usize, op: &str, detail: &str) -> String {
+        format!(
+            "direct PDF page {} cannot replay {op} without visual loss: {detail}; use the svg backend",
+            page_index + 1
+        )
+    }
+
+    fn validate_transform(
+        transform: ShapeTransform,
+        page_index: usize,
+        op: &str,
+    ) -> Result<(), String> {
+        if !is_valid_skia_scalar(transform.rotation) {
+            return Err(format!(
+                "direct PDF page {} has invalid {op} rotation",
+                page_index + 1
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_shape_style(
+        style: &ShapeStyle,
+        has_gradient: bool,
+        page_index: usize,
+        op: &str,
+    ) -> Result<(), String> {
+        if has_gradient {
+            return Err(unsupported(page_index, op, "gradient fill"));
+        }
+        if style.pattern.is_some() {
+            return Err(unsupported(page_index, op, "pattern fill"));
+        }
+        if style.shadow.is_some() {
+            return Err(unsupported(page_index, op, "shape shadow"));
+        }
+        if !is_valid_skia_scalar(style.opacity) || !(0.0..=1.0).contains(&style.opacity) {
+            return Err(format!(
+                "direct PDF page {} has invalid {op} opacity: {}",
+                page_index + 1,
+                style.opacity
+            ));
+        }
+        if !is_valid_skia_scalar(style.stroke_width) || style.stroke_width < 0.0 {
+            return Err(format!(
+                "direct PDF page {} has invalid {op} stroke width: {}",
+                page_index + 1,
+                style.stroke_width
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_image_payload(data: &[u8], page_index: usize, context: &str) -> Result<(), String> {
+        let format = match crate::renderer::image_resolver::detect_image_mime_type(data) {
+            "image/png" => image::ImageFormat::Png,
+            "image/jpeg" => image::ImageFormat::Jpeg,
+            "image/gif" => image::ImageFormat::Gif,
+            "image/bmp" => image::ImageFormat::Bmp,
+            "image/tiff" => image::ImageFormat::Tiff,
+            format => {
+                return Err(format!(
+                    "direct PDF page {} does not support {context} payload format {format}; use the svg backend",
+                    page_index + 1
+                ));
+            }
+        };
+        image::load_from_memory_with_format(data, format)
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "direct PDF page {} cannot decode {context} payload: {error}",
+                    page_index + 1
+                )
+            })
+    }
+
+    fn validate_node(node: &LayerNode, page_index: usize) -> Result<(), String> {
+        validate_bbox(node.bounds, page_index, "layer")?;
+        match &node.kind {
+            LayerNodeKind::Group { children, .. } => {
+                for child in children {
+                    validate_node(child, page_index)?;
+                }
+            }
+            LayerNodeKind::ClipRect { clip, child, .. } => {
+                validate_bbox(*clip, page_index, "clip")?;
+                validate_node(child, page_index)?;
+            }
+            LayerNodeKind::Leaf { ops } => {
+                for op in ops {
+                    validate_bbox(op.bounds(), page_index, "paint operation")?;
+                    match op {
+                        PaintOp::PageBackground { background, .. } => {
+                            if background.gradient.is_some() {
+                                return Err(unsupported(
+                                    page_index,
+                                    "page background",
+                                    "gradient fill",
+                                ));
+                            }
+                            if !is_valid_skia_scalar(background.border_width)
+                                || background.border_width < 0.0
+                            {
+                                return Err(format!(
+                                    "direct PDF page {} has invalid page background border width",
+                                    page_index + 1
+                                ));
+                            }
+                            if let Some(image) = &background.image {
+                                validate_image_payload(
+                                    &image.data,
+                                    page_index,
+                                    "page background image",
+                                )?;
+                                if image.brightness != 0 || image.contrast != 0 {
+                                    return Err(unsupported(
+                                        page_index,
+                                        "page background image",
+                                        "unbaked brightness or contrast",
+                                    ));
+                                }
+                                if image.effect == ImageEffect::Pattern8x8 {
+                                    return Err(unsupported(
+                                        page_index,
+                                        "page background image",
+                                        "Pattern8x8 effect",
+                                    ));
+                                }
+                            }
+                        }
+                        PaintOp::Line { line, .. } => {
+                            validate_transform(line.transform, page_index, "line")?;
+                            if line.style.line_type != LineRenderType::Single
+                                || line.style.start_arrow != ArrowStyle::None
+                                || line.style.end_arrow != ArrowStyle::None
+                                || line.style.shadow.is_some()
+                            {
+                                return Err(unsupported(
+                                    page_index,
+                                    "line",
+                                    "multi-line, arrow, or shadow style",
+                                ));
+                            }
+                            if [line.x1, line.y1, line.x2, line.y2, line.style.width]
+                                .iter()
+                                .any(|value| !is_valid_skia_scalar(*value))
+                                || line.style.width < 0.0
+                            {
+                                return Err(format!(
+                                    "direct PDF page {} has invalid line geometry",
+                                    page_index + 1
+                                ));
+                            }
+                        }
+                        PaintOp::Rectangle { rect, .. } => {
+                            validate_transform(rect.transform, page_index, "rectangle")?;
+                            if !is_valid_skia_scalar(rect.corner_radius) || rect.corner_radius < 0.0
+                            {
+                                return Err(format!(
+                                    "direct PDF page {} has invalid rectangle corner radius",
+                                    page_index + 1
+                                ));
+                            }
+                            validate_shape_style(
+                                &rect.style,
+                                rect.gradient.is_some(),
+                                page_index,
+                                "rectangle",
+                            )?;
+                        }
+                        PaintOp::Ellipse { ellipse, .. } => {
+                            validate_transform(ellipse.transform, page_index, "ellipse")?;
+                            validate_shape_style(
+                                &ellipse.style,
+                                ellipse.gradient.is_some(),
+                                page_index,
+                                "ellipse",
+                            )?;
+                        }
+                        PaintOp::Path { path, .. } => {
+                            validate_transform(path.transform, page_index, "path")?;
+                            validate_shape_style(
+                                &path.style,
+                                path.gradient.is_some(),
+                                page_index,
+                                "path",
+                            )?;
+                            if path.connector_endpoints.is_some() || path.line_style.is_some() {
+                                return Err(unsupported(
+                                    page_index,
+                                    "path",
+                                    "connector line style",
+                                ));
+                            }
+                            let finite = path.commands.iter().all(|command| match *command {
+                                PathCommand::MoveTo(x, y) | PathCommand::LineTo(x, y) => {
+                                    is_valid_skia_scalar(x) && is_valid_skia_scalar(y)
+                                }
+                                PathCommand::CurveTo(x1, y1, x2, y2, x, y) => {
+                                    [x1, y1, x2, y2, x, y]
+                                        .iter()
+                                        .all(|value| is_valid_skia_scalar(*value))
+                                }
+                                PathCommand::ArcTo(rx, ry, rotation, _, _, x, y) => {
+                                    [rx, ry, rotation, x, y]
+                                        .iter()
+                                        .all(|value| is_valid_skia_scalar(*value))
+                                }
+                                PathCommand::ClosePath => true,
+                            });
+                            if !finite {
+                                return Err(format!(
+                                    "direct PDF page {} has invalid path geometry",
+                                    page_index + 1
+                                ));
+                            }
+                        }
+                        PaintOp::Image {
+                            image, resolved, ..
+                        } => {
+                            validate_transform(image.transform, page_index, "image")?;
+                            if let Some(data) = resolved
+                                .as_deref()
+                                .map(|payload| &payload.data[..])
+                                .or(image.data.as_deref())
+                            {
+                                validate_image_payload(data, page_index, "image")?;
+                            }
+                            let effects_are_baked = resolved
+                                .as_deref()
+                                .is_some_and(|payload| payload.suppress_effects);
+                            if !effects_are_baked && (image.brightness != 0 || image.contrast != 0)
+                            {
+                                return Err(unsupported(
+                                    page_index,
+                                    "image",
+                                    "unbaked brightness or contrast",
+                                ));
+                            }
+                            if !effects_are_baked && image.effect == ImageEffect::Pattern8x8 {
+                                return Err(unsupported(page_index, "image", "Pattern8x8 effect"));
+                            }
+                            if !is_valid_skia_scalar(image.opacity)
+                                || !(0.0..=1.0).contains(&image.opacity)
+                            {
+                                return Err(format!(
+                                    "direct PDF page {} has invalid image opacity: {}",
+                                    page_index + 1,
+                                    image.opacity
+                                ));
+                            }
+                        }
+                        PaintOp::TextRun { run, .. } => {
+                            if [
+                                run.baseline,
+                                run.rotation,
+                                run.style.font_size,
+                                run.style.letter_spacing,
+                                run.style.ratio,
+                            ]
+                            .iter()
+                            .any(|value| !is_valid_skia_scalar(*value))
+                            {
+                                return Err(format!(
+                                    "direct PDF page {} has invalid text geometry",
+                                    page_index + 1
+                                ));
+                            }
+                        }
+                        PaintOp::FootnoteMarker { marker, .. } => {
+                            if !is_valid_skia_scalar(marker.base_font_size) {
+                                return Err(format!(
+                                    "direct PDF page {} has invalid footnote marker font size",
+                                    page_index + 1
+                                ));
+                            }
+                        }
+                        PaintOp::Equation { equation, .. } => {
+                            if !is_valid_skia_scalar(equation.font_size)
+                                || !is_valid_skia_scalar(equation.layout_box.width)
+                                || !is_valid_skia_scalar(equation.layout_box.height)
+                            {
+                                return Err(format!(
+                                    "direct PDF page {} has invalid equation geometry",
+                                    page_index + 1
+                                ));
+                            }
+                        }
+                        PaintOp::GlyphRun { .. }
+                        | PaintOp::GlyphOutline { .. }
+                        | PaintOp::CharOverlap { .. }
+                        | PaintOp::TextControlMark { .. }
+                        | PaintOp::TabLeader { .. }
+                        | PaintOp::TextDecoration { .. }
+                        | PaintOp::ControlLabel { .. }
+                        | PaintOp::FormObject { .. }
+                        | PaintOp::Placeholder { .. }
+                        | PaintOp::RawSvg { .. } => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    validate_node(&tree.root, page_index)
+}
+
+/// PDF 내보내기 폰트 설정.
+///
+/// `export-pdf`는 SVG를 usvg/svg2pdf로 변환하므로 generic font family와 수식 SVG
+/// font-family를 PDF 변환 직전에 조정한다.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfExportOptions {
+    /// serif generic fallback family.
+    pub fallback_serif: String,
+    /// sans-serif generic fallback family.
+    pub fallback_sans: String,
+    /// monospace generic fallback family.
+    pub fallback_mono: String,
+    /// 사용자 지정 수식 우선 폰트. None이면 기존 수식 font-family 체인을 유지한다.
+    pub equation_font: Option<String>,
+    /// 사용자 지정 폰트 탐색 디렉토리. 기본 탐색 경로보다 먼저 로드한다.
+    pub font_paths: Vec<std::path::PathBuf>,
+    /// 텍스트를 PDF 폰트로 임베드할지 여부. `false` 면 글리프를 path 로 변환한다.
+    ///
+    /// [Task #2264] 임베드 경로(폰트 서브셋)가 PDF 변환 메모리의 지배항이다.
+    /// 실측(텍스트 1639개·이미지 2개인 1페이지 기준): `svg2pdf::to_chunk` 최대 RSS 가
+    /// 164 MB → 69 MB 로 떨어진다. 대신 **PDF 의 텍스트 선택·검색 기능을 잃는다**
+    /// (시각적 출력은 동일). 기본값은 종전 동작인 `true` 다.
+    pub embed_text: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for PdfExportOptions {
+    fn default() -> Self {
+        Self {
+            fallback_serif: default_serif_family().to_string(),
+            fallback_sans: default_sans_family().to_string(),
+            fallback_mono: default_mono_family().to_string(),
+            equation_font: None,
+            font_paths: Vec::new(),
+            embed_text: true,
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+fn default_serif_family() -> &'static str {
+    "바탕"
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+fn default_sans_family() -> &'static str {
+    "맑은 고딕"
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+fn default_mono_family() -> &'static str {
+    "D2Coding"
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
+fn default_serif_family() -> &'static str {
+    "Noto Serif CJK KR"
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
+fn default_sans_family() -> &'static str {
+    "Noto Sans CJK KR"
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
+fn default_mono_family() -> &'static str {
+    "Noto Sans Mono CJK KR"
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
+fn default_serif_family() -> &'static str {
+    "AppleMyungjo"
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
+fn default_sans_family() -> &'static str {
+    "Apple SD Gothic Neo"
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
+fn default_mono_family() -> &'static str {
+    "Menlo"
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "windows", target_os = "linux", target_os = "macos"))
+))]
+fn default_serif_family() -> &'static str {
+    "Noto Serif CJK KR"
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "windows", target_os = "linux", target_os = "macos"))
+))]
+fn default_sans_family() -> &'static str {
+    "Noto Sans CJK KR"
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "windows", target_os = "linux", target_os = "macos"))
+))]
+fn default_mono_family() -> &'static str {
+    "Noto Sans Mono CJK KR"
+}
+
+/// 폰트 데이터베이스를 초기화 (시스템 폰트 + 프로젝트 폰트 로드)
+#[cfg(not(target_arch = "wasm32"))]
+fn create_fontdb(options: &PdfExportOptions) -> usvg::fontdb::Database {
+    let mut fontdb = usvg::fontdb::Database::new();
+    fontdb.load_system_fonts();
+    // [#2864] 조달 순서는 renderer::font_paths 가 단일 정의한다.
+    // 종전의 ttfs/hwp·ttfs/windows(로컬 전용)와 /mnt/c/Windows/Fonts(WSL2 전용)는
+    // 제거했다 — 서버·컨테이너에서 무의미하고 /mnt/c 는 #2268 간헐 행의 원인이었다.
+    crate::renderer::font_paths::load_into_fontdb(&mut fontdb, &options.font_paths);
+    fontdb.set_serif_family(options.fallback_serif.as_str());
+    fontdb.set_sans_serif_family(options.fallback_sans.as_str());
+    fontdb.set_monospace_family(options.fallback_mono.as_str());
+    warn_missing_family(
+        &fontdb,
+        "serif",
+        &options.fallback_serif,
+        "--fallback-serif",
+    );
+    warn_missing_family(
+        &fontdb,
+        "sans-serif",
+        &options.fallback_sans,
+        "--fallback-sans",
+    );
+    warn_missing_family(
+        &fontdb,
+        "monospace",
+        &options.fallback_mono,
+        "--fallback-mono",
+    );
+    if let Some(equation_font) = options.equation_font.as_deref() {
+        let family = first_font_family(equation_font);
+        if !family.is_empty() {
+            warn_missing_family(&fontdb, "equation", &family, "--equation-font");
+        }
+    }
+    fontdb
+}
+
+// A document with more distinct fallback characters than this is unusual enough
+// that keeping the stock resolver is safer than retaining an unbounded index.
+#[cfg(not(target_arch = "wasm32"))]
+const PDF_FONT_FALLBACK_INDEX_MAX_CHARS: usize = 4_096;
+
+// Coverage is stored as one Option<bool> slot per visited face position. Cap the
+// total logical slot length as well as the number of characters so Vec capacity
+// and HashMap metadata cannot grow with an unbounded system font inventory.
+#[cfg(not(target_arch = "wasm32"))]
+const PDF_FONT_FALLBACK_INDEX_MAX_FACE_SLOTS: usize = 262_144;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct PdfFontFallbackIndex {
+    database: Option<(std::sync::Weak<usvg::fontdb::Database>, usize)>,
+    coverage_by_char: std::collections::HashMap<char, Vec<Option<bool>>>,
+    face_slot_count: usize,
+    disabled: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PdfFontFallbackIndex {
+    fn new() -> Self {
+        Self {
+            database: None,
+            coverage_by_char: std::collections::HashMap::new(),
+            face_slot_count: 0,
+            disabled: false,
+        }
+    }
+
+    fn disable(&mut self) {
+        self.coverage_by_char.clear();
+        self.face_slot_count = 0;
+        self.disabled = true;
+    }
+
+    fn select(
+        &mut self,
+        c: char,
+        used_fonts: &[usvg::fontdb::ID],
+        fontdb: &std::sync::Arc<usvg::fontdb::Database>,
+        max_chars: usize,
+        max_face_slots: usize,
+    ) -> PdfFontFallbackLookup {
+        if self.disabled {
+            return PdfFontFallbackLookup::Default;
+        }
+
+        // A custom select_font callback may add faces through Arc::make_mut. Cached
+        // IDs and ordering only describe the exact database observed on first use;
+        // fall back globally if that identity or face inventory changes.
+        let database = std::sync::Arc::downgrade(fontdb);
+        let face_count = fontdb.len();
+        match self.database.as_ref() {
+            None => self.database = Some((database, face_count)),
+            Some((cached, cached_face_count))
+                if *cached_face_count != face_count
+                    || !std::sync::Weak::ptr_eq(cached, &database) =>
+            {
+                self.disable();
+                return PdfFontFallbackLookup::Default;
+            }
+            Some(_) => {}
+        }
+
+        if !self.coverage_by_char.contains_key(&c) {
+            if self.coverage_by_char.len() >= max_chars {
+                self.disable();
+                return PdfFontFallbackLookup::Default;
+            }
+            self.coverage_by_char.insert(c, Vec::new());
+        }
+
+        // Preserve usvg 0.45's exact short-circuit order: exclusion and face
+        // compatibility are checked before the potentially expensive cmap probe,
+        // and the first supporting face returns immediately. The index only
+        // replaces has_char calls that stock usvg would otherwise repeat.
+        let base_face = fontdb.face(used_fonts[0]);
+        for (face_index, face) in fontdb.faces().enumerate() {
+            if used_fonts.contains(&face.id) {
+                continue;
+            }
+            let Some(base_face) = base_face else {
+                return PdfFontFallbackLookup::Cached(None);
+            };
+            if base_face.style != face.style
+                && base_face.weight != face.weight
+                && base_face.stretch != face.stretch
+            {
+                continue;
+            }
+
+            let cached = self
+                .coverage_by_char
+                .get(&c)
+                .and_then(|coverage| coverage.get(face_index))
+                .copied()
+                .flatten();
+            let supports_char = match cached {
+                Some(supports_char) => supports_char,
+                None => {
+                    let Some(required_len) = face_index.checked_add(1) else {
+                        self.disable();
+                        return PdfFontFallbackLookup::Default;
+                    };
+                    let current_len = self
+                        .coverage_by_char
+                        .get(&c)
+                        .map_or(0, |coverage| coverage.len());
+                    let additional_slots = required_len.saturating_sub(current_len);
+                    let Some(next_face_slot_count) =
+                        self.face_slot_count.checked_add(additional_slots)
+                    else {
+                        self.disable();
+                        return PdfFontFallbackLookup::Default;
+                    };
+                    if next_face_slot_count > max_face_slots {
+                        self.disable();
+                        return PdfFontFallbackLookup::Default;
+                    }
+
+                    let supports_char = pdf_font_face_has_char(fontdb, face.id, c);
+                    let coverage = self
+                        .coverage_by_char
+                        .get_mut(&c)
+                        .expect("fallback coverage was inserted above");
+                    if coverage.len() < required_len {
+                        coverage.resize(required_len, None);
+                        self.face_slot_count = next_face_slot_count;
+                    }
+                    coverage[face_index] = Some(supports_char);
+                    supports_char
+                }
+            };
+            if supports_char {
+                return PdfFontFallbackLookup::Cached(Some(face.id));
+            }
+        }
+
+        PdfFontFallbackLookup::Cached(None)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum PdfFontFallbackLookup {
+    Cached(Option<usvg::fontdb::ID>),
+    Default,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pdf_font_face_has_char(fontdb: &usvg::fontdb::Database, id: usvg::fontdb::ID, c: char) -> bool {
+    fontdb
+        .with_face_data(id, |font_data, face_index| {
+            ttf_parser::Face::parse(font_data, face_index)
+                .ok()
+                .and_then(|face| face.glyph_index(c))
+                .is_some()
+        })
+        .unwrap_or(false)
+}
+
+/// Builds the bounded fallback selector used by compatibility PDF conversion.
+///
+/// The limits are arguments so integration tests can exercise overflow without
+/// manufacturing a production-sized font database. Callers should normally use
+/// [`svgs_to_pdf_with_options`] instead.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub fn pdf_font_fallback_selector_with_limits(
+    max_chars: usize,
+    max_face_slots: usize,
+) -> usvg::FallbackSelectionFn<'static> {
+    let index = std::sync::Mutex::new(PdfFontFallbackIndex::new());
+    let default_selector = usvg::FontResolver::default_fallback_selector();
+
+    Box::new(move |c, used_fonts, fontdb| {
+        let lookup = match index.lock() {
+            Ok(mut index) => index.select(c, used_fonts, fontdb, max_chars, max_face_slots),
+            Err(_) => PdfFontFallbackLookup::Default,
+        };
+        match lookup {
+            PdfFontFallbackLookup::Cached(id) => id,
+            PdfFontFallbackLookup::Default => default_selector(c, used_fonts, fontdb),
+        }
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn warn_missing_family(
+    fontdb: &usvg::fontdb::Database,
+    kind: &str,
+    family: &str,
+    option_name: &str,
+) {
+    if !font_family_exists(fontdb, family) {
+        eprintln!(
+            "WARN: fallback {kind} font '{family}' not found.\n      한글 또는 수식이 빈칸으로 렌더링될 수 있습니다.\n      {option_name} \"<family>\" 로 설치된 폰트를 지정하세요."
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn font_family_exists(fontdb: &usvg::fontdb::Database, family: &str) -> bool {
+    fontdb.faces().any(|face| {
+        face.families
+            .iter()
+            .any(|(name, _)| name == family || name.eq_ignore_ascii_case(family))
+    })
+}
+
+/// SVG에서 없는 한글 폰트명에 fallback 추가
+#[cfg(not(target_arch = "wasm32"))]
+fn add_font_fallbacks(svg: &str, options: &PdfExportOptions) -> String {
+    let serif = css_family_for_attr(&options.fallback_serif);
+    let sans = css_family_for_attr(&options.fallback_sans);
+    svg.replace(
+        "font-family=\"휴먼명조\"",
+        &format!("font-family=\"휴먼명조, {serif}, serif\""),
+    )
+    .replace(
+        "font-family=\"HCI Poppy\"",
+        &format!("font-family=\"HCI Poppy, {sans}, sans-serif\""),
+    )
+}
+
+/// #3772: bold `<text>`/`<tspan>` 에서만 ExtraLight 를 뺀다.
+///
+/// SVG 생성기가 이미 뺀 경우 no-op. 외부 SVG 나 옛 골든을 svg2pdf 에 넣을 때도
+/// ExtraLight(200) 이 bold 로 남지 않게 하는 PDF 직전 안전망이다.
+#[cfg(not(target_arch = "wasm32"))]
+fn drop_extralight_from_bold_svg_runs(svg: &str) -> String {
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(rel) = rest.find('<') {
+        out.push_str(&rest[..rel]);
+        rest = &rest[rel..];
+        let end = rest.find('>').map(|i| i + 1).unwrap_or(rest.len());
+        let tag = &rest[..end];
+        rest = &rest[end..];
+        if svg_tag_is_text_run(tag) && svg_tag_is_bold_weight(tag) {
+            out.push_str(&crate::renderer::drop_noto_sans_kr_extralight(tag));
+        } else {
+            out.push_str(tag);
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn svg_tag_is_text_run(tag: &str) -> bool {
+    let Some(rest) = tag.strip_prefix('<') else {
+        return false;
+    };
+    let name = rest
+        .split(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+        .next()
+        .unwrap_or("");
+    name.eq_ignore_ascii_case("text") || name.eq_ignore_ascii_case("tspan")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn svg_tag_is_bold_weight(tag: &str) -> bool {
+    let lower = tag.to_ascii_lowercase();
+    if lower.contains("font-weight=\"bold\"") || lower.contains("font-weight='bold'") {
+        return true;
+    }
+    for weight in ["600", "700", "800", "900"] {
+        if lower.contains(&format!("font-weight=\"{weight}\""))
+            || lower.contains(&format!("font-weight='{weight}'"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// SVG→PDF 직전에 generic 폴백·수식 폰트·bold ExtraLight 제거를 적용한다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn apply_pdf_font_options(svg: &str, options: &PdfExportOptions) -> String {
+    let svg = add_font_fallbacks(svg, options);
+    let svg = drop_extralight_from_bold_svg_runs(&svg);
+    if let Some(equation_font) = options.equation_font.as_deref() {
+        let attr = format!(
+            "font-family=\"{}\"",
+            escape_xml_attr(&equation_font_chain(equation_font))
+        );
+        svg.replace(
+            crate::renderer::equation::svg_render::DEFAULT_EQUATION_FONT_FAMILY_ATTR,
+            &attr,
+        )
+    } else {
+        svg
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn equation_font_chain(equation_font: &str) -> String {
+    if equation_font.contains(',') {
+        return equation_font.trim().to_string();
+    }
+    let first = css_family_for_attr(equation_font);
+    let default =
+        "'Latin Modern Math', 'STIX Two Text', 'STIX Two Math', 'Times New Roman', 'Times', serif";
+    if first == "'Latin Modern Math'" {
+        default.to_string()
+    } else {
+        format!("{first}, {default}")
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn first_font_family(value: &str) -> String {
+    value
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn css_family_for_attr(family: &str) -> String {
+    let family = family.trim();
+    if family.eq_ignore_ascii_case("serif")
+        || family.eq_ignore_ascii_case("sans-serif")
+        || family.eq_ignore_ascii_case("monospace")
+    {
+        return family.to_string();
+    }
+    let escaped = escape_xml_attr(family);
+    format!("'{escaped}'")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn escape_xml_attr(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            // XML 1.0 허용 문자: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+            // 그 외(제어문자 등)는 제거 — PDF 에 심는 XMP 메타데이터가 불법 XML 이 되지 않도록 (#3382 계열)
+            '\u{09}' | '\u{0A}' | '\u{0D}' => escaped.push(ch),
+            '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}' => {
+                escaped.push(ch)
+            }
+            _ => {} // XML 무효 문자 제거
+        }
+    }
+    escaped
+}
+
+/// [#3824] PDF 텍스트 표면(`ToUnicode`)의 한컴 PUA 를 표준 코드포인트로 바꾼다.
+///
+/// #3385 가 `export-text` 표면을 고쳤지만, 사용자가 실제로 검색하는 **PDF 표면**은
+/// 그대로 PUA 를 내보내고 있었다. "①" 을 검색하면 안 걸리고 스크린리더는 사설 영역
+/// 문자를 읽는다.
+///
+/// **렌더 결정은 건드리지 않는다.** 글리프 선택은 PUA 로 두어야 fallback 이 맞는다
+/// (`map_pua_bullet_char` 주석 참조). 바꿀 곳은 글리프 → 유니코드 대응표뿐이다.
+///
+/// 매핑은 새로 짓지 않고 텍스트 표면이 쓰는 표(`pua_to_text_surface`)를 그대로
+/// 재사용한다 — 두 표면이 갈리지 않게 하는 것이 이 수정의 요지다.
+///
+/// ## 왜 바이트 수준인가
+///
+/// `ToUnicode` CMap 은 svg2pdf 가 만든다. 그런데 한컴 PUA 의 뜻은 **rhwp 도메인
+/// 지식**이라 범용 SVG 변환기가 알 이유가 없다. 그래서 rhwp 가 자기 출력에서
+/// 대응표만 고친다.
+///
+/// 안전 근거 — 실측으로 확인한 세 성질에 기댄다.
+///   1. CMap 스트림은 **비압축**이다(`/Type /CMap`, `/Filter` 없음).
+///   2. svg2pdf 는 `beginbfchar` 만 쓴다(`beginbfrange` 0개).
+///   3. 대체 문자열이 원본보다 짧으므로 **공백으로 채워 길이를 보존**한다 →
+///      `/Length` 와 xref 오프셋을 건드리지 않는다. 채움 공백은 꺾쇠 **안**에
+///      들어가는데(`<2460    >`), PDF 명세상 16진 문자열 안의 공백은 무시되므로
+///      `<2460>` 과 같은 값이다.
+///
+/// 길이가 늘어나는 경우(다중 문자 대체)는 **건너뛴다** — 길이 보존이 깨지기 때문이다.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn remap_pua_in_tounicode(pdf: &mut [u8]) {
+    const BEGIN: &[u8] = b"beginbfchar";
+    const END: &[u8] = b"endbfchar";
+    let mut cursor = 0usize;
+    while let Some(rel) = find_bytes(&pdf[cursor..], BEGIN) {
+        let start = cursor + rel + BEGIN.len();
+        let Some(rel_end) = find_bytes(&pdf[start..], END) else {
+            break;
+        };
+        let end = start + rel_end;
+        remap_bfchar_block(&mut pdf[start..end]);
+        cursor = end + END.len();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// `<src> <dst>` 쌍이 늘어선 블록에서 dst 만 고친다.
+#[cfg(not(target_arch = "wasm32"))]
+fn remap_bfchar_block(block: &mut [u8]) {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < block.len() {
+        if block[i] == b'<' {
+            match block[i + 1..].iter().position(|&b| b == b'>') {
+                Some(rel) => {
+                    spans.push((i + 1, i + 1 + rel));
+                    i += rel + 2;
+                }
+                None => break,
+            }
+            continue;
+        }
+        i += 1;
+    }
+    // 짝수 번째가 src, 홀수 번째가 dst 다.
+    for pair in spans.chunks(2) {
+        let dst = match pair {
+            [_src, dst] => *dst,
+            _ => continue,
+        };
+        let (s, e) = dst;
+        let text = match utf16be_hex_to_string(&block[s..e]) {
+            Some(t) => t,
+            None => continue,
+        };
+        let mapped = crate::renderer::composer::pua_to_text_surface(&text);
+        if mapped.as_ref() == text.as_str() {
+            continue;
+        }
+        let hex = string_to_utf16be_hex(mapped.as_ref());
+        if hex.len() > e - s {
+            continue; // 길이 보존이 깨진다 — 손대지 않는다
+        }
+        block[s..s + hex.len()].copy_from_slice(hex.as_bytes());
+        for b in &mut block[s + hex.len()..e] {
+            *b = b' ';
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn utf16be_hex_to_string(hex: &[u8]) -> Option<String> {
+    if hex.is_empty() || !hex.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut units = Vec::with_capacity(hex.len() / 4);
+    for quad in hex.chunks(4) {
+        let mut v: u16 = 0;
+        for &b in quad {
+            let d = (b as char).to_digit(16)? as u16;
+            v = v.checked_mul(16)?.checked_add(d)?;
+        }
+        units.push(v);
+    }
+    String::from_utf16(&units).ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn string_to_utf16be_hex(s: &str) -> String {
+    let mut out = String::new();
+    for unit in s.encode_utf16() {
+        out.push_str(&format!("{unit:04X}"));
+    }
+    out
+}
+
+/// 단일 SVG를 PDF로 변환
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svg_to_pdf(svg_content: &str) -> Result<Vec<u8>, String> {
+    svgs_to_pdf(&[svg_content.to_string()])
+}
+
+/// 단일 SVG를 옵션 기반 PDF로 변환
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svg_to_pdf_with_options(
+    svg_content: &str,
+    options: &PdfExportOptions,
+) -> Result<Vec<u8>, String> {
+    svgs_to_pdf_with_options(&[svg_content.to_string()], options)
+}
+
+/// #3773: 한 페이지의 svg2pdf `SubsetError` 를 문서 전체 실패로 올리지 않는다.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Svg2pdfPageIsolation {
+    /// 서브셋과 무관한 변환 오류. 문서 전체를 실패시킨다.
+    Fatal,
+    /// `embed_text=true` 첫 실패. 글리프 path 변환으로 한 번 재시도한다.
+    RetryWithoutEmbedText,
+    /// 재시도 뒤에도 `SubsetError`. 해당 페이지만 건너뛴다.
+    SkipPage,
+}
+
+/// svg2pdf 페이지 변환 오류를 격리 정책으로 분류한다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn classify_svg2pdf_page_error(
+    err: &svg2pdf::ConversionError,
+    embed_text: bool,
+    already_retried: bool,
+) -> Svg2pdfPageIsolation {
+    if !matches!(err, svg2pdf::ConversionError::SubsetError(_)) {
+        return Svg2pdfPageIsolation::Fatal;
+    }
+    if embed_text && !already_retried {
+        Svg2pdfPageIsolation::RetryWithoutEmbedText
+    } else {
+        Svg2pdfPageIsolation::SkipPage
+    }
+}
+
+/// 시험용 dummy `SubsetError`. 실제 폰트 ID 가 없어도 격리 분기를 탈 수 있다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svg2pdf_subset_error_stub() -> svg2pdf::ConversionError {
+    svg2pdf::ConversionError::SubsetError(usvg::fontdb::ID::dummy())
+}
+
+/// 시험용 비-Subset 변환 오류. 문서 전체 실패 분기를 고정한다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svg2pdf_invalid_image_error() -> svg2pdf::ConversionError {
+    svg2pdf::ConversionError::InvalidImage
+}
+
+/// svg2pdf `to_chunk` 래퍼. 시험이 성공 경로를 재사용할 때 쓴다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svg2pdf_to_chunk(
+    tree: &usvg::Tree,
+    embed_text: bool,
+) -> Result<(pdf_writer::Chunk, pdf_writer::Ref), svg2pdf::ConversionError> {
+    let mut conversion = svg2pdf::ConversionOptions::default();
+    conversion.embed_text = embed_text;
+    svg2pdf::to_chunk(tree, conversion)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn convert_page_chunk<F>(
+    tree: &usvg::Tree,
+    embed_text: bool,
+    page_index: usize,
+    to_chunk: &mut F,
+) -> Result<Option<(pdf_writer::Chunk, pdf_writer::Ref)>, String>
+where
+    F: FnMut(
+        &usvg::Tree,
+        bool,
+    ) -> Result<(pdf_writer::Chunk, pdf_writer::Ref), svg2pdf::ConversionError>,
+{
+    match to_chunk(tree, embed_text) {
+        Ok(ok) => Ok(Some(ok)),
+        Err(err) => match classify_svg2pdf_page_error(&err, embed_text, false) {
+            Svg2pdfPageIsolation::Fatal => Err(format!("SVG→chunk 변환 실패: {:?}", err)),
+            Svg2pdfPageIsolation::RetryWithoutEmbedText => {
+                eprintln!(
+                    "WARN: 페이지 {} svg2pdf SubsetError({err:?}) — embed_text=false 로 재시도합니다.",
+                    page_index + 1
+                );
+                match to_chunk(tree, false) {
+                    Ok(ok) => Ok(Some(ok)),
+                    Err(err2) => match classify_svg2pdf_page_error(&err2, false, true) {
+                        Svg2pdfPageIsolation::SkipPage => {
+                            eprintln!(
+                                "WARN: 페이지 {} svg2pdf SubsetError({err2:?}) — 이 페이지만 건너뛰고 PDF 를 계속합니다.",
+                                page_index + 1
+                            );
+                            Ok(None)
+                        }
+                        Svg2pdfPageIsolation::Fatal
+                        | Svg2pdfPageIsolation::RetryWithoutEmbedText => {
+                            Err(format!("SVG→chunk 변환 실패: {:?}", err2))
+                        }
+                    },
+                }
+            }
+            Svg2pdfPageIsolation::SkipPage => {
+                eprintln!(
+                    "WARN: 페이지 {} svg2pdf SubsetError({err:?}) — 이 페이지만 건너뛰고 PDF 를 계속합니다.",
+                    page_index + 1
+                );
+                Ok(None)
+            }
+        },
+    }
+}
+
+/// 여러 SVG 페이지를 단일 다중 페이지 PDF로 생성
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svgs_to_pdf(svg_pages: &[String]) -> Result<Vec<u8>, String> {
+    svgs_to_pdf_with_options(svg_pages, &PdfExportOptions::default())
+}
+
+/// 여러 SVG 페이지를 옵션 기반 단일 다중 페이지 PDF로 생성
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svgs_to_pdf_with_options(
+    svg_pages: &[String],
+    export_options: &PdfExportOptions,
+) -> Result<Vec<u8>, String> {
+    svgs_to_pdf_with_to_chunk(svg_pages, export_options, svg2pdf_to_chunk)
+}
+
+/// [#6612] 페이지 SVG 안의 `data:image/svg+xml` 그림을 이미지째 읽는 usvg 리졸버.
+///
+/// rhwp 는 WMF·EMF·AI 그림을 SVG 로 바꿔 `<image href="data:image/svg+xml;base64,…">` 로
+/// 심는다. usvg 의 기본 데이터 리졸버는 이런 하위 SVG 를 `load_sub_svg` 로 읽는데, 그 함수는
+/// SVG 규격("`<image>` 가 참조한 SVG 는 자기 안에 `<image>` 를 둘 수 없다")대로 하위 SVG 의
+/// `<image>` 를 전부 버린다. 비트맵을 품은 WMF(`<svg viewBox><image href="data:image/png"/></svg>`)
+/// 는 그래서 PDF 에서 빈칸이 됐다(hwp3-sample14 그림 13장 전부). 페이지 SVG 와 하위 SVG 를
+/// 모두 rhwp 가 만들므로 하위 SVG 를 같은 옵션으로 파싱해 이미지를 유지한다. 다른 mime 은
+/// usvg 기본 리졸버가 처리한다.
+#[cfg(not(target_arch = "wasm32"))]
+fn pdf_image_href_resolver() -> usvg::ImageHrefResolver<'static> {
+    let default_data = usvg::ImageHrefResolver::default_data_resolver();
+    usvg::ImageHrefResolver {
+        resolve_data: Box::new(move |mime, data, opts| match mime {
+            "image/svg+xml" => match usvg::Tree::from_data(&data, opts) {
+                Ok(tree) => Some(usvg::ImageKind::SVG(tree)),
+                Err(e) => {
+                    eprintln!("경고: PDF 변환 중 하위 SVG 그림을 파싱하지 못해 건너뜁니다: {e}");
+                    None
+                }
+            },
+            _ => default_data(mime, data, opts),
+        }),
+        resolve_string: usvg::ImageHrefResolver::default_string_resolver(),
+    }
+}
+
+/// 페이지별 `to_chunk` 를 주입할 수 있는 PDF 변환.
+///
+/// #3773: `SubsetError` 는 경고로 강등하고 나머지 페이지를 계속한다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svgs_to_pdf_with_to_chunk<F>(
+    svg_pages: &[String],
+    export_options: &PdfExportOptions,
+    to_chunk: F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(
+        &usvg::Tree,
+        bool,
+    ) -> Result<(pdf_writer::Chunk, pdf_writer::Ref), svg2pdf::ConversionError>,
+{
+    svgs_to_pdf_with_links_and_to_chunk(
+        svg_pages,
+        &vec![Vec::new(); svg_pages.len()],
+        export_options,
+        to_chunk,
+    )
+}
+
+/// 페이지와 같은 순서의 링크 사각형을 PDF annotation으로 저장한다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svgs_to_pdf_with_links(
+    svg_pages: &[String],
+    links: &[Vec<super::hyperlinks::PdfLink>],
+    options: &PdfExportOptions,
+) -> Result<Vec<u8>, String> {
+    svgs_to_pdf_with_links_and_to_chunk(svg_pages, links, options, svg2pdf_to_chunk)
+}
+
+/// 페이지 변환 실패 시 링크 귀속도 검증하는 주입점.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub fn svgs_to_pdf_with_links_and_to_chunk<F>(
+    svg_pages: &[String],
+    links: &[Vec<super::hyperlinks::PdfLink>],
+    export_options: &PdfExportOptions,
+    mut to_chunk: F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(
+        &usvg::Tree,
+        bool,
+    ) -> Result<(pdf_writer::Chunk, pdf_writer::Ref), svg2pdf::ConversionError>,
+{
+    if links.len() != svg_pages.len() {
+        return Err("PDF 페이지와 링크 목록의 길이가 다릅니다".into());
+    }
+    if svg_pages.is_empty() {
+        return Err("페이지가 없습니다".to_string());
+    }
+    use pdf_writer::{Finish, Pdf, Ref};
+    use std::collections::HashMap;
+
+    let fontdb = create_fontdb(export_options);
+    let mut options = usvg::Options::default();
+    options.fontdb = std::sync::Arc::new(fontdb);
+    options.font_resolver.select_fallback = pdf_font_fallback_selector_with_limits(
+        PDF_FONT_FALLBACK_INDEX_MAX_CHARS,
+        PDF_FONT_FALLBACK_INDEX_MAX_FACE_SLOTS,
+    );
+    options.image_href_resolver = pdf_image_href_resolver();
+
+    let mut alloc = Ref::new(1);
+    let catalog_ref = alloc.bump();
+    let page_tree_ref = alloc.bump();
+
+    // 각 페이지의 SVG를 파싱하여 chunk + page 정보 수집
+    struct PageData {
+        chunk: pdf_writer::Chunk,
+        svg_ref: Ref,
+        width: f32,
+        height: f32,
+        source_index: usize,
+    }
+
+    let mut page_datas: Vec<PageData> = Vec::new();
+
+    for (page_index, svg) in svg_pages.iter().enumerate() {
+        let svg_with_fallback = apply_pdf_font_options(svg, export_options);
+        let (svg_with_bold, bold_report) =
+            prepare_svg_with_synthetic_bold(&svg_with_fallback, &options)?;
+        if bold_report.unsupported_texts > 0 {
+            eprintln!("경고: PDF {}페이지의 굵게 text {}개는 혼합 글꼴/복잡한 paint로 합성하지 못했습니다.", page_index + 1, bold_report.unsupported_texts);
+        }
+        let (tree, italic_report) = parse_svg_with_synthetic_italic(&svg_with_bold, &options)
+            .map_err(|e| format!("SVG 파싱 실패: {}", e))?;
+        if italic_report.unsupported_texts > 0 {
+            eprintln!(
+                "경고: PDF {}페이지의 기울임 text {}개는 혼합 글꼴/복잡한 배치로 합성하지 못했습니다.",
+                page_index + 1,
+                italic_report.unsupported_texts,
+            );
+        }
+
+        // [Task #2264] 텍스트 임베드(폰트 서브셋)가 PDF 변환 메모리의 지배항이다.
+        // `embed_text=false` 면 글리프를 path 로 변환해 서브셋 경로를 통째로 건너뛴다.
+        // [#3773] SubsetError 는 페이지 단위로 격리한다.
+        let Some((chunk, svg_ref)) =
+            convert_page_chunk(&tree, export_options.embed_text, page_index, &mut to_chunk)?
+        else {
+            continue;
+        };
+
+        let dpi_ratio = 72.0 / 96.0; // 96 DPI → 72 pt
+        let w = tree.size().width() * dpi_ratio;
+        let h = tree.size().height() * dpi_ratio;
+
+        page_datas.push(PageData {
+            chunk,
+            svg_ref,
+            width: w,
+            height: h,
+            source_index: page_index,
+        });
+    }
+
+    if page_datas.is_empty() {
+        return Err("모든 페이지의 SVG→PDF 변환이 SubsetError 로 건너뛰어졌습니다".to_string());
+    }
+
+    // 각 chunk를 재번호화하고 페이지 참조 수집
+    let mut page_refs: Vec<Ref> = Vec::new();
+    let mut renumbered_chunks: Vec<pdf_writer::Chunk> = Vec::new();
+    let mut svg_refs_remapped: Vec<Ref> = Vec::new();
+
+    for pd in &page_datas {
+        let page_ref = alloc.bump();
+        let content_ref = alloc.bump();
+        page_refs.push(page_ref);
+
+        // chunk 재번호화
+        let mut map = HashMap::new();
+        let renumbered = pd
+            .chunk
+            .renumber(|old| *map.entry(old).or_insert_with(|| alloc.bump()));
+
+        let remapped_svg_ref = map.get(&pd.svg_ref).copied().unwrap_or(pd.svg_ref);
+        svg_refs_remapped.push(remapped_svg_ref);
+        renumbered_chunks.push(renumbered);
+    }
+
+    // PDF 생성
+    let mut pdf = Pdf::new();
+    pdf.catalog(catalog_ref).pages(page_tree_ref);
+    pdf.pages(page_tree_ref)
+        .count(page_refs.len() as i32)
+        .kids(page_refs.iter().copied());
+
+    // 각 페이지 생성
+    let svg_name = pdf_writer::Name(b"S1");
+
+    for (i, pd) in page_datas.iter().enumerate() {
+        let page_ref = page_refs[i];
+        let content_ref = alloc.bump();
+        let svg_ref = svg_refs_remapped[i];
+
+        let page_links = super::hyperlinks::page_links(
+            &links[pd.source_index],
+            f64::from(pd.width) / 0.75,
+            f64::from(pd.height) / 0.75,
+        );
+        let annotation_refs: Vec<_> = page_links.iter().map(|_| alloc.bump()).collect();
+        let mut page = pdf.page(page_ref);
+        page.media_box(pdf_writer::Rect::new(0.0, 0.0, pd.width, pd.height));
+        page.parent(page_tree_ref);
+        page.contents(content_ref);
+        if !annotation_refs.is_empty() {
+            page.annotations(annotation_refs.iter().copied());
+        }
+
+        let mut resources = page.resources();
+        resources.x_objects().pair(svg_name, svg_ref);
+        resources.finish();
+        page.finish();
+        for (link, annotation_ref) in page_links.iter().zip(annotation_refs) {
+            let r = link.rect;
+            let mut annotation = pdf.annotation(annotation_ref);
+            annotation
+                .subtype(pdf_writer::types::AnnotationType::Link)
+                .rect(pdf_writer::Rect::new(
+                    (r.x * 0.75) as f32,
+                    pd.height - ((r.y + r.height) * 0.75) as f32,
+                    ((r.x + r.width) * 0.75) as f32,
+                    pd.height - (r.y * 0.75) as f32,
+                ))
+                .page(page_ref)
+                .border(0.0, 0.0, 0.0, None);
+            annotation
+                .action()
+                .action_type(pdf_writer::types::ActionType::Uri)
+                .uri(pdf_writer::Str(link.uri.as_bytes()));
+            annotation.finish();
+        }
+
+        // 컨텐츠 스트림: SVG XObject를 페이지 크기에 맞게 배치
+        let mut content = pdf_writer::Content::new();
+        content.transform([pd.width, 0.0, 0.0, pd.height, 0.0, 0.0]);
+        content.x_object(svg_name);
+
+        pdf.stream(content_ref, &content.finish());
+    }
+
+    // 모든 chunk를 PDF에 추가
+    for chunk in &renumbered_chunks {
+        pdf.extend(chunk);
+    }
+
+    // 문서 정보
+    let info_ref = alloc.bump();
+    pdf.document_info(info_ref)
+        .producer(pdf_writer::TextStr("rhwp"));
+
+    // [#3824] 텍스트 표면만 표준 코드포인트로 맞춘다 — 렌더 결정은 불변.
+    let mut bytes = pdf.finish();
+    remap_pua_in_tounicode(&mut bytes);
+    Ok(bytes)
+}
+
+/// Record PageLayerTree pages directly into a native Skia PDF document.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+pub fn layer_trees_to_pdf(layer_trees: &[crate::paint::PageLayerTree]) -> Result<Vec<u8>, String> {
+    layer_trees_to_pdf_with_options(layer_trees, &DirectPdfExportOptions::default())
+}
+
+/// Record PageLayerTree pages directly into a native Skia PDF document.
+///
+/// PageLayerTree coordinates are CSS pixels at 96 DPI. PDF page coordinates
+/// are points at 72 DPI, so the page and canvas are scaled by 72/96. Skia keeps
+/// text, paths, and supported effects as vector commands and uses `raster_dpi`
+/// for effects without a native PDF representation.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+pub fn layer_trees_to_pdf_with_options(
+    layer_trees: &[crate::paint::PageLayerTree],
+    options: &DirectPdfExportOptions,
+) -> Result<Vec<u8>, String> {
+    layer_trees_to_pdf_with_links(layer_trees, &vec![Vec::new(); layer_trees.len()], options)
+}
+
+/// Skia PDF에도 같은 CSS px 링크 영역을 적용한다.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+pub fn layer_trees_to_pdf_with_links(
+    layer_trees: &[crate::paint::PageLayerTree],
+    links: &[Vec<super::hyperlinks::PdfLink>],
+    options: &DirectPdfExportOptions,
+) -> Result<Vec<u8>, String> {
+    if links.len() != layer_trees.len() {
+        return Err("PDF 페이지와 링크 목록의 길이가 다릅니다".into());
+    }
+    const CSS_PX_TO_PDF_POINT: f64 = 72.0 / 96.0;
+    const MAX_PDF_PAGE_DIMENSION_POINTS: f64 = 14_400.0;
+
+    if layer_trees.is_empty() {
+        return Err("direct PDF export requires at least one page".to_string());
+    }
+    if !options.raster_dpi.is_finite() || options.raster_dpi <= 0.0 {
+        return Err(format!(
+            "invalid direct PDF raster dpi: {}",
+            options.raster_dpi
+        ));
+    }
+
+    let page_dimension = |value: f64, label: &str| -> Result<f32, String> {
+        let points = value * CSS_PX_TO_PDF_POINT;
+        if !points.is_finite() || points <= 0.0 {
+            return Err(format!("invalid direct PDF page {label}: {value}"));
+        }
+        if points > MAX_PDF_PAGE_DIMENSION_POINTS {
+            return Err(format!(
+                "direct PDF page {label} exceeds {MAX_PDF_PAGE_DIMENSION_POINTS} points: {points}"
+            ));
+        }
+        Ok(points as f32)
+    };
+
+    let page_sizes = layer_trees
+        .iter()
+        .enumerate()
+        .map(|(page_index, tree)| {
+            validate_direct_pdf_tree(tree, page_index)?;
+            Ok((
+                page_dimension(tree.page_width, "width")?,
+                page_dimension(tree.page_height, "height")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let metadata = skia_safe::pdf::Metadata {
+        title: options.title.clone().unwrap_or_default(),
+        author: options.author.clone().unwrap_or_default(),
+        subject: options.subject.clone().unwrap_or_default(),
+        keywords: options.keywords.clone().unwrap_or_default(),
+        creator: "rhwp".to_string(),
+        producer: "rhwp PageLayerTree direct PDF (Skia)".to_string(),
+        raster_dpi: Some(options.raster_dpi),
+        ..Default::default()
+    };
+    let renderer = crate::renderer::skia::SkiaLayerRenderer::new()
+        .with_font_paths(options.font_paths.as_slice());
+    let mut output = Vec::new();
+
+    {
+        let mut document = skia_safe::pdf::new_document(&mut output, Some(&metadata));
+        for ((tree, &(width, height)), links) in
+            layer_trees.iter().zip(page_sizes.iter()).zip(links)
+        {
+            let mut page = document.begin_page((width, height), None);
+            let canvas = page.canvas();
+            canvas.clear(skia_safe::Color::WHITE);
+            canvas.scale((CSS_PX_TO_PDF_POINT as f32, CSS_PX_TO_PDF_POINT as f32));
+            renderer
+                .render_page_to_canvas_strict(canvas, tree, options.raster_dpi / 96.0)
+                .map_err(|error| format!("direct PDF page replay failed: {error}"))?;
+            for link in super::hyperlinks::page_links(links, tree.page_width, tree.page_height) {
+                let r = link.rect;
+                let mut uri = link.uri.into_bytes();
+                uri.push(0); // Skia URL annotation payload는 NUL 종료 문자열이다.
+                canvas.annotate_rect_with_url(
+                    skia_safe::Rect::from_xywh(
+                        r.x as f32,
+                        r.y as f32,
+                        r.width as f32,
+                        r.height as f32,
+                    ),
+                    &skia_safe::Data::new_copy(&uri),
+                );
+            }
+            document = page.end_page();
+        }
+        document.close();
+    }
+
+    if !output.starts_with(b"%PDF-") || !output.windows(5).any(|window| window == b"%%EOF") {
+        return Err("Skia direct PDF writer returned an incomplete document".to_string());
+    }
+    Ok(output)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// [#3824] ToUnicode 의 한컴 PUA 를 표준 코드포인트로 바꾸되 **길이를 보존**한다.
+    ///
+    /// 길이가 보존돼야 `/Length` 와 xref 오프셋을 건드리지 않는다 — 이 수정이
+    /// 바이트 수준에서 안전한 근거가 그것뿐이다.
+    #[test]
+    fn tounicode_pua_is_remapped_without_changing_length() {
+        // U+F02B1(사각 안 1)은 평면 15 라 UTF-16BE 서로게이트 쌍 DB80 DEB1 이다.
+        let src = b"beginbfchar
+<0001> <DB80DEB1>
+<0002> <DB80DEB2>
+endbfchar";
+        let mut buf = src.to_vec();
+        let before = buf.len();
+        remap_pua_in_tounicode(&mut buf);
+
+        assert_eq!(buf.len(), before, "길이가 바뀌면 /Length 와 xref 가 깨진다");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(
+            out.contains("<2460") && out.contains("<2461"),
+            "표준 원문자로 안 바뀌었다: {out}"
+        );
+        assert!(!out.contains("DB80"), "PUA 서로게이트가 남아 있다: {out}");
+    }
+
+    /// 뜻을 모르는 코드포인트는 손대지 않는다 — 매핑을 지어내지 않는다는 계약.
+    #[test]
+    fn tounicode_leaves_unmapped_codepoints_alone() {
+        let src = b"beginbfchar
+<0001> <AC00>
+<0002> <0041>
+endbfchar";
+        let mut buf = src.to_vec();
+        remap_pua_in_tounicode(&mut buf);
+        assert_eq!(buf, src.to_vec(), "매핑 없는 문자를 건드렸다");
+    }
+
+    /// `beginbfchar` 블록 **밖**은 건드리지 않는다 — 콘텐츠 스트림 오손 방지.
+    #[test]
+    fn tounicode_does_not_touch_bytes_outside_the_block() {
+        let src = b"<DB80DEB1> beginbfchar
+<0001> <DB80DEB1>
+endbfchar <DB80DEB1>";
+        let mut buf = src.to_vec();
+        remap_pua_in_tounicode(&mut buf);
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert_eq!(
+            out.matches("DB80DEB1").count(),
+            2,
+            "블록 밖 바이트까지 고쳤다: {out}"
+        );
+        assert!(out.contains("<2460"), "블록 안은 고쳐야 한다: {out}");
+    }
+
+    #[test]
+    fn pdf_backend_aliases_are_explicit() {
+        assert_eq!(PdfBackend::default(), PdfBackend::CompatibilitySvg);
+        assert_eq!(PdfBackend::parse("svg"), Some(PdfBackend::CompatibilitySvg));
+        assert_eq!(
+            PdfBackend::parse("compat"),
+            Some(PdfBackend::CompatibilitySvg)
+        );
+        assert_eq!(PdfBackend::parse("direct"), Some(PdfBackend::DirectLayer));
+        assert_eq!(PdfBackend::parse("skia"), Some(PdfBackend::DirectLayer));
+        assert_eq!(PdfBackend::parse("unknown"), None);
+        assert_eq!(PdfBackend::CompatibilitySvg.as_str(), "svg");
+        assert_eq!(PdfBackend::DirectLayer.as_str(), "direct");
+    }
+
+    #[test]
+    fn default_pdf_font_options_are_os_specific_and_non_empty() {
+        let options = PdfExportOptions::default();
+        assert!(!options.fallback_serif.is_empty());
+        assert!(!options.fallback_sans.is_empty());
+        assert!(!options.fallback_mono.is_empty());
+        assert!(options.equation_font.is_none());
+    }
+
+    #[test]
+    fn pdf_font_options_replace_generic_fallbacks_and_equation_font() {
+        let options = PdfExportOptions {
+            fallback_serif: "Noto Serif CJK KR".to_string(),
+            fallback_sans: "Noto Sans CJK KR".to_string(),
+            fallback_mono: "Noto Sans Mono CJK KR".to_string(),
+            equation_font: Some("STIX Two Math".to_string()),
+            font_paths: Vec::new(),
+            embed_text: true,
+        };
+        let svg = format!(
+            r#"<svg><text font-family="휴먼명조">가</text><text font-family="HCI Poppy">A</text><text {}>x</text></svg>"#,
+            crate::renderer::equation::svg_render::DEFAULT_EQUATION_FONT_FAMILY_ATTR
+        );
+
+        let out = apply_pdf_font_options(&svg, &options);
+
+        assert!(out.contains(r#"font-family="휴먼명조, 'Noto Serif CJK KR', serif""#));
+        assert!(out.contains(r#"font-family="HCI Poppy, 'Noto Sans CJK KR', sans-serif""#));
+        assert!(out
+            .contains(r#"font-family="&apos;STIX Two Math&apos;, &apos;Latin Modern Math&apos;"#));
+    }
+
+    #[test]
+    fn equation_font_accepts_full_family_chain() {
+        let chain = equation_font_chain("'Custom Math', 'Fallback Math', serif");
+        assert_eq!(chain, "'Custom Math', 'Fallback Math', serif");
+    }
+
+    #[cfg(feature = "native-skia")]
+    fn direct_pdf_test_tree(
+        width: f64,
+        height: f64,
+        fill_color: crate::model::ColorRef,
+    ) -> crate::paint::PageLayerTree {
+        use crate::paint::{LayerNode, PaintOp, RenderProfile};
+        use crate::renderer::render_tree::{BoundingBox, RectangleNode};
+        use crate::renderer::ShapeStyle;
+
+        let page_bounds = BoundingBox::new(0.0, 0.0, width, height);
+        let rectangle = RectangleNode::new(
+            0.0,
+            ShapeStyle {
+                fill_color: Some(fill_color),
+                ..Default::default()
+            },
+            None,
+        );
+        crate::paint::PageLayerTree::with_profile(
+            width,
+            height,
+            LayerNode::leaf(
+                page_bounds,
+                None,
+                vec![PaintOp::rectangle(
+                    BoundingBox::new(8.0, 8.0, width - 16.0, height - 16.0),
+                    rectangle,
+                )],
+            ),
+            RenderProfile::Print,
+        )
+    }
+
+    #[cfg(feature = "native-skia")]
+    #[test]
+    fn skia_direct_pdf_records_multiple_layer_pages() {
+        let pages = [
+            direct_pdf_test_tree(96.0, 144.0, 0x000000ff),
+            direct_pdf_test_tree(192.0, 96.0, 0x0000ff00),
+        ];
+        let options = DirectPdfExportOptions {
+            title: Some("P37 direct PDF test".to_string()),
+            ..Default::default()
+        };
+
+        let pdf = layer_trees_to_pdf_with_options(&pages, &options).unwrap();
+
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert!(pdf.windows(5).any(|window| window == b"%%EOF"));
+        assert!(pdf
+            .windows(b"P37 direct PDF test".len())
+            .any(|window| window == b"P37 direct PDF test"));
+        assert!(pdf
+            .windows(b"/Count 2".len())
+            .any(|window| window == b"/Count 2"));
+        assert!(pdf
+            .windows(b"/MediaBox [0 0 72 108]".len())
+            .any(|window| window == b"/MediaBox [0 0 72 108]"));
+        assert!(pdf
+            .windows(b"/MediaBox [0 0 144 72]".len())
+            .any(|window| window == b"/MediaBox [0 0 144 72]"));
+        assert!(!pdf
+            .windows(b"/Subtype /Image".len())
+            .any(|window| window == b"/Subtype /Image"));
+    }
+
+    #[cfg(feature = "native-skia")]
+    #[test]
+    fn skia_direct_pdf_rejects_invalid_export_inputs() {
+        assert_eq!(
+            layer_trees_to_pdf(&[]).unwrap_err(),
+            "direct PDF export requires at least one page"
+        );
+
+        let valid = direct_pdf_test_tree(96.0, 96.0, 0x000000ff);
+        for raster_dpi in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let options = DirectPdfExportOptions {
+                raster_dpi,
+                ..Default::default()
+            };
+            assert!(
+                layer_trees_to_pdf_with_options(std::slice::from_ref(&valid), &options)
+                    .unwrap_err()
+                    .contains("invalid direct PDF raster dpi")
+            );
+        }
+
+        for invalid in [
+            direct_pdf_test_tree(0.0, 96.0, 0x000000ff),
+            direct_pdf_test_tree(f64::NAN, 96.0, 0x000000ff),
+            direct_pdf_test_tree(20_000.0, 96.0, 0x000000ff),
+        ] {
+            assert!(layer_trees_to_pdf(std::slice::from_ref(&invalid)).is_err());
+        }
+
+        let mut oversized_layer = direct_pdf_test_tree(96.0, 96.0, 0x000000ff);
+        oversized_layer.root.bounds.x = f32::MAX as f64 * 2.0;
+        assert!(layer_trees_to_pdf(&[oversized_layer])
+            .unwrap_err()
+            .contains("invalid layer bounds"));
+    }
+
+    #[cfg(feature = "native-skia")]
+    #[test]
+    fn skia_direct_pdf_rejects_corrupt_and_unvalidated_images() {
+        use crate::paint::{LayerNode, PaintOp, RenderProfile};
+        use crate::renderer::render_tree::{BoundingBox, ImageNode};
+        use image::{ImageFormat, Rgb, RgbImage};
+        use std::io::Cursor;
+
+        let image = RgbImage::from_fn(64, 64, |x, y| {
+            Rgb([
+                (x.wrapping_mul(17) ^ y.wrapping_mul(31)) as u8,
+                (x.wrapping_mul(47).wrapping_add(y.wrapping_mul(13))) as u8,
+                (x.wrapping_mul(7) ^ y.wrapping_mul(53)) as u8,
+            ])
+        });
+        let mut cursor = Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, ImageFormat::Png)
+            .expect("encode test PNG");
+        let mut corrupt_png = cursor.into_inner();
+        let idat_type_offset = corrupt_png
+            .windows(4)
+            .position(|window| window == b"IDAT")
+            .expect("encoded PNG must contain IDAT");
+        corrupt_png[idat_type_offset + 4] ^= 0xff;
+        assert!(
+            skia_safe::Image::from_encoded(skia_safe::Data::new_copy(&corrupt_png)).is_some(),
+            "fixture must pass Skia's encoded-header check"
+        );
+        assert!(
+            image::load_from_memory_with_format(&corrupt_png, ImageFormat::Png).is_err(),
+            "fixture must fail strict PNG decoding"
+        );
+
+        let page_bounds = BoundingBox::new(0.0, 0.0, 96.0, 96.0);
+        let tree = crate::paint::PageLayerTree::with_profile(
+            96.0,
+            96.0,
+            LayerNode::leaf(
+                page_bounds,
+                None,
+                vec![PaintOp::image(
+                    BoundingBox::new(8.0, 8.0, 32.0, 32.0),
+                    ImageNode::new(1, Some(corrupt_png)),
+                    None,
+                )],
+            ),
+            RenderProfile::Print,
+        );
+
+        let error = layer_trees_to_pdf(&[tree]).unwrap_err();
+        assert!(
+            error.contains("cannot decode image payload"),
+            "unexpected error: {error}"
+        );
+
+        let malformed_gif = crate::paint::PageLayerTree::with_profile(
+            96.0,
+            96.0,
+            LayerNode::leaf(
+                page_bounds,
+                None,
+                vec![PaintOp::image(
+                    BoundingBox::new(8.0, 8.0, 32.0, 32.0),
+                    ImageNode::new(2, Some(b"GIF89a\x01\x00\x01\x00\x80\x00\x00".to_vec())),
+                    None,
+                )],
+            ),
+            RenderProfile::Print,
+        );
+        let error = layer_trees_to_pdf(&[malformed_gif]).unwrap_err();
+        assert!(
+            error.contains("cannot decode image payload"),
+            "unexpected error: {error}"
+        );
+
+        let unsupported = crate::paint::PageLayerTree::with_profile(
+            96.0,
+            96.0,
+            LayerNode::leaf(
+                page_bounds,
+                None,
+                vec![PaintOp::image(
+                    BoundingBox::new(8.0, 8.0, 32.0, 32.0),
+                    ImageNode::new(3, Some(b"unrecognized image payload".to_vec())),
+                    None,
+                )],
+            ),
+            RenderProfile::Print,
+        );
+        let error = layer_trees_to_pdf(&[unsupported]).unwrap_err();
+        assert!(
+            error.contains("does not support image payload format application/octet-stream"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(feature = "native-skia")]
+    #[test]
+    fn skia_direct_pdf_rejects_known_lossy_shape_replay() {
+        use crate::paint::{LayerNode, PaintOp, RenderProfile};
+        use crate::renderer::render_tree::{BoundingBox, RectangleNode};
+        use crate::renderer::{GradientFillInfo, ShapeStyle};
+
+        let bbox = BoundingBox::new(0.0, 0.0, 96.0, 96.0);
+        let gradient = GradientFillInfo {
+            gradient_type: 1,
+            angle: 0,
+            center_x: 50,
+            center_y: 50,
+            colors: vec![0x000000ff, 0x00ff0000],
+            positions: vec![0.0, 1.0],
+        };
+        let tree = crate::paint::PageLayerTree::with_profile(
+            96.0,
+            96.0,
+            LayerNode::leaf(
+                bbox,
+                None,
+                vec![PaintOp::rectangle(
+                    bbox,
+                    RectangleNode::new(0.0, ShapeStyle::default(), Some(Box::new(gradient))),
+                )],
+            ),
+            RenderProfile::Print,
+        );
+
+        let error = layer_trees_to_pdf(&[tree]).unwrap_err();
+        assert!(error.contains("gradient fill"), "unexpected error: {error}");
+        assert!(error.contains("use the svg backend"));
+    }
+
+    #[cfg(feature = "native-skia")]
+    #[test]
+    fn skia_direct_pdf_raw_svg_fallback_is_strict_and_uses_requested_dpi() {
+        use crate::paint::{LayerNode, PaintOp, RenderProfile};
+        use crate::renderer::render_tree::{BoundingBox, RawSvgNode};
+
+        let page_bounds = BoundingBox::new(0.0, 0.0, 96.0, 96.0);
+        let svg_bounds = BoundingBox::new(8.0, 8.0, 32.0, 16.0);
+        let tree_with_svg = |svg: &str| {
+            crate::paint::PageLayerTree::with_profile(
+                96.0,
+                96.0,
+                LayerNode::leaf(
+                    page_bounds,
+                    None,
+                    vec![PaintOp::raw_svg(
+                        svg_bounds,
+                        RawSvgNode::new(svg.to_string()),
+                    )],
+                ),
+                RenderProfile::Print,
+            )
+        };
+
+        let invalid = layer_trees_to_pdf(&[tree_with_svg("<path")]).unwrap_err();
+        assert!(invalid.contains("raw SVG raster fallback failed"));
+
+        let options = DirectPdfExportOptions {
+            raster_dpi: 192.0,
+            ..Default::default()
+        };
+        let pdf = layer_trees_to_pdf_with_options(
+            &[tree_with_svg(
+                r##"<rect x="8" y="8" width="32" height="16" fill="#f00"/>"##,
+            )],
+            &options,
+        )
+        .unwrap();
+        assert!(pdf.windows(9).any(|window| window == b"/Width 64"));
+        assert!(pdf.windows(10).any(|window| window == b"/Height 32"));
+    }
+}

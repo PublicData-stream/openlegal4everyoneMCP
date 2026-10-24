@@ -117,7 +117,7 @@ pub async fn extract(
     input: &DocumentInput,
     output: &mut DocumentOutput,
 ) -> Result<(), DocumentError> {
-    output.processor_version = "document-v1;rhwp=680111ec7bea;xberg=1.2.2;resvg=0.47.0;tessdata=4.1.0;NotoSansCJK=2.004;render=150dpi-max4000;ocr=plaintext".into();
+    output.processor_version = "document-v1;rhwp=0.8.7@1a76570e8339+zip9.0.5;xberg=1.3.10;resvg=0.48.1;tessdata=4.1.0;NotoSansCJK=2.004;render=150dpi-max4000;ocr=plaintext".into();
     match input.format {
         DocumentFormat::Pdf => pdf(input, output).await?,
         DocumentFormat::Hwp5 | DocumentFormat::Hwpx => hwp(input, output).await?,
@@ -223,10 +223,9 @@ async fn hwp(input: &DocumentInput, output: &mut DocumentOutput) -> Result<(), D
         .push("hwp_rendered_text_projection".into());
     output.diagnostics.push("font_substitution_possible".into());
     let mut options = resvg::usvg::Options::default();
-    options
-        .fontdb_mut()
-        .load_font_file(FONT)
-        .map_err(|_| DocumentError::SandboxUnavailable)?;
+    // Load only the immutable bundled font; resvg keeps system discovery disabled.
+    let font_data = std::fs::read(FONT).map_err(|_| DocumentError::SandboxUnavailable)?;
+    options.fontdb_mut().load_font_data(font_data);
     options.font_family = "Noto Sans CJK KR".into();
     // SVGs from HWP often request fonts absent from the image. Map every
     // generic fallback to the one explicitly bundled font; leaving fontdb's

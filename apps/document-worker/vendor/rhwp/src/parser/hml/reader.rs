@@ -1,0 +1,1856 @@
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::Reader;
+
+use crate::model::page::{ColumnDef, ColumnDirection, ColumnType, PageDef};
+use crate::model::paragraph::{CharShapeRef, ColumnBreakType};
+use crate::model::shape::{
+    CommonObjAttr, HorzAlign, HorzRelTo, ShapeComponentAttr, TextWrap, VertAlign, VertRelTo,
+};
+use crate::model::style::{
+    border_width_index, Alignment, BorderFill, BorderLineType, CharShape, Fill, FillType, Font,
+    LineSpacingType, ParaShape, ShapeBorderLine, SolidFill, Style, TabDef,
+};
+use crate::model::table::VerticalAlign;
+use crate::model::Padding;
+
+use super::envelope::PreservedFragment;
+use super::error::HmlError;
+use super::warnings::{HmlWarning, HmlWarningCode};
+
+const LANGUAGE_NAMES: [&str; 7] = [
+    "Hangul", "Latin", "Hanja", "Japanese", "Other", "Symbol", "User",
+];
+
+const MAX_EQUATION_DIAGNOSTIC_CHARS: usize = 256;
+
+fn bounded_equation_semantics(name: &str, value: &str) -> String {
+    let semantics = format!("{name}={value}");
+    if semantics.chars().count() <= MAX_EQUATION_DIAGNOSTIC_CHARS {
+        return semantics;
+    }
+    let mut bounded = semantics
+        .chars()
+        .take(MAX_EQUATION_DIAGNOSTIC_CHARS - 1)
+        .collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
+#[derive(Debug, Clone)]
+pub struct HmlLimits {
+    pub max_xml_bytes: usize,
+    pub max_depth: usize,
+    pub max_attributes: usize,
+    pub max_text_node_bytes: usize,
+    /// [#2743] 리소스 테이블(`FONT`/`BORDERFILL`/`CHARSHAPE`/`PARASHAPE`/`TABDEF`/
+    /// `STYLE`)의 `Id` 상한.
+    ///
+    /// 다른 필드는 전부 *입력 크기* 상한이지만 이것만 *할당 크기* 상한이다. `Id` 는
+    /// 문자 몇 개인데 `set_indexed` 의 `resize_with(id + 1, ..)` 는 그 값에 선형
+    /// 비례해 예약하므로, 상한이 없으면 382바이트 파일이 오류 없이 120 MB 를 쓰고
+    /// 385바이트 파일이 240 GB 를 요구하다 abort 한다.
+    ///
+    /// 기본값 65,535 근거: `samples/` 345개 파일 실측에서 리소스 테이블 최대 길이는
+    /// 28,193(char_shapes) 이라 2.32배 여유이며, `Paragraph.para_shape_id`(u16)·
+    /// `Style.para_shape_id`/`char_shape_id`(u16)·`Paragraph.style_id`(u8) 참조는
+    /// 애초에 이 범위를 넘길 수 없다. 다만 `CharShapeRef.char_shape_id` 는 u32 라
+    /// char_shapes 에 대해서는 표현 한계가 아닌 정책 상한이며, 그래서 초과분은
+    /// 하드 오류가 아니라 경고를 남기고 건너뛴다.
+    pub max_resource_id: usize,
+}
+
+impl Default for HmlLimits {
+    fn default() -> Self {
+        Self {
+            max_xml_bytes: 100 * 1024 * 1024,
+            max_depth: 256,
+            max_attributes: 256,
+            max_text_node_bytes: 8 * 1024 * 1024,
+            max_resource_id: 65_535,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HmlSource {
+    pub version: String,
+    pub sub_version: Option<String>,
+    pub style: Option<String>,
+    pub resource_count: usize,
+    pub warnings: Vec<HmlWarning>,
+    pub preserved_fragments: Vec<PreservedFragment>,
+    pub font_faces: Vec<Vec<Font>>,
+    pub border_fills: Vec<BorderFill>,
+    pub char_shapes: Vec<CharShape>,
+    pub para_shapes: Vec<ParaShape>,
+    pub tab_defs: Vec<TabDef>,
+    pub styles: Vec<Style>,
+    pub sections: Vec<HmlSection>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HmlSection {
+    pub page_def: Option<PageDef>,
+    pub paragraphs: Vec<HmlParagraph>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HmlParagraph {
+    pub para_shape_id: u16,
+    pub style_id: u8,
+    pub column_type: ColumnBreakType,
+    pub raw_break_type: u8,
+    pub text: String,
+    pub char_offsets: Vec<u32>,
+    pub char_shapes: Vec<CharShapeRef>,
+    pub controls: Vec<HmlControl>,
+    pub raw_pos: u32,
+}
+
+#[derive(Debug)]
+pub(crate) enum HmlControl {
+    Equation(HmlEquation),
+    Rectangle(HmlRectangle),
+    Table(HmlTable),
+    ColumnDef(ColumnDef),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HmlEquation {
+    pub script: String,
+    pub font_size: u32,
+    pub color: u32,
+    pub baseline: i16,
+    pub version_info: String,
+    pub font_name: String,
+    script_count: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HmlRectangle {
+    pub width: u32,
+    pub height: u32,
+    pub x_coords: [i32; 4],
+    pub y_coords: [i32; 4],
+    pub horizontal_offset: i32,
+    pub vertical_offset: i32,
+    pub treat_as_char: bool,
+    pub flow_with_text: bool,
+    pub allow_overlap: bool,
+    pub vert_rel_to: VertRelTo,
+    pub vert_align: VertAlign,
+    pub horz_rel_to: HorzRelTo,
+    pub horz_align: HorzAlign,
+    pub text_wrap: TextWrap,
+    pub shape_attr: ShapeComponentAttr,
+    pub border_line: ShapeBorderLine,
+    pub fill: Fill,
+    pub text_margin: Padding,
+    pub text_box: Vec<HmlParagraph>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HmlTable {
+    pub common: CommonObjAttr,
+    pub row_count: u16,
+    pub col_count: u16,
+    pub cell_spacing: i16,
+    pub border_fill_id: u16,
+    pub padding: Padding,
+    pub cells: Vec<HmlCell>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HmlCell {
+    pub col: u16,
+    pub row: u16,
+    pub col_span: u16,
+    pub row_span: u16,
+    pub width: u32,
+    pub height: u32,
+    pub padding: Padding,
+    pub border_fill_id: u16,
+    /// [#3189] `<PARALIST VertAlign="...">` 의 셀 세로 정렬.
+    /// `VerticalAlign::default()` 는 `Top` 이지만 HML 경로의 실효 기본값은 `Center`
+    /// 다(종전 adapter 가 모든 셀을 Center 로 하드코딩했다). 그래서 `start_cell` 이
+    /// `..Default::default()` 에 맡기지 않고 Center 를 명시로 넣는다 — 이 필드를
+    /// 파생 기본값으로 두면 PARALIST 가 없는 기존 문서의 정렬이 통째로 바뀐다.
+    pub vertical_align: VerticalAlign,
+    pub paragraphs: Vec<HmlParagraph>,
+}
+
+/// 캡처 시작 지점을 기록해두었다가 대응하는 종료 태그에서 원문을 잘라내기 위한 대기 상태.
+struct PendingCapture {
+    /// `end()`가 이 서브트리를 닫을 때 스택 깊이가 이 값과 같아야 한다 (push 직후 깊이).
+    target_depth: usize,
+    /// 시작 태그의 첫 바이트 오프셋 (디코딩된 XML 텍스트 기준).
+    start_offset: u64,
+    parent: String,
+    xml_path: String,
+    modeled_siblings_before: usize,
+}
+
+struct ReadState<'a> {
+    xml: &'a str,
+    stack: Vec<String>,
+    source: HmlSource,
+    pending_capture: Option<PendingCapture>,
+    paragraphs: Vec<HmlParagraph>,
+    equations: Vec<HmlEquation>,
+    accepted_script_depth: Option<usize>,
+    rectangles: Vec<HmlRectangle>,
+    tables: Vec<HmlTable>,
+    cells: Vec<HmlCell>,
+    font_language: Option<usize>,
+    current_border_fill: Option<usize>,
+    /// 자식 요소(FONTID/RATIO/...)를 귀속할 CHARSHAPE 의 `Id` 위치.
+    /// `set_indexed` 는 `Id` 위치에 배치하므로 `last_mut` 로는 내림차순·건너뜀
+    /// 입력에서 엉뚱한 도형을 가리킨다 — `current_border_fill` 과 같은 방식.
+    current_char_shape: Option<usize>,
+    /// 자식 요소(PARAMARGIN/PARABORDER)를 귀속할 PARASHAPE 의 `Id` 위치.
+    current_para_shape: Option<usize>,
+    head_modeled_children: usize,
+    body_modeled_children: usize,
+    saw_head: bool,
+    saw_body: bool,
+    /// [#2743] `HmlLimits::max_resource_id` 사본 — 리소스 `Id` 상한.
+    max_resource_id: usize,
+    /// [#5848] 내부 DTD 가 선언한 엔티티. **리터럴 값만** 담는다 —
+    /// 값에 `&` 가 있으면(중첩 참조) 아예 싣지 않으므로 재귀 확장이 성립하지 않는다.
+    doctype_entities: std::collections::HashMap<String, String>,
+}
+
+impl<'a> ReadState<'a> {
+    fn new(xml: &'a str, max_resource_id: usize) -> Self {
+        Self {
+            xml,
+            stack: Vec::new(),
+            source: HmlSource::default(),
+            doctype_entities: std::collections::HashMap::new(),
+            pending_capture: None,
+            paragraphs: Vec::new(),
+            equations: Vec::new(),
+            accepted_script_depth: None,
+            rectangles: Vec::new(),
+            tables: Vec::new(),
+            cells: Vec::new(),
+            font_language: None,
+            current_border_fill: None,
+            current_char_shape: None,
+            current_para_shape: None,
+            head_modeled_children: 0,
+            body_modeled_children: 0,
+            saw_head: false,
+            saw_body: false,
+            max_resource_id,
+        }
+    }
+
+    /// [#2743] 상한을 넘겨 건너뛴 리소스를 경고로 남긴다.
+    /// 기존 `InvalidReference` 경고 코드를 그대로 쓴다 — 잘못된 참조를 기본값으로
+    /// 대체하고 계속 진행하는 이 리더의 확립된 방침과 같은 처리다.
+    fn warn_resource_id_out_of_range(&mut self, element: &str, id: usize) {
+        let max = self.max_resource_id;
+        self.source.warnings.push(HmlWarning::invalid_reference(
+            format!("/{}", self.stack.join("/")),
+            format!("{element} Id={id} (상한 {max} 초과, 건너뜀)"),
+        ));
+    }
+
+    fn start(
+        &mut self,
+        element: &BytesStart<'_>,
+        limits: &HmlLimits,
+        start_pos: u64,
+    ) -> Result<(), HmlError> {
+        let name = element_name(element)?;
+        validate_attributes(element, limits.max_attributes)?;
+        if self.pending_capture.is_some() {
+            self.stack.push(name);
+            return Ok(());
+        }
+        let modeled_siblings_before = self.modeled_siblings_before();
+        let preserve_target = self.warn_if_unsupported(&name, element)?;
+        self.note_modeled_child(&name);
+        if self.is_unsupported_inline(&name) {
+            self.reserve_control_slot()?;
+        }
+        self.stack.push(name.clone());
+        if let Some((parent, xml_path)) = preserve_target {
+            self.pending_capture = Some(PendingCapture {
+                target_depth: self.stack.len(),
+                start_offset: start_pos,
+                parent,
+                xml_path,
+                modeled_siblings_before,
+            });
+        }
+        self.capture_start(&name, element)
+    }
+
+    fn empty(
+        &mut self,
+        element: &BytesStart<'_>,
+        limits: &HmlLimits,
+        start_pos: u64,
+        end_pos: u64,
+    ) -> Result<(), HmlError> {
+        let name = element_name(element)?;
+        validate_attributes(element, limits.max_attributes)?;
+        if self.pending_capture.is_some() {
+            self.stack.push(name);
+            self.stack.pop();
+            return Ok(());
+        }
+        let modeled_siblings_before = self.modeled_siblings_before();
+        let preserve_target = self.warn_if_unsupported(&name, element)?;
+        self.note_modeled_child(&name);
+        if self.is_unsupported_inline(&name) {
+            self.reserve_control_slot()?;
+        }
+        self.stack.push(name.clone());
+        if let Some((parent, xml_path)) = preserve_target {
+            self.push_preserved_fragment(
+                parent,
+                xml_path,
+                modeled_siblings_before,
+                start_pos,
+                end_pos,
+            );
+        }
+        self.capture_start(&name, element)?;
+        self.finish_element(&name)?;
+        self.stack.pop();
+        Ok(())
+    }
+
+    fn end(&mut self, name: &[u8], end_pos: u64) -> Result<(), HmlError> {
+        let actual = std::str::from_utf8(name)
+            .map_err(|_| HmlError::InvalidXml("non-UTF-8 element name".to_string()))?;
+        let expected = self
+            .stack
+            .last()
+            .ok_or_else(|| HmlError::InvalidXml("unexpected closing element".to_string()))?;
+        if actual != expected {
+            return Err(HmlError::InvalidXml(format!(
+                "closing element {actual} does not match {expected}"
+            )));
+        }
+        if self
+            .pending_capture
+            .as_ref()
+            .is_some_and(|pending| pending.target_depth < self.stack.len())
+        {
+            self.stack.pop();
+            return Ok(());
+        }
+        if self
+            .pending_capture
+            .as_ref()
+            .is_some_and(|pending| pending.target_depth == self.stack.len())
+        {
+            let pending = self
+                .pending_capture
+                .take()
+                .expect("pending_capture presence checked above");
+            self.push_preserved_fragment(
+                pending.parent,
+                pending.xml_path,
+                pending.modeled_siblings_before,
+                pending.start_offset,
+                end_pos,
+            );
+        }
+        self.finish_element(actual)?;
+        self.stack.pop();
+        Ok(())
+    }
+
+    /// 부모/경로/바이트 구간으로부터 보존 캡슐 하나를 만들어 저장한다.
+    fn push_preserved_fragment(
+        &mut self,
+        parent: String,
+        xml_path: String,
+        modeled_siblings_before: usize,
+        start_offset: u64,
+        end_offset: u64,
+    ) {
+        let order = self
+            .source
+            .preserved_fragments
+            .iter()
+            .filter(|fragment| fragment.parent == parent)
+            .count();
+        let raw_xml = self.xml[start_offset as usize..end_offset as usize].to_string();
+        self.source.preserved_fragments.push(PreservedFragment {
+            parent,
+            order,
+            modeled_siblings_before,
+            xml_path,
+            raw_xml,
+        });
+    }
+
+    fn modeled_siblings_before(&self) -> usize {
+        match self.stack.last().map(String::as_str) {
+            Some("HEAD") => self.head_modeled_children,
+            Some("BODY") => self.body_modeled_children,
+            _ => 0,
+        }
+    }
+
+    fn note_modeled_child(&mut self, name: &str) {
+        if self.stack.last().map(String::as_str) == Some("HEAD") && name == "MAPPINGTABLE" {
+            self.head_modeled_children += 1;
+        }
+        if self.stack.last().map(String::as_str) == Some("BODY") && name == "SECTION" {
+            self.body_modeled_children += 1;
+        }
+    }
+
+    fn capture_start(&mut self, name: &str, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        match name {
+            "HWPML" => self.capture_root(element),
+            "HEAD" if self.stack.len() == 2 => {
+                self.saw_head = true;
+                Ok(())
+            }
+            "BODY" if self.stack.len() == 2 => {
+                self.saw_body = true;
+                Ok(())
+            }
+            "SECTION" => {
+                self.source.sections.push(HmlSection::default());
+                Ok(())
+            }
+            "FONTFACE" => self.start_font_face(element),
+            "FONT" if self.font_language.is_some() => self.capture_font(element),
+            "BORDERFILL" => self.capture_border_fill(element),
+            "LEFTBORDER" | "RIGHTBORDER" | "TOPBORDER" | "BOTTOMBORDER" => {
+                self.capture_border_line(name, element)
+            }
+            "CHARSHAPE" => self.capture_char_shape(element),
+            "FONTID" | "RATIO" | "CHARSPACING" | "RELSIZE" | "CHAROFFSET" => {
+                self.capture_char_shape_array(name, element)
+            }
+            "PARASHAPE" => self.capture_para_shape(element),
+            "PARAMARGIN" => self.capture_para_margin(element),
+            "PARABORDER" => self.capture_para_border(element),
+            "TABDEF" => self.capture_tab_def(element),
+            "STYLE" => self.capture_style(element),
+            "PAGEDEF" => self.capture_page_def(element),
+            "PAGEMARGIN" => self.capture_page_margin(element),
+            "P" => self.start_paragraph(element),
+            "TEXT" => self.start_text_run(element),
+            "EQUATION" if self.stack.iter().rev().nth(1).map(String::as_str) == Some("TEXT") => {
+                self.start_equation(element)
+            }
+            "SCRIPT" => self.start_equation_script(element),
+            "RECTANGLE" => self.start_rectangle(element),
+            "COLDEF" => self.capture_col_def(element),
+            "SHAPEOBJECT" => self.capture_shape_object(element),
+            "SHAPECOMPONENT" => self.capture_shape_component(element),
+            "LINESHAPE" => self.capture_line_shape(element),
+            "WINDOWBRUSH" => self.capture_window_brush(element),
+            "TEXTMARGIN" => self.capture_text_margin(element),
+            "TABLE" => self.start_table(element),
+            "CELL" => self.start_cell(element),
+            "PARALIST" => self.capture_paralist(element),
+            "SIZE" => self.capture_object_size(element),
+            "POSITION" => self.capture_object_position(element),
+            "INSIDEMARGIN" => self.capture_table_padding(element),
+            "CELLMARGIN" => self.capture_cell_padding(element),
+            "BINDATA" => {
+                self.source.resource_count += 1;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn finish_element(&mut self, name: &str) -> Result<(), HmlError> {
+        match name {
+            "FONTFACE" => self.font_language = None,
+            "BORDERFILL" => self.current_border_fill = None,
+            "CHARSHAPE" => self.current_char_shape = None,
+            "PARASHAPE" => self.current_para_shape = None,
+            "P" => self.finish_paragraph()?,
+            "EQUATION" if self.stack.iter().rev().nth(1).map(String::as_str) == Some("TEXT") => {
+                self.finish_equation()?
+            }
+            "SCRIPT" => self.finish_equation_script(),
+            "RECTANGLE" => self.finish_rectangle()?,
+            "CELL" => self.finish_cell()?,
+            "TABLE" => self.finish_table()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn capture_root(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if self.stack.len() != 1 || !self.source.version.is_empty() {
+            return Err(HmlError::InvalidXml("multiple HWPML roots".to_string()));
+        }
+        let version = attribute(element, b"Version")?.unwrap_or_default();
+        // [#5848] 법제처 국가법령정보센터 배포본은 `Version="2.1"` 로 나온다.
+        //
+        // 이 게이트를 넓혀도 해석은 달라지지 않는다 — **파서는 버전 값으로 분기하지
+        // 않는다.** 여기서 검사한 뒤 `source.version` 에 담아 `doc_info.hwpml_version`
+        // 메타데이터로 흘려보낼 뿐이고(`adapter.rs:29`), 요소 처리는 전부 태그 이름으로
+        // 간다. 그래서 2.1 을 통과시키는 것은 같은 태그 기반 경로로 보내는 것뿐이다.
+        if !matches!(version.as_str(), "2.1" | "2.9" | "2.91") {
+            return Err(HmlError::UnsupportedVersion(version));
+        }
+        self.source.version = version;
+        self.source.sub_version = attribute(element, b"SubVersion")?;
+        self.source.style = attribute(element, b"Style")?;
+        Ok(())
+    }
+
+    fn start_font_face(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let lang = attribute(element, b"Lang")?.unwrap_or_default();
+        self.font_language = LANGUAGE_NAMES
+            .iter()
+            .position(|candidate| *candidate == lang);
+        if self.font_language.is_some() && self.source.font_faces.len() < 7 {
+            self.source.font_faces.resize_with(7, Vec::new);
+        }
+        Ok(())
+    }
+
+    fn capture_font(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let Some(language) = self.font_language else {
+            return Ok(());
+        };
+        let id = parse_attribute::<usize>(element, b"Id")?.unwrap_or(0);
+        let font = Font {
+            name: attribute(element, b"Name")?.unwrap_or_default(),
+            alt_type: match attribute(element, b"Type")?.as_deref() {
+                Some("ttf") => 1,
+                Some("hft") => 2,
+                _ => 0,
+            },
+            ..Default::default()
+        };
+        if !set_indexed(
+            &mut self.source.font_faces[language],
+            id,
+            font,
+            self.max_resource_id,
+        ) {
+            self.warn_resource_id_out_of_range("FONT", id);
+        }
+        Ok(())
+    }
+
+    fn capture_border_fill(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let id = parse_attribute::<usize>(element, b"Id")?.unwrap_or(1);
+        if id == 0 {
+            return Err(HmlError::InvalidReference("BORDERFILL Id=0".to_string()));
+        }
+        if !set_indexed(
+            &mut self.source.border_fills,
+            id - 1,
+            BorderFill::default(),
+            self.max_resource_id,
+        ) {
+            self.warn_resource_id_out_of_range("BORDERFILL", id);
+            // 이 BORDERFILL 은 테이블에 없으므로 뒤따르는 *BORDER 자식도 버린다.
+            // (`capture_border_line` 은 `current_border_fill` 이 None 이면 무시한다)
+            self.current_border_fill = None;
+            return Ok(());
+        }
+        self.current_border_fill = Some(id - 1);
+        Ok(())
+    }
+
+    fn capture_border_line(
+        &mut self,
+        name: &str,
+        element: &BytesStart<'_>,
+    ) -> Result<(), HmlError> {
+        if self.stack.iter().rev().nth(1).map(String::as_str) != Some("BORDERFILL") {
+            return Ok(());
+        }
+        let Some(border_fill_index) = self.current_border_fill else {
+            return Ok(());
+        };
+        let side = match name {
+            "LEFTBORDER" => 0,
+            "RIGHTBORDER" => 1,
+            "TOPBORDER" => 2,
+            "BOTTOMBORDER" => 3,
+            _ => return Ok(()),
+        };
+        let line_type = match attribute(element, b"Type")?.as_deref() {
+            Some("None") => BorderLineType::None,
+            Some("Solid") | None => BorderLineType::Solid,
+            Some(value) => {
+                self.source.warnings.push(HmlWarning::unsupported_attribute(
+                    format!("/{}", self.stack.join("/")),
+                    &format!("Type={value}"),
+                ));
+                BorderLineType::Solid
+            }
+        };
+        let width = parse_border_width(element)?;
+        let border_fill = self
+            .source
+            .border_fills
+            .get_mut(border_fill_index)
+            .ok_or_else(|| {
+                HmlError::InvalidReference(format!("BORDERFILL index {}", border_fill_index + 1))
+            })?;
+        border_fill.borders[side].line_type = line_type;
+        border_fill.borders[side].width = width;
+        Ok(())
+    }
+
+    fn capture_char_shape(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let id = parse_attribute::<usize>(element, b"Id")?.unwrap_or(0);
+        let shape = CharShape {
+            base_size: parse_attribute(element, b"Height")?.unwrap_or(1000),
+            border_fill_id: parse_attribute(element, b"BorderFillId")?.unwrap_or(0),
+            text_color: parse_attribute(element, b"TextColor")?.unwrap_or(0),
+            // 속성 부재 = 음영 없음. 한/글 산출 HML 은 4294967295 를 명시한다 (#4155)
+            shade_color: parse_attribute(element, b"ShadeColor")?
+                .unwrap_or(crate::model::color::NONE),
+            ..Default::default()
+        };
+        if !set_indexed(
+            &mut self.source.char_shapes,
+            id,
+            shape,
+            self.max_resource_id,
+        ) {
+            self.warn_resource_id_out_of_range("CHARSHAPE", id);
+            // 건너뛴 CHARSHAPE 의 FONTID/RATIO/... 자식이 다른 도형을 덮어쓰지
+            // 않도록 귀속 대상을 비운다 (BORDERFILL 의 *BORDER 처리와 동일).
+            self.current_char_shape = None;
+            return Ok(());
+        }
+        self.current_char_shape = Some(id);
+        Ok(())
+    }
+
+    fn capture_char_shape_array(
+        &mut self,
+        name: &str,
+        element: &BytesStart<'_>,
+    ) -> Result<(), HmlError> {
+        let Some(shape) = self
+            .current_char_shape
+            .and_then(|index| self.source.char_shapes.get_mut(index))
+        else {
+            return Ok(());
+        };
+        match name {
+            "FONTID" => shape.font_ids = language_array(element)?,
+            "RATIO" => shape.ratios = language_array(element)?,
+            "CHARSPACING" => shape.spacings = language_array(element)?,
+            "RELSIZE" => shape.relative_sizes = language_array(element)?,
+            "CHAROFFSET" => shape.char_offsets = language_array(element)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn capture_para_shape(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let id = parse_attribute::<usize>(element, b"Id")?.unwrap_or(0);
+        let shape = ParaShape {
+            alignment: parse_alignment(attribute(element, b"Align")?.as_deref()),
+            tab_def_id: parse_attribute(element, b"TabDef")?.unwrap_or(0),
+            para_level: parse_attribute(element, b"Level")?.unwrap_or(0),
+            // `<PARAMARGIN>` 이 없는 PARASHAPE 도 "미지정 = 160%" 계약을 따른다.
+            // 160 기본값이 capture_para_margin() 안에만 있어 PARAMARGIN 없는 문단이
+            // line_spacing 0 으로 남았는데, 0 을 실값(advance 0)으로 존중하게 바꾼 뒤로는
+            // 그 문단의 줄이 전부 본문 상단 한 점에 겹쳤다.
+            // `LineSpacing="0"` 이 명시된 문서는 capture_para_margin() 이 0 으로 덮어쓰므로
+            // "미지정 vs 명시 0" 구분은 그대로다.
+            line_spacing: 160,
+            line_spacing_type: LineSpacingType::Percent,
+            ..Default::default()
+        };
+        if !set_indexed(
+            &mut self.source.para_shapes,
+            id,
+            shape,
+            self.max_resource_id,
+        ) {
+            self.warn_resource_id_out_of_range("PARASHAPE", id);
+            // 건너뛴 PARASHAPE 의 PARAMARGIN/PARABORDER 자식도 버린다.
+            self.current_para_shape = None;
+            return Ok(());
+        }
+        self.current_para_shape = Some(id);
+        Ok(())
+    }
+
+    fn capture_para_margin(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let Some(shape) = self
+            .current_para_shape
+            .and_then(|index| self.source.para_shapes.get_mut(index))
+        else {
+            return Ok(());
+        };
+        shape.margin_left = parse_attribute(element, b"Left")?.unwrap_or(0);
+        shape.margin_right = parse_attribute(element, b"Right")?.unwrap_or(0);
+        shape.indent = parse_attribute(element, b"Indent")?.unwrap_or(0);
+        shape.spacing_before = parse_attribute(element, b"Prev")?.unwrap_or(0);
+        shape.spacing_after = parse_attribute(element, b"Next")?.unwrap_or(0);
+        shape.line_spacing = parse_attribute(element, b"LineSpacing")?.unwrap_or(160);
+        shape.line_spacing_type = match attribute(element, b"LineSpacingType")?.as_deref() {
+            Some("Fixed") => LineSpacingType::Fixed,
+            Some("BetweenLines") => LineSpacingType::SpaceOnly,
+            Some("AtLeast") => LineSpacingType::Minimum,
+            _ => LineSpacingType::Percent,
+        };
+        Ok(())
+    }
+
+    fn capture_para_border(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if let Some(shape) = self
+            .current_para_shape
+            .and_then(|index| self.source.para_shapes.get_mut(index))
+        {
+            shape.border_fill_id = parse_attribute(element, b"BorderFill")?.unwrap_or(0);
+        }
+        Ok(())
+    }
+
+    fn capture_tab_def(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let id = parse_attribute::<usize>(element, b"Id")?.unwrap_or(0);
+        if !set_indexed(
+            &mut self.source.tab_defs,
+            id,
+            TabDef::default(),
+            self.max_resource_id,
+        ) {
+            self.warn_resource_id_out_of_range("TABDEF", id);
+        }
+        Ok(())
+    }
+
+    fn capture_style(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let id = parse_attribute::<usize>(element, b"Id")?.unwrap_or(0);
+        let style = Style {
+            local_name: attribute(element, b"Name")?.unwrap_or_default(),
+            english_name: attribute(element, b"EngName")?.unwrap_or_default(),
+            style_type: u8::from(attribute(element, b"Type")?.as_deref() == Some("Char")),
+            next_style_id: parse_attribute(element, b"NextStyle")?.unwrap_or(0),
+            lang_id: parse_attribute(element, b"LangId")?.unwrap_or(1042),
+            para_shape_id: parse_attribute(element, b"ParaShape")?.unwrap_or(0),
+            char_shape_id: parse_attribute(element, b"CharShape")?.unwrap_or(0),
+            ..Default::default()
+        };
+        if !set_indexed(&mut self.source.styles, id, style, self.max_resource_id) {
+            self.warn_resource_id_out_of_range("STYLE", id);
+        }
+        Ok(())
+    }
+
+    fn capture_page_def(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let page = self.current_page_def()?;
+        page.width = parse_attribute(element, b"Width")?.unwrap_or(page.width);
+        page.height = parse_attribute(element, b"Height")?.unwrap_or(page.height);
+        page.landscape = parse_attribute::<u8>(element, b"Landscape")?.unwrap_or(0) != 0;
+        Ok(())
+    }
+
+    fn capture_page_margin(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let page = self.current_page_def()?;
+        page.margin_left = parse_attribute(element, b"Left")?.unwrap_or(page.margin_left);
+        page.margin_right = parse_attribute(element, b"Right")?.unwrap_or(page.margin_right);
+        page.margin_top = parse_attribute(element, b"Top")?.unwrap_or(page.margin_top);
+        page.margin_bottom = parse_attribute(element, b"Bottom")?.unwrap_or(page.margin_bottom);
+        page.margin_header = parse_attribute(element, b"Header")?.unwrap_or(page.margin_header);
+        page.margin_footer = parse_attribute(element, b"Footer")?.unwrap_or(page.margin_footer);
+        page.margin_gutter = parse_attribute(element, b"Gutter")?.unwrap_or(page.margin_gutter);
+        Ok(())
+    }
+
+    fn current_page_def(&mut self) -> Result<&mut PageDef, HmlError> {
+        let section = self
+            .source
+            .sections
+            .last_mut()
+            .ok_or_else(|| HmlError::InvalidXml("PAGEDEF outside SECTION".to_string()))?;
+        Ok(section.page_def.get_or_insert_with(PageDef::a4_default))
+    }
+
+    fn start_paragraph(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let page_break = parse_bool_attribute(element, b"PageBreak")?;
+        let column_break = parse_bool_attribute(element, b"ColumnBreak")?;
+        let (column_type, raw_break_type) = if page_break {
+            (ColumnBreakType::Page, 0x04)
+        } else if column_break {
+            (ColumnBreakType::Column, 0x08)
+        } else {
+            (ColumnBreakType::None, 0)
+        };
+        self.paragraphs.push(HmlParagraph {
+            para_shape_id: parse_attribute(element, b"ParaShape")?.unwrap_or(0),
+            style_id: parse_attribute(element, b"Style")?.unwrap_or(0),
+            column_type,
+            raw_break_type,
+            ..Default::default()
+        });
+        Ok(())
+    }
+
+    fn start_text_run(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let char_shape_id = parse_attribute(element, b"CharShape")?.unwrap_or(0);
+        let paragraph = self.current_paragraph()?;
+        if paragraph
+            .char_shapes
+            .last()
+            .is_none_or(|last| last.char_shape_id != char_shape_id)
+        {
+            paragraph.char_shapes.push(CharShapeRef {
+                start_pos: paragraph.raw_pos,
+                char_shape_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn start_equation(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        self.reserve_control_slot()?;
+        let path = format!("/{}", self.stack.join("/"));
+        for item in element.attributes() {
+            let attr = item.map_err(|error| HmlError::InvalidXml(error.to_string()))?;
+            let name = std::str::from_utf8(attr.key.as_ref().as_bytes())
+                .map_err(|_| HmlError::InvalidXml("non-UTF-8 attribute name".to_string()))?;
+            if !matches!(
+                name,
+                "BaseLine" | "BaseUnit" | "TextColor" | "Version" | "Font"
+            ) {
+                let raw = std::str::from_utf8(attr.value.as_ref().as_bytes())
+                    .map_err(|_| HmlError::InvalidXml("non-UTF-8 attribute".to_string()))?;
+                let value = quick_xml::escape::unescape(raw)
+                    .map_err(|error| HmlError::InvalidXml(error.to_string()))?;
+                self.source
+                    .warnings
+                    .push(HmlWarning::unsupported_equation_semantics(
+                        format!("{path}/@{name}"),
+                        &bounded_equation_semantics(name, &value),
+                    ));
+            }
+        }
+        self.equations.push(HmlEquation {
+            baseline: parse_attribute(element, b"BaseLine")?.unwrap_or(0),
+            font_size: parse_attribute(element, b"BaseUnit")?.unwrap_or(1000),
+            color: parse_attribute(element, b"TextColor")?.unwrap_or(0),
+            version_info: attribute(element, b"Version")?.unwrap_or_default(),
+            font_name: attribute(element, b"Font")?.unwrap_or_default(),
+            ..Default::default()
+        });
+        Ok(())
+    }
+
+    fn start_equation_script(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if self.stack.iter().rev().nth(1).map(String::as_str) != Some("EQUATION") {
+            return Ok(());
+        }
+        let equation = self
+            .equations
+            .last_mut()
+            .ok_or_else(|| HmlError::InvalidXml("SCRIPT outside EQUATION".to_string()))?;
+        equation.script_count += 1;
+        if equation.script_count == 1 {
+            self.accepted_script_depth = Some(self.stack.len());
+        } else {
+            self.source
+                .warnings
+                .push(HmlWarning::unsupported_equation_semantics(
+                    format!("/{}[{}]", self.stack.join("/"), equation.script_count),
+                    "SCRIPT",
+                ));
+        }
+        let path = if equation.script_count == 1 {
+            format!("/{}", self.stack.join("/"))
+        } else {
+            format!("/{}[{}]", self.stack.join("/"), equation.script_count)
+        };
+        for item in element.attributes() {
+            let attr = item.map_err(|error| HmlError::InvalidXml(error.to_string()))?;
+            let name = std::str::from_utf8(attr.key.as_ref().as_bytes())
+                .map_err(|_| HmlError::InvalidXml("non-UTF-8 attribute name".to_string()))?;
+            let raw = std::str::from_utf8(attr.value.as_ref().as_bytes())
+                .map_err(|_| HmlError::InvalidXml("non-UTF-8 attribute".to_string()))?;
+            let value = quick_xml::escape::unescape(raw)
+                .map_err(|error| HmlError::InvalidXml(error.to_string()))?;
+            self.source
+                .warnings
+                .push(HmlWarning::unsupported_equation_semantics(
+                    format!("{path}/@{name}"),
+                    &bounded_equation_semantics(name, &value),
+                ));
+        }
+        Ok(())
+    }
+
+    fn finish_equation_script(&mut self) {
+        if self.accepted_script_depth == Some(self.stack.len()) {
+            self.accepted_script_depth = None;
+        }
+    }
+
+    fn start_rectangle(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        self.reserve_control_slot()?;
+        let mut rectangle = HmlRectangle::default();
+        for (index, key) in [b"X0", b"X1", b"X2", b"X3"].iter().enumerate() {
+            rectangle.x_coords[index] = parse_attribute(element, *key)?.unwrap_or(0);
+        }
+        for (index, key) in [b"Y0", b"Y1", b"Y2", b"Y3"].iter().enumerate() {
+            rectangle.y_coords[index] = parse_attribute(element, *key)?.unwrap_or(0);
+        }
+        self.rectangles.push(rectangle);
+        Ok(())
+    }
+
+    /// [#4386] `TEXT` 직계 `COLDEF`(다단 정의) → `Control::ColumnDef`.
+    ///
+    /// `COLDEF`는 `RECTANGLE`/`TABLE`/`EQUATION`과 달리 자식 요소가 없는 빈 태그라
+    /// (`<COLDEF .../>`, 실물 관찰: `samples/hml/aligns.hml`) 시작·종료를 나눠 스테이징할
+    /// 필요가 없다 — 속성만으로 완성된 `ColumnDef`를 만들어 그 자리에서 바로
+    /// `controls`에 넣는다. 다른 인라인 컨트롤과 마찬가지로 원본 텍스트 스트림에서
+    /// 8-utf16 자리를 차지하므로 `reserve_control_slot`으로 `raw_pos`를 맞춘다.
+    ///
+    /// HWPX `hwpx/section.rs::parse_col_pr`가 같은 IR 필드를 채우는 방식을 참고했다:
+    /// `SameGap`(간격 수치)→`spacing`, `SameSize`(bool)→`same_width`. HML은 간격을
+    /// `SECDEF`가 아니라 `COLDEF` 자신의 `SameGap`에 싣는다(HWPX의 `sameGap`과 동형).
+    fn capture_col_def(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        self.reserve_control_slot()?;
+        let column_def = ColumnDef {
+            column_type: parse_column_type(attribute(element, b"Type")?.as_deref()),
+            column_count: parse_attribute(element, b"Count")?.unwrap_or(1),
+            direction: parse_column_direction(attribute(element, b"Layout")?.as_deref()),
+            same_width: parse_bool_attribute(element, b"SameSize")?,
+            spacing: parse_attribute(element, b"SameGap")?.unwrap_or(0),
+            ..Default::default()
+        };
+        self.current_paragraph()?
+            .controls
+            .push(HmlControl::ColumnDef(column_def));
+        Ok(())
+    }
+
+    fn start_table(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        self.reserve_control_slot()?;
+        self.tables.push(HmlTable {
+            row_count: parse_attribute(element, b"RowCount")?.unwrap_or(0),
+            col_count: parse_attribute(element, b"ColCount")?.unwrap_or(0),
+            cell_spacing: parse_attribute(element, b"CellSpacing")?.unwrap_or(0),
+            border_fill_id: parse_attribute(element, b"BorderFill")?.unwrap_or(0),
+            ..Default::default()
+        });
+        Ok(())
+    }
+
+    fn start_cell(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        self.cells.push(HmlCell {
+            col: parse_attribute(element, b"ColAddr")?.unwrap_or(0),
+            row: parse_attribute(element, b"RowAddr")?.unwrap_or(0),
+            col_span: parse_attribute(element, b"ColSpan")?.unwrap_or(1),
+            row_span: parse_attribute(element, b"RowSpan")?.unwrap_or(1),
+            width: parse_attribute(element, b"Width")?.unwrap_or(0),
+            height: parse_attribute(element, b"Height")?.unwrap_or(0),
+            border_fill_id: parse_attribute(element, b"BorderFill")?.unwrap_or(0),
+            // [#3189] PARALIST 가 아예 없는 셀도 종전 동작(Center)을 유지해야 한다.
+            vertical_align: VerticalAlign::Center,
+            ..Default::default()
+        });
+        Ok(())
+    }
+
+    /// [#3189] `<PARALIST VertAlign="...">` 의 셀 세로 정렬을 가장 안쪽 셀에 귀속한다.
+    ///
+    /// PARALIST 는 셀뿐 아니라 글상자(`DRAWTEXT`) 아래에도 나오므로, 셀 안 글상자의
+    /// PARALIST 가 바깥 셀 값을 덮어쓰지 않도록 문단 귀속과 같은
+    /// `nearest_paragraph_owner_is_cell` 판정을 재사용한다(#2723 과 동일한 규칙).
+    fn capture_paralist(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if !self.nearest_paragraph_owner_is_cell() {
+            return Ok(());
+        }
+        let vertical_align =
+            parse_cell_vertical_align(attribute(element, b"VertAlign")?.as_deref());
+        if let Some(cell) = self.cells.last_mut() {
+            cell.vertical_align = vertical_align;
+        }
+        Ok(())
+    }
+
+    fn capture_object_size(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if self.nearest_object_is_table() {
+            if let Some(table) = self.tables.last_mut() {
+                table.common.width = parse_attribute(element, b"Width")?.unwrap_or(0);
+                table.common.height = parse_attribute(element, b"Height")?.unwrap_or(0);
+            }
+        } else if let Some(rectangle) = self.rectangles.last_mut() {
+            rectangle.width = parse_attribute(element, b"Width")?.unwrap_or(0);
+            rectangle.height = parse_attribute(element, b"Height")?.unwrap_or(0);
+        }
+        Ok(())
+    }
+
+    fn capture_object_position(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if self.nearest_object_is_table() {
+            if let Some(table) = self.tables.last_mut() {
+                table.common.horizontal_offset =
+                    parse_attribute::<i32>(element, b"HorzOffset")?.unwrap_or(0) as u32;
+                table.common.vertical_offset =
+                    parse_attribute::<i32>(element, b"VertOffset")?.unwrap_or(0) as u32;
+                table.common.treat_as_char = parse_bool_attribute(element, b"TreatAsChar")?;
+                table.common.flow_with_text = parse_bool_attribute(element, b"FlowWithText")?;
+                table.common.allow_overlap = parse_bool_attribute(element, b"AllowOverlap")?;
+                table.common.horz_rel_to =
+                    parse_horz_rel_to(attribute(element, b"HorzRelTo")?.as_deref());
+                table.common.vert_rel_to =
+                    parse_vert_rel_to(attribute(element, b"VertRelTo")?.as_deref());
+                table.common.horz_align =
+                    parse_horz_align(attribute(element, b"HorzAlign")?.as_deref());
+                table.common.vert_align =
+                    parse_vert_align(attribute(element, b"VertAlign")?.as_deref());
+            }
+        } else if let Some(rectangle) = self.rectangles.last_mut() {
+            rectangle.horizontal_offset = parse_attribute(element, b"HorzOffset")?.unwrap_or(0);
+            rectangle.vertical_offset = parse_attribute(element, b"VertOffset")?.unwrap_or(0);
+            rectangle.treat_as_char = parse_bool_attribute(element, b"TreatAsChar")?;
+            rectangle.flow_with_text = parse_bool_attribute(element, b"FlowWithText")?;
+            rectangle.allow_overlap = parse_bool_attribute(element, b"AllowOverlap")?;
+            rectangle.horz_rel_to = parse_horz_rel_to(attribute(element, b"HorzRelTo")?.as_deref());
+            rectangle.vert_rel_to = parse_vert_rel_to(attribute(element, b"VertRelTo")?.as_deref());
+            rectangle.horz_align = parse_horz_align(attribute(element, b"HorzAlign")?.as_deref());
+            rectangle.vert_align = parse_vert_align(attribute(element, b"VertAlign")?.as_deref());
+        }
+        Ok(())
+    }
+
+    fn nearest_object_is_table(&self) -> bool {
+        let rectangle = self.stack.iter().rposition(|name| name == "RECTANGLE");
+        let table = self.stack.iter().rposition(|name| name == "TABLE");
+        table.is_some_and(|table_index| rectangle.is_none_or(|rect_index| table_index > rect_index))
+    }
+
+    /// [#2723] 닫히는 P 를 셀에 넣을지 글상자에 넣을지 판정한다.
+    /// cells 와 rectangles 는 둘 다 열린 요소 스택이라 동시에 비어 있지 않을 수 있고,
+    /// 그때 실제 부모는 스택에서 더 안쪽인 쪽이다. nearest_object_is_table 과 동일한
+    /// rposition 비교를 쓴다. 사각형이 문단을 받는 자식은 DRAWTEXT 뿐이므로
+    /// RECTANGLE 대신 DRAWTEXT 를 비교해 형제 요소로 인한 오판을 배제한다.
+    fn nearest_paragraph_owner_is_cell(&self) -> bool {
+        let draw_text = self.stack.iter().rposition(|name| name == "DRAWTEXT");
+        let cell = self.stack.iter().rposition(|name| name == "CELL");
+        cell.is_some_and(|cell_index| draw_text.is_none_or(|text_index| cell_index > text_index))
+    }
+
+    fn capture_shape_object(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let text_wrap = parse_text_wrap(attribute(element, b"TextWrap")?.as_deref());
+        // SHAPEOBJECT 는 표에도 방출되므로(write_shape_object) rectangle 뿐 아니라
+        // 표의 common.text_wrap 도 되읽어야 한다. 종전엔 rectangle 만 처리해 표의
+        // TextWrap(예: TopAndBottom)이 HML 재로드 시 기본값 Square 로 유실됐다.
+        // capture_object_position 과 동일한 표/사각형 판별을 사용한다.
+        if self.nearest_object_is_table() {
+            if let Some(table) = self.tables.last_mut() {
+                table.common.text_wrap = text_wrap;
+            }
+        } else if let Some(rectangle) = self.rectangles.last_mut() {
+            rectangle.text_wrap = text_wrap;
+        }
+        Ok(())
+    }
+
+    fn capture_shape_component(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if let Some(rectangle) = self.rectangles.last_mut() {
+            rectangle.shape_attr.offset_x = parse_attribute(element, b"XPos")?.unwrap_or(0);
+            rectangle.shape_attr.offset_y = parse_attribute(element, b"YPos")?.unwrap_or(0);
+            rectangle.shape_attr.original_width =
+                parse_attribute(element, b"OriWidth")?.unwrap_or(0);
+            rectangle.shape_attr.original_height =
+                parse_attribute(element, b"OriHeight")?.unwrap_or(0);
+            rectangle.shape_attr.current_width = parse_attribute(element, b"CurWidth")?
+                .filter(|value| *value > 0)
+                .unwrap_or(rectangle.shape_attr.original_width);
+            rectangle.shape_attr.current_height = parse_attribute(element, b"CurHeight")?
+                .filter(|value| *value > 0)
+                .unwrap_or(rectangle.shape_attr.original_height);
+            if rectangle.width == 0 {
+                rectangle.width = rectangle.shape_attr.original_width;
+            }
+            if rectangle.height == 0 {
+                rectangle.height = rectangle.shape_attr.original_height;
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_line_shape(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        let width = parse_attribute(element, b"Width")?.unwrap_or(0);
+        let style = attribute(element, b"Style")?.unwrap_or_else(|| "Solid".to_string());
+        let end_cap = attribute(element, b"EndCap")?.unwrap_or_else(|| "Flat".to_string());
+        let alpha = parse_attribute::<u8>(element, b"Alpha")?.unwrap_or(0);
+        let mut attr = 0u32;
+
+        if style == "Solid" {
+            attr |= 1;
+        } else {
+            self.source.warnings.push(HmlWarning::unsupported_attribute(
+                format!("/{}", self.stack.join("/")),
+                &format!("Style={style}"),
+            ));
+        }
+        if end_cap == "Flat" {
+            attr |= 1 << 6;
+        } else {
+            self.source.warnings.push(HmlWarning::unsupported_attribute(
+                format!("/{}", self.stack.join("/")),
+                &format!("EndCap={end_cap}"),
+            ));
+        }
+        if alpha != 0 {
+            self.source.warnings.push(HmlWarning::unsupported_attribute(
+                format!("/{}", self.stack.join("/")),
+                &format!("Alpha={alpha}"),
+            ));
+        }
+        if let Some(rectangle) = self.rectangles.last_mut() {
+            rectangle.border_line.width = width;
+            rectangle.border_line.attr = attr;
+        }
+        Ok(())
+    }
+
+    fn capture_text_margin(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if let Some(rectangle) = self.rectangles.last_mut() {
+            rectangle.text_margin = parse_padding(element)?;
+        }
+        Ok(())
+    }
+
+    fn capture_window_brush(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if self.rectangles.is_empty() {
+            return Ok(());
+        }
+        let Some(background_color) = parse_attribute(element, b"FaceColor")? else {
+            return Ok(());
+        };
+        let pattern_color = parse_attribute(element, b"HatchColor")?.unwrap_or(0);
+        let alpha = parse_attribute(element, b"Alpha")?.unwrap_or(0);
+        if let Some(hatch_style) = attribute(element, b"HatchStyle")? {
+            self.source.warnings.push(HmlWarning::unsupported_attribute(
+                format!("/{}", self.stack.join("/")),
+                &format!("HatchStyle={hatch_style}"),
+            ));
+        }
+        if let Some(rectangle) = self.rectangles.last_mut() {
+            rectangle.fill = Fill {
+                fill_type: FillType::Solid,
+                solid: Some(SolidFill {
+                    background_color,
+                    pattern_color,
+                    pattern_type: -1,
+                }),
+                alpha,
+                ..Fill::default()
+            };
+        }
+        Ok(())
+    }
+
+    fn capture_table_padding(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if let Some(table) = self.tables.last_mut() {
+            table.padding = parse_padding(element)?;
+        }
+        Ok(())
+    }
+
+    fn capture_cell_padding(&mut self, element: &BytesStart<'_>) -> Result<(), HmlError> {
+        if let Some(cell) = self.cells.last_mut() {
+            cell.padding = parse_padding(element)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_control_slot(&mut self) -> Result<(), HmlError> {
+        self.current_paragraph()?.raw_pos += 8;
+        Ok(())
+    }
+
+    fn finish_paragraph(&mut self) -> Result<(), HmlError> {
+        let paragraph = self
+            .paragraphs
+            .pop()
+            .ok_or_else(|| HmlError::InvalidXml("unexpected P end".to_string()))?;
+        // [#2723] 종전엔 종류 우선순위(셀 먼저)로 골라, CELL 안 사각형의 DRAWTEXT
+        // 문단이 셀로 흘러들어 글상자는 비고(adapter 가 None 으로 접음) 셀에는 이물
+        // 문단이 남았다. 글상자가 스택상 더 안쪽일 때만 글상자를 고르고, 나머지는
+        // 종전 순서(셀 → 구역)를 그대로 유지한다.
+        let owner_is_cell = self.nearest_paragraph_owner_is_cell();
+        if let Some(rectangle) = self.rectangles.last_mut().filter(|_| !owner_is_cell) {
+            rectangle.text_box.push(paragraph);
+        } else if let Some(cell) = self.cells.last_mut() {
+            cell.paragraphs.push(paragraph);
+        } else {
+            self.source
+                .sections
+                .last_mut()
+                .ok_or_else(|| HmlError::InvalidXml("P outside SECTION".to_string()))?
+                .paragraphs
+                .push(paragraph);
+        }
+        Ok(())
+    }
+
+    fn finish_rectangle(&mut self) -> Result<(), HmlError> {
+        let rectangle = self
+            .rectangles
+            .pop()
+            .ok_or_else(|| HmlError::InvalidXml("unexpected RECTANGLE end".to_string()))?;
+        self.current_paragraph()?
+            .controls
+            .push(HmlControl::Rectangle(rectangle));
+        Ok(())
+    }
+
+    fn finish_equation(&mut self) -> Result<(), HmlError> {
+        let equation = self
+            .equations
+            .pop()
+            .ok_or_else(|| HmlError::InvalidXml("unexpected EQUATION end".to_string()))?;
+        self.current_paragraph()?
+            .controls
+            .push(HmlControl::Equation(equation));
+        Ok(())
+    }
+
+    fn finish_cell(&mut self) -> Result<(), HmlError> {
+        let cell = self
+            .cells
+            .pop()
+            .ok_or_else(|| HmlError::InvalidXml("unexpected CELL end".to_string()))?;
+        self.tables
+            .last_mut()
+            .ok_or_else(|| HmlError::InvalidXml("CELL outside TABLE".to_string()))?
+            .cells
+            .push(cell);
+        Ok(())
+    }
+
+    fn finish_table(&mut self) -> Result<(), HmlError> {
+        let table = self
+            .tables
+            .pop()
+            .ok_or_else(|| HmlError::InvalidXml("unexpected TABLE end".to_string()))?;
+        self.current_paragraph()?
+            .controls
+            .push(HmlControl::Table(table));
+        Ok(())
+    }
+
+    fn append_text(&mut self, text: &str) -> Result<(), HmlError> {
+        if self.pending_capture.is_some() {
+            return Ok(());
+        }
+        if self.stack.last().map(String::as_str) == Some("SCRIPT")
+            && self.accepted_script_depth == Some(self.stack.len())
+        {
+            self.equations
+                .last_mut()
+                .ok_or_else(|| HmlError::InvalidXml("SCRIPT outside EQUATION".to_string()))?
+                .script
+                .push_str(text);
+            return Ok(());
+        }
+        let inside_equation = self.stack.iter().any(|item| item == "EQUATION");
+        if inside_equation && !text.trim().is_empty() {
+            self.append_unsupported_equation_text(text);
+            return Ok(());
+        }
+        if self.stack.last().map(String::as_str) != Some("CHAR") {
+            return Ok(());
+        }
+        let paragraph = self.current_paragraph()?;
+        for character in text.chars() {
+            paragraph.char_offsets.push(paragraph.raw_pos);
+            paragraph.text.push(character);
+            paragraph.raw_pos += character.len_utf16() as u32;
+        }
+        Ok(())
+    }
+
+    fn append_unsupported_equation_text(&mut self, text: &str) {
+        const MESSAGE_PREFIX: &str = "보존할 수 없는 HML 수식 의미를 건너뛰었습니다: #text=";
+        let path = format!("/{}/#text", self.stack.join("/"));
+        if let Some(warning) = self.source.warnings.last_mut().filter(|warning| {
+            warning.code == HmlWarningCode::UnsupportedEquationSemantics
+                && warning.xml_path == path
+                && warning.message.starts_with(MESSAGE_PREFIX)
+        }) {
+            let current = &warning.message[MESSAGE_PREFIX.len()..];
+            if current.chars().count() + "#text=".chars().count() == MAX_EQUATION_DIAGNOSTIC_CHARS
+                && current.ends_with('…')
+            {
+                return;
+            }
+            warning.message = HmlWarning::unsupported_equation_semantics(
+                path,
+                &bounded_equation_semantics("#text", &format!("{current}{text}")),
+            )
+            .message;
+            return;
+        }
+        self.source
+            .warnings
+            .push(HmlWarning::unsupported_equation_semantics(
+                path,
+                &bounded_equation_semantics("#text", text),
+            ));
+    }
+
+    fn current_paragraph(&mut self) -> Result<&mut HmlParagraph, HmlError> {
+        self.paragraphs
+            .last_mut()
+            .ok_or_else(|| HmlError::InvalidXml("inline content outside P".to_string()))
+    }
+
+    /// 미지원 요소를 경고로 기록하고, 저장 시 원문 그대로 되돌릴 수 있는 대상이면
+    /// `(부모 요소, xml_path)`를 반환한다.
+    fn warn_if_unsupported(
+        &mut self,
+        name: &str,
+        element: &BytesStart<'_>,
+    ) -> Result<Option<(String, String)>, HmlError> {
+        let parent = self.stack.last().map(String::as_str);
+        let unknown_document_child = match parent {
+            Some("HEAD") => !matches!(name, "DOCSUMMARY" | "DOCSETTING" | "MAPPINGTABLE"),
+            Some("BODY") => name != "SECTION",
+            Some("TAIL") => true,
+            _ => false,
+        };
+        let unsupported_control = self.is_unsupported_inline(name);
+        let unsupported_equation_child = self.stack.iter().any(|item| item == "EQUATION")
+            && !(parent == Some("EQUATION") && name == "SCRIPT");
+        let explicitly_unsupported = matches!(name, "PICTURE" | "BINDATA");
+        if unknown_document_child
+            || name == "SCRIPTCODE"
+            || unsupported_control
+            || unsupported_equation_child
+            || explicitly_unsupported
+        {
+            let path = format!("/{}/{}", self.stack.join("/"), name);
+            let preserved = unknown_document_child
+                || (name == "SCRIPTCODE" && matches!(parent, Some("TAIL") | Some("HEAD")));
+            let warning = if unsupported_equation_child {
+                HmlWarning::unsupported_equation_semantics(path.clone(), name)
+            } else {
+                HmlWarning::unsupported_element(path.clone(), name, preserved)
+            };
+            self.source.warnings.push(warning);
+            if unsupported_equation_child {
+                for item in element.attributes() {
+                    let attr = item.map_err(|error| HmlError::InvalidXml(error.to_string()))?;
+                    let attr_name =
+                        std::str::from_utf8(attr.key.as_ref().as_bytes()).map_err(|_| {
+                            HmlError::InvalidXml("non-UTF-8 attribute name".to_string())
+                        })?;
+                    let raw = std::str::from_utf8(attr.value.as_ref().as_bytes())
+                        .map_err(|_| HmlError::InvalidXml("non-UTF-8 attribute".to_string()))?;
+                    let value = quick_xml::escape::unescape(raw)
+                        .map_err(|error| HmlError::InvalidXml(error.to_string()))?;
+                    self.source
+                        .warnings
+                        .push(HmlWarning::unsupported_equation_semantics(
+                            format!("{path}/@{attr_name}"),
+                            &bounded_equation_semantics(attr_name, &value),
+                        ));
+                }
+            }
+            if preserved {
+                return Ok(Some((
+                    parent
+                        .expect("preserved implies parent present")
+                        .to_string(),
+                    path,
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    fn is_unsupported_inline(&self, name: &str) -> bool {
+        self.stack.last().map(String::as_str) == Some("TEXT")
+            && !matches!(
+                name,
+                "CHAR" | "SECDEF" | "COLDEF" | "EQUATION" | "RECTANGLE" | "TABLE"
+            )
+    }
+
+    fn finish(mut self) -> Result<HmlSource, HmlError> {
+        if !self.stack.is_empty() || self.source.version.is_empty() {
+            return Err(HmlError::InvalidXml(
+                "incomplete HWPML document".to_string(),
+            ));
+        }
+        if !self.saw_head {
+            return Err(HmlError::MissingHead);
+        }
+        if !self.saw_body {
+            return Err(HmlError::MissingBody);
+        }
+        self.warn_invalid_references();
+        Ok(self.source)
+    }
+
+    fn warn_invalid_references(&mut self) {
+        let char_count = self.source.char_shapes.len();
+        let para_count = self.source.para_shapes.len();
+        let style_count = self.source.styles.len();
+        for (section_index, section) in self.source.sections.iter().enumerate() {
+            for (paragraph_index, paragraph) in section.paragraphs.iter().enumerate() {
+                let path = format!("/HWPML/BODY/SECTION[{section_index}]/P[{paragraph_index}]");
+                if paragraph.para_shape_id as usize >= para_count && para_count != 0 {
+                    self.source.warnings.push(HmlWarning::invalid_reference(
+                        path.clone(),
+                        format!("ParaShape {}", paragraph.para_shape_id),
+                    ));
+                }
+                if paragraph.style_id as usize >= style_count && style_count != 0 {
+                    self.source.warnings.push(HmlWarning::invalid_reference(
+                        path.clone(),
+                        format!("Style {}", paragraph.style_id),
+                    ));
+                }
+                for reference in &paragraph.char_shapes {
+                    if reference.char_shape_id as usize >= char_count && char_count != 0 {
+                        self.source.warnings.push(HmlWarning::invalid_reference(
+                            path.clone(),
+                            format!("CharShape {}", reference.char_shape_id),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn has_hwpml_root(xml: &str) -> bool {
+    let mut reader = Reader::from_str(xml);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
+                return element.name().as_ref().as_bytes() == b"HWPML"
+                    && attribute(&element, b"Version")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|version| !version.is_empty());
+            }
+            // [#5848] `<!DOCTYPE HWPML [ … ]>` 도 루트 앞에 올 수 있는 프롤로그다.
+            // 법제처 국가법령정보센터 배포본이 엔티티 선언(`&nbsp;`)을 담아 내보내는데,
+            // 종전에는 이 이벤트가 아래 `_ => return false` 로 떨어져 포맷 감지가
+            // 실패했다 — 실제로는 HWPML 인데 "알 수 없는 파일 형식"으로 거부됐다.
+            Ok(Event::DocType(_)) => {}
+            Ok(Event::Decl(_) | Event::Comment(_) | Event::PI(_)) => {}
+            Ok(Event::Text(text)) if text.as_ref().chars().all(char::is_whitespace) => {}
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => return false,
+        }
+    }
+}
+
+pub(crate) fn read_hml(xml: &str, limits: &HmlLimits) -> Result<HmlSource, HmlError> {
+    let mut reader = Reader::from_str(xml);
+    let mut state = ReadState::new(xml, limits.max_resource_id);
+    // 이전 이벤트가 소비를 마친 지점 = 다음 시작 태그의 첫 바이트 오프셋.
+    // 보존 캡슐이 원문을 바이트 그대로 잘라내는 데 사용한다.
+    let mut prev_pos: u64 = 0;
+    loop {
+        let start_pos = prev_pos;
+        let event = reader
+            .read_event()
+            .map_err(|error| HmlError::InvalidXml(error.to_string()))?;
+        let end_pos = reader.buffer_position();
+        match event {
+            Event::Start(element) => {
+                enforce_depth(state.stack.len(), limits.max_depth)?;
+                state.start(&element, limits, start_pos)?;
+            }
+            Event::Empty(element) => {
+                enforce_depth(state.stack.len(), limits.max_depth)?;
+                state.empty(&element, limits, start_pos, end_pos)?;
+            }
+            Event::End(element) => state.end(element.name().as_ref().as_bytes(), end_pos)?,
+            Event::Text(text) => append_decoded_text(&mut state, &text, limits)?,
+            Event::CData(text) => append_cdata(&mut state, &text, limits)?,
+            Event::GeneralRef(reference) => append_reference(&mut state, &reference)?,
+            // [#5848] 내부 DTD 는 **엔티티 선언만** 거둬 쓰고 나머지는 버린다.
+            // 법제처 국가법령정보센터 배포본이 `<!ENTITY nbsp "&#160;">` 를 앞에 달고
+            // 나오는데, 종전에는 여기서 거부해 문서가 통째로 안 열렸다.
+            //
+            // 확장 폭탄·XXE 는 `collect_doctype_entities` 가 구조적으로 막는다 —
+            // 값에 `&` 가 있거나(중첩 참조) `SYSTEM`/`PUBLIC` 이 붙은 선언은 싣지 않고,
+            // 개수·길이에 상한을 둔다. 담긴 값은 그대로 한 번 치환될 뿐 재귀하지 않는다.
+            Event::DocType(doctype) => collect_doctype_entities(&mut state, &doctype)?,
+            Event::Eof => break,
+            _ => {}
+        }
+        prev_pos = end_pos;
+    }
+    state.finish()
+}
+
+fn append_cdata(
+    state: &mut ReadState<'_>,
+    text: &quick_xml::events::BytesCData<'_>,
+    limits: &HmlLimits,
+) -> Result<(), HmlError> {
+    if text.len() > limits.max_text_node_bytes {
+        return Err(HmlError::LimitExceeded("text node size".to_string()));
+    }
+    state.append_text(text.as_ref())
+}
+
+fn enforce_depth(current_depth: usize, max_depth: usize) -> Result<(), HmlError> {
+    if current_depth >= max_depth {
+        return Err(HmlError::LimitExceeded("XML depth".to_string()));
+    }
+    Ok(())
+}
+
+fn append_decoded_text(
+    state: &mut ReadState<'_>,
+    text: &quick_xml::events::BytesText<'_>,
+    limits: &HmlLimits,
+) -> Result<(), HmlError> {
+    if text.len() > limits.max_text_node_bytes {
+        return Err(HmlError::LimitExceeded("text node size".to_string()));
+    }
+    state.append_text(text.as_ref())
+}
+
+/// [#5848] 숫자 문자참조(`&#160;` · `&#xA0;`)만 실제 문자로 푼다.
+/// 엔티티 참조는 호출부가 이미 걸러 두므로 여기 들어오지 않는다.
+fn is_xml_10_char(code: u32) -> bool {
+    matches!(
+        code,
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+    )
+}
+
+fn resolve_char_refs(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find("&#") {
+        out.push_str(&rest[..at]);
+        let body = &rest[at + 2..];
+        let end = body.find(';')?;
+        let digits = &body[..end];
+        let code = if let Some(hex) = digits.strip_prefix(['x', 'X']) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else {
+            digits.parse::<u32>().ok()?
+        };
+        if !is_xml_10_char(code) {
+            return None;
+        }
+        out.push(char::from_u32(code)?);
+        rest = &body[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// [#5848] 내부 DTD 에서 **안전한 엔티티 선언만** 거둔다.
+///
+/// 받아들이는 것: `<!ENTITY 이름 "값">` 에서 값에 `&` 가 없는 리터럴.
+/// 버리는 것:
+/// - 값에 `&` 가 있는 선언 — 중첩 참조는 재귀 확장(billion laughs)의 씨앗이다.
+/// - `SYSTEM`/`PUBLIC` 외부 엔티티 — XXE 경로다. 애초에 값을 읽지 않는다.
+/// - 파라미터 엔티티(`<!ENTITY % …>`) — DTD 자체를 조립하는 문법이라 쓰지 않는다.
+///
+/// 상한을 둬 선언이 많거나 긴 문서가 메모리를 밀어내지 못하게 한다.
+fn collect_doctype_entities(
+    state: &mut ReadState<'_>,
+    doctype: &quick_xml::events::BytesText<'_>,
+) -> Result<(), HmlError> {
+    const MAX_ENTITIES: usize = 64;
+    const MAX_VALUE_BYTES: usize = 256;
+
+    let mut rest = doctype.as_ref();
+    while let Some(at) = rest.find("<!ENTITY") {
+        rest = &rest[at + "<!ENTITY".len()..];
+        let Some(decl_end) = rest.find('>') else {
+            break;
+        };
+        let decl = &rest[..decl_end];
+        rest = &rest[decl_end + 1..];
+
+        let decl = decl.trim();
+        if decl.starts_with('%') || decl.contains("SYSTEM") || decl.contains("PUBLIC") {
+            continue;
+        }
+        let mut parts = decl.splitn(2, char::is_whitespace);
+        let Some(name) = parts.next().map(str::trim) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let Some(tail) = parts.next() else { continue };
+        let tail = tail.trim();
+        let quote = match tail.chars().next() {
+            Some(c @ ('"' | '\'')) => c,
+            _ => continue,
+        };
+        let body = &tail[quote.len_utf8()..];
+        let Some(close) = body.find(quote) else {
+            continue;
+        };
+        let value = &body[..close];
+        if value.len() > MAX_VALUE_BYTES {
+            continue;
+        }
+        // 값 안의 `&` 는 **숫자 문자참조(`&#160;`)만** 허용한다. 그것은 코드포인트
+        // 하나로 즉시 확정되어 재귀가 성립하지 않는다. 반면 `&other;` 는 다른 엔티티를
+        // 부르는 문법이라 확장 폭탄의 씨앗이므로 그런 선언은 통째로 버린다.
+        // (법제처 배포본이 쓰는 형태가 정확히 `<!ENTITY nbsp "&#160;">` 다.)
+        if value
+            .match_indices('&')
+            .any(|(at, _)| !value[at + 1..].starts_with('#'))
+        {
+            continue;
+        }
+        let Some(resolved) = resolve_char_refs(value) else {
+            continue;
+        };
+        if state.doctype_entities.len() >= MAX_ENTITIES {
+            break;
+        }
+        state.doctype_entities.insert(name.to_string(), resolved);
+    }
+    Ok(())
+}
+
+fn append_reference(
+    state: &mut ReadState<'_>,
+    reference: &quick_xml::events::BytesRef<'_>,
+) -> Result<(), HmlError> {
+    if let Some(character) = reference
+        .resolve_char_ref()
+        .map_err(|error| HmlError::InvalidXml(error.to_string()))?
+    {
+        return state.append_text(&character.to_string());
+    }
+    let name = reference.as_ref();
+    let value = match name {
+        "lt" => "<",
+        "gt" => ">",
+        "amp" => "&",
+        "quot" => "\"",
+        "apos" => "'",
+        // [#5848] 내부 DTD 가 리터럴로 선언한 엔티티. 값에 `&` 가 없는 것만 실렸으므로
+        // 여기서 한 번 붙이고 끝난다 — 재귀 확장이 일어날 수 없다.
+        other if state.doctype_entities.contains_key(other) => {
+            let text = state.doctype_entities[other].clone();
+            return state.append_text(&text);
+        }
+        _ => {
+            return Err(HmlError::InvalidXml(format!(
+                "entity &{name}; is not allowed"
+            )))
+        }
+    };
+    state.append_text(value)
+}
+
+fn element_name(element: &BytesStart<'_>) -> Result<String, HmlError> {
+    Ok(element.name().as_ref().to_owned())
+}
+
+fn validate_attributes(element: &BytesStart<'_>, max: usize) -> Result<(), HmlError> {
+    let mut count = 0usize;
+    for item in element.attributes() {
+        item.map_err(|error| HmlError::InvalidXml(error.to_string()))?;
+        count += 1;
+        if count > max {
+            return Err(HmlError::LimitExceeded("attribute count".to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn attribute(element: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>, HmlError> {
+    for item in element.attributes() {
+        let attr = item.map_err(|error| HmlError::InvalidXml(error.to_string()))?;
+        if attr.key.as_ref().as_bytes() == key {
+            let raw = std::str::from_utf8(attr.value.as_ref().as_bytes())
+                .map_err(|_| HmlError::InvalidXml("non-UTF-8 attribute".to_string()))?;
+            let value = quick_xml::escape::unescape(raw)
+                .map_err(|error| HmlError::InvalidXml(error.to_string()))?;
+            return Ok(Some(value.into_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_attribute<T>(element: &BytesStart<'_>, key: &[u8]) -> Result<Option<T>, HmlError>
+where
+    T: std::str::FromStr,
+{
+    attribute(element, key)?
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| HmlError::InvalidXml(format!("invalid numeric attribute {value}")))
+        })
+        .transpose()
+}
+
+fn parse_border_width(element: &BytesStart<'_>) -> Result<u8, HmlError> {
+    let Some(value) = attribute(element, b"Width")? else {
+        return Ok(border_width_index(0.1));
+    };
+    let millimeters = value
+        .strip_suffix("mm")
+        .and_then(|number| number.trim().parse::<f64>().ok())
+        .ok_or_else(|| HmlError::InvalidXml(format!("invalid border width {value}")))?;
+    Ok(border_width_index(millimeters))
+}
+
+fn parse_bool_attribute(element: &BytesStart<'_>, key: &[u8]) -> Result<bool, HmlError> {
+    Ok(matches!(
+        attribute(element, key)?.as_deref(),
+        Some("true" | "1")
+    ))
+}
+
+fn parse_padding(element: &BytesStart<'_>) -> Result<Padding, HmlError> {
+    Ok(Padding {
+        left: parse_attribute(element, b"Left")?.unwrap_or(0),
+        right: parse_attribute(element, b"Right")?.unwrap_or(0),
+        top: parse_attribute(element, b"Top")?.unwrap_or(0),
+        bottom: parse_attribute(element, b"Bottom")?.unwrap_or(0),
+    })
+}
+
+fn language_array<T>(element: &BytesStart<'_>) -> Result<[T; 7], HmlError>
+where
+    T: std::str::FromStr + Copy + Default,
+{
+    let mut values = [T::default(); 7];
+    for (index, name) in LANGUAGE_NAMES.iter().enumerate() {
+        values[index] = parse_attribute(element, name.as_bytes())?.unwrap_or_default();
+    }
+    Ok(values)
+}
+
+fn parse_alignment(value: Option<&str>) -> Alignment {
+    match value {
+        Some("Left") => Alignment::Left,
+        Some("Right") => Alignment::Right,
+        Some("Center") => Alignment::Center,
+        Some("Distribute") => Alignment::Distribute,
+        Some("Split") => Alignment::Split,
+        _ => Alignment::Justify,
+    }
+}
+
+/// [#4386] `COLDEF@Type`. 실물(`samples/hml/aligns.hml` 등)에서 관찰된 값은
+/// `"Newspaper"`(신문형=일반 흐름) 뿐이다. `Distribute`/`Parallel`은 HWPX
+/// `colPr@type`(`BalancedNewspaper`/`Parallel`)과 이 파일의 다른 속성들(예:
+/// `parse_alignment`의 `"Distribute"`)이 이미 따르는 PascalCase 열거값 표기 관례를
+/// 그대로 적용한 것으로, 실물로 확인되지 않았다 — 문서 밖 값은 전부 `Normal`로 접는다.
+fn parse_column_type(value: Option<&str>) -> ColumnType {
+    match value {
+        Some("Distribute") => ColumnType::Distribute,
+        Some("Parallel") => ColumnType::Parallel,
+        _ => ColumnType::Normal,
+    }
+}
+
+/// [#4386] `COLDEF@Layout`. 실물 관찰값은 `"Left"`뿐이다. HWPX
+/// `colPr@layout`(`"RIGHT"` → `RightToLeft`)과 동일한 fallback 방향으로 `"Right"`를
+/// `RightToLeft`에 매핑한다.
+fn parse_column_direction(value: Option<&str>) -> ColumnDirection {
+    match value {
+        Some("Right") => ColumnDirection::RightToLeft,
+        Some("Mirror") => ColumnDirection::Mirror,
+        _ => ColumnDirection::LeftToRight,
+    }
+}
+
+fn parse_vert_rel_to(value: Option<&str>) -> VertRelTo {
+    match value {
+        Some("Page") => VertRelTo::Page,
+        Some("Para") => VertRelTo::Para,
+        _ => VertRelTo::Paper,
+    }
+}
+
+fn parse_vert_align(value: Option<&str>) -> VertAlign {
+    match value {
+        Some("Center") => VertAlign::Center,
+        Some("Bottom") => VertAlign::Bottom,
+        Some("Inside") => VertAlign::Inside,
+        Some("Outside") => VertAlign::Outside,
+        _ => VertAlign::Top,
+    }
+}
+
+/// [#3189] 셀 세로 정렬(`PARALIST@VertAlign`). 개체 위치용 `parse_vert_align` 과 달리
+/// 속성이 없으면 `Top` 이 아니라 `Center` 로 접는다 — HML 경로의 실효 기본값이다.
+fn parse_cell_vertical_align(value: Option<&str>) -> VerticalAlign {
+    match value {
+        Some("Top") => VerticalAlign::Top,
+        Some("Bottom") => VerticalAlign::Bottom,
+        _ => VerticalAlign::Center,
+    }
+}
+
+fn parse_horz_rel_to(value: Option<&str>) -> HorzRelTo {
+    match value {
+        Some("Page") => HorzRelTo::Page,
+        Some("Column") => HorzRelTo::Column,
+        Some("Para") => HorzRelTo::Para,
+        _ => HorzRelTo::Paper,
+    }
+}
+
+fn parse_horz_align(value: Option<&str>) -> HorzAlign {
+    match value {
+        Some("Center") => HorzAlign::Center,
+        Some("Right") => HorzAlign::Right,
+        Some("Inside") => HorzAlign::Inside,
+        Some("Outside") => HorzAlign::Outside,
+        _ => HorzAlign::Left,
+    }
+}
+
+fn parse_text_wrap(value: Option<&str>) -> TextWrap {
+    match value {
+        Some("Tight") => TextWrap::Tight,
+        Some("Through") => TextWrap::Through,
+        Some("TopAndBottom") => TextWrap::TopAndBottom,
+        Some("BehindText") => TextWrap::BehindText,
+        Some("InFrontOfText") => TextWrap::InFrontOfText,
+        _ => TextWrap::Square,
+    }
+}
+
+/// 리소스 테이블의 `index` 칸에 값을 배치한다. 필요한 만큼 테이블을 늘린다.
+///
+/// [#2743] `index` 는 HML `Id` 속성에서 그대로 온 값이라 상한이 필요하다. 종전엔
+/// `resize_with(index + 1, ..)` 에 검증이 없어 `Id="1000000"` 이면 오류 없이
+/// 120 MB 를(측정값: 힙 최대 120,009,531 바이트) 조용히 예약하고, `Id="2000000000"`
+/// 이면 240,000,000,120 바이트를 요구하다 `handle_alloc_error` → abort 로 프로세스가
+/// 죽었다. 상한을 넘으면 **아무것도 할당하지 않고** `false` 를 반환한다 — 호출부는
+/// 경고를 남기고 그 리소스만 건너뛴다(정상 파일은 상한에 닿지 않아 동작 불변).
+fn set_indexed<T: Default>(values: &mut Vec<T>, index: usize, value: T, max_index: usize) -> bool {
+    if index > max_index {
+        return false;
+    }
+    if values.len() <= index {
+        values.resize_with(index + 1, T::default);
+    }
+    values[index] = value;
+    true
+}

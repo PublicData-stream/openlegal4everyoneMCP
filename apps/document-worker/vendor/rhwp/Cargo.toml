@@ -1,0 +1,210 @@
+# Library-only vendored manifest; see README.openlegal.md and UPSTREAM.json.
+[package]
+name = "rhwp"
+version = "0.8.7"
+edition = "2021"
+description = "HWP file viewer and editor written in Rust, targeting WebAssembly"
+license = "MIT"
+repository = "https://github.com/edwardkim/rhwp"
+autotests = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+[workspace]
+members = [".", "crates/*"]
+default-members = [".", "crates/*"]
+resolver = "2"
+
+[lib]
+# rhwp 는 Rust 라이브러리가 먼저다 — CLI 두 개, `bindings/Native`, `tools/*` 가 전부 rlib 으로
+# 링크한다. 브라우저용 cdylib 이 그 다음이다. 이 순서는 Dioxus CLI 가 핫패치 인자를 잡을 때 첫
+# crate type 으로 분류하는 규칙과도 맞아떨어진다 — 뒤집으면 `--hot-patch` 가 조용히 안 먹는다.
+# (버전은 여기 적지 않는다. 유일한 사본은 아래 `subsecond` 의 정확 핀이다 — #4580.)
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+rhwp-contracts = { path = "crates/rhwp-contracts", version = "=0.1.0" }
+rhwp-ooxml-chart = { path = "crates/rhwp-ooxml-chart", version = "=0.1.0" }
+rhwp-password-crypto = { path = "crates/rhwp-password-crypto", version = "=0.1.0" }
+wasm-bindgen = "0.2"
+cfb = "0.15"
+crc32fast = "1"
+des = "0.9"
+flate2 = "1.0"
+byteorder = "1.5"
+base64 = "0.23"
+# [#4509] 캡슐 서명(4년 축) — 결정론 서명이라 replay/lineage 의 결정론 문화와
+# 정합. 순수 Rust 라 wasm 타깃도 그대로 컴파일된다.
+ed25519-dalek = "3"
+# 양자내성 서명(ML-DSA / Dilithium, NIST FIPS 204) — Ed25519 는 Shor 로 깨지므로
+# 작업캡슐·출처 서명을 양자 이후에도 살리는 확장. 순수 Rust 라 wasm 도 그대로 컴파일된다.
+# 시드(32B) 결정론 키생성·결정론 서명만 쓰므로 crate 의 getrandom/rand_core/pkcs8 기능은
+# 끄고(엔트로피는 프로젝트의 getrandom::fill 로 공급) alloc 만 켠다 — 의존 표면 최소화.
+ml-dsa = { version = "0.1", default-features = false, features = ["alloc"] }
+aes = "0.9"
+cbc = "0.2"
+cipher = "0.5"
+hmac = "0.13"
+pbkdf2 = "0.13"
+getrandom = { version = "0.4", features = ["wasm_js"] }
+# [agent_seal] 에이전트 전용 완전 엔트로피 봉인(1번 모드)도 아래 보안 트레일러와
+# 같은 XChaCha20-Poly1305를 쓴다. OTP(2번 모드)는 XOR+getrandom뿐이라 별도
+# 의존성이 없다.
+sha1 = "0.11"
+sha2 = "0.11"
+blake3 = "1"
+# [보안 트레일러] HWP3 강암호 append 트레일러 — memory-hard KDF(Argon2id) +
+# misuse-resistant AEAD(XChaCha20-Poly1305). 순수 Rust(RustCrypto) 라 wasm 도 그대로 컴파일.
+#
+# 기본 피처는 끈다 — argon2 의 `rand`/`password-hash` 와 chacha20poly1305 의
+# `getrandom` 은 rand_core 0.6 을 거쳐 **getrandom 0.2** 를 끌어오는데, 0.2 는
+# wasm32-unknown-unknown 에서 `js` 피처 없이는 compile_error! 로 죽는다(이
+# 저장소는 getrandom 0.4 + wasm_js 를 쓴다). 여기 코드는 소금·논스를
+# `getrandom::fill` 로 직접 만들고 저수준 Argon2 API 만 쓰므로 그 피처가
+# 필요 없다 — 끊어 두면 wasm 빌드가 구버전 getrandom 을 아예 만나지 않는다.
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+zeroize = "1"
+# [보안 트레일러 · 포스트양자] ML-KEM-768(NIST FIPS 203) 격자 KEM — 공개키 봉인의
+# 양자안전 키교환. 대칭부(XChaCha20-Poly1305)는 이미 양자내성이고, Shor 에 깨지는
+# 비대칭 키교환만 격자 KEM 으로 교체한다. 순수 Rust(RustCrypto) 라 wasm 도 그대로 컴파일.
+ml-kem = "0.3"
+rand_core = "0.10"
+zip = { version = "=9.0.5", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+roxmltree = "0.21"
+svgtypes = "0.16"
+codepage = "0.1.2"
+embedded-io = "0.7.1"
+encoding_rs = "0.8.35"
+paste = "1.0.15"
+snafu = "0.9.0"
+strum = { version = "0.28.0", default-features = false, features = ["derive"] }
+unicode-segmentation = "1.12.0"
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
+unicode-width = "0.2.2"
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "tiff"] }
+pcx = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ttf-parser = "0.25"
+rustybuzz = "0.20"
+
+console_error_panic_hook = { version = "0.1", optional = true }
+# [#4580] 핫패치 버전의 **유일한** 사본. `dx` 가 만든 점프 테이블을 이 크레이트가 역직렬화하므로
+# 설치할 dioxus-cli 도 같은 버전이어야 한다 — `scripts/dioxus-cli-version.mjs` 가 여기서 유도한다.
+# 정확 핀(`=`)이 아니면 그 유도가 성립하지 않는다.
+subsecond = { version = "=0.7.10", optional = true }
+
+[features]
+default = ["console_error_panic_hook"]
+native-skia = ["dep:resvg", "dep:skia-safe"]
+subsecond-dev = ["dep:subsecond"]
+# [gym_gpu_raster] GPU 가속 SVG 래스터화 경로 (네이티브 전용). native-skia 와 같은 방식으로
+# 선택 게이팅한다 — CI 는 GPU 없이도 컴파일되고, 실제 GPU 실행은 로컬에서만 일어난다.
+# vello(+vello_svg)로 SVG 를 GPU 래스터화하고, resvg(CPU)를 같은 usvg 트리로 돌려 정직한
+# 벤치마크 기준선으로 삼는다.
+gpu = ["dep:vello", "dep:vello_svg", "dep:pollster", "dep:resvg-gpu"]
+
+# PDF 내보내기 (네이티브 전용, Task #21)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+svg2pdf = "0.13"
+usvg = "0.45"
+resvg = { version = "0.47", optional = true }
+pdf-writer = "0.12"
+subsetter = "0.2"
+skia-safe = { version = "0.153.2", optional = true, default-features = false, features = ["binary-cache", "embed-icudtl", "pdf", "textlayout"] }
+
+# [gym_gpu_raster] GPU 래스터화 스택 (feature = "gpu", 네이티브 전용).
+# vello: Linebender 의 GPU 2D 렌더러(컴퓨트 파이프라인). vello_svg: usvg 트리 → vello Scene.
+# pollster: 헤드리스라 이벤트 루프가 없으므로 wgpu 의 async(adapter/device/버퍼매핑)를 블로킹.
+# resvg-gpu: CPU 기준선. vello_svg 0.11 과 usvg 0.48 을 공유하도록 0.48 계열로 맞춘다(같은 트리를
+# 두 래스터라이저에 동일 입력으로 넣어 벤치마크·픽셀비교를 성립). native-skia 의 resvg 0.47 과
+# 별개 버전으로 공존한다.
+vello = { version = "0.10", optional = true }
+vello_svg = { version = "0.11", optional = true }
+pollster = { version = "1.0", optional = true }
+resvg-gpu = { package = "resvg", version = "0.48", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = [
+    "CanvasRenderingContext2d",
+    "CanvasGradient",
+    "CanvasPattern",
+    "HtmlCanvasElement",
+    "HtmlImageElement",
+    "ImageData",
+    "TextMetrics",
+    "Document",
+    "Window",
+    "console",
+] }
+js-sys = "0.3"
+
+[lints.clippy]
+# ── 구조적 경고: 리팩토링에서 해결 예정 ──
+too_many_arguments = "allow"        # Phase 1-3 완료 후 warn
+type_complexity = "allow"           # Phase 1-3 완료 후 warn
+cognitive_complexity = "allow"      # Phase 4 완료 후 warn
+needless_pass_by_value = "allow"    # Phase 4 완료 후 warn
+# ── 코드 스타일: 리팩토링 과정에서 점진 수정 ──
+redundant_closure = "allow"         # 각 파일 분할 시 수정
+field_reassign_with_default = "allow"  # 각 파일 분할 시 수정
+manual_div_ceil = "allow"           # 각 파일 분할 시 수정
+manual_range_contains = "allow"     # 각 파일 분할 시 수정
+unnecessary_cast = "allow"          # 각 파일 분할 시 수정
+collapsible_if = "allow"            # 각 파일 분할 시 수정
+unnecessary_map_or = "allow"         # 각 파일 분할 시 수정
+needless_borrow = "allow"           # 각 파일 분할 시 수정
+if_same_then_else = "allow"         # 각 파일 분할 시 수정
+needless_range_loop = "allow"       # 각 파일 분할 시 수정
+option_map_or_none = "allow"        # 각 파일 분할 시 수정
+bool_comparison = "allow"           # 각 파일 분할 시 수정
+collapsible_else_if = "allow"       # 각 파일 분할 시 수정
+collapsible_match = "allow"         # 각 파일 분할 시 수정
+needless_borrows_for_generic_args = "allow"
+vec_init_then_push = "allow"
+single_match = "allow"
+match_like_matches_macro = "allow"
+useless_format = "allow"
+derivable_impls = "allow"
+redundant_pattern_matching = "allow"
+iter_cloned_collect = "allow"
+manual_clamp = "allow"
+manual_saturating_arithmetic = "allow"
+manual_rem_euclid = "allow"
+manual_strip = "allow"
+manual_is_ascii_check = "allow"
+clone_on_copy = "allow"
+explicit_into_iter_loop = "allow"
+needless_lifetimes = "allow"
+filter_map_identity = "allow"
+ptr_arg = "allow"
+should_implement_trait = "allow"
+new_without_default = "allow"
+assign_op_pattern = "allow"
+blocks_in_conditions = "allow"
+enum_variant_names = "allow"
+repeat_vec_with_capacity = "allow"
+manual_repeat_n = "allow"
+useless_conversion = "allow"
+same_item_push = "allow"
+nonminimal_bool = "allow"
+implicit_saturating_sub = "allow"
+unused_enumerate_index = "allow"
+unnecessary_filter_map = "allow"
+manual_pattern_char_comparison = "allow"
+# ── 새 코드 품질 게이팅: 즉시 적용 ──
+large_enum_variant = "warn"
+
+[lints.rust]
+# dead_code, unused 계열 — 리팩토링 과정에서 정리
+dead_code = "allow"
+unused_variables = "allow"
+unused_imports = "allow"
+unused_mut = "allow"
+unused_assignments = "allow"
+unused_macros = "allow"
+# wmf 모듈의 tracing feature cfg 경고 억제
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("tracing", "svg"))'] }

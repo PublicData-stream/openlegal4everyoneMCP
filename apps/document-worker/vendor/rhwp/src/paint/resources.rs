@@ -1,0 +1,571 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::paint::font::{BinaryResourceKind, BinaryResourceRef, FontResourceTable};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImageResourceId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SvgResourceId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FontBlobResourceId(pub usize);
+
+pub const RESOURCE_KEY_ALGORITHM: &str = "blake3";
+
+/// 레이어 replay가 공유하는 바이너리/문자열 자원 저장소.
+///
+/// 현재 leaf payload는 대부분 직접 보관하지만, P12부터 font blob/face
+/// identity는 glyph replay contract에서 참조할 수 있게 한다.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceArena {
+    /// 그림 신원 키에 섞는 문서 단위 세대. 기존 공개 `PageLayerTree` 모양은 바꾸지 않는다.
+    source_image_epoch: u32,
+    image_bytes: Vec<Vec<u8>>,
+    image_hashes: Vec<u64>,
+    image_fingerprints: Vec<[u8; 16]>,
+    image_resource_keys: Vec<String>,
+    image_lookup: HashMap<u64, Vec<ImageResourceId>>,
+    svg_fragments: Vec<String>,
+    svg_hashes: Vec<u64>,
+    svg_fingerprints: Vec<[u8; 16]>,
+    svg_resource_keys: Vec<String>,
+    svg_lookup: HashMap<u64, Vec<SvgResourceId>>,
+    font_blob_bytes: Vec<Arc<[u8]>>,
+    font_blob_hashes: Vec<u64>,
+    font_blob_fingerprints: Vec<[u8; 16]>,
+    font_blob_resource_keys: Vec<String>,
+    font_blob_lookup: HashMap<u64, Vec<FontBlobResourceId>>,
+    font_blob_ref_lookup: HashMap<String, FontBlobResourceId>,
+    font_resources: FontResourceTable,
+}
+
+impl ResourceArena {
+    pub(crate) fn set_source_image_epoch(&mut self, epoch: u32) {
+        self.source_image_epoch = epoch;
+    }
+
+    pub(crate) fn source_image_epoch(&self) -> u32 {
+        self.source_image_epoch
+    }
+
+    pub fn intern_image_bytes(&mut self, bytes: &[u8]) -> ImageResourceId {
+        let hash = resource_hash(bytes);
+        if let Some(candidates) = self.image_lookup.get(&hash) {
+            for id in candidates {
+                if self.image_bytes[id.0].as_slice() == bytes {
+                    return *id;
+                }
+            }
+        }
+
+        let id = ImageResourceId(self.image_bytes.len());
+        let digest = blake3::hash(bytes);
+        let mut fingerprint = [0; 16];
+        fingerprint.copy_from_slice(&digest.as_bytes()[..16]);
+        let resource_key = image_resource_key(bytes.len(), digest.to_hex().as_str());
+        self.image_bytes.push(bytes.to_vec());
+        self.image_hashes.push(hash);
+        self.image_fingerprints.push(fingerprint);
+        self.image_resource_keys.push(resource_key);
+        self.image_lookup.entry(hash).or_default().push(id);
+        id
+    }
+
+    pub fn image_bytes(&self, id: ImageResourceId) -> Option<&[u8]> {
+        self.image_bytes.get(id.0).map(Vec::as_slice)
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.image_bytes.len()
+    }
+
+    pub fn image_hash(&self, id: ImageResourceId) -> Option<u64> {
+        self.image_hashes.get(id.0).copied()
+    }
+
+    pub fn image_fingerprint(&self, id: ImageResourceId) -> Option<[u8; 16]> {
+        self.image_fingerprints.get(id.0).copied()
+    }
+
+    pub fn image_resource_key(&self, id: ImageResourceId) -> Option<&str> {
+        self.image_resource_keys.get(id.0).map(String::as_str)
+    }
+
+    pub fn image_resources(&self) -> impl Iterator<Item = (ImageResourceId, &[u8])> + '_ {
+        self.image_bytes
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| (ImageResourceId(index), bytes.as_slice()))
+    }
+
+    pub fn intern_svg_fragment(&mut self, svg: &str) -> SvgResourceId {
+        let hash = resource_hash(svg);
+        if let Some(candidates) = self.svg_lookup.get(&hash) {
+            for id in candidates {
+                if self.svg_fragments[id.0].as_str() == svg {
+                    return *id;
+                }
+            }
+        }
+
+        let id = SvgResourceId(self.svg_fragments.len());
+        let digest = blake3::hash(svg.as_bytes());
+        let mut fingerprint = [0; 16];
+        fingerprint.copy_from_slice(&digest.as_bytes()[..16]);
+        let resource_key = svg_resource_key(svg.len(), digest.to_hex().as_str());
+        self.svg_fragments.push(svg.to_string());
+        self.svg_hashes.push(hash);
+        self.svg_fingerprints.push(fingerprint);
+        self.svg_resource_keys.push(resource_key);
+        self.svg_lookup.entry(hash).or_default().push(id);
+        id
+    }
+
+    pub fn svg_fragment(&self, id: SvgResourceId) -> Option<&str> {
+        self.svg_fragments.get(id.0).map(String::as_str)
+    }
+
+    pub fn svg_count(&self) -> usize {
+        self.svg_fragments.len()
+    }
+
+    pub fn svg_hash(&self, id: SvgResourceId) -> Option<u64> {
+        self.svg_hashes.get(id.0).copied()
+    }
+
+    pub fn svg_fingerprint(&self, id: SvgResourceId) -> Option<[u8; 16]> {
+        self.svg_fingerprints.get(id.0).copied()
+    }
+
+    pub fn svg_resource_key(&self, id: SvgResourceId) -> Option<&str> {
+        self.svg_resource_keys.get(id.0).map(String::as_str)
+    }
+
+    pub fn svg_resources(&self) -> impl Iterator<Item = (SvgResourceId, &str)> + '_ {
+        self.svg_fragments
+            .iter()
+            .enumerate()
+            .map(|(index, svg)| (SvgResourceId(index), svg.as_str()))
+    }
+
+    pub fn intern_font_blob_bytes(&mut self, bytes: &[u8]) -> FontBlobResourceId {
+        let hash = resource_hash(bytes);
+        if let Some(candidates) = self.font_blob_lookup.get(&hash) {
+            for id in candidates {
+                if self.font_blob_bytes[id.0].as_ref() == bytes {
+                    return *id;
+                }
+            }
+        }
+
+        let id = FontBlobResourceId(self.font_blob_bytes.len());
+        let digest = blake3::hash(bytes);
+        let mut fingerprint = [0; 16];
+        fingerprint.copy_from_slice(&digest.as_bytes()[..16]);
+        let digest_hex = digest.to_hex();
+        let resource_key = font_blob_resource_key(bytes.len(), digest_hex.as_str());
+        self.font_blob_bytes.push(Arc::from(bytes));
+        self.font_blob_hashes.push(hash);
+        self.font_blob_fingerprints.push(fingerprint);
+        self.font_blob_resource_keys.push(resource_key.clone());
+        self.font_blob_lookup.entry(hash).or_default().push(id);
+        self.font_blob_ref_lookup.insert(resource_key, id);
+        id
+    }
+
+    /// Intern an immutable exact-source Arc whose complete-content identity was
+    /// prepared and certified before the atomic paint commit.
+    ///
+    /// This avoids copying and re-hashing a multi-megabyte font during every
+    /// layer rebuild. The caller must already have validated the canonical
+    /// resource key and conflicts against this arena; general callers continue
+    /// to use [`Self::intern_font_blob_bytes`].
+    pub(crate) fn intern_prepared_font_blob_arc(
+        &mut self,
+        bytes: Arc<[u8]>,
+        hash: u64,
+        fingerprint: [u8; 16],
+        resource_key: String,
+    ) -> FontBlobResourceId {
+        if let Some(id) = self.font_blob_ref_lookup.get(&resource_key).copied() {
+            debug_assert_eq!(self.font_blob_bytes(id), Some(bytes.as_ref()));
+            return id;
+        }
+        if let Some(candidates) = self.font_blob_lookup.get(&hash) {
+            for id in candidates {
+                if self.font_blob_bytes[id.0].as_ref() == bytes.as_ref() {
+                    self.font_blob_ref_lookup.insert(resource_key, *id);
+                    return *id;
+                }
+            }
+        }
+
+        let id = FontBlobResourceId(self.font_blob_bytes.len());
+        self.font_blob_bytes.push(bytes);
+        self.font_blob_hashes.push(hash);
+        self.font_blob_fingerprints.push(fingerprint);
+        self.font_blob_resource_keys.push(resource_key.clone());
+        self.font_blob_lookup.entry(hash).or_default().push(id);
+        self.font_blob_ref_lookup.insert(resource_key, id);
+        id
+    }
+
+    pub fn font_blob_bytes(&self, id: FontBlobResourceId) -> Option<&[u8]> {
+        self.font_blob_bytes.get(id.0).map(Arc::as_ref)
+    }
+
+    pub fn font_blob_count(&self) -> usize {
+        self.font_blob_bytes.len()
+    }
+
+    pub fn font_blob_hash(&self, id: FontBlobResourceId) -> Option<u64> {
+        self.font_blob_hashes.get(id.0).copied()
+    }
+
+    pub fn font_blob_fingerprint(&self, id: FontBlobResourceId) -> Option<[u8; 16]> {
+        self.font_blob_fingerprints.get(id.0).copied()
+    }
+
+    pub fn font_blob_resource_key(&self, id: FontBlobResourceId) -> Option<&str> {
+        self.font_blob_resource_keys.get(id.0).map(String::as_str)
+    }
+
+    pub fn font_blob_resources(&self) -> impl Iterator<Item = (FontBlobResourceId, &[u8])> + '_ {
+        self.font_blob_bytes
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| (FontBlobResourceId(index), bytes.as_ref()))
+    }
+
+    pub fn font_blob_bytes_for_ref(&self, data_ref: &BinaryResourceRef) -> Option<&[u8]> {
+        if data_ref.kind != BinaryResourceKind::FontBlob {
+            return None;
+        }
+        self.font_blob_ref_lookup
+            .get(&data_ref.id)
+            .and_then(|id| self.font_blob_bytes(*id))
+    }
+
+    pub fn font_resources(&self) -> &FontResourceTable {
+        &self.font_resources
+    }
+
+    pub fn font_resources_mut(&mut self) -> &mut FontResourceTable {
+        &mut self.font_resources
+    }
+}
+
+fn resource_hash(bytes: impl AsRef<[u8]>) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in bytes.as_ref() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn resource_fingerprint(bytes: impl AsRef<[u8]>) -> [u8; 16] {
+    let digest = blake3::hash(bytes.as_ref());
+    let mut fingerprint = [0; 16];
+    fingerprint.copy_from_slice(&digest.as_bytes()[..16]);
+    fingerprint
+}
+
+pub fn resource_digest_hex(bytes: impl AsRef<[u8]>) -> String {
+    blake3::hash(bytes.as_ref()).to_hex().to_string()
+}
+
+pub fn image_resource_key(byte_len: usize, digest: &str) -> String {
+    resource_key("img", byte_len, digest)
+}
+
+/// 그림 op 이 내보내는 바이트의 신원 키 (Task #3315).
+///
+/// 위의 `image_resource_key` 는 arena 에 담긴 바이트의 **내용** 키(blake3)다. 이쪽은
+/// 리페인트마다 다시 계산돼야 하므로 내용 해시를 쓸 수 없다 — 그림 1장에 수 MB 를 매 키
+/// 입력마다 훑게 된다. 대신 문서가 이미 가진 신원을 쓴다.
+///
+/// - `bin_data_id`: 등록이 append-only 라 세션 중 id→바이트가 안정하다.
+/// - `epoch`: 문서를 통째로 갈아끼우는 연산(스냅샷 복원, 새 문서, `set_document`)만이 이
+///   안정성을 깨므로, 그때만 올라간다. 그림을 **추가**하는 것은 기존 id 의 바이트를 바꾸지
+///   않으므로 올리지 않는다 — 올리면 무관한 그림의 캐시까지 함께 버려진다.
+/// - variant: JPEG 워터마크 bake는 같은 원본에서도 base64 payload를 바꾸므로 구분한다.
+///   BMP/PCX/TIFF/회색 JPEG 변환 여부는 원본 바이트만으로 결정되므로 별도 variant가
+///   필요 없다. 이렇게 해야 작은 키 조회가 변환 메모의 전체 바이트 해시를 되풀이하지 않는다.
+///
+/// 접두어를 `img:` 가 아니라 `bin:` 으로 둔 것은 위 내용 키(`img:blake3:…`)와 한눈에
+/// 구분되게 하기 위해서다. 두 키는 서로 다른 이름공간이다.
+///
+/// 바이트를 내보내지 않는 op, 그리고 문서 BinData 에 대응하지 않는 합성 이미지
+/// (`bin_data_id == 0`)는 안정된 신원이 없으므로 `None` 이다 — 소비자는 캐시 대상에서
+/// 제외한다.
+pub fn source_image_key(
+    bin_data_epoch: u32,
+    image: &crate::renderer::render_tree::ImageNode,
+) -> Option<String> {
+    let data = image.data.as_deref()?;
+    if image.bin_data_id == 0 {
+        return None;
+    }
+
+    // 술어는 `image_resolver::is_watermark_image` 가 단일 권위다 — 여기서 사본을 들면
+    // 키가 가리키는 바이트와 실제로 내보내는 바이트가 조용히 갈라진다 (#3315).
+    let bakes_watermark = crate::renderer::image_resolver::detect_image_mime_type(data)
+        == "image/jpeg"
+        && crate::renderer::image_resolver::is_watermark_image(image);
+    let variant = if crate::renderer::image_resolver::is_baked_blackwhite_image(image) {
+        SourceImageVariant::BakedBlackWhitePng
+    } else if bakes_watermark {
+        SourceImageVariant::BakedWatermarkPng
+    } else {
+        SourceImageVariant::Source
+    };
+    Some(format!(
+        "bin:{bin_data_epoch}:{}:{}",
+        image.bin_data_id,
+        variant.as_str()
+    ))
+}
+
+/// `source_image_key` 의 variant — 같은 원본에서 다른 바이트가 나오는 갈림 (Task #3315).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceImageVariant {
+    /// 원본 바이트. 브라우저가 못 읽는 포맷(BMP/PCX/TIFF/회색 JPEG)이면 PNG 변환까지.
+    Source,
+    /// JPEG 워터마크를 한컴 규칙으로 bake 한 PNG.
+    BakedWatermarkPng,
+    /// 원본 해상도에서 흑백을 확정한 PNG.
+    BakedBlackWhitePng,
+}
+
+impl SourceImageVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceImageVariant::Source => "src",
+            SourceImageVariant::BakedWatermarkPng => "wmpng",
+            SourceImageVariant::BakedBlackWhitePng => "bwpng",
+        }
+    }
+
+    pub fn bakes_watermark(self) -> bool {
+        matches!(self, SourceImageVariant::BakedWatermarkPng)
+    }
+}
+
+/// `source_image_key` 가 만든 키를 되읽는다 (Task #3315).
+///
+/// 발급과 해석을 같은 모듈에 묶는다 — 소비자가 문자열을 직접 쪼개게 두면 접두어나 variant
+/// 를 바꿀 때 조용히 어긋난다. 모르는 variant 는 받아들이지 않는다: `src` 로 넘겨 버리면
+/// 워터마크 그림에 원본 JPEG 을 돌려주고도 성공한 것처럼 보인다.
+pub fn parse_source_image_key(key: &str) -> Option<(u32, u16, SourceImageVariant)> {
+    let mut parts = key.split(':');
+    if parts.next()? != "bin" {
+        return None;
+    }
+    let epoch = parts.next()?.parse::<u32>().ok()?;
+    let bin_data_id = parts.next()?.parse::<u16>().ok()?;
+    let variant = match parts.next()? {
+        "src" => SourceImageVariant::Source,
+        "wmpng" => SourceImageVariant::BakedWatermarkPng,
+        "bwpng" => SourceImageVariant::BakedBlackWhitePng,
+        _ => return None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((epoch, bin_data_id, variant))
+}
+
+pub fn svg_resource_key(byte_len: usize, digest: &str) -> String {
+    resource_key("svg", byte_len, digest)
+}
+
+pub fn font_blob_resource_key(byte_len: usize, digest: &str) -> String {
+    resource_key("font", byte_len, digest)
+}
+
+/// Exact portable font resource key를 검증하고 `(byte_len, digest)`로 푼다.
+///
+/// 길이와 digest의 표기까지 canonical해야 한다. 느슨하게 해석하면 같은 font bytes에 여러
+/// cache key가 생겨 document-generation cache의 상한과 무효화 계약을 우회할 수 있다.
+pub fn parse_font_blob_resource_key(key: &str) -> Option<(usize, &str)> {
+    let value = key.strip_prefix("font:blake3:")?;
+    let (byte_len_text, digest) = value.split_once(':')?;
+    if byte_len_text.is_empty()
+        || (byte_len_text.len() > 1 && byte_len_text.starts_with('0'))
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let byte_len = byte_len_text.parse::<usize>().ok()?;
+    (byte_len > 0).then_some((byte_len, digest))
+}
+
+fn resource_key(kind: &str, byte_len: usize, digest: &str) -> String {
+    format!("{kind}:{RESOURCE_KEY_ALGORITHM}:{byte_len}:{digest}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        font_blob_resource_key, image_resource_key, resource_digest_hex, resource_fingerprint,
+        source_image_key, svg_resource_key, BinaryResourceKind, BinaryResourceRef,
+        FontBlobResourceId, ImageResourceId, ResourceArena, SvgResourceId,
+    };
+    use crate::model::image::ImageEffect;
+    use crate::renderer::render_tree::ImageNode;
+
+    #[test]
+    fn interns_duplicate_resources_once() {
+        let mut arena = ResourceArena::default();
+        let image_a = arena.intern_image_bytes(&[1, 2, 3, 4]);
+        let image_b = arena.intern_image_bytes(&[1, 2, 3, 4]);
+        let svg_a = arena.intern_svg_fragment("<svg/>");
+        let svg_b = arena.intern_svg_fragment("<svg/>");
+        let font_a = arena.intern_font_blob_bytes(&[5, 6, 7, 8]);
+        let font_b = arena.intern_font_blob_bytes(&[5, 6, 7, 8]);
+
+        assert_eq!(image_a, ImageResourceId(0));
+        assert_eq!(image_b, ImageResourceId(0));
+        assert_eq!(arena.image_count(), 1);
+        assert_eq!(arena.image_bytes(image_a), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(arena.image_hash(image_a), arena.image_hash(image_b));
+        assert!(arena.image_hash(image_a).is_some());
+        assert_eq!(
+            arena.image_fingerprint(image_a),
+            Some(resource_fingerprint([1, 2, 3, 4]))
+        );
+        let image_key = image_resource_key(4, &resource_digest_hex([1, 2, 3, 4]));
+        assert_eq!(arena.image_resource_key(image_a), Some(image_key.as_str()));
+        assert_eq!(
+            arena.image_resources().collect::<Vec<_>>(),
+            vec![(ImageResourceId(0), &[1, 2, 3, 4][..])]
+        );
+
+        assert_eq!(svg_a, SvgResourceId(0));
+        assert_eq!(svg_b, SvgResourceId(0));
+        assert_eq!(arena.svg_count(), 1);
+        assert_eq!(arena.svg_fragment(svg_a), Some("<svg/>"));
+        assert_eq!(arena.svg_hash(svg_a), arena.svg_hash(svg_b));
+        assert!(arena.svg_hash(svg_a).is_some());
+        assert_eq!(
+            arena.svg_fingerprint(svg_a),
+            Some(resource_fingerprint("<svg/>"))
+        );
+        let svg_key = svg_resource_key(6, &resource_digest_hex("<svg/>"));
+        assert_eq!(arena.svg_resource_key(svg_a), Some(svg_key.as_str()));
+        assert_eq!(
+            arena.svg_resources().collect::<Vec<_>>(),
+            vec![(SvgResourceId(0), "<svg/>")]
+        );
+
+        assert_eq!(font_a, FontBlobResourceId(0));
+        assert_eq!(font_b, FontBlobResourceId(0));
+        assert_eq!(arena.font_blob_count(), 1);
+        assert_eq!(arena.font_blob_bytes(font_a), Some(&[5, 6, 7, 8][..]));
+        assert_eq!(arena.font_blob_hash(font_a), arena.font_blob_hash(font_b));
+        assert!(arena.font_blob_hash(font_a).is_some());
+        assert_eq!(
+            arena.font_blob_fingerprint(font_a),
+            Some(resource_fingerprint([5, 6, 7, 8]))
+        );
+        let font_key = font_blob_resource_key(4, &resource_digest_hex([5, 6, 7, 8]));
+        assert_eq!(
+            arena.font_blob_resource_key(font_a),
+            Some(font_key.as_str())
+        );
+        assert_eq!(
+            arena.font_blob_resources().collect::<Vec<_>>(),
+            vec![(FontBlobResourceId(0), &[5, 6, 7, 8][..])]
+        );
+    }
+
+    #[test]
+    fn resolves_font_blob_bytes_by_versioned_resource_ref() {
+        let mut arena = ResourceArena::default();
+        let font_id = arena.intern_font_blob_bytes(&[9, 8, 7, 6]);
+        let digest = resource_digest_hex([9, 8, 7, 6]);
+        let data_ref = BinaryResourceRef {
+            kind: BinaryResourceKind::FontBlob,
+            id: font_blob_resource_key(4, &digest),
+        };
+
+        assert_eq!(font_id, FontBlobResourceId(0));
+        assert_eq!(
+            arena.font_blob_bytes_for_ref(&data_ref),
+            Some(&[9, 8, 7, 6][..])
+        );
+        assert_eq!(
+            arena.font_blob_bytes_for_ref(&BinaryResourceRef {
+                kind: BinaryResourceKind::ExternalFont,
+                id: font_blob_resource_key(4, &digest),
+            }),
+            None
+        );
+        assert_eq!(
+            arena.font_blob_bytes_for_ref(&BinaryResourceRef {
+                kind: BinaryResourceKind::FontBlob,
+                id: font_blob_resource_key(5, &digest),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn resource_digest_is_stable_and_content_dependent() {
+        let digest = resource_digest_hex([1, 2, 3, 4]);
+        assert_eq!(digest.len(), 64);
+        assert_eq!(digest, resource_digest_hex([1, 2, 3, 4]));
+        assert_ne!(digest, resource_digest_hex([1, 2, 3, 5]));
+    }
+
+    #[test]
+    fn resource_keys_include_kind_algorithm_length_and_digest() {
+        assert_eq!(image_resource_key(4, "abcd"), "img:blake3:4:abcd");
+        assert_eq!(
+            svg_resource_key(6, "0123456789abcdef"),
+            "svg:blake3:6:0123456789abcdef"
+        );
+        assert_eq!(font_blob_resource_key(8, "feed"), "font:blake3:8:feed");
+    }
+
+    #[test]
+    fn source_image_key_changes_only_when_jpeg_base64_is_baked() {
+        // MIME 판정은 다른 포맷의 8-byte magic과 같은 최소 길이 계약을 사용한다.
+        let mut image = ImageNode::new(
+            7,
+            Some(vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00]),
+        );
+        assert_eq!(source_image_key(3, &image).as_deref(), Some("bin:3:7:src"));
+
+        image.effect = ImageEffect::GrayScale;
+        image.brightness = 1;
+        assert_eq!(
+            source_image_key(3, &image).as_deref(),
+            Some("bin:3:7:wmpng")
+        );
+
+        // 밝기와 명암 중 하나만 바뀌어도 기존 bake 술어는 같은 variant를 발급한다.
+        image.brightness = 0;
+        image.contrast = 1;
+        assert_eq!(
+            source_image_key(3, &image).as_deref(),
+            Some("bin:3:7:wmpng")
+        );
+
+        // JPEG 이 아니면 효과 필드는 별도 JSON 속성일 뿐 base64 payload는 바뀌지 않는다.
+        image.data = Some(vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        assert_eq!(source_image_key(3, &image).as_deref(), Some("bin:3:7:src"));
+
+        image.bin_data_id = 0;
+        assert_eq!(source_image_key(3, &image), None);
+    }
+}

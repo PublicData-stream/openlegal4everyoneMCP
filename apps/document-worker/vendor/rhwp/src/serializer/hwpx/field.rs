@@ -1,0 +1,637 @@
+//! 필드 컨트롤 직렬화 — Bookmark, Hyperlink, Field (fieldBegin/End) 뼈대.
+//!
+//! Stage 5 (#182): 인라인 필드 컨트롤의 `<hp:fieldBegin>` / `<hp:fieldEnd>` 및 `<hp:bookmark>`
+//! 의 XML 뼈대를 제공한다. 각주(`<hp:fn>`) / 미주(`<hp:en>`) 는 향후 이슈에서 확장.
+//!
+//! ## 범위 한정
+//!
+//! - Stage 5 에서는 **필드 뼈대 출력** 기능만 제공 (section.rs dispatcher 연결은 #186).
+//! - 누름틀(ClickHere), 날짜, 메일머지 등 복잡한 필드는 `<hp:fieldBegin type="...">` 의
+//!   type 속성만 구분하고 내부 command 직렬화는 #186 에서 확장.
+
+use std::io::Write;
+
+use quick_xml::Writer;
+
+use crate::model::control::{Bookmark, Field, FieldType, Hyperlink};
+use crate::parser::tags;
+
+use super::utils::{empty_tag, end_tag, filter_xml_1_0_chars, start_tag, start_tag_attrs, text};
+use super::SerializeError;
+
+// =====================================================================
+// <hp:bookmark>
+// =====================================================================
+
+pub fn write_bookmark<W: Write>(w: &mut Writer<W>, bm: &Bookmark) -> Result<(), SerializeError> {
+    empty_tag(w, "hp:bookmark", &[("name", &bm.name)])
+}
+
+// =====================================================================
+// <hp:fieldBegin> / <hp:fieldEnd>
+// =====================================================================
+
+/// `<hp:fieldBegin>` 여는 태그 + 속성 문자열을 만든다 (자기닫힘 `/>` 없이).
+///
+/// [#1391] parameters / memo subList 가 있으면 호출부가 자식을 채우고 `</hp:fieldBegin>`
+/// 로 닫는다. 없으면 호출부가 `/>` 로 자기닫힘 처리.
+pub fn field_begin_open_tag(field: &Field) -> String {
+    let id_str = field.field_id.to_string();
+    let ft = field_type_attr(field);
+    let name = xml_escape_attr(field.ctrl_data_name.as_deref().unwrap_or(""));
+    // [#task-m100] 원본 `fieldid` 속성 보존 — id 와 별개 값일 수 있어(#1512) 생략하면
+    // 왕복 시 영구 손실된다. 없으면(None) 속성 자체를 생략(#1391 자기닫힘 태그 호환).
+    match field.instance_id {
+        Some(fieldid) => format!(
+            r#"<hp:fieldBegin id="{}" type="{}" name="{}" editable="{}" dirty="{}" fieldid="{}""#,
+            id_str,
+            ft,
+            name,
+            bool01(field.is_editable_in_form()),
+            bool01(field.is_dirty()),
+            fieldid,
+        ),
+        None => format!(
+            r#"<hp:fieldBegin id="{}" type="{}" name="{}" editable="{}" dirty="{}""#,
+            id_str,
+            ft,
+            name,
+            bool01(field.is_editable_in_form()),
+            bool01(field.is_dirty()),
+        ),
+    }
+}
+
+fn xml_escape_attr(s: &str) -> String {
+    // XML 1.0 이 담을 수 없는 문자(제어문자 등)를 먼저 제거한다 — 남겨 두면 저장된 HWPX 안의
+    // XML 이 불법이 되어 한컴·뷰어가 파일 자체를 열지 못한다 (#3382 계열).
+    filter_xml_1_0_chars(s)
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// `<hp:fieldBegin>` — 필드 시작 마커 (자식 없는 경우 자기닫힘).
+///
+/// HWPX 필드는 텍스트 흐름 안에서 `<hp:fieldBegin>` ~ 텍스트 ~ `<hp:fieldEnd>` 쌍으로 표현된다.
+pub fn write_field_begin<W: Write>(w: &mut Writer<W>, field: &Field) -> Result<(), SerializeError> {
+    let id_str = field.field_id.to_string();
+    let ft = field_type_attr(field);
+    let fieldid_str = field.instance_id.map(|v| v.to_string());
+    let editable_str = bool01(field.is_editable_in_form());
+    let dirty_str = bool01(field.is_dirty());
+    match &fieldid_str {
+        Some(fieldid_str) => empty_tag(
+            w,
+            "hp:fieldBegin",
+            &[
+                ("id", &id_str),
+                ("type", ft),
+                ("name", field.ctrl_data_name.as_deref().unwrap_or("")),
+                ("editable", editable_str),
+                ("dirty", dirty_str),
+                ("fieldid", fieldid_str),
+            ],
+        ),
+        None => empty_tag(
+            w,
+            "hp:fieldBegin",
+            &[
+                ("id", &id_str),
+                ("type", ft),
+                ("name", field.ctrl_data_name.as_deref().unwrap_or("")),
+                ("editable", editable_str),
+                ("dirty", dirty_str),
+            ],
+        ),
+    }
+}
+
+/// `<hp:fieldEnd>` — 필드 끝 마커.
+pub fn write_field_end<W: Write>(w: &mut Writer<W>, field_id: u32) -> Result<(), SerializeError> {
+    let id_str = field_id.to_string();
+    empty_tag(w, "hp:fieldEnd", &[("beginIDRef", &id_str)])
+}
+
+/// `<hp:fieldEnd beginIDRef=".." fieldid="..">` — beginIDRef 와 fieldid 동시 방출.
+/// 다단락 필드의 고아 fieldEnd 복원용 (Task #1556). `field_id == 0` 이면 `fieldid` 생략.
+pub fn write_field_end_full<W: Write>(
+    w: &mut Writer<W>,
+    begin_id_ref: u32,
+    field_id: u32,
+) -> Result<(), SerializeError> {
+    let begin_str = begin_id_ref.to_string();
+    if field_id == 0 {
+        return empty_tag(w, "hp:fieldEnd", &[("beginIDRef", &begin_str)]);
+    }
+    let field_str = field_id.to_string();
+    empty_tag(
+        w,
+        "hp:fieldEnd",
+        &[("beginIDRef", &begin_str), ("fieldid", &field_str)],
+    )
+}
+
+// =====================================================================
+// 메모 (필드의 특수형) — <hp:fieldBegin type="MEMO"> 자식 (#5866)
+// =====================================================================
+
+/// [#5866] HWP5 출처 메모 필드(command `MEMO/…`)의 fieldBegin 자식 XML.
+///
+/// 한글 2024 SaveAs HWPX 실측(07868)을 미러한다 — 파라미터 7종 중 IR 에 없는
+/// `CreateDateTime` 만 생략하고, 나머지는 전부 command 토큰에서 유도한다:
+/// `MEMO/<MemoShapeIDRef>/<Number>/<id>/<id>/<Author>/\;;`. 빈 subList(문단 1개,
+/// run 만)는 필수다 — 이슈 실측에서 subList 없이 type 만 바꾸면 한글이 파일을
+/// 열지 못했다. `memoShape` 정의는 정답에도 없다(IDRef=65535 = 없음).
+///
+/// command 가 MEMO 형식이 아니면 `None` — 호출부는 기존 경로를 탄다.
+pub fn memo_field_children_xml(field: &Field) -> Option<String> {
+    if field.field_type != FieldType::Unknown
+        || field.raw_type.is_some()
+        || field.raw_parameters_xml.is_some()
+        || !field.parameters.is_empty()
+        || !field.command.starts_with("MEMO/")
+    {
+        return None;
+    }
+    let tokens: Vec<&str> = field.command.split('/').collect();
+    let memo_shape_id_ref = tokens.get(1).copied().unwrap_or("65535");
+    let number = tokens.get(2).copied().unwrap_or("1");
+    let author = tokens.get(5).copied().unwrap_or("");
+    Some(format!(
+        concat!(
+            r#"<hp:parameters cnt="6" name="">"#,
+            r#"<hp:integerParam name="Prop">0</hp:integerParam>"#,
+            r#"<hp:stringParam name="Command">{command}</hp:stringParam>"#,
+            r#"<hp:stringParam name="ID">memo{number}</hp:stringParam>"#,
+            r#"<hp:integerParam name="Number">{number}</hp:integerParam>"#,
+            r#"<hp:stringParam name="Author">{author}</hp:stringParam>"#,
+            r#"<hp:stringParam name="MemoShapeIDRef">{shape}</hp:stringParam>"#,
+            r#"</hp:parameters>"#,
+            r#"<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" "#,
+            r#"linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" "#,
+            r#"hasTextRef="0" hasNumRef="0">"#,
+            r#"<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">"#,
+            r#"<hp:run charPrIDRef="0"/>"#,
+            r#"<hp:linesegarray><hp:lineseg textpos="0" vertpos="0" vertsize="1000" "#,
+            r#"textheight="1000" baseline="850" spacing="600" horzpos="0" horzsize="42524" "#,
+            r#"flags="393216"/></hp:linesegarray>"#,
+            r#"</hp:p></hp:subList>"#,
+        ),
+        command = xml_escape_attr(&field.command),
+        number = xml_escape_attr(number),
+        author = xml_escape_attr(author),
+        shape = xml_escape_attr(memo_shape_id_ref),
+    ))
+}
+
+// =====================================================================
+// 하이퍼링크 (필드의 특수형) — <hp:fieldBegin type="HYPERLINK"> 변형
+// =====================================================================
+
+pub fn write_hyperlink_begin<W: Write>(
+    w: &mut Writer<W>,
+    link: &Hyperlink,
+    field_id: u32,
+) -> Result<(), SerializeError> {
+    // [#2957 계열] HWPX 스키마는 `<hp:fieldBegin>` 에 `command` 속성을 정의하지 않는다.
+    // URL 은 파서(parse_field_parameters)가 읽는 대로 `<hp:parameters>` 자식의
+    // `<hp:stringParam name="Command">` 텍스트로 담아야 한다. 종전엔 존재하지 않는
+    // `command` 속성으로 방출해, 파서가 이를 무시(알 수 없는 속성)하여 저장 후 재로드 시
+    // 하이퍼링크 URL 이 조용히 소실됐다.
+    let id_str = field_id.to_string();
+    start_tag_attrs(
+        w,
+        "hp:fieldBegin",
+        &[
+            ("id", &id_str),
+            ("type", "HYPERLINK"),
+            ("name", ""),
+            ("editable", "0"),
+        ],
+    )?;
+    start_tag(w, "hp:parameters")?;
+    start_tag_attrs(w, "hp:stringParam", &[("name", "Command")])?;
+    // HWP3 Hyperlink control은 추가 정보 블록이 없거나 순서가 어긋난 경우 url을
+    // 비워 둔 채 표시 텍스트만 남긴다. 이때 URL처럼 보이는 표시 텍스트를 버리기보다
+    // HWPX Command의 최소값으로 승격한다.
+    let target = if link.url.is_empty() {
+        &link.text
+    } else {
+        &link.url
+    };
+    text(w, target)?;
+    end_tag(w, "hp:stringParam")?;
+    end_tag(w, "hp:parameters")?;
+    end_tag(w, "hp:fieldBegin")
+}
+
+// =====================================================================
+// 각주 / 미주 뼈대 — <hp:fn> / <hp:en>
+// =====================================================================
+
+/// `<hp:fn>` 각주 뼈대 (내부 문단 직렬화는 #186 에서 연결).
+#[allow(dead_code)]
+pub fn write_footnote_open<W: Write>(w: &mut Writer<W>, number: u16) -> Result<(), SerializeError> {
+    let n = number.to_string();
+    start_tag(w, "hp:fn")?;
+    empty_tag(w, "hp:autoNum", &[("num", &n)])?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn write_footnote_close<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
+    end_tag(w, "hp:fn")
+}
+
+#[allow(dead_code)]
+pub fn write_endnote_open<W: Write>(w: &mut Writer<W>, number: u16) -> Result<(), SerializeError> {
+    let n = number.to_string();
+    start_tag(w, "hp:en")?;
+    empty_tag(w, "hp:autoNum", &[("num", &n)])?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn write_endnote_close<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
+    end_tag(w, "hp:en")
+}
+
+// =====================================================================
+// 헬퍼
+// =====================================================================
+
+fn bool01(b: bool) -> &'static str {
+    if b {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+/// `<hp:fieldBegin type="...">` 에 실을 값 — **원본 종류를 잃지 않는 자리**.
+///
+/// [#4896] IR `FieldType` 이 모델링하지 않는 종류(`Unknown`)를 무턱대고 `CROSSREF` 로
+/// 굳히면 본문은 살아도 **필드 정체성이 영구히 사라진다**(10k 스윕: 교정부호 필드 27경로가
+/// 상호참조로 바뀌었다). 원본이 준 값은 한글이 이미 받아들인 값이므로, 그 값을 알고 있으면
+/// 그대로 되돌려준다. 순서대로:
+///
+/// 1. HWPX 출처의 `type` 원문(`Field::raw_type`)
+/// 2. HWP5 출처의 command 실측 대응(`tags::OWPML_FIELD_TYPE_BY_COMMAND`, 예:
+///    `$RevisionDelete;` — hwp 는 종류를 ctrl_id 가 아니라 command 로 들고 있다)
+/// 3. ctrl_id 실측 대응(`tags::OWPML_EXTRA_FIELD_TYPES`, 예: `%%*d`)
+/// 4. 아무 근거도 없을 때만 본문 보존용 `CROSSREF` 대체
+fn field_type_attr(field: &Field) -> &str {
+    if field.field_type != FieldType::Unknown {
+        return field_type_str(field.field_type);
+    }
+    if let Some(raw) = field.raw_type.as_deref() {
+        return raw;
+    }
+    tags::owpml_field_type_by_command(&field.command)
+        .or_else(|| tags::owpml_extra_field_type_str(field.ctrl_id))
+        .unwrap_or_else(|| field_type_str(field.field_type))
+}
+
+/// `<hp:fieldBegin type="...">` 값. **반드시 OWPML `FieldType` 열거 안의 값이어야 한다**
+/// (`mydocs/manual/OWPML SCHEMA/ParaList XML schema.xml:2701-2719` — 15개).
+///
+/// 열거 밖의 값을 쓰면 한글은 그 지점에서 섹션 파싱을 포기하고 **이후 본문을 통째로
+/// 버린다**(파일은 열리지만 뒷부분이 사라진다). 10k 스윕 실측: `type="UNKNOWN"` 을 담은
+/// h2x 산출물에서 한글이 원본 105,388자 중 5,306자만 읽었고, 값을 열거 안의 값으로
+/// 바꾸자 100% 복원됐다(03787·03788·06841 동일).
+///
+/// **공개 스키마 파일은 제품보다 낡았다.** 위 15개 열거에는 `PROOFREADING_MARKS_DELETE` 도
+/// `TABLEOFCONTENTS` 도 없지만, 한글 2022 가 만든 HWPX 는 둘 다 쓴다(#4896 이 앞의 것을
+/// 실측표로 이미 받아들였다). 판정 기준은 스키마 파일이 아니라 **한글이 쓰는 값**이다.
+///
+/// `Unknown` 은 여전히 대응 값이 없어 `CROSSREF` 로 보낸다 — `type` 속성을 아예 빼는 대안은
+/// 실측에서 본문을 무너뜨렸다(#5171: `06792` 86쪽 87,282자 → 12쪽 12,944자,
+/// `06841` 219쪽 233,532자 → 143쪽 156,128자). `MEMO` 는 memo subList/memoShape 를 요구해서
+/// 내용 없이 type 만 바꾸면 한글이 **파일을 아예 열지 못한다**(실측 확인).
+fn field_type_str(t: FieldType) -> &'static str {
+    use FieldType::*;
+    match t {
+        Unknown => "CROSSREF",
+        Date => "DATE",
+        DocDate => "DOC_DATE",
+        Path => "PATH",
+        Bookmark => "BOOKMARK",
+        MailMerge => "MAILMERGE",
+        CrossRef => "CROSSREF",
+        Formula => "FORMULA",
+        ClickHere => "CLICK_HERE",
+        Summary => "SUMMERY", // OWPML 스키마의 실제 표기(한컴 오탈자). schema.xml:2707
+        UserInfo => "USER_INFO",
+        Hyperlink => "HYPERLINK",
+        Memo => "MEMO",
+        PrivateInfoSecurity => "PRIVATE_INFO",
+        // [#5171] 한글이 쓰는 값은 밑줄 **없는** `TABLEOFCONTENTS` 다. #2845 가 시험한
+        // `TABLE_OF_CONTENTS`(밑줄 있음)는 열거 밖이라 본문 폐기를 불렀고(03787: 5,727자
+        // -> 840자), 그래서 `CROSSREF` 대체가 선택됐다 — 철자가 문제였지 항목이 없던 게 아니다.
+        //
+        // 한글 2022 SaveAs 실측(06792): `type="TABLEOFCONTENTS"`, 파라미터는 `Prop`+`Command`
+        // 둘뿐으로 `CROSSREF` 와 구조가 같다. rhwp 산출의 type 만 바꿔 재측정하면
+        // 86쪽 87,282자에 컨트롤 인구조사가 `:1,atno:6,...` 로 **원본과 완전히 일치**한다
+        // (종전 `CROSSREF` 는 같은 자리를 `%xrf:1` 로 만든다).
+        // 파서(parser/hwpx/section.rs)는 이미 세 철자를 모두 받아들인다.
+        TableOfContents => "TABLEOFCONTENTS",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::control::{Bookmark, Field, FieldType, Hyperlink};
+
+    fn to_string<F: FnOnce(&mut Writer<Vec<u8>>) -> Result<(), SerializeError>>(f: F) -> String {
+        let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
+        f(&mut w).expect("write");
+        String::from_utf8(w.into_inner()).unwrap()
+    }
+
+    #[test]
+    fn bookmark_emits_name() {
+        let bm = Bookmark {
+            name: "chapter1".to_string(),
+        };
+        let xml = to_string(|w| write_bookmark(w, &bm));
+        assert!(xml.contains(r#"<hp:bookmark name="chapter1"/>"#), "{}", xml);
+    }
+
+    /// [#4896] HWPX 출처의 종류 원문은 그대로 되돌아간다 — 한글이 이미 받아들인 값이다.
+    /// 10k 코퍼스 실측: 한컴 원본이 쓰는 열거 밖 값은 `PROOFREADING_MARKS_DELETE` 하나였고
+    /// (12회/7문서), 종전 코드는 이를 `CROSSREF` 로 굳혀 교정부호를 상호참조로 바꿨다.
+    #[test]
+    fn unknown_field_keeps_original_type_string() {
+        let f = Field {
+            field_type: FieldType::Unknown,
+            raw_type: Some("PROOFREADING_MARKS_DELETE".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(field_type_attr(&f), "PROOFREADING_MARKS_DELETE");
+    }
+
+    /// [#4896] HWP5 출처는 원문 문자열이 없다 — ctrl_id 실측 대응표로 이름을 되찾는다.
+    /// (`%%*d` ↔ `PROOFREADING_MARKS_DELETE`: 같은 문서에서 한글 컨트롤 집계와 개수 일치)
+    #[test]
+    fn unknown_field_recovers_type_from_ctrl_id() {
+        let f = Field {
+            field_type: FieldType::Unknown,
+            ctrl_id: tags::FIELD_PROOFREADING_DELETE,
+            ..Default::default()
+        };
+        assert_eq!(field_type_attr(&f), "PROOFREADING_MARKS_DELETE");
+    }
+
+    /// [#4896] HWP5 원본은 종류를 ctrl_id 가 아니라 **command** 로 들고 있다 — 실측(03430)에서
+    /// 교정부호 필드의 ctrl_id 는 `%unk` 이고 command 만 `$RevisionDelete;` 였다.
+    #[test]
+    fn unknown_field_recovers_type_from_command() {
+        let f = Field {
+            field_type: FieldType::Unknown,
+            ctrl_id: tags::FIELD_UNKNOWN,
+            command: "$RevisionDelete;".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(field_type_attr(&f), "PROOFREADING_MARKS_DELETE");
+    }
+
+    /// 되찾을 근거가 하나도 없을 때만 본문 보존용 `CROSSREF` 로 대체한다(#4776 계약 유지).
+    #[test]
+    fn unknown_field_without_evidence_falls_back_to_crossref() {
+        let f = Field {
+            field_type: FieldType::Unknown,
+            ..Default::default()
+        };
+        assert_eq!(field_type_attr(&f), "CROSSREF");
+    }
+
+    /// 아는 종류는 종전대로 IR 값이 이긴다 — raw_type 이 끼어들지 않는다.
+    #[test]
+    fn known_field_type_ignores_raw_type() {
+        let f = Field {
+            field_type: FieldType::Hyperlink,
+            raw_type: Some("ZZZ_NOT_A_TYPE".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(field_type_attr(&f), "HYPERLINK");
+    }
+
+    #[test]
+    fn field_begin_emits_type_attr() {
+        let mut f = Field::default();
+        f.field_type = FieldType::ClickHere;
+        f.field_id = 42;
+        let xml = to_string(|w| write_field_begin(w, &f));
+        assert!(xml.contains(r#"id="42""#));
+        // [#1595] 올바른 HWPX 값은 CLICK_HERE (언더스코어). 종전 "CLICKHERE" 는
+        // 한글이 미인식해 ClickHere placeholder 높이 변동 → 페이지 붕괴(#1589).
+        assert!(xml.contains(r#"type="CLICK_HERE""#), "{xml}");
+    }
+
+    #[test]
+    fn field_begin_preserves_distinct_fieldid_attr() {
+        // [#task-m100] 실물 필드는 id(=field_id, 고유)와 fieldid(instance id)가
+        // 서로 다를 수 있다(id=1878228493, fieldid=627272811). 종전엔 fieldid_attr 가
+        // field_id 계산의 폴백으로만 쓰이고 별도 보존되지 않아, 직렬화기가 이 속성을
+        // 영구히 방출하지 못했다(#1512 이후 회귀).
+        let mut f = Field::default();
+        f.field_type = FieldType::ClickHere;
+        f.field_id = 1_878_228_493;
+        f.instance_id = Some(627_272_811);
+        let xml = to_string(|w| write_field_begin(w, &f));
+        assert!(xml.contains(r#"fieldid="627272811""#), "{xml}");
+    }
+
+    #[test]
+    fn field_end_references_begin_id() {
+        let xml = to_string(|w| write_field_end(w, 42));
+        assert!(xml.contains(r#"<hp:fieldEnd beginIDRef="42"/>"#));
+    }
+
+    #[test]
+    fn hyperlink_begin_uses_string_param_command() {
+        // fieldBegin 에는 `command` 속성이 없다(HWPX 스키마 미정의) — 파서가 읽는
+        // <hp:parameters><hp:stringParam name="Command"> 자식으로 URL 을 담아야
+        // 저장 후 재로드 시 하이퍼링크 대상이 유지된다.
+        let link = Hyperlink {
+            url: "https://example.com".to_string(),
+            text: "".to_string(),
+        };
+        let xml = to_string(|w| write_hyperlink_begin(w, &link, 7));
+        assert!(xml.contains(r#"type="HYPERLINK""#), "{xml}");
+        assert!(
+            !xml.contains("command="),
+            "fieldBegin 에 command 속성이 없어야 함: {xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:stringParam name="Command">https://example.com</hp:stringParam>"#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn hyperlink_begin_uses_display_text_when_hwp3_url_is_absent() {
+        // HWP3 추가정보 블록이 없으면 URL 자리에 빈 문자열만 남을 수 있다. 표시 문자열을
+        // Command로 승격해야 HWPX 변환본이 빈 하이퍼링크가 되지 않는다.
+        let link = Hyperlink {
+            url: String::new(),
+            text: "https://example.com/help".to_string(),
+        };
+        let xml = to_string(|w| write_hyperlink_begin(w, &link, 8));
+        assert!(
+            xml.contains(
+                r#"<hp:stringParam name="Command">https://example.com/help</hp:stringParam>"#
+            ),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn footnote_emits_auto_num() {
+        let xml = to_string(|w| {
+            write_footnote_open(w, 3)?;
+            write_footnote_close(w)
+        });
+        assert!(xml.contains("<hp:fn>"));
+        assert!(xml.contains(r#"<hp:autoNum num="3"/>"#));
+        assert!(xml.contains("</hp:fn>"));
+    }
+
+    #[test]
+    fn field_type_str_covers_main_variants() {
+        assert_eq!(field_type_str(FieldType::Hyperlink), "HYPERLINK");
+        assert_eq!(field_type_str(FieldType::Bookmark), "BOOKMARK");
+        assert_eq!(field_type_str(FieldType::Date), "DATE");
+    }
+
+    #[test]
+    fn field_type_str_toc_uses_the_spelling_hancom_writes() {
+        // [#5171] 철자가 문제였다. #2845 가 시험한 `TABLE_OF_CONTENTS`(밑줄 있음)는 열거 밖이라
+        // 한글이 본문을 버렸다(03787, type 값만 교체):
+        //   CROSSREF/CLICK_HERE/BOOKMARK -> 5,727자(100%)
+        //   TABLE_OF_CONTENTS/UNKNOWN/ZZZ_NOT_A_TYPE -> 840자(14.7%)
+        // 그래서 `CROSSREF` 대체가 선택됐지만, **한글 자신은 밑줄 없는 `TABLEOFCONTENTS` 를
+        // 쓴다**(06792 SaveAs 실측). 그 값으로 바꿔 재측정하면 86쪽 87,282자에 컨트롤
+        // 인구조사가 원본과 완전히 일치한다(종전 `CROSSREF` 는 `%xrf:1` 로 만든다).
+        let emitted = field_type_str(FieldType::TableOfContents);
+        assert_eq!(emitted, "TABLEOFCONTENTS");
+        // 밑줄 있는 표기로 되돌아가면 본문이 사라진다 — 회귀 방지.
+        assert_ne!(emitted, "TABLE_OF_CONTENTS");
+        assert!(hancom_accepts(emitted), "got: {emitted}");
+    }
+
+    #[test]
+    fn every_field_type_maps_to_a_value_hancom_accepts() {
+        // 불변식: `type` 은 어떤 IR 값에서도 **한글이 받아들이는 것으로 확인된 값**이어야 한다.
+        // 확인되지 않은 값을 쓰면 한글이 그 지점부터 본문을 버린다(실측상
+        // "TABLE_OF_CONTENTS" 도 "ZZZ_NOT_A_TYPE" 과 동일하게 폐기됐다).
+        //
+        // [#5171] 기준을 "공개 스키마 열거 안"에서 "스키마 ∪ 한컴 실측값"으로 넓혔다 —
+        // 스키마 파일이 제품보다 낡아서(`HANCOM_MEASURED_FIELD_TYPES` 주석 참조) 스키마만
+        // 기준으로 삼으면 한글이 실제로 쓰는 값을 우리가 못 쓴다.
+        use FieldType::*;
+        for t in [
+            Unknown,
+            Date,
+            DocDate,
+            Path,
+            Bookmark,
+            MailMerge,
+            CrossRef,
+            Formula,
+            ClickHere,
+            Summary,
+            UserInfo,
+            Hyperlink,
+            Memo,
+            PrivateInfoSecurity,
+            TableOfContents,
+        ] {
+            let s = field_type_str(t);
+            assert!(
+                hancom_accepts(s),
+                "{t:?} -> {s:?} 는 한글이 받아들인다고 확인된 값이 아니다 \
+                 (스키마 열거도 실측표도 아님 — 한글이 본문을 버린다)"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_field_type_never_emits_schema_outside_value() {
+        // [#4896] 이 불변식은 **되찾을 근거가 없을 때의 대체값**(`field_type_str`)에 걸린다.
+        // 원본이 준 값(`raw_type`)이나 ctrl_id 실측 대응은 열거 밖이어도 그대로 내보낸다 —
+        // 한컴 자신이 쓰는 값이라 한글이 받아들이고(코퍼스 실측 `PROOFREADING_MARKS_DELETE`
+        // 12회/7문서), 열거로 뭉개면 필드 정체성이 사라진다.
+        //
+        // OWPML FieldType 열거(ParaList XML schema.xml:2701-2719)에 "UNKNOWN" 은 없다.
+        // 열거 밖 값을 만나면 한글은 그 지점에서 섹션 파싱을 포기하고 이후 본문을 버린다
+        // — 10k 스윕 h2x 절단군의 근인 하나다. 실측: 07868 은 105,388자 중 5,306자만
+        // 읽히다가 열거 안의 값으로 바꾸자 100% 복원(03787·03788·06841 동일).
+        let emitted = field_type_str(FieldType::Unknown);
+        assert_ne!(
+            emitted, "UNKNOWN",
+            "스키마 밖 값을 방출하면 한글이 본문을 버린다"
+        );
+        assert!(
+            OWPML_FIELD_TYPES.contains(&emitted),
+            "Unknown 은 열거 안의 값으로 내려가야 한다: {emitted}"
+        );
+    }
+
+    /// OWPML `FieldType` 열거 전체 (ParaList XML schema.xml:2701-2719).
+    ///
+    /// [#4896] **실물 파일은 이 목록보다 넓다** — 한컴이 만든 hwpx 가
+    /// `PROOFREADING_MARKS_DELETE`(목록에 없는 값)를 쓴다(10k 코퍼스 12회/7문서, 정상 개방).
+    /// 그러므로 이 목록은 "우리가 새로 지어낼 때 고를 값"의 화이트리스트일 뿐,
+    /// 원본에서 온 값을 거를 필터가 아니다.
+    const OWPML_FIELD_TYPES: &[&str] = &[
+        "CLICK_HERE",
+        "HYPERLINK",
+        "BOOKMARK",
+        "FORMULA",
+        "SUMMERY",
+        "USER_INFO",
+        "DATE",
+        "DOC_DATE",
+        "PATH",
+        "CROSSREF",
+        "MAILMERGE",
+        "MEMO",
+        "PROOFREADING_MARKS",
+        "PRIVATE_INFO",
+        "METATAG",
+    ];
+
+    /// 공개 스키마 밖이지만 **한글이 실제로 쓰는** `type` 값.
+    ///
+    /// 판정 기준은 스키마 파일이 아니라 한컴 산출물이다. 각 값의 근거:
+    /// - `PROOFREADING_MARKS_DELETE` — [#4896] 10k 코퍼스 hwpx 원본 12회/7문서, 정상 개방
+    /// - `PROOFREADING_MARKS_SIMPLECHANGE` — [#5171] 한글 2022 가 `03787` 을 SaveAs 하면
+    ///   `$RevisionSimpleChange?…` 3개를 이 값으로 쓴다. 원본 컨트롤 인구조사 `%%*c:3` 과 일치
+    /// - `TABLEOFCONTENTS` — [#5171] 한글 2022 가 `06792` 를 SaveAs 하면 이 값을 쓴다.
+    ///   rhwp 산출의 type 만 이 값으로 바꿔 재측정하면 86쪽 87,282자에 컨트롤 인구조사가
+    ///   원본과 완전히 일치한다. **밑줄 있는 `TABLE_OF_CONTENTS` 는 열거 밖이라 본문을
+    ///   버린다** — #2845 가 시험한 값이 그것이었다(철자 문제였다).
+    const HANCOM_MEASURED_FIELD_TYPES: &[&str] = &[
+        "PROOFREADING_MARKS_DELETE",
+        "PROOFREADING_MARKS_SIMPLECHANGE",
+        "TABLEOFCONTENTS",
+    ];
+
+    /// 한글이 받아들이는 것으로 확인된 값 전체.
+    fn hancom_accepts(t: &str) -> bool {
+        OWPML_FIELD_TYPES.contains(&t) || HANCOM_MEASURED_FIELD_TYPES.contains(&t)
+    }
+
+    #[test]
+    fn field_type_str_matches_owpml_schema() {
+        // OWPML ParaList schema.xml(2707-2710)의 실제 enum 표기와 일치해야 한컴이 인식한다.
+        // (종전 DOCDATE/USERINFO/SUMMARY 는 스키마에 없어 한컴이 필드 타입을 잃었다.)
+        assert_eq!(field_type_str(FieldType::DocDate), "DOC_DATE");
+        assert_eq!(field_type_str(FieldType::UserInfo), "USER_INFO");
+        assert_eq!(field_type_str(FieldType::Summary), "SUMMERY");
+    }
+}

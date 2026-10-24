@@ -18,7 +18,7 @@ pub async fn process(input: DocumentInput) -> Result<DocumentOutput, DocumentErr
     }
     let mut output = DocumentOutput {
         source_sha256: input.source_sha256.clone(),
-        processor_version: "document-v1;xml=roxmltree-0.21.1;html=scraper-0.27.0".into(),
+        processor_version: "document-v1;xml=roxmltree-0.21.1;html=scraper-0.29.0".into(),
         format: input.format,
         tree: None,
         text: String::new(),

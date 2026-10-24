@@ -20,6 +20,7 @@ COPY .cargo/config.toml ./.cargo/config.toml
 COPY crates ./crates
 COPY apps/server ./apps/server
 COPY apps/document-worker ./apps/document-worker
+RUN cd apps/document-worker/vendor/rhwp && sha256sum -c SHA256SUMS >/dev/null
 ENV CARGO_TARGET_DIR=/build
 ARG ADMISSION_REFRESH=manual
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=type=cache,target=/usr/local/cargo/git,sharing=locked --mount=type=cache,id=openlegal-worker-musl-rust-1.98.1-amd64,target=/build,sharing=locked \
@@ -36,12 +37,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=t
     && cargo build --manifest-path apps/document-worker/Cargo.toml --locked --release -j 2 \
     && readelf -l /build/release/openlegal-document-worker | grep -F '[Requesting program interpreter: /lib/ld-musl-x86_64.so.1]' \
     && ! readelf -d /build/release/openlegal-document-worker | grep -F 'libc.so.6' \
-    && mkdir -p /assets/notices \
+    && mkdir -p /assets/notices/rhwp \
     && cp /build/release/openlegal-document-worker /assets/openlegal-document-worker \
+    && cp apps/document-worker/vendor/rhwp/LICENSE apps/document-worker/vendor/rhwp/THIRD_PARTY_LICENSES.md apps/document-worker/vendor/rhwp/README.openlegal.md apps/document-worker/vendor/rhwp/UPSTREAM.json apps/document-worker/vendor/rhwp/SHA256SUMS /assets/notices/rhwp/ \
     && test "$(find /build/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable | wc -l)" -eq 1 \
     && find /build/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable -exec cp {} /assets/document-format-tests \; \
     && test -x /assets/document-format-tests \
-    && find /usr/local/cargo/registry/src /usr/local/cargo/git/checkouts -type f \( -iname "license*" -o -iname "copying*" -o -iname "notice*" \) -exec cp --parents {} /assets/notices \;
+    && find /usr/local/cargo/registry/src -type f \( -iname "license*" -o -iname "copying*" -o -iname "notice*" \) -exec cp --parents {} /assets/notices \;
 WORKDIR /assets
 COPY apps/document-worker/assets.sha256 ./
 RUN curl -fsSLO https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/65727574dfcd264acbb0c3e07860e4e9e9b22185/eng.traineddata \

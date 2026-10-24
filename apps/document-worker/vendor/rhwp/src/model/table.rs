@@ -1,0 +1,2223 @@
+//! 표 (Table, Cell, Row)
+
+use super::paragraph::Paragraph;
+use super::shape::{common_obj_offsets, Caption};
+use super::*;
+
+/// [#2722] `Table::rebuild_grid()` 가 예약할 수 있는 최대 그리드 칸 수.
+///
+/// 실측 근거: `samples/` 전수 조사(파일 343개, 중첩 포함 표 5,353개)에서
+/// `row_count × col_count` 최댓값은 52,770 (5,277행 × 10열,
+/// `issue2063_huge_cellbreak_table.hwp`) 이었다. 이 상한은 그 75.8배이므로
+/// 정상 문서는 상한 분기에 닿지 않는다. 최악의 경우 예약량은
+/// 4,000,000 × 16B = 64 MiB (wasm32 는 8B → 32 MiB) 로 abort 없이 처리된다.
+pub const MAX_TABLE_GRID_CELLS: usize = 4_000_000;
+
+/// [#6145] 칸 줄바꿈 방식 "한 줄로 입력" — 자간을 조절해 한 줄을 유지한다.
+pub const CELL_LINE_WRAP_SQUEEZE: u8 = 1;
+
+pub const CELL_FLAG_HAS_MARGIN: u16 = 0x0001;
+pub const CELL_FLAG_PROTECT: u16 = 0x0002;
+pub const CELL_FLAG_HEADER: u16 = 0x0004;
+pub const CELL_FLAG_EDITABLE_IN_FORM: u16 = 0x0008;
+
+#[cfg(test)]
+std::thread_local! {
+    static PARAGRAPH_FRAME_OWNER_WIDTHS_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// 표 개체 (HWPTAG_TABLE)
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct Table {
+    /// 속성 비트 플래그
+    pub attr: u32,
+    /// 행 수
+    pub row_count: u16,
+    /// 열 수
+    pub col_count: u16,
+    /// 셀 간격
+    pub cell_spacing: HwpUnit16,
+    /// 안쪽 여백
+    pub padding: Padding,
+    /// 행별 셀 수 (HWP 스펙: UINT16[NRows])
+    pub row_sizes: Vec<HwpUnit16>,
+    /// 테두리/배경 ID 참조
+    pub border_fill_id: u16,
+    /// 영역 속성 목록
+    pub zones: Vec<TableZone>,
+    /// 셀 목록 (행 우선 순서)
+    pub cells: Vec<Cell>,
+    /// 2D 그리드 인덱스: grid[row * col_count + col] = Some(cell_idx)
+    /// 병합 셀의 span 영역 전체가 앵커 셀 인덱스를 가리킴
+    pub cell_grid: Vec<Option<usize>>,
+    /// 쪽 경계에서 나눔 (0: 나누지 않음, 1: 셀 단위로 나눔)
+    pub page_break: TablePageBreak,
+    /// 제목 줄 자동 반복
+    pub repeat_header: bool,
+    /// 캡션 정보
+    pub caption: Option<Caption>,
+    /// 공통 객체 속성 (위치, 배치, 크기 등)
+    pub common: crate::model::shape::CommonObjAttr,
+    /// 바깥 여백 (CommonObjAttr의 오브젝트 바깥 4방향 여백)
+    pub outer_margin_left: i16,
+    pub outer_margin_right: i16,
+    pub outer_margin_top: i16,
+    pub outer_margin_bottom: i16,
+    /// CTRL_HEADER ctrl_data의 4바이트(attr) 이후 추가 바이트 (라운드트립 보존용)
+    pub raw_ctrl_data: Vec<u8>,
+    /// [#4495] raw_ctrl_data 출처 봉인 — 봉인 시점 `common`(CommonObjAttr) 의
+    /// 다이제스트. 저장 시 `common` 이 봉인과 같을 때만 raw 를 재사용한다.
+    /// None(합성 IR·봉인 이전)은 종전 계약(raw 우선) 유지. 다이제스트 밖 —
+    /// `model::raw_provenance` 참조.
+    #[serde(skip)]
+    pub raw_ctrl_seal: Option<[u8; 32]>,
+    /// HWPTAG_TABLE 레코드의 원본 속성 값 (라운드트립 보존용, 0이면 재구성)
+    pub raw_table_record_attr: u32,
+    /// HWPTAG_TABLE 레코드의 border_fill_id 이후 추가 바이트 (라운드트립 보존용)
+    pub raw_table_record_extra: Vec<u8>,
+}
+
+/// 표 쪽 나눔 종류
+/// bit 0-1: 0=나누지 않음, 1=셀 단위로 나눔, 2=나눔(행 단위)
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub enum TablePageBreak {
+    /// 나누지 않음 (0)
+    #[default]
+    None,
+    /// 셀 단위로 나눔 (1) — 행 내부(인트라-로우) 분할 허용
+    CellBreak,
+    /// 나눔 (2) — 행 경계에서만 나눔 (인트라-로우 분할 없음)
+    RowBreak,
+}
+
+/// 표 영역 속성
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TableZone {
+    /// 시작 열 주소
+    pub start_col: u16,
+    /// 시작 행 주소
+    pub start_row: u16,
+    /// 끝 열 주소
+    pub end_col: u16,
+    /// 끝 행 주소
+    pub end_row: u16,
+    /// 테두리/배경 ID 참조
+    pub border_fill_id: u16,
+}
+
+/// 표 셀 (HWPTAG_LIST_HEADER + 셀 속성)
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct Cell {
+    /// 셀 열 주소 (0부터 시작)
+    pub col: u16,
+    /// 셀 행 주소 (0부터 시작)
+    pub row: u16,
+    /// 열 병합 개수
+    pub col_span: u16,
+    /// 행 병합 개수
+    pub row_span: u16,
+    /// 셀 폭
+    pub width: HwpUnit,
+    /// 셀 높이
+    pub height: HwpUnit,
+    /// 셀 여백
+    pub padding: Padding,
+    /// 테두리/배경 ID 참조
+    pub border_fill_id: u16,
+    /// 셀 내 문단 리스트
+    pub paragraphs: Vec<Paragraph>,
+    /// LIST_HEADER의 텍스트 영역 폭 참조 (라운드트립 보존용)
+    pub list_header_width_ref: u16,
+    /// 텍스트 방향 (0: 가로, 1: 세로)
+    pub text_direction: u8,
+    /// [#4898] 줄바꿈 방식 — LIST_HEADER `list_attr` bit 19~20, OWPML `lineWrap`.
+    ///
+    /// `0` = BREAK(어절 단위 줄바꿈, 기본) · `1` = SQUEEZE(자간을 조절해 한 줄 유지) ·
+    /// `2` = KEEP. 종전에는 이 두 비트를 읽지도 쓰지도 않아 HWPX→HWP 저장에서 항상 0 이
+    /// 됐다 — 셀 줄바꿈 방식이 바뀌면 줄 수·셀 높이·표 높이가 따라 바뀐다.
+    /// 매핑은 한글 2022 실측이다(SQUEEZE 만 쓰는 문서를 SaveAs → LIST_HEADER 19개가 전부
+    /// bit19=1, BREAK 위주 문서는 SQUEEZE 인 셀 하나만 1). KEEP=2 는 스키마 열거 순서다.
+    pub line_wrap: u8,
+    /// 세로 정렬 (0: top, 1: center, 2: bottom)
+    pub vertical_align: VerticalAlign,
+    /// 안 여백 지정 여부 (list_attr bit 16)
+    /// true: 셀 고유 padding 사용, false: 표 기본 padding 사용
+    pub apply_inner_margin: bool,
+    /// 제목 셀 여부 (list_attr bit 18)
+    pub is_header: bool,
+    /// LIST_HEADER 레코드의 34바이트 이후 추가 바이트 (라운드트립 보존용)
+    pub raw_list_extra: Vec<u8>,
+    /// 셀 필드 이름 (한컴 셀 속성 → 필드 → 필드 이름)
+    /// raw_list_extra의 offset 14-15(name_len) + offset 16~(UTF-16LE)에서 추출
+    pub field_name: Option<String>,
+    /// HWPX `<hp:tc dirty>` 속성 (편집기 캐시 무효화 표시, 라운드트립 보존용).
+    /// HWP5 바이너리에는 대응 비트가 없어 list_header_width_ref 재사용 대상에서 제외한다.
+    pub dirty_flag: bool,
+}
+
+/// 표 셀 행/열 바꿈 복사 데이터.
+///
+/// `cells[row][col]` 은 원본 범위의 셀 문단 목록이다.
+#[derive(Debug, Clone, Default)]
+pub struct TableTransposeData {
+    pub source_rows: u16,
+    pub source_cols: u16,
+    pub cells: Vec<Vec<Vec<Paragraph>>>,
+}
+
+fn distribute_hwp_units(total: HwpUnit, count: u16) -> Vec<HwpUnit> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let base = total / count as u32;
+    let remainder = total % count as u32;
+    (0..count)
+        .map(|idx| base + u32::from(idx < remainder as u16))
+        .collect()
+}
+
+/// 손상된 표 메타데이터를 편집할 때 u16 좌표·span·개수가 넘지 않게 한다.
+fn checked_table_u16_add(value: u16, delta: u16, field: &str) -> Result<u16, String> {
+    value
+        .checked_add(delta)
+        .ok_or_else(|| format!("{field}가 u16 범위를 초과합니다"))
+}
+
+fn checked_table_span_end(start: u16, span: u16, axis: &str) -> Result<u16, String> {
+    if span == 0 {
+        return Err(format!("손상된 셀({axis} span 0)은 편집할 수 없습니다"));
+    }
+    checked_table_u16_add(start, span, &format!("셀 {axis} 범위"))
+}
+
+/// 세로 정렬
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub enum VerticalAlign {
+    #[default]
+    Top,
+    Center,
+    Bottom,
+}
+
+impl Cell {
+    pub fn set_apply_inner_margin(&mut self, value: bool) {
+        self.apply_inner_margin = value;
+        self.set_list_header_flag(CELL_FLAG_HAS_MARGIN, value);
+    }
+
+    /// [Task #1785] 렌더에 실제 적용되는 축별 안 여백 선택 규칙 (단일 출처).
+    ///
+    /// HWP 스펙: aim=true → 유효한 cell.padding(0 포함), aim=false → table.padding.
+    /// 레이아웃(resolve_cell_padding)과 높이 측정(height_measurer)이 반드시 같은 값을
+    /// 봐야 한다 — 규칙이 갈리면 예약 높이와 실제 렌더가 어긋나 표 높이가 틀어진다.
+    pub fn use_cell_padding_axis(&self, cell_padding: i16, table_padding: i16) -> bool {
+        if self.apply_inner_margin {
+            // [#2070] aim=true 의 0 은 사용자가 지정한 셀 고유 안 여백 — 존중한다
+            // (한글 PDF 실측: 시장구조조사 c0 pad=(0,0) 코드 폭 37.0px > 표 폴백
+            // inner 26.5px — 표 패딩 폴백이면 물리적으로 1줄 불가). 음수는 결측
+            // 센티널로 보고 표 패딩 폴백 유지.
+            return cell_padding >= 0;
+        }
+        // [#2195] aim=false 는 **전 축 표 기본** — pad 통제 사다리 2종 실측:
+        // (1) 표(0,0,141,141)+셀(510,510,141,141): 실효 좌우 0·상하 141,
+        // (2) 표(510,510,223,223)+셀 동일: inner = 표폭-1020(좌우 510x2)·상하 223.
+        //
+        // [#5301] 종전에는 "중첩 비글자표는 셀의 작은 저장 여백을 한컴이 쓴다"는 예외를
+        // 뒀는데(`#2308 p34`), 그 근거 문서를 한글 2024 오라클로 다시 재니 **반대**였다.
+        // `samples/issue1891/76076_regulatory_analysis.hwp` 는 34쪽·66쪽 모두 중첩 칸
+        // (표 pad 0/0 · 셀 pad 510/510 · aim=false)인데 한컴이 그린 글자 상자가
+        // `156.96..522.60pt = 365.6pt` 로 **칸 폭 36572HU(365.72pt) 전부**다 —
+        // 여백 0 이다. 510 을 적용하면 폭이 10.2pt 좁아져 줄이 하나 더 생기고,
+        // 그 초과 줄이 조각 용량을 넘어 66쪽에서 `로 예상` 세 글자가 소실됐다.
+        let _ = (cell_padding, table_padding);
+        false
+    }
+
+    /// [#6442] 셀 안 여백으로는 설명되지 않는 절대 크기 (HWPUNIT). 2cm —
+    /// 한글이 실제로 내는 안 여백(대개 141~1417HU, #2195 의 레거시 상한도
+    /// 2500HU)을 두 배 이상 웃돈다. 실제로 걸린 쓰레기값은 23812~29693HU 다.
+    const ABSURD_INNER_MARGIN_HU: i32 = 5669;
+
+    /// [#6442] **측정용** 저장 상하 안 여백 (HWPUNIT) — 쓰이지 않는 필드에 담긴
+    /// 쓰레기값만 걸러 낸다.
+    ///
+    /// `apply_inner_margin=false` 셀의 `padding` 필드는 한글이 렌더에 **쓰지 않는**
+    /// 값이라 파일에 무엇이 들어 있어도 무방하고, 실제로 좌표성 쓰레기가 들어 있는
+    /// 문서가 있다.
+    ///
+    /// | 문서 | `pad.top` | `pad.bottom` | 셀 선언 높이 |
+    /// |---|---|---|---|
+    /// | 대산항 출입증(#6442) | 29693 | 10433 | **683** |
+    /// | 59043 규제분석(#1921 표본) | 23812 | 10930 | **282** |
+    ///
+    /// 이 원시값을 그대로 더하면 행 하나가 500px 씩 부푼다.
+    ///
+    /// **aim=false 저장값을 전부 버리면 안 된다** — rhwp 조판은 그 값에 의존하는
+    /// 경로가 여럿이라(중첩 비글자표 #2195 등) 전부 버리면 10건이 회귀한다.
+    /// 두 조건을 **모두** 요구해 걸러지는 범위를 좁혔다.
+    ///
+    /// 1. `total > height` — **엄격 초과**. `>=` 로 두면 `total = height = 282`
+    ///    (141+141 안 여백에 내용 높이 0) 인 정상 셀까지 잡는다(#3637 2587개 셀).
+    /// 2. `total >= ABSURD_INNER_MARGIN_HU` — 안 여백으로는 설명이 안 되는 절대 크기.
+    pub fn stored_vertical_padding_hu(&self) -> i32 {
+        let total = (self.padding.top as i32).saturating_add(self.padding.bottom as i32);
+        if self.apply_inner_margin || total <= 0 {
+            return total;
+        }
+        // 선언 높이가 없으면(0 / 미지 센티널) 판정 근거가 없으니 종전대로 둔다.
+        if self.height == 0 || self.height >= 0x8000_0000 {
+            return total;
+        }
+        if total > self.height as i32 && total >= Self::ABSURD_INNER_MARGIN_HU {
+            if std::env::var("RHWP_6442_SCAN").is_ok() {
+                eprintln!(
+                    "[6442S] total={total} h={} pads=({},{})",
+                    self.height, self.padding.top, self.padding.bottom
+                );
+            }
+            return 0;
+        }
+        total
+    }
+
+    /// [Task #501 / #5751] 한컴 방어 가드의 발동 기준 — 셀 상하 안 여백 합이 셀
+    /// 선언 높이 **자체**를 넘으면 그 저장값을 비정상으로 본다
+    /// (mel-001 p2 셀[21]: pad 3400 HU vs h 1280 HU).
+    ///
+    /// 렌더(`table_layout`: padding 비례 축소)와 측정(`height_measurer`: 선언 높이
+    /// 권위 clamp)이 **같은 기준**을 쓰도록 단일 출처로 둔다 (#1785 의
+    /// `use_cell_padding_axis` 와 같은 결). 기준이 갈리면 측정만 행을 안 늘리고
+    /// 렌더는 저장 여백을 그대로 써서 글자가 아래 괘선을 넘는다 — 여백이 셀
+    /// 높이의 절반~1배인 정상 조밀 표에서 오발동한 #5751 이 그 사례다
+    /// (156505020 데이터 셀: pad 15.09px, h 21.09px).
+    pub fn vertical_padding_is_abnormal(cell_height_px: f64, total_v_pad_px: f64) -> bool {
+        cell_height_px > 0.0 && total_v_pad_px >= cell_height_px
+    }
+
+    /// 1×1 표의 선언된 바깥 높이는 유일한 셀의 물리 높이이기도 하다.
+    /// 여러 쪽에 걸치는 표도 셀에는 작은 초기 행 높이를 저장할 수 있다.
+    /// 이 초기값만으로 판단하면 실제 안 여백이 축소된다(#7406, PrEP 39–40쪽:
+    /// 셀 282HU, 표 68738HU, 위·아래 안 여백 각각 850HU).
+    /// 저장 안 여백이 초기 높이를 초과해야 한다. 둘이 같은 경우는 일반적인
+    /// 조밀한 표(80168)에도 있으므로 바깥 상자가 여백을 소유한다는 근거가 아니다.
+    /// 측정과 배치는 이 높이를 함께 사용해 안 여백의 비정상 여부를 판단한다.
+    pub fn vertical_padding_guard_height_hu(&self, table: &Table) -> u32 {
+        let pad = self.effective_padding(&table.padding);
+        if table.row_count == 1
+            && table.col_count == 1
+            && table.cells.len() == 1
+            && table.common.height < 0x8000_0000
+            && table.common.height > self.height
+            && (i64::from(pad.top) + i64::from(pad.bottom) > i64::from(self.height)
+                || self.saved_reset_closes_initial_table_frame(table))
+        {
+            table.common.height
+        } else {
+            self.height
+        }
+    }
+
+    /// A short first viewport can leave only the padding in cellSz. The
+    /// original monotone source prefix, followed by a reset, identifies the
+    /// actual initial frame; its padding must not be scaled against that stub.
+    pub(crate) fn saved_reset_closes_initial_table_frame(&self, table: &Table) -> bool {
+        // A later edited/reset line cannot authenticate the earlier source frame.
+        if self.paragraphs.iter().any(|para| {
+            para.stored_text_partition_is_dirty()
+                || para.cell_format_vpos_dirty
+                || !para.controls.is_empty()
+                || para.line_segs.is_empty()
+                || para.line_segs.iter().any(|seg| {
+                    seg.tag & super::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
+                        || seg.vertical_pos < 0
+                        || seg.line_height <= 0
+                })
+        }) {
+            return false;
+        }
+        let padding = self.effective_padding(&table.padding);
+        let mut previous: Option<&super::paragraph::LineSeg> = None;
+        for para in &self.paragraphs {
+            if para.stored_text_partition_is_dirty()
+                || para.cell_format_vpos_dirty
+                || !para.controls.is_empty()
+                || para.line_segs.is_empty()
+            {
+                return false;
+            }
+            for seg in &para.line_segs {
+                if seg.tag & super::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
+                    || seg.vertical_pos < 0
+                    || seg.line_height <= 0
+                {
+                    return false;
+                }
+                if let Some(prev) = previous {
+                    if seg.vertical_pos < prev.vertical_pos {
+                        let end = i64::from(prev.vertical_pos)
+                            + i64::from(prev.line_height)
+                            + i64::from(padding.top)
+                            + i64::from(padding.bottom);
+                        return end == i64::from(table.common.height);
+                    }
+                }
+                previous = Some(seg);
+            }
+        }
+        false
+    }
+
+    /// 표 기본 안 여백이 네 축 모두 0인지 확인한다.
+    pub fn table_padding_unspecified(table_padding: &crate::model::Padding) -> bool {
+        table_padding.left == 0
+            && table_padding.right == 0
+            && table_padding.top == 0
+            && table_padding.bottom == 0
+    }
+
+    /// 축별 선택 규칙을 측정과 실제 배치의 네 축에 동일하게 적용한다.
+    /// hasMargin=false인 셀의 보존 여백은 표 기본값 0도 덮어쓰지 않는다.
+    pub fn effective_padding(
+        &self,
+        table_padding: &crate::model::Padding,
+    ) -> crate::model::Padding {
+        let pick = |c: i16, t: i16| -> i16 {
+            // hasMargin이 꺼져 있으면 0을 포함한 표 기본 여백을 사용한다.
+            // 셀에 남은 저장값은 측정이나 배치에서 되살리지 않는다.
+            // 음수 셀 여백의 결측 처리는 축별 공통 규칙을 따른다.
+            if self.use_cell_padding_axis(c, t) {
+                c
+            } else {
+                t
+            }
+        };
+        crate::model::Padding {
+            left: pick(self.padding.left, table_padding.left),
+            right: pick(self.padding.right, table_padding.right),
+            top: pick(self.padding.top, table_padding.top),
+            bottom: pick(self.padding.bottom, table_padding.bottom),
+        }
+    }
+
+    /// 행 축소 하한도 실제 측정·배치와 같은 상하 여백을 사용한다.
+    pub fn effective_vertical_padding_hu(&self, table_padding: &crate::model::Padding) -> i32 {
+        let padding = self.effective_padding(table_padding);
+        i32::from(padding.top) + i32::from(padding.bottom)
+    }
+
+    /// 새 문단 프레임도 높이 측정·배치와 같은 유효 안 여백을 사용한다.
+    pub(crate) fn paragraph_frame_padding(
+        &self,
+        table_padding: &crate::model::Padding,
+    ) -> crate::model::Padding {
+        self.effective_padding(table_padding)
+    }
+
+    pub fn cell_protect(&self) -> bool {
+        self.list_header_width_ref & CELL_FLAG_PROTECT != 0
+    }
+
+    pub fn set_cell_protect(&mut self, value: bool) {
+        self.set_list_header_flag(CELL_FLAG_PROTECT, value);
+    }
+
+    pub fn set_header(&mut self, value: bool) {
+        self.is_header = value;
+        self.set_list_header_flag(CELL_FLAG_HEADER, value);
+    }
+
+    pub fn editable_in_form(&self) -> bool {
+        self.list_header_width_ref & CELL_FLAG_EDITABLE_IN_FORM != 0
+    }
+
+    pub fn set_editable_in_form(&mut self, value: bool) {
+        self.set_list_header_flag(CELL_FLAG_EDITABLE_IN_FORM, value);
+    }
+
+    /// LIST_HEADER 속성 상위 절반의 비트를 세우거나 지운다.
+    ///
+    /// **이 필드는 이름과 달리 폭이 아니다** — LIST_HEADER 속성 u32 의 상위 16비트다(계획서
+    /// §4.21). 진짜 텍스트 영역 폭은 `raw_list_extra` 앞머리 u16 에 있다.
+    /// LIST_HEADER offset 34 의 **텍스트 영역 폭**을 델타만큼 옮긴다(라운드트립 보존 바이트).
+    ///
+    /// 이 값은 대개 셀 폭과 같지만 표본 전수에서 **414셀은 폭+30**이었다(안 여백 따위). 그래서
+    /// 리사이즈 때 `cell.width` 를 절대값으로 덮으면 그 오프셋을 지운다 — 한글은 이 필드를
+    /// **폭과 같은 델타**로 옮기므로(실측: 7384→7667 일 때 216,28→243,29 = +283) 증분한다.
+    pub fn shift_text_area_width(&mut self, delta: i64) {
+        if self.raw_list_extra.len() < 2 {
+            return;
+        }
+        let cur = i64::from(u16::from_le_bytes([
+            self.raw_list_extra[0],
+            self.raw_list_extra[1],
+        ]));
+        let next = u16::try_from(cur.saturating_add(delta).max(0)).unwrap_or(u16::MAX);
+        let bytes = next.to_le_bytes();
+        self.raw_list_extra[0] = bytes[0];
+        self.raw_list_extra[1] = bytes[1];
+    }
+
+    pub fn set_list_header_flag_pub(&mut self, flag: u16, value: bool) {
+        self.set_list_header_flag(flag, value);
+    }
+
+    fn set_list_header_flag(&mut self, flag: u16, value: bool) {
+        if value {
+            self.list_header_width_ref |= flag;
+        } else {
+            self.list_header_width_ref &= !flag;
+        }
+    }
+
+    /// 빈 셀을 생성한다 (빈 문단 1개 포함).
+    pub fn new_empty(
+        col: u16,
+        row: u16,
+        width: HwpUnit,
+        height: HwpUnit,
+        border_fill_id: u16,
+    ) -> Self {
+        Cell {
+            col,
+            row,
+            col_span: 1,
+            row_span: 1,
+            width,
+            height,
+            border_fill_id,
+            paragraphs: vec![Paragraph::new_empty()],
+            ..Default::default()
+        }
+    }
+
+    /// 기존 셀을 템플릿으로 사용하여 빈 셀을 생성한다.
+    ///
+    /// raw_list_extra, padding, vertical_align 등 메타데이터를 복사하고,
+    /// 첫 문단의 raw_header_extra, char_shapes, line_segs 구조를 복사한다.
+    pub fn new_from_template(
+        col: u16,
+        row: u16,
+        width: HwpUnit,
+        height: HwpUnit,
+        template: &Cell,
+    ) -> Self {
+        // 템플릿 문단의 구조를 복사하되 텍스트는 비움
+        let para = if let Some(tpl_para) = template.paragraphs.first() {
+            // instanceId를 0으로 초기화 (새 셀의 문단은 고유 ID 불필요)
+            let mut raw_header_extra = tpl_para.raw_header_extra.clone();
+            if raw_header_extra.len() >= 10 {
+                // raw_header_extra[6..10] = instanceId
+                raw_header_extra[6..10].copy_from_slice(&[0, 0, 0, 0]);
+            }
+
+            Paragraph {
+                char_count: 1,        // 빈 문단: 끝 마커(0x000D) 포함
+                char_count_msb: true, // 셀 문단은 항상 MSB 설정
+                text: String::new(),
+                char_shapes: tpl_para.char_shapes.iter().take(1).cloned().collect(),
+                // A new source paragraph may inherit source metrics, never a
+                // renderer-only fill line whose suffix ownership would be lost.
+                line_segs: tpl_para
+                    .serializable_line_segs()
+                    .iter()
+                    .take(1)
+                    .cloned()
+                    .collect(),
+                para_shape_id: tpl_para.para_shape_id,
+                style_id: tpl_para.style_id,
+                raw_header_extra,
+                has_para_text: false, // 빈 셀은 PARA_TEXT 불필요
+                ..Default::default()
+            }
+        } else {
+            Paragraph::new_empty()
+        };
+
+        Cell {
+            col,
+            row,
+            col_span: 1,
+            row_span: 1,
+            width,
+            height,
+            border_fill_id: template.border_fill_id,
+            padding: template.padding,
+            list_header_width_ref: template.list_header_width_ref,
+            text_direction: template.text_direction,
+            line_wrap: template.line_wrap,
+            vertical_align: template.vertical_align,
+            apply_inner_margin: template.apply_inner_margin,
+            is_header: template.is_header,
+            raw_list_extra: template.raw_list_extra.clone(),
+            field_name: None,
+            dirty_flag: false,
+            paragraphs: vec![para],
+        }
+    }
+}
+
+impl Table {
+    #[cfg(test)]
+    pub(crate) fn reset_paragraph_frame_owner_widths_calls_for_test() {
+        PARAGRAPH_FRAME_OWNER_WIDTHS_CALLS.with(|calls| calls.set(0));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paragraph_frame_owner_widths_calls_for_test() -> usize {
+        PARAGRAPH_FRAME_OWNER_WIDTHS_CALLS.with(|calls| calls.get())
+    }
+
+    /// Widths owned by cell paragraph frames before padding and paragraph margins.
+    ///
+    /// Native tables may repeat a row with raw cell widths whose sum is a few
+    /// HWPUNIT short of the table's resolved column grid. Those raw values are
+    /// serialization auxiliaries, not independent row boundaries. Use genuine
+    /// base-track evidence and place any positive table-width residual on the
+    /// last column without inferring a prior editing gesture.
+    ///
+    /// This is deliberately batch-shaped. Row-role inference examines the table
+    /// as a whole, so repeating it once per cell makes large native tables
+    /// quadratic and can prevent on-demand reflow from completing.
+    pub(crate) fn paragraph_frame_owner_widths(&self) -> Vec<i32> {
+        #[cfg(test)]
+        PARAGRAPH_FRAME_OWNER_WIDTHS_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+        let to_i32 = |width: u64| width.min(i32::MAX as u64) as i32;
+        let mut owners = self
+            .cells
+            .iter()
+            .map(|cell| to_i32(u64::from(cell.width)))
+            .collect::<Vec<_>>();
+        let col_count = usize::from(self.col_count);
+        if owners.is_empty()
+            || col_count == 0
+            || self.common.treat_as_char
+            || self.common.width == 0
+        {
+            return owners;
+        }
+
+        let nonclosing_rows = self.declared_width_rows_exceeding(0);
+
+        // Extract only real single-column evidence. `base_grid_column_widths`
+        // intentionally fills holes from the display grid; that fallback would
+        // make excluded local/outlier data look like a paragraph-frame base.
+        let mut base_tracks = vec![0u32; col_count];
+        for cell in &self.cells {
+            let col = usize::from(cell.col);
+            if cell.row >= self.row_count
+                || cell.col_span != 1
+                || cell.width == 0
+                || col >= col_count
+                || nonclosing_rows.contains(&cell.row)
+            {
+                continue;
+            }
+            base_tracks[col] = base_tracks[col].max(cell.width);
+        }
+        if base_tracks.contains(&0) {
+            return owners;
+        }
+        let base_total = base_tracks.iter().copied().map(u64::from).sum::<u64>();
+        let table_width = u64::from(self.common.width);
+        if table_width > base_total {
+            let residual = (table_width - base_total).min(u64::from(u32::MAX)) as u32;
+            if let Some(last) = base_tracks.last_mut() {
+                *last = last.saturating_add(residual);
+            }
+        }
+
+        let mut rows = vec![Vec::<usize>::new(); usize::from(self.row_count)];
+        for (cell_index, cell) in self.cells.iter().enumerate() {
+            if let Some(row) = rows.get_mut(usize::from(cell.row)) {
+                row.push(cell_index);
+            }
+        }
+        for (row_index, cell_indices) in rows.iter_mut().enumerate() {
+            if nonclosing_rows.contains(&(row_index as u16)) {
+                continue;
+            }
+            cell_indices.sort_by_key(|index| self.cells[*index].col);
+            let mut next_col = 0usize;
+            let mut row_total = 0u64;
+            let mut complete = !cell_indices.is_empty();
+            for &cell_index in cell_indices.iter() {
+                let cell = &self.cells[cell_index];
+                let start = usize::from(cell.col);
+                let Some(end) = start.checked_add(usize::from(cell.col_span)) else {
+                    complete = false;
+                    break;
+                };
+                if cell.row_span != 1
+                    || cell.col_span == 0
+                    || cell.width == 0
+                    || start != next_col
+                    || end > col_count
+                {
+                    complete = false;
+                    break;
+                }
+                row_total = row_total.saturating_add(u64::from(cell.width));
+                next_col = end;
+            }
+            if !complete || next_col != col_count || row_total == table_width {
+                continue;
+            }
+            for &cell_index in cell_indices.iter() {
+                let cell = &self.cells[cell_index];
+                let start = usize::from(cell.col);
+                let end = start + usize::from(cell.col_span);
+                let resolved = base_tracks[start..end]
+                    .iter()
+                    .copied()
+                    .map(u64::from)
+                    .sum::<u64>();
+                owners[cell_index] = to_i32(resolved);
+            }
+        }
+        owners
+    }
+
+    /// Complete row declarations wider than the persisted table width.
+    ///
+    /// This is a format-validity check, not edit-history inference: each row is
+    /// judged solely against its own cells and `common.width`. Such auxiliary
+    /// widths cannot define the shared fallback grid.
+    pub fn invalid_declared_width_rows(&self) -> std::collections::BTreeSet<u16> {
+        let tolerance =
+            (u64::from(self.common.width) / 100).max(usize::from(self.col_count).max(1) as u64);
+        self.declared_width_rows_exceeding(tolerance)
+    }
+
+    fn declared_width_rows_exceeding(&self, tolerance: u64) -> std::collections::BTreeSet<u16> {
+        let mut invalid = std::collections::BTreeSet::new();
+        let col_count = usize::from(self.col_count);
+        if col_count == 0 || self.common.width == 0 {
+            return invalid;
+        }
+        for row in 0..self.row_count {
+            let mut cells = self
+                .cells
+                .iter()
+                .filter(|cell| cell.row == row && cell.row_span == 1)
+                .collect::<Vec<_>>();
+            cells.sort_by_key(|cell| cell.col);
+            let mut next_col = 0usize;
+            let mut total = 0u64;
+            let mut complete = !cells.is_empty();
+            for cell in cells {
+                let start = usize::from(cell.col);
+                let end = start.saturating_add(usize::from(cell.col_span));
+                if cell.col_span == 0 || start != next_col || end > col_count {
+                    complete = false;
+                    break;
+                }
+                total = total.saturating_add(u64::from(cell.width));
+                next_col = end;
+            }
+            // A short row can be closed by the table-width residual. A row
+            // wider than its persisted table cannot be a valid shared grid.
+            if complete
+                && next_col == col_count
+                && total.saturating_sub(u64::from(self.common.width)) > tolerance
+            {
+                invalid.insert(row);
+            }
+        }
+        invalid
+    }
+    /// [#5910] 병합 셀 선언 높이가 걸친 행들의 단일행 선언 합보다 **작을** 때, 한글이
+    /// 마지막 걸침 행에서 흡수하는 축소량(HWPUNIT)을 행별로 계산한다.
+    ///
+    /// HWP 표의 행 높이는 셀마다 따로 저장되므로, `row_span>1` 셀의 선언 높이와 그 셀이
+    /// 걸친 행들의 `row_span==1` 선언 합이 어긋난 문서가 존재한다. 선언 합이 **모자랄**
+    /// 때(병합 선언이 더 큼) 잔여를 마지막 걸침 행에 더하는 규칙은 이미 있으나
+    /// (#2291/#2237), 반대 방향에는 규칙이 없어 걸침 묶음이 실제보다 부풀었다.
+    ///
+    /// 다만 두 선언이 어긋난다는 사실만으로는 어느 쪽이 옳은지 알 수 없다 — 걸침 선언이
+    /// 0 이거나 한 행 값과 같은 손상 문서도 실재한다(1342000_edu_curriculum_map: 걸침
+    /// 선언 0 vs 행합 1500). 그래서 **저장된 표 높이(`common.height`)가 축소 결과를
+    /// 확인해 줄 때만** 적용한다: 마지막 걸침 행까지의 행합이 축소 후 `common.height` 와
+    /// 정확히 같아야 한다. 이 확인이 없으면 종전 동작(축소 없음)을 유지한다.
+    ///
+    /// 실측 근거 — `samples/kps-ai.hwp` 43쪽 표(13행×5열)의 `r8 rs=3` 선언은 17,354HU
+    /// 인데 걸친 세 행의 단일행 선언은 6,082HU×3 = 18,246HU 다. 한글 2022 정본
+    /// (`pdf/kps-ai-2022.pdf` 46쪽)의 행 괘선 실측은 60.8/60.8/**51.9**pt 이고, 마지막
+    /// 행 5,190HU = 17,354 − 6,082×2 로 정확히 닫힌다. 같은 표의 `common.height`
+    /// 62,725HU 도 머리행 2,797 + 6,082×9 + 5,190 으로 같은 값에 닫혀 두 경로가 서로를
+    /// 확인해 준다.
+    ///
+    /// 걸친 행 중 하나라도 `row_span==1` 선언이 없으면(미지 행) 기존 분배 규칙이
+    /// 담당하므로 0 을 돌려준다. 반환 벡터의 길이는 `row_count` 다.
+    pub fn rowspan_declared_overflow_shrink(&self) -> Vec<HwpUnit> {
+        let row_count = self.row_count as usize;
+        let mut shrink = vec![0 as HwpUnit; row_count];
+        if row_count == 0 || self.common.height == 0 {
+            return shrink;
+        }
+
+        // 행별 단일행 선언 높이 (없으면 None = 미지 행)
+        let mut declared: Vec<Option<HwpUnit>> = vec![None; row_count];
+        for cell in &self.cells {
+            if cell.row_span != 1 || cell.height >= 0x8000_0000 {
+                continue;
+            }
+            let r = cell.row as usize;
+            if r >= row_count {
+                continue;
+            }
+            let slot = &mut declared[r];
+            if slot.is_none_or(|h| cell.height > h) {
+                *slot = Some(cell.height);
+            }
+        }
+
+        for cell in &self.cells {
+            let span = cell.row_span as usize;
+            let r = cell.row as usize;
+            if span <= 1 || cell.height >= 0x8000_0000 || r + span > row_count {
+                continue;
+            }
+            let last = r + span - 1;
+            // 걸친 행 합 — 미지 행이 있으면 기존 분배 규칙 담당.
+            let mut span_sum: u64 = 0;
+            let mut prefix_sum: u64 = 0;
+            let mut all_known = true;
+            for (i, h) in declared.iter().enumerate().take(last + 1) {
+                match h {
+                    Some(v) => {
+                        prefix_sum += *v as u64;
+                        if i >= r {
+                            span_sum += *v as u64;
+                        }
+                    }
+                    None => {
+                        all_known = false;
+                        break;
+                    }
+                }
+            }
+            if !all_known || span_sum <= cell.height as u64 {
+                continue;
+            }
+            let deficit = span_sum - cell.height as u64;
+            // 저장 표 높이 확인 — 축소 후 마지막 걸침 행까지의 행합이 `common.height`
+            // 와 정확히 같을 때만 적용한다. 손상 선언(걸침 선언 0 등)은 여기서 걸러진다.
+            if prefix_sum.checked_sub(deficit) != Some(self.common.height as u64) {
+                continue;
+            }
+            let capped = deficit.min(declared[last].unwrap_or(0) as u64) as HwpUnit;
+            // 같은 마지막 행에 상한이 여러 개면 **덜 줄이는** 쪽을 택한다 —
+            // 이 규칙은 부푼 묶음을 되돌리는 보정이지 새 압축이 아니다.
+            if shrink[last] == 0 || capped < shrink[last] {
+                shrink[last] = capped;
+            }
+        }
+        shrink
+    }
+
+    /// [Task #1716] 반복 제목행으로 재사용할 **표 상단의 연속 제목행 블록** `0..H` 를 반환한다.
+    ///
+    /// 행 r 이 제목행 ⟺ header 셀(`is_header`, rowspan 덮개 포함)이 r 을 덮음. 상단(행 0)부터
+    /// 제목행이 연속되는 최대 구간만 반환하고, 표 중간·하단에 흩어진 `is_header` 행은 제외한다.
+    /// (일부 문서는 본문 행에도 `header="1"` 을 다수 부여한다. 그 행들까지 반복 대상으로 잡으면
+    /// 연속 페이지마다 반복 overhead 가 누적되어 가용 높이가 0이 되고 페이지당 1행 폭주가 발생.)
+    pub fn leading_header_rows(&self) -> Vec<usize> {
+        let rc = self.row_count as usize;
+        if rc == 0 {
+            return Vec::new();
+        }
+        let mut is_header_row = vec![false; rc];
+        for cell in &self.cells {
+            if !cell.is_header {
+                continue;
+            }
+            let start = cell.row as usize;
+            let span = (cell.row_span as usize).max(1);
+            for r in start..(start + span).min(rc) {
+                is_header_row[r] = true;
+            }
+        }
+        let mut h = 0usize;
+        while h < rc && is_header_row[h] {
+            h += 1;
+        }
+        (0..h).collect()
+    }
+
+    /// 2D 그리드 인덱스를 재구축한다.
+    /// 구조 변경(파싱, 행/열 추가/삭제, 병합/분할) 후 호출해야 한다.
+    ///
+    /// [#2722] `row_count`/`col_count` 는 파일에서 그대로 온 `u16` 이다(HWPX `rowCnt`/
+    /// `colCnt`, HWP5 `HWPTAG_TABLE`, HML `RowCount`/`ColCount`). 종전엔 상한 없이
+    /// `vec![None; rc * cc]` 를 예약해, 65535×65535 = 4,294,836,225 칸 ×
+    /// `Option<usize>` 16바이트 = 68,717,379,600 바이트 예약을 시도하고 실패 시
+    /// `handle_alloc_error` → abort 로 프로세스가 죽었다(250바이트 HML 로 재현).
+    /// wasm32 에서는 `Layout::array` 가 32비트 `usize` 를 넘겨 capacity overflow
+    /// 패닉 → 모듈 트랩이 된다. 정상 파일은 실측상 최대 52,770 칸이라 아래
+    /// 분기가 아예 실행되지 않으므로 동작 불변이다.
+    pub fn rebuild_grid(&mut self) {
+        let rc = self.row_count as usize;
+        let cc = self.col_count as usize;
+        let requested = rc.saturating_mul(cc);
+        let grid_len = if requested > MAX_TABLE_GRID_CELLS {
+            // 손상된 행/열 수. 실제 셀이 가리키는 마지막 칸 + 1 까지만 예약한다.
+            // 아래 채우기 루프에 이미 `gi < self.cell_grid.len()` 가드가 있어
+            // 범위를 넘는 칸은 원래도 무시됐다.
+            self.addressed_grid_len(cc)
+                .min(MAX_TABLE_GRID_CELLS)
+                .min(requested)
+        } else {
+            requested
+        };
+        self.cell_grid = vec![None; grid_len];
+        for (idx, cell) in self.cells.iter().enumerate() {
+            // [#4264] row/col은 파일에서 그대로 온 u16이고 span은 상한 검증이 없어
+            // (row_span/col_span은 .max(1)로 최소값만 보장) row+row_span이 u16 상한을
+            // 넘을 수 있다. addressed_grid_len()과 같은 saturating 패턴으로 맞춘다.
+            for r in cell.row..cell.row.saturating_add(cell.row_span) {
+                for c in cell.col..cell.col.saturating_add(cell.col_span) {
+                    let gi = (r as usize) * cc + (c as usize);
+                    if gi < self.cell_grid.len() {
+                        self.cell_grid[gi] = Some(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// [#2722] 셀이 실제로 가리키는 마지막 그리드 인덱스 + 1.
+    /// 손상된 `row_count`/`col_count` 로 그리드가 상한을 넘을 때만 쓰인다.
+    /// 셀이 없으면 0 — 셀 0개짜리 악성 표는 그리드도 0칸이면 충분하다.
+    fn addressed_grid_len(&self, cc: usize) -> usize {
+        self.cells
+            .iter()
+            .map(|cell| {
+                let last_row = (cell.row as usize)
+                    .saturating_add(cell.row_span as usize)
+                    .saturating_sub(1);
+                let last_col = (cell.col as usize)
+                    .saturating_add(cell.col_span as usize)
+                    .saturating_sub(1);
+                last_row
+                    .saturating_mul(cc)
+                    .saturating_add(last_col)
+                    .saturating_add(1)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// O(1) 셀 인덱스 조회. rebuild_grid() 호출 후 사용해야 한다.
+    pub fn cell_index_at(&self, row: u16, col: u16) -> Option<usize> {
+        let idx = (row as usize) * (self.col_count as usize) + (col as usize);
+        self.cell_grid.get(idx)?.as_ref().copied()
+    }
+
+    /// O(1) 셀 접근 (불변). rebuild_grid() 호출 후 사용해야 한다.
+    pub fn cell_at(&self, row: u16, col: u16) -> Option<&Cell> {
+        let idx = (row as usize) * (self.col_count as usize) + (col as usize);
+        let &cell_idx = self.cell_grid.get(idx)?.as_ref()?;
+        self.cells.get(cell_idx)
+    }
+
+    /// O(1) 셀 접근 (가변). rebuild_grid() 호출 후 사용해야 한다.
+    pub fn cell_at_mut(&mut self, row: u16, col: u16) -> Option<&mut Cell> {
+        let idx = (row as usize) * (self.col_count as usize) + (col as usize);
+        let &cell_idx = self.cell_grid.get(idx)?.as_ref()?;
+        self.cells.get_mut(cell_idx)
+    }
+
+    fn validate_unmerged_rect(
+        &self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) -> Result<(), String> {
+        if start_row > end_row || start_col > end_col {
+            return Err("셀 범위가 유효하지 않습니다".to_string());
+        }
+        if end_row >= self.row_count || end_col >= self.col_count {
+            return Err(format!(
+                "셀 범위 ({},{})~({},{})가 표 크기 {}×{}를 초과합니다",
+                start_row, start_col, end_row, end_col, self.row_count, self.col_count
+            ));
+        }
+
+        for row in start_row..=end_row {
+            for col in start_col..=end_col {
+                let cell_idx = self
+                    .cell_index_at(row, col)
+                    .ok_or_else(|| format!("셀 ({},{})을 찾을 수 없습니다", row, col))?;
+                let cell = &self.cells[cell_idx];
+                if cell.row != row || cell.col != col || cell.row_span != 1 || cell.col_span != 1 {
+                    return Err(format!(
+                        "병합 셀 ({},{})은 행/열 바꿈 범위에 포함할 수 없습니다",
+                        cell.row, cell.col
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 직사각형 범위의 셀 문단을 행/열 바꿈 복사용 데이터로 복사한다.
+    pub fn copy_transpose_range(
+        &self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) -> Result<TableTransposeData, String> {
+        self.validate_unmerged_rect(start_row, start_col, end_row, end_col)?;
+
+        let source_rows = end_row - start_row + 1;
+        let source_cols = end_col - start_col + 1;
+        let mut cells = Vec::with_capacity(source_rows as usize);
+
+        for row in start_row..=end_row {
+            let mut row_cells = Vec::with_capacity(source_cols as usize);
+            for col in start_col..=end_col {
+                let cell_idx = self
+                    .cell_index_at(row, col)
+                    .ok_or_else(|| format!("셀 ({},{})을 찾을 수 없습니다", row, col))?;
+                row_cells.push(self.cells[cell_idx].paragraphs.clone());
+            }
+            cells.push(row_cells);
+        }
+
+        Ok(TableTransposeData {
+            source_rows,
+            source_cols,
+            cells,
+        })
+    }
+
+    /// 행/열 바꿈 복사 데이터를 대상 시작 셀부터 붙여넣는다.
+    ///
+    /// 반환값은 내용이 교체된 `(cell_idx, paragraph_count)` 목록이다.
+    pub fn paste_transposed_cells(
+        &mut self,
+        start_row: u16,
+        start_col: u16,
+        data: &TableTransposeData,
+    ) -> Result<Vec<(usize, usize)>, String> {
+        if data.source_rows == 0 || data.source_cols == 0 || data.cells.is_empty() {
+            return Err("행/열 바꿈 복사 데이터가 비어 있습니다".to_string());
+        }
+        if data.cells.len() != data.source_rows as usize
+            || data
+                .cells
+                .iter()
+                .any(|row| row.len() != data.source_cols as usize)
+        {
+            return Err("행/열 바꿈 복사 데이터의 행/열 크기가 일치하지 않습니다".to_string());
+        }
+
+        let target_rows = data.source_cols;
+        let target_cols = data.source_rows;
+        let end_row = start_row
+            .checked_add(target_rows - 1)
+            .ok_or_else(|| "대상 행 범위가 너무 큽니다".to_string())?;
+        let end_col = start_col
+            .checked_add(target_cols - 1)
+            .ok_or_else(|| "대상 열 범위가 너무 큽니다".to_string())?;
+        self.validate_unmerged_rect(start_row, start_col, end_row, end_col)?;
+
+        let mut changed = Vec::with_capacity((target_rows as usize) * (target_cols as usize));
+        for source_row in 0..data.source_rows {
+            for source_col in 0..data.source_cols {
+                let target_row = start_row + source_col;
+                let target_col = start_col + source_row;
+                let cell_idx = self.cell_index_at(target_row, target_col).ok_or_else(|| {
+                    format!("셀 ({},{})을 찾을 수 없습니다", target_row, target_col)
+                })?;
+                let mut paragraphs = data.cells[source_row as usize][source_col as usize].clone();
+                if paragraphs.is_empty() {
+                    paragraphs.push(Paragraph::new_empty());
+                }
+                let para_count = paragraphs.len();
+                self.cells[cell_idx].paragraphs = paragraphs;
+                changed.push((cell_idx, para_count));
+            }
+        }
+
+        Ok(changed)
+    }
+
+    /// 병합 없는 전체 표를 제자리에서 전치한다.
+    pub fn transpose_unmerged_table_in_place(&mut self) -> Result<Vec<(usize, usize)>, String> {
+        if self.row_count == 0 || self.col_count == 0 {
+            return Err("행/열을 바꿀 표가 비어 있습니다".to_string());
+        }
+        self.validate_unmerged_rect(0, 0, self.row_count - 1, self.col_count - 1)?;
+
+        let source_rows = self.row_count;
+        let source_cols = self.col_count;
+        let source_cells = (0..source_rows)
+            .map(|row| {
+                (0..source_cols)
+                    .map(|col| {
+                        let cell_idx = self
+                            .cell_index_at(row, col)
+                            .ok_or_else(|| format!("셀 ({},{})을 찾을 수 없습니다", row, col))?;
+                        Ok(self.cells[cell_idx].clone())
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let target_rows = source_cols;
+        let target_cols = source_rows;
+        let total_width: HwpUnit = self.get_column_widths().iter().sum();
+        let target_widths = distribute_hwp_units(total_width.max(1800), target_cols);
+        let row_height = self
+            .get_row_heights()
+            .into_iter()
+            .max()
+            .unwrap_or(400)
+            .max(400);
+
+        let mut cells = Vec::with_capacity((target_rows as usize) * (target_cols as usize));
+        for target_row in 0..target_rows {
+            for target_col in 0..target_cols {
+                let mut cell = source_cells[target_col as usize][target_row as usize].clone();
+                cell.row = target_row;
+                cell.col = target_col;
+                cell.row_span = 1;
+                cell.col_span = 1;
+                cell.width = target_widths[target_col as usize];
+                cell.height = row_height;
+                if cell.paragraphs.is_empty() {
+                    cell.paragraphs.push(Paragraph::new_empty());
+                }
+                cells.push(cell);
+            }
+        }
+
+        self.row_count = target_rows;
+        self.col_count = target_cols;
+        self.row_sizes = vec![target_cols as i16; target_rows as usize];
+        self.cells = cells;
+        self.zones.clear();
+        self.update_ctrl_dimensions();
+        self.rebuild_grid();
+
+        Ok(self
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(idx, cell)| (idx, cell.paragraphs.len()))
+            .collect())
+    }
+
+    /// raw_ctrl_data 내 CommonObjAttr의 width/height를 재계산하여 갱신한다 (의도된 dual).
+    ///
+    /// **Dual maintenance 의 이유** (Picture/Shape 와 다른 점):
+    /// - **Table**: `serializer/control.rs:461` 가 `table.raw_ctrl_data` 를 그대로 기록 →
+    ///   `raw_ctrl_data` 가 **source-of-truth**. 본 함수가 cell 조절 후 갱신 필수.
+    /// - **Picture/Shape**: `serializer/control.rs:895` 가 `&serialize_common_obj_attr(&pic.common)`
+    ///   으로 매번 재생성 → `self.common` 이 source-of-truth, raw bytes 는 derived.
+    ///
+    /// Table 만 dual 인 것은 serializer 의 source-of-truth 정책 차이로 의도된 구조.
+    /// 추후 모델 통일 (Picture/Shape 정합으로 Table 전환) 시 본 함수도 단순화 가능.
+    ///
+    /// raw_ctrl_data 레이아웃 (parse_common_obj_attr 정합):
+    ///   [0..4] flags, [4..8] v_offset, [8..12] h_offset,
+    ///   [12..16] width, [16..20] height, [20..24] z_order,
+    ///   [24..32] outer_margin (i16×4), [32..36] instance_id
+    pub fn update_ctrl_dimensions(&mut self) {
+        let total_width: HwpUnit = self.base_grid_column_widths().iter().sum();
+        let total_height: HwpUnit = self.get_row_heights().iter().sum();
+        // (1) serialize source — raw_ctrl_data bytes (HWP 직렬화 시 사용).
+        // HWPX 파스 문서처럼 raw 가 없으면 건너뛴다 — 그 경우 직렬화기가
+        // self.common 에서 합성하므로 (2)만으로 충분하다.
+        if self.raw_ctrl_data.len() >= common_obj_offsets::HEIGHT.end {
+            self.raw_ctrl_data[common_obj_offsets::WIDTH]
+                .copy_from_slice(&total_width.to_le_bytes());
+            self.raw_ctrl_data[common_obj_offsets::HEIGHT]
+                .copy_from_slice(&total_height.to_le_bytes());
+        }
+        // (2) [Task #1151 v6] paragraph_layout cache — self.common.width/height.
+        // v3 helper (calc_sibling_topandbottom_table_reserved_hu) 가 self.common.height 사용.
+        // dual maintenance 가 필수 — 한쪽만 갱신 시 stale 결함.
+        self.common.width = total_width;
+        self.common.height = total_height;
+    }
+
+    pub(crate) fn sync_ctrl_height(&mut self, height: HwpUnit) {
+        self.common.height = height;
+        if self.raw_ctrl_data.len() >= common_obj_offsets::HEIGHT.end {
+            self.raw_ctrl_data[common_obj_offsets::HEIGHT].copy_from_slice(&height.to_le_bytes());
+        }
+    }
+
+    pub(crate) fn stretched_row_heights(&self) -> Option<Vec<HwpUnit>> {
+        let mut heights = self.get_row_heights();
+        let raw_sum: u64 = heights.iter().map(|h| *h as u64).sum();
+        let target = self.common.height as u64;
+        if heights.is_empty() || raw_sum == 0 || target <= raw_sum {
+            return None;
+        }
+
+        let mut scaled_sum = 0u64;
+        for height in &mut heights {
+            let scaled = ((*height as u64 * target) + raw_sum / 2) / raw_sum;
+            *height = scaled.max(1).min(u32::MAX as u64) as HwpUnit;
+            scaled_sum += *height as u64;
+        }
+
+        if let Some(last) = heights.last_mut() {
+            match target.cmp(&scaled_sum) {
+                std::cmp::Ordering::Greater => {
+                    let delta = (target - scaled_sum).min(u32::MAX as u64);
+                    *last = last.saturating_add(delta as HwpUnit);
+                }
+                std::cmp::Ordering::Less => {
+                    let delta = (scaled_sum - target).min(*last as u64);
+                    *last = last.saturating_sub(delta as HwpUnit).max(1);
+                }
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+
+        Some(heights)
+    }
+
+    /// 열별 폭을 추출한다 (col_span==1인 셀 기준).
+    /// 흐름에서 이 표가 차지하는 가로 폭(HWPUNIT).
+    ///
+    /// [#5785] `get_column_widths()` 의 합을 쓰면 안 된다. 그 합은 전역 그리드에서
+    /// `col_span == 1` 인 셀의 **열별 최대값** 합이라, 행마다 열 구획이 다른 표에서
+    /// 실제 폭보다 커진다(3049001 약장 실측 12,872 vs 17,299 HU). 선언 폭
+    /// `common.width` 가 있으면 그것이 이 표의 폭이다.
+    ///
+    /// 선언 폭이 0 인 합성 표에서만 열 합으로 폴백한다.
+    ///
+    /// 이 규칙은 종전에 `is_tac_table_inline` 한 자리에만 있었고, 나머지 흐름 폭
+    /// 호출부 셋은 원시 합을 그대로 써서 같은 결함이 남아 있었다 — 표가 선언보다
+    /// 넓게 배치돼 본문 오른쪽 여백을 넘었다(samples 전수에서 12문서).
+    /// 규칙을 모델로 올려 호출부가 고를 수 없게 한다.
+    pub fn flow_width_hu(&self) -> HwpUnit {
+        if self.common.width > 0 {
+            self.common.width
+        } else {
+            self.get_column_widths().iter().sum()
+        }
+    }
+
+    pub fn get_column_widths(&self) -> Vec<HwpUnit> {
+        let mut widths = vec![0u32; self.col_count as usize];
+        for cell in &self.cells {
+            if cell.col_span == 1 && (cell.col as usize) < widths.len() {
+                if cell.width > widths[cell.col as usize] {
+                    widths[cell.col as usize] = cell.width;
+                }
+            }
+        }
+        // 폭이 0인 열은 기본값 1800 HWPUNIT (약 6.35mm)
+        for w in &mut widths {
+            if *w == 0 {
+                *w = 1800;
+            }
+        }
+        widths
+    }
+
+    /// Base grid column widths.
+    ///
+    /// Independent persisted row boundaries are consumed by layout directly;
+    /// this aggregate remains a fallback for incomplete rows and merged-cell
+    /// constraints.
+    pub fn base_grid_column_widths(&self) -> Vec<HwpUnit> {
+        self.get_column_widths()
+    }
+
+    /// 열별 폭(HWPUNIT)을 절대값으로 설정한다.
+    ///
+    /// `widths.len()` 은 `col_count` 와 같아야 한다. 병합 셀(`col_span > 1`)은
+    /// 걸친 열들의 폭 합으로 설정된다. 설정 후 표 전체 크기
+    /// (`update_ctrl_dimensions`)와 그리드 인덱스(`rebuild_grid`)를 갱신한다.
+    ///
+    /// `insert_column` 이 기준 열 폭을 복제해 표를 넓히는 것과 달리, 이 메서드는
+    /// 입력한 폭들의 합이 그대로 표 전체 폭이 된다. 페이지 폭에 맞추려면
+    /// 합이 본문 폭 이하가 되도록 전달한다.
+    pub fn set_column_widths(&mut self, widths: &[HwpUnit]) -> Result<(), String> {
+        if widths.len() != self.col_count as usize {
+            return Err(format!(
+                "열 폭 개수 {} 가 표의 열 수 {} 와 다릅니다",
+                widths.len(),
+                self.col_count
+            ));
+        }
+        for cell in &mut self.cells {
+            let c = cell.col as usize;
+            if c >= widths.len() {
+                continue;
+            }
+            let end = (c + cell.col_span as usize).min(widths.len());
+            cell.width = widths[c..end].iter().sum();
+        }
+        self.update_ctrl_dimensions();
+        self.rebuild_grid();
+        Ok(())
+    }
+
+    /// 행별 높이를 추출한다 (row_span==1인 셀 기준).
+    /// 높이가 0인 행은 기본값 400으로 대체 (새 셀 생성용).
+    pub fn get_row_heights(&self) -> Vec<HwpUnit> {
+        let mut heights = self.get_raw_row_heights();
+        // 높이가 0인 행은 기본값 400 HWPUNIT
+        for h in &mut heights {
+            if *h == 0 {
+                *h = 400;
+            }
+        }
+        heights
+    }
+
+    /// 행별 높이를 추출한다 (fallback 없이 원본 값 그대로).
+    /// 병합 시 원본 height=0 (자동 맞춤) 보존용.
+    pub fn get_raw_row_heights(&self) -> Vec<HwpUnit> {
+        let mut heights = vec![0u32; self.row_count as usize];
+        for cell in &self.cells {
+            if cell.row_span == 1 && (cell.row as usize) < heights.len() {
+                if cell.height > heights[cell.row as usize] {
+                    heights[cell.row as usize] = cell.height;
+                }
+            }
+        }
+        heights
+    }
+
+    /// row_sizes를 행별 실제 셀 개수로 재계산한다.
+    pub(crate) fn rebuild_row_sizes(&mut self) {
+        self.row_sizes = (0..self.row_count)
+            .map(|r| self.cells.iter().filter(|c| c.row == r).count() as i16)
+            .collect();
+    }
+
+    /// 행을 삽입한다.
+    ///
+    /// `row_idx`: 기준 행 인덱스, `below`: true면 아래에, false면 위에 삽입.
+    /// 반환: Ok(()) 또는 에러 메시지.
+    pub fn insert_row(&mut self, row_idx: u16, below: bool) -> Result<(), String> {
+        if row_idx >= self.row_count {
+            return Err(format!(
+                "행 인덱스 {} 범위 초과 (총 {}행)",
+                row_idx, self.row_count
+            ));
+        }
+
+        let new_row_count = checked_table_u16_add(self.row_count, 1, "표 행 수")?;
+        let target_row = if below {
+            checked_table_u16_add(row_idx, 1, "삽입 행 인덱스")?
+        } else {
+            row_idx
+        };
+        // 변형 전에 모든 좌표와 span의 증가 가능 여부를 확인한다. saturating_add만
+        // 쓰면 count는 포화됐는데 셀만 움직이는 불일치가 남는다.
+        for cell in &self.cells {
+            let row_end = checked_table_span_end(cell.row, cell.row_span, "행")?;
+            if cell.row >= target_row {
+                checked_table_u16_add(cell.row, 1, "셀 행 인덱스")?;
+            }
+            if cell.row < target_row && row_end > target_row {
+                checked_table_u16_add(cell.row_span, 1, "셀 행 span")?;
+            }
+        }
+
+        let stretched_new_row_height = self
+            .stretched_row_heights()
+            .and_then(|heights| heights.get(row_idx as usize).copied());
+        let original_height = self.common.height;
+        let col_widths = self.get_column_widths();
+
+        // 셀 height용
+        let row_heights = self.get_row_heights();
+        let new_cell_height: HwpUnit = if (row_idx as usize) < row_heights.len() {
+            row_heights[row_idx as usize]
+        } else {
+            400
+        };
+
+        // 병합 셀 확장 + 기존 셀 시프트 (커버리지 맵 생성용으로 먼저 처리)
+        // 삽입 지점을 걸치는 병합 셀 추적
+        let mut covered_cols = vec![false; self.col_count as usize];
+
+        // [#4264] row+row_span/col+col_span 은 파일에서 그대로 온 u16 이라
+        // saturating_add 없이 더하면 오버플로 패닉한다(rebuild_grid()와 동일 원인).
+        for cell in &mut self.cells {
+            // 병합 셀이 삽입 지점을 걸치는 경우: row_span 확장
+            if cell.row < target_row
+                && checked_table_span_end(cell.row, cell.row_span, "행")? > target_row
+            {
+                cell.row_span = checked_table_u16_add(cell.row_span, 1, "셀 행 span")?;
+                // 이 셀이 커버하는 열 표시
+                for c in cell.col..cell.col.saturating_add(cell.col_span).min(self.col_count) {
+                    covered_cols[c as usize] = true;
+                }
+            }
+            // target_row 이상의 셀은 1행 아래로 시프트
+            if cell.row >= target_row {
+                cell.row = checked_table_u16_add(cell.row, 1, "셀 행 인덱스")?;
+            }
+        }
+
+        // 새 셀 생성: 병합 셀에 의해 커버되지 않는 열에만
+        // 삽입 지점 아래 행의 셀을 템플릿으로 우선 사용 (헤더 행 대신 데이터 행)
+        // target_row 아래(+1)의 셀이 원래 데이터 행이므로 먼저 시도, 없으면 위(-1), 그래도 없으면 아무 셀
+        for c in 0..self.col_count {
+            if !covered_cols[c as usize] {
+                let width = col_widths[c as usize];
+                let template = self
+                    .cells
+                    .iter()
+                    .find(|cell| {
+                        cell.col == c
+                            && cell.col_span == 1
+                            && cell.row == target_row.saturating_add(1)
+                    })
+                    .or_else(|| {
+                        if target_row > 0 {
+                            self.cells.iter().find(|cell| {
+                                cell.col == c && cell.col_span == 1 && cell.row == target_row - 1
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        self.cells
+                            .iter()
+                            .find(|cell| cell.col == c && cell.col_span == 1)
+                    })
+                    // 열 c 가 전부 병합 셀이면 위 탐색이 모두 실패한다. 서식 0 짜리 셀을
+                    // 만드느니 표의 아무 셀이나 템플릿으로 쓴다 (주석의 "아무 셀").
+                    .or_else(|| self.cells.first());
+                let new_cell = if let Some(tpl) = template {
+                    Cell::new_from_template(c, target_row, width, new_cell_height, tpl)
+                } else {
+                    // 셀이 하나도 없는 표 — 상속원이 존재하지 않는 유일한 경우
+                    Cell::new_empty(c, target_row, width, new_cell_height, self.border_fill_id)
+                };
+                self.cells.push(new_cell);
+            }
+        }
+
+        // row_count 갱신 및 row_sizes 재계산 (행별 셀 개수)
+        // [#4264] row_count도 파일에서 그대로 온 u16이라 이미 65535인 손상된
+        // 문서에서 삽입을 시도하면 오버플로 패닉했다.
+        self.row_count = new_row_count;
+        self.rebuild_row_sizes();
+
+        // 행 우선 순서 정렬
+        self.cells.sort_by_key(|c| (c.row, c.col));
+
+        // CommonObjAttr 크기 갱신
+        self.update_ctrl_dimensions();
+        if let Some(new_row_height) = stretched_new_row_height {
+            // 일반 표는 셀 저장 height보다 큰 표시 height를 별도로 가진다.
+            // 행 추가 시 표시 기준 행 높이를 더해 표가 납작해지지 않도록 보존한다.
+            self.sync_ctrl_height(original_height.saturating_add(new_row_height));
+        }
+
+        // 그리드 인덱스 재구축
+        self.rebuild_grid();
+
+        Ok(())
+    }
+
+    /// 열을 삽입한다.
+    ///
+    /// `col_idx`: 기준 열 인덱스, `right`: true면 오른쪽에, false면 왼쪽에 삽입.
+    pub fn insert_column(&mut self, col_idx: u16, right: bool) -> Result<(), String> {
+        if col_idx >= self.col_count {
+            return Err(format!(
+                "열 인덱스 {} 범위 초과 (총 {}열)",
+                col_idx, self.col_count
+            ));
+        }
+
+        let new_col_count = checked_table_u16_add(self.col_count, 1, "표 열 수")?;
+        let target_col = if right {
+            checked_table_u16_add(col_idx, 1, "삽입 열 인덱스")?
+        } else {
+            col_idx
+        };
+        for cell in &self.cells {
+            let col_end = checked_table_span_end(cell.col, cell.col_span, "열")?;
+            if cell.col >= target_col {
+                checked_table_u16_add(cell.col, 1, "셀 열 인덱스")?;
+            }
+            if cell.col < target_col && col_end > target_col {
+                checked_table_u16_add(cell.col_span, 1, "셀 열 span")?;
+            }
+        }
+
+        let original_height = self.common.height;
+        let col_widths = self.get_column_widths();
+        let row_heights = self.get_row_heights();
+        let new_col_width = col_widths[col_idx as usize];
+
+        // 병합 셀 확장 + 기존 셀 시프트
+        let mut covered_rows = vec![false; self.row_count as usize];
+
+        // [#4264] row+row_span/col+col_span 은 파일에서 그대로 온 u16 이라
+        // saturating_add 없이 더하면 오버플로 패닉한다(rebuild_grid()와 동일 원인).
+        for cell in &mut self.cells {
+            // 병합 셀이 삽입 지점을 걸치는 경우: col_span 확장
+            if cell.col < target_col
+                && checked_table_span_end(cell.col, cell.col_span, "열")? > target_col
+            {
+                cell.col_span = checked_table_u16_add(cell.col_span, 1, "셀 열 span")?;
+                cell.width += new_col_width;
+                // 이 셀이 커버하는 행 표시
+                for r in cell.row..cell.row.saturating_add(cell.row_span).min(self.row_count) {
+                    covered_rows[r as usize] = true;
+                }
+            }
+            // target_col 이상의 셀은 1열 오른쪽으로 시프트
+            if cell.col >= target_col {
+                cell.col = checked_table_u16_add(cell.col, 1, "셀 열 인덱스")?;
+            }
+        }
+
+        // 새 셀 생성: 병합 셀에 의해 커버되지 않는 행에만
+        // 삽입 지점 오른쪽 열의 셀을 템플릿으로 우선 사용, 없으면 왼쪽, 그래도 없으면 아무 셀
+        for r in 0..self.row_count {
+            if !covered_rows[r as usize] {
+                let height = row_heights[r as usize];
+                let template = self
+                    .cells
+                    .iter()
+                    .find(|cell| {
+                        cell.row == r
+                            && cell.row_span == 1
+                            && cell.col == target_col.saturating_add(1)
+                    })
+                    .or_else(|| {
+                        if target_col > 0 {
+                            self.cells.iter().find(|cell| {
+                                cell.row == r && cell.row_span == 1 && cell.col == target_col - 1
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        self.cells
+                            .iter()
+                            .find(|cell| cell.row == r && cell.row_span == 1)
+                    })
+                    // 행 r 이 전부 병합 셀이면 위 탐색이 모두 실패한다. 서식 0 짜리 셀을
+                    // 만드느니 표의 아무 셀이나 템플릿으로 쓴다 (주석의 "아무 셀").
+                    .or_else(|| self.cells.first());
+                let new_cell = if let Some(tpl) = template {
+                    Cell::new_from_template(target_col, r, new_col_width, height, tpl)
+                } else {
+                    // 셀이 하나도 없는 표 — 상속원이 존재하지 않는 유일한 경우
+                    Cell::new_empty(target_col, r, new_col_width, height, self.border_fill_id)
+                };
+                self.cells.push(new_cell);
+            }
+        }
+
+        // col_count 갱신 및 row_sizes 재계산 (행별 셀 개수)
+        // [#4264] col_count도 파일에서 그대로 온 u16이라 이미 65535인 손상된
+        // 문서에서 삽입을 시도하면 오버플로 패닉했다.
+        self.col_count = new_col_count;
+        self.rebuild_row_sizes();
+
+        // 행 우선 순서 정렬
+        self.cells.sort_by_key(|c| (c.row, c.col));
+
+        // CommonObjAttr 크기 갱신
+        self.update_ctrl_dimensions();
+        if original_height > 0 {
+            // 열 추가는 행 수를 바꾸지 않으므로 표 외곽 높이는 기존 값을 유지한다.
+            self.common.height = original_height;
+            if self.raw_ctrl_data.len() >= common_obj_offsets::HEIGHT.end {
+                self.raw_ctrl_data[common_obj_offsets::HEIGHT]
+                    .copy_from_slice(&original_height.to_le_bytes());
+            }
+        }
+
+        // 그리드 인덱스 재구축
+        self.rebuild_grid();
+
+        Ok(())
+    }
+
+    /// 행을 삭제한다.
+    ///
+    /// `row_idx`: 삭제할 행 인덱스. 최소 1행은 유지 (row_count == 1이면 에러).
+    pub fn delete_row(&mut self, row_idx: u16) -> Result<(), String> {
+        if row_idx >= self.row_count {
+            return Err(format!(
+                "행 인덱스 {} 범위 초과 (총 {}행)",
+                row_idx, self.row_count
+            ));
+        }
+        if self.row_count <= 1 {
+            return Err("최소 1행은 유지해야 합니다".to_string());
+        }
+
+        let stretched_deleted_row_height = self
+            .stretched_row_heights()
+            .and_then(|heights| heights.get(row_idx as usize).copied());
+        let original_height = self.common.height;
+
+        // 삭제 행을 걸치는 병합 셀: row_span 축소
+        // [#4264] row/row_span은 파일에서 그대로 온 u16이라 saturating_add 없이
+        // 더하면 오버플로 패닉한다(rebuild_grid()와 동일 원인).
+        for cell in &mut self.cells {
+            if cell.row < row_idx && cell.row.saturating_add(cell.row_span) > row_idx {
+                cell.row_span -= 1;
+            }
+        }
+
+        // 삭제 대상 행의 셀 제거 (해당 행에 앵커가 있고 row_span==1인 셀)
+        self.cells
+            .retain(|cell| !(cell.row == row_idx && cell.row_span == 1));
+
+        // 삭제 행에 앵커가 있지만 row_span > 1인 병합 셀: 다음 행으로 이동, row_span 축소
+        for cell in &mut self.cells {
+            if cell.row == row_idx && cell.row_span > 1 {
+                cell.row_span -= 1;
+            }
+        }
+
+        // 삭제 행 아래 셀: row -= 1
+        for cell in &mut self.cells {
+            if cell.row > row_idx {
+                cell.row -= 1;
+            }
+        }
+
+        // row_count 갱신 및 row_sizes 재계산
+        self.row_count -= 1;
+        self.rebuild_row_sizes();
+
+        // 행 우선 순서 정렬
+        self.cells.sort_by_key(|c| (c.row, c.col));
+
+        // CommonObjAttr 크기 갱신
+        self.update_ctrl_dimensions();
+        if let Some(deleted_row_height) = stretched_deleted_row_height {
+            // 일반 표의 표시 높이는 셀 저장 height 합보다 크므로 삭제 행의 표시
+            // 높이만큼 외곽 height를 줄여 한컴식 비례를 유지한다.
+            let raw_sum: HwpUnit = self.get_row_heights().iter().sum();
+            self.sync_ctrl_height(
+                original_height
+                    .saturating_sub(deleted_row_height)
+                    .max(raw_sum),
+            );
+        }
+
+        // 그리드 인덱스 재구축
+        self.rebuild_grid();
+
+        Ok(())
+    }
+
+    /// 열을 삭제한다.
+    ///
+    /// `col_idx`: 삭제할 열 인덱스. 최소 1열은 유지 (col_count == 1이면 에러).
+    pub fn delete_column(&mut self, col_idx: u16) -> Result<(), String> {
+        if col_idx >= self.col_count {
+            return Err(format!(
+                "열 인덱스 {} 범위 초과 (총 {}열)",
+                col_idx, self.col_count
+            ));
+        }
+        if self.col_count <= 1 {
+            return Err("최소 1열은 유지해야 합니다".to_string());
+        }
+
+        let original_height = self.common.height;
+
+        // 삭제 열의 폭 (셀 width 축소용)
+        let col_widths = self.get_column_widths();
+        let deleted_width = col_widths[col_idx as usize];
+
+        // 삭제 열을 걸치는 병합 셀: col_span 축소, width 축소
+        // [#4264] col/col_span은 파일에서 그대로 온 u16이라 saturating_add 없이
+        // 더하면 오버플로 패닉한다(rebuild_grid()와 동일 원인).
+        for cell in &mut self.cells {
+            if cell.col < col_idx && cell.col.saturating_add(cell.col_span) > col_idx {
+                cell.col_span -= 1;
+                if cell.width >= deleted_width {
+                    cell.width -= deleted_width;
+                }
+            }
+        }
+
+        // 삭제 대상 열의 셀 제거 (해당 열에 앵커가 있고 col_span==1인 셀)
+        self.cells
+            .retain(|cell| !(cell.col == col_idx && cell.col_span == 1));
+
+        // 삭제 열에 앵커가 있지만 col_span > 1인 병합 셀: 다음 열로 이동, col_span 축소
+        for cell in &mut self.cells {
+            if cell.col == col_idx && cell.col_span > 1 {
+                cell.col_span -= 1;
+                if cell.width >= deleted_width {
+                    cell.width -= deleted_width;
+                }
+            }
+        }
+
+        // 삭제 열 오른쪽 셀: col -= 1
+        for cell in &mut self.cells {
+            if cell.col > col_idx {
+                cell.col -= 1;
+            }
+        }
+
+        // col_count 갱신 및 row_sizes 재계산
+        self.col_count -= 1;
+        self.rebuild_row_sizes();
+
+        // 행 우선 순서 정렬
+        self.cells.sort_by_key(|c| (c.row, c.col));
+
+        // CommonObjAttr 크기 갱신
+        self.update_ctrl_dimensions();
+        if original_height > 0 {
+            // 열 삭제는 행 수를 바꾸지 않으므로 표 외곽 높이는 기존 값을 유지한다.
+            self.common.height = original_height;
+            if self.raw_ctrl_data.len() >= common_obj_offsets::HEIGHT.end {
+                self.raw_ctrl_data[common_obj_offsets::HEIGHT]
+                    .copy_from_slice(&original_height.to_le_bytes());
+            }
+        }
+
+        // 그리드 인덱스 재구축
+        self.rebuild_grid();
+
+        Ok(())
+    }
+
+    /// 직사각형 범위의 셀을 병합한다.
+    ///
+    /// 범위: (start_col, start_row) ~ (end_col, end_row) (모두 포함).
+    /// 좌상단 셀이 병합 결과가 되고, 나머지 셀은 제거된다.
+    pub fn merge_cells(
+        &mut self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) -> Result<(), String> {
+        // 범위 유효성 검증
+        if start_row > end_row || start_col > end_col {
+            return Err("병합 범위가 유효하지 않습니다".to_string());
+        }
+        if end_row >= self.row_count || end_col >= self.col_count {
+            return Err(format!(
+                "병합 범위 ({},{})~({},{})가 표 크기 {}×{}를 초과합니다",
+                start_row, start_col, end_row, end_col, self.row_count, self.col_count
+            ));
+        }
+
+        // 범위 내 셀이 모두 범위 안에 들어오는지 확인 (부분 겹침 방지)
+        //
+        // row_span/col_span은 정상 경로(HWPX/HWP3 파서)에서는 항상 1 이상으로
+        // 정규화되지만, HWP5 바이너리 파서(src/parser/control.rs)는 파일에 기록된
+        // 값을 검증 없이 그대로 사용하므로 손상된 문서에서는 0이 들어올 수 있다.
+        // saturating 연산 없이 `row + row_span - 1`을 계산하면 row_span=0일 때
+        // u16 언더플로로 패닉한다.
+        for cell in &self.cells {
+            let cell_end_row = cell.row.saturating_add(cell.row_span).saturating_sub(1);
+            let cell_end_col = cell.col.saturating_add(cell.col_span).saturating_sub(1);
+
+            // 셀이 범위와 겹치는지 확인
+            let overlaps = cell.col <= end_col
+                && cell_end_col >= start_col
+                && cell.row <= end_row
+                && cell_end_row >= start_row;
+
+            if overlaps {
+                // 겹치는 셀은 범위 안에 완전히 포함되어야 함
+                let contained = cell.col >= start_col
+                    && cell_end_col <= end_col
+                    && cell.row >= start_row
+                    && cell_end_row <= end_row;
+                if !contained {
+                    return Err(format!(
+                        "셀 ({},{}) span ({},{})이 병합 범위를 벗어납니다",
+                        cell.row, cell.col, cell.row_span, cell.col_span
+                    ));
+                }
+            }
+        }
+
+        // 주 셀 존재 확인
+        if !self
+            .cells
+            .iter()
+            .any(|c| c.col == start_col && c.row == start_row)
+        {
+            return Err(format!(
+                "주 셀 ({},{})을 찾을 수 없습니다",
+                start_row, start_col
+            ));
+        }
+
+        // 열폭/행높이 합산 (원본 값 보존: 0은 fallback 없이 그대로 유지)
+        let col_widths = self.get_column_widths();
+        let raw_row_heights = self.get_raw_row_heights();
+        let new_width: HwpUnit = (start_col..=end_col)
+            .map(|c| col_widths.get(c as usize).copied().unwrap_or(0))
+            .sum();
+        let new_height: HwpUnit = (start_row..=end_row)
+            .map(|r| raw_row_heights.get(r as usize).copied().unwrap_or(0))
+            .sum();
+
+        // 비주 셀을 제거하며 (한컴 오피스와 동일하게 셀을 실제로 제거) 그 문단을 통째로
+        // 옮긴다. 컨트롤·필드 범위와 빈 문단도 그대로 간다. 빈 셀(컨트롤 없는 빈 문단
+        // 하나)만 보탤 내용이 없어 건너뛴다.
+        let mut extra_paragraphs: Vec<Paragraph> = Vec::new();
+        self.cells.retain_mut(|cell| {
+            if cell.col == start_col && cell.row == start_row {
+                return true; // 주 셀 유지
+            }
+            let in_range = cell.col >= start_col
+                && cell.col <= end_col
+                && cell.row >= start_row
+                && cell.row <= end_row;
+            if !in_range {
+                return true; // 범위 밖 셀 유지
+            }
+            let empty_cell = matches!(
+                cell.paragraphs.as_slice(),
+                [para] if para.text.is_empty() && para.controls.is_empty()
+            );
+            if !empty_cell {
+                extra_paragraphs.append(&mut cell.paragraphs);
+            }
+            false
+        });
+
+        // 주 셀 갱신
+        let primary = self
+            .cells
+            .iter_mut()
+            .find(|c| c.col == start_col && c.row == start_row)
+            .expect("주 셀이 retain 후에도 존재해야 합니다");
+
+        primary.col_span = end_col - start_col + 1;
+        primary.row_span = end_row - start_row + 1;
+        // raw_list_extra[0..4]에 참조 폭이 저장되어 있으면 갱신
+        if primary.raw_list_extra.len() >= 4 {
+            let old_ref_width =
+                u32::from_le_bytes(primary.raw_list_extra[0..4].try_into().unwrap());
+            if old_ref_width == primary.width {
+                primary.raw_list_extra[0..4].copy_from_slice(&new_width.to_le_bytes());
+            }
+        }
+        primary.width = new_width;
+        primary.height = new_height;
+
+        // 옮긴 문단 추가
+        for para in extra_paragraphs {
+            primary.paragraphs.push(para);
+        }
+
+        // 행 우선 순서 정렬
+        self.cells.sort_by_key(|c| (c.row, c.col));
+
+        // row_sizes 갱신 (행별 실제 셀 개수)
+        self.rebuild_row_sizes();
+
+        // 그리드 인덱스 재구축
+        self.rebuild_grid();
+
+        Ok(())
+    }
+
+    /// 병합된 셀을 나눈다 (merge_cells의 역연산).
+    ///
+    /// 대상 셀의 col_span > 1 또는 row_span > 1이어야 한다.
+    /// 원본 셀은 (target_col, target_row)에 col_span=1, row_span=1로 축소되고,
+    /// 나머지 위치에 새 빈 셀이 생성된다.
+    pub fn split_cell(&mut self, target_row: u16, target_col: u16) -> Result<(), String> {
+        // 대상 셀 찾기 및 검증
+        let cell_idx = self
+            .cells
+            .iter()
+            .position(|c| c.col == target_col && c.row == target_row)
+            .ok_or_else(|| format!("셀 ({},{})을 찾을 수 없습니다", target_row, target_col))?;
+
+        let orig_col_span = self.cells[cell_idx].col_span;
+        let orig_row_span = self.cells[cell_idx].row_span;
+        let orig_width = self.cells[cell_idx].width;
+        let orig_height = self.cells[cell_idx].height;
+
+        if orig_col_span <= 1 && orig_row_span <= 1 {
+            return Err("병합되지 않은 셀은 나눌 수 없습니다".to_string());
+        }
+        // [#4280] col_span/row_span은 HML "ColSpan"/"RowSpan"="0" 같은 손상된
+        // 문서에서 0으로 파싱될 수 있다(parser/hml/reader.rs의 parse_attribute는
+        // 속성이 없을 때만 unwrap_or(1)을 적용하고, 명시적 "0"은 그대로 통과시킨다).
+        // span 0이 섞이면 아래 `orig_width / orig_col_span`이 0-나누기로 패닉하거나,
+        // `target_col..target_col+0` 빈 범위로 split_col_widths가 비어
+        // `split_col_widths[0]`에서 index-out-of-bounds로 패닉한다.
+        if orig_col_span == 0 || orig_row_span == 0 {
+            return Err("손상된 셀(span 0)은 나눌 수 없습니다".to_string());
+        }
+        let col_end = checked_table_span_end(target_col, orig_col_span, "열")?;
+        let row_end = checked_table_span_end(target_row, orig_row_span, "행")?;
+        if col_end > self.col_count || row_end > self.row_count {
+            return Err("손상된 셀 범위가 표 크기를 벗어나 나눌 수 없습니다".to_string());
+        }
+
+        // 열폭 계산: 다른 행의 col_span==1 셀에서 실제 폭 추출, 없으면 균등 분배
+        let col_widths = self.get_column_widths();
+        let split_col_widths: Vec<HwpUnit> = {
+            let has_real = (target_col..col_end).all(|c| {
+                self.cells.iter().any(|cell| {
+                    cell.col == c
+                        && cell.col_span == 1
+                        && !(cell.col == target_col && cell.row == target_row)
+                })
+            });
+            if has_real {
+                (target_col..col_end)
+                    .map(|c| col_widths[c as usize])
+                    .collect()
+            } else {
+                let each = orig_width / orig_col_span as u32;
+                vec![each; orig_col_span as usize]
+            }
+        };
+
+        // 행높이 계산: 다른 열의 row_span==1 셀에서 실제 높이 추출, 없으면 균등 분배
+        let raw_row_heights = self.get_raw_row_heights();
+        let split_row_heights: Vec<HwpUnit> = {
+            let has_real = (target_row..row_end).all(|r| {
+                self.cells.iter().any(|cell| {
+                    cell.row == r
+                        && cell.row_span == 1
+                        && !(cell.col == target_col && cell.row == target_row)
+                })
+            });
+            if has_real {
+                (target_row..row_end)
+                    .map(|r| raw_row_heights[r as usize])
+                    .collect()
+            } else {
+                let each = orig_height / orig_row_span as u32;
+                vec![each; orig_row_span as usize]
+            }
+        };
+
+        // 주 셀 축소
+        let new_width = split_col_widths[0];
+        let primary = &mut self.cells[cell_idx];
+        primary.col_span = 1;
+        primary.row_span = 1;
+        if primary.raw_list_extra.len() >= 4 {
+            let old_ref = u32::from_le_bytes(primary.raw_list_extra[0..4].try_into().unwrap());
+            if old_ref == primary.width {
+                primary.raw_list_extra[0..4].copy_from_slice(&new_width.to_le_bytes());
+            }
+        }
+        primary.width = new_width;
+        primary.height = split_row_heights[0];
+
+        // 새 셀 생성: 범위 내 (target_col, target_row) 제외한 모든 위치
+        for ri in 0..orig_row_span {
+            for ci in 0..orig_col_span {
+                let r = checked_table_u16_add(target_row, ri, "분할 셀 행 인덱스")?;
+                let c = checked_table_u16_add(target_col, ci, "분할 셀 열 인덱스")?;
+                if r == target_row && c == target_col {
+                    continue; // 주 셀 위치 스킵
+                }
+                let w = split_col_widths[ci as usize];
+                let h = split_row_heights[ri as usize];
+                let new_cell = Cell::new_from_template(c, r, w, h, &self.cells[cell_idx]);
+                self.cells.push(new_cell);
+            }
+        }
+
+        // 행 우선 순서 정렬
+        self.cells.sort_by_key(|c| (c.row, c.col));
+
+        // row_sizes 갱신 (행별 실제 셀 개수)
+        self.rebuild_row_sizes();
+
+        // 그리드 인덱스 재구축
+        self.rebuild_grid();
+
+        Ok(())
+    }
+
+    /// 셀을 N줄 × M칸으로 분할한다.
+    ///
+    /// 기존 `split_cell()`은 병합 해제만 지원하지만, 이 메서드는 임의 셀을
+    /// 지정한 행/열 수로 분할한다. 테이블 그리드에 새 행/열이 추가되고,
+    /// 인접 셀은 col_span/row_span이 확장되어 기존 형태를 유지한다.
+    pub fn split_cell_into(
+        &mut self,
+        target_row: u16,
+        target_col: u16,
+        n_rows: u16,
+        m_cols: u16,
+        equal_row_height: bool,
+        merge_first: bool,
+    ) -> Result<(), String> {
+        if n_rows < 1 || m_cols < 1 {
+            return Err("분할 행/열 수는 1 이상이어야 합니다".to_string());
+        }
+        if n_rows == 1 && m_cols == 1 {
+            return Ok(()); // no-op
+        }
+
+        // 대상 셀 찾기
+        let cell_idx = self
+            .cells
+            .iter()
+            .position(|c| c.col == target_col && c.row == target_row)
+            .ok_or_else(|| format!("셀 ({},{})을 찾을 수 없습니다", target_row, target_col))?;
+
+        let cs = self.cells[cell_idx].col_span;
+        let rs = self.cells[cell_idx].row_span;
+
+        // 병합 셀이면서 merge_first 옵션 → 먼저 병합 해제
+        if merge_first && (cs > 1 || rs > 1) {
+            self.split_cell(target_row, target_col)?;
+            // split_cell 후 셀 인덱스 변경됨 → 재탐색
+        }
+
+        // 대상 셀 재탐색 (병합 해제 후 span=1x1)
+        let cell_idx = self
+            .cells
+            .iter()
+            .position(|c| c.col == target_col && c.row == target_row)
+            .ok_or_else(|| {
+                format!(
+                    "분할 대상 셀 ({},{})을 찾을 수 없습니다",
+                    target_row, target_col
+                )
+            })?;
+
+        let target_width = self.cells[cell_idx].width;
+        let target_height = self.cells[cell_idx].height;
+        let cs = self.cells[cell_idx].col_span;
+        let rs = self.cells[cell_idx].row_span;
+
+        // 현재 span 기준으로 추가 열/행 계산
+        // (다중 셀 분할 시 이전 분할로 span이 확장된 경우 extra=0)
+        let extra_cols = if m_cols > cs { m_cols - cs } else { 0 };
+        let extra_rows = if n_rows > rs { n_rows - rs } else { 0 };
+
+        // 서브셀이 차지할 그리드 열/행 수
+        let grid_cols = checked_table_u16_add(cs, extra_cols, "분할 열 span")?; // = max(m_cols, cs)
+        let grid_rows = checked_table_u16_add(rs, extra_rows, "분할 행 span")?; // = max(n_rows, rs)
+        let new_col_count = checked_table_u16_add(self.col_count, extra_cols, "표 열 수")?;
+        let new_row_count = checked_table_u16_add(self.row_count, extra_rows, "표 행 수")?;
+        let target_col_end = checked_table_span_end(target_col, grid_cols, "열")?;
+        let target_row_end = checked_table_span_end(target_row, grid_rows, "행")?;
+        if target_col_end > new_col_count || target_row_end > new_row_count {
+            return Err("손상된 셀 범위가 표 크기를 벗어나 분할할 수 없습니다".to_string());
+        }
+
+        // 모든 변형의 u16 증가를 먼저 검증한다. 이후의 쓰기는 이 검사와 같은
+        // checked_add를 사용하므로 실패 시 부분 편집이 남지 않는다.
+        for (i, cell) in self.cells.iter().enumerate() {
+            if i == cell_idx {
+                continue;
+            }
+            if extra_cols > 0 {
+                let col_end = checked_table_span_end(cell.col, cell.col_span, "열")?;
+                if cell.col > target_col {
+                    checked_table_u16_add(cell.col, extra_cols, "셀 열 인덱스")?;
+                } else if cell.col == target_col || col_end > target_col {
+                    checked_table_u16_add(cell.col_span, extra_cols, "셀 열 span")?;
+                }
+            }
+            if extra_rows > 0 {
+                let row_end = checked_table_span_end(cell.row, cell.row_span, "행")?;
+                if cell.row > target_row {
+                    checked_table_u16_add(cell.row, extra_rows, "셀 행 인덱스")?;
+                } else if cell.row == target_row || row_end > target_row {
+                    checked_table_u16_add(cell.row_span, extra_rows, "셀 행 span")?;
+                }
+            }
+        }
+
+        // 폭 분배: 균등 분배 (나머지는 첫 셀에 가산)
+        let base_w = target_width / m_cols as u32;
+        let remainder_w = target_width - base_w * m_cols as u32;
+        let sub_widths: Vec<HwpUnit> = (0..m_cols)
+            .map(|i| base_w + if i == 0 { remainder_w } else { 0 })
+            .collect();
+
+        // 높이 분배
+        let sub_heights: Vec<HwpUnit> = if equal_row_height || n_rows > 1 {
+            let base_h = target_height / n_rows as u32;
+            let remainder_h = target_height - base_h * n_rows as u32;
+            (0..n_rows)
+                .map(|i| base_h + if i == 0 { remainder_h } else { 0 })
+                .collect()
+        } else {
+            vec![target_height]
+        };
+
+        // 서브셀의 col_span/row_span 분배 (grid_cols를 m_cols개에 분배)
+        let base_cspan = grid_cols / m_cols;
+        let cspan_rem = grid_cols - base_cspan * m_cols;
+        let sub_cspans: Vec<u16> = (0..m_cols)
+            .map(|i| base_cspan + if i < cspan_rem { 1 } else { 0 })
+            .collect();
+        let base_rspan = grid_rows / n_rows;
+        let rspan_rem = grid_rows - base_rspan * n_rows;
+        let sub_rspans: Vec<u16> = (0..n_rows)
+            .map(|i| base_rspan + if i < rspan_rem { 1 } else { 0 })
+            .collect();
+
+        // 서브셀의 그리드 col 오프셋 계산 (col_span 누적)
+        let mut sub_col_offsets: Vec<u16> = vec![0; m_cols as usize];
+        for i in 1..m_cols as usize {
+            sub_col_offsets[i] =
+                checked_table_u16_add(sub_col_offsets[i - 1], sub_cspans[i - 1], "분할 열 오프셋")?;
+        }
+        let mut sub_row_offsets: Vec<u16> = vec![0; n_rows as usize];
+        for i in 1..n_rows as usize {
+            sub_row_offsets[i] =
+                checked_table_u16_add(sub_row_offsets[i - 1], sub_rspans[i - 1], "분할 행 오프셋")?;
+        }
+
+        // 기존 셀 조정 (대상 셀 제외)
+        for i in 0..self.cells.len() {
+            if i == cell_idx {
+                continue;
+            }
+            let cell = &mut self.cells[i];
+
+            // [#4264] col/row 는 파일에서 그대로 온 u16 이라 saturating_add 없이
+            // 더하면 오버플로 패닉한다(rebuild_grid()와 동일 원인).
+            // --- 열 방향 조정 ---
+            if extra_cols > 0 {
+                if cell.col > target_col {
+                    cell.col = checked_table_u16_add(cell.col, extra_cols, "셀 열 인덱스")?;
+                } else if cell.col == target_col {
+                    cell.col_span = checked_table_u16_add(cell.col_span, extra_cols, "셀 열 span")?;
+                } else if cell.col < target_col
+                    && checked_table_span_end(cell.col, cell.col_span, "열")? > target_col
+                {
+                    cell.col_span = checked_table_u16_add(cell.col_span, extra_cols, "셀 열 span")?;
+                }
+            }
+
+            // --- 행 방향 조정 ---
+            if extra_rows > 0 {
+                if cell.row > target_row {
+                    cell.row = checked_table_u16_add(cell.row, extra_rows, "셀 행 인덱스")?;
+                } else if cell.row == target_row {
+                    cell.row_span = checked_table_u16_add(cell.row_span, extra_rows, "셀 행 span")?;
+                } else if cell.row < target_row
+                    && checked_table_span_end(cell.row, cell.row_span, "행")? > target_row
+                {
+                    cell.row_span = checked_table_u16_add(cell.row_span, extra_rows, "셀 행 span")?;
+                }
+            }
+        }
+
+        // 주 셀(0,0) 축소
+        let template = self.cells[cell_idx].clone();
+        let primary = &mut self.cells[cell_idx];
+        primary.width = sub_widths[0];
+        primary.height = sub_heights[0];
+        primary.col_span = sub_cspans[0];
+        primary.row_span = sub_rspans[0];
+        if primary.raw_list_extra.len() >= 4 {
+            primary.raw_list_extra[0..4].copy_from_slice(&sub_widths[0].to_le_bytes());
+        }
+
+        // 나머지 서브셀 생성
+        for ri in 0..n_rows {
+            for ci in 0..m_cols {
+                if ri == 0 && ci == 0 {
+                    continue;
+                } // 주 셀 스킵
+                let r = checked_table_u16_add(
+                    target_row,
+                    sub_row_offsets[ri as usize],
+                    "분할 셀 행 인덱스",
+                )?;
+                let c = checked_table_u16_add(
+                    target_col,
+                    sub_col_offsets[ci as usize],
+                    "분할 셀 열 인덱스",
+                )?;
+                let w = sub_widths[ci as usize];
+                let h = sub_heights[ri as usize];
+                let mut new_cell = Cell::new_from_template(c, r, w, h, &template);
+                new_cell.col_span = sub_cspans[ci as usize];
+                new_cell.row_span = sub_rspans[ri as usize];
+                if new_cell.raw_list_extra.len() >= 4 {
+                    new_cell.raw_list_extra[0..4].copy_from_slice(&w.to_le_bytes());
+                }
+                self.cells.push(new_cell);
+            }
+        }
+
+        // 테이블 메타 갱신
+        // [#4264] col_count/row_count 도 파일에서 그대로 온 u16 이다.
+        self.col_count = new_col_count;
+        self.row_count = new_row_count;
+
+        self.cells.sort_by_key(|c| (c.row, c.col));
+        self.rebuild_row_sizes();
+        self.update_ctrl_dimensions();
+        self.rebuild_grid();
+
+        Ok(())
+    }
+
+    /// 범위 내 셀들을 각각 N줄 × M칸으로 분할한다.
+    ///
+    /// 우측→좌측, 하단→상단 순서로 처리하여 그리드 시프트가
+    /// 아직 처리되지 않은 셀에 영향을 주지 않도록 한다.
+    pub fn split_cells_in_range(
+        &mut self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+        n_rows: u16,
+        m_cols: u16,
+        equal_row_height: bool,
+    ) -> Result<(), String> {
+        if n_rows < 1 || m_cols < 1 {
+            return Err("분할 행/열 수는 1 이상이어야 합니다".to_string());
+        }
+        if n_rows == 1 && m_cols == 1 {
+            return Ok(());
+        }
+
+        // 열 우선 순서: 우측→좌측 열, 각 열 내에서 하단→상단
+        // 같은 열 내 분할은 col을 시프트하지 않고 col_span만 확장하므로 안전.
+        // 우측 열 처리 후 좌측 열의 셀 col은 아직 원래 값을 유지한다.
+        for c in (start_col..=end_col).rev() {
+            // 행 분할: 하단→상단 (같은 행 내 분할은 row_span만 확장)
+            for r in (start_row..=end_row).rev() {
+                if !self.cells.iter().any(|cell| cell.col == c && cell.row == r) {
+                    continue;
+                }
+                self.split_cell_into(r, c, n_rows, m_cols, equal_row_height, false)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;

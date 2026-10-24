@@ -1,0 +1,2816 @@
+//! 렌더 트리 노드 (RenderNode, Box Model)
+//!
+//! IR(Document Model)로부터 변환된 렌더링 전용 트리 구조.
+//! 각 노드는 페이지 내 위치와 크기가 계산된 상태를 가진다.
+
+use serde::Serialize;
+use std::ops::{Deref, DerefMut};
+
+use super::composer::{legacy_hancom_product_display_text, CharOverlapInfo};
+use super::layout::CellContext;
+use super::shaping_publication::{
+    HorizontalShapingPageSidecars, HorizontalShapingRunDecision, HorizontalShapingRunRange,
+    HorizontalShapingSidecarRejectReason,
+};
+use super::shaping_vertical::{
+    BoundedVerticalHwp5TableCellSidecar, VerticalShapingPageSidecars,
+    VerticalShapingSidecarRejectReason,
+};
+use super::{GradientFillInfo, LineStyle, PathCommand, ShapeStyle, TextStyle};
+use crate::model::image::ImageEffect;
+use crate::model::shape::{RectangleControlKind, TextWrap};
+use crate::model::style::ImageFillMode;
+use crate::model::{ColorRef, Rect};
+
+/// 가운뎃점 `·`(U+00B7) 합성 원의 반지름 / em (Task #257, #2999).
+///
+/// Task #257 이 폰트 대체 시 글리프 LSB·폭 불일치를 피하려고 `·` 를 폰트 비의존
+/// 벡터로 그린다. 상수는 한글 COM PDF 12문서 실측으로 보정했다 — 문자 bbox
+/// 내부 잉크를 900dpi 로 측정한 폰트·크기 그룹별 중앙값이 0.053~0.080 범위이고,
+/// 양자화 영향이 작은 fs ≥ 12 그룹의 중앙값이 0.0598 이다. 종전 값 0.08 은 그
+/// 범위의 최상단(휴먼명조 0.0798)이라 대부분의 폰트에서 반지름 ~1.3배, 면적
+/// ~1.8배 과대였다.
+pub const MIDDLE_DOT_RADIUS_EM: f64 = 0.060;
+
+/// 가운뎃점 합성 원의 세로 중심 오프셋 / em — baseline 기준 위쪽.
+/// 실측 중앙값 0.3520~0.3559 로 종전 값이 정확해 유지한다.
+pub const MIDDLE_DOT_CY_OFFSET_EM: f64 = 0.35;
+
+/// [#5698 계열] 탭 점선 리더(채움 종류 3)의 점 간격 / em.
+///
+/// 한글 2022 정본 실측 — `samples/KTX.hwp` 2쪽 목차의 점 1,435개를 글자 좌표로 뽑아
+/// 줄마다 이웃 간격을 셌다: 글꼴 14.04pt 줄에서 3.48pt, 15.00pt 줄에서 3.72pt →
+/// **두 크기 모두 0.248 em** 이다(잔여 폭을 채우느라 줄마다 3.48~3.84 로 늘어난다).
+///
+/// 종전 렌더는 `stroke-dasharray="0.1 3"` 로 **폰트 크기와 무관한 3.1px 고정**이라
+/// 14pt 기준 4.64px 여야 할 간격이 33% 촘촘했고, 점 지름도 1.0px 고정이라
+/// 가운뎃점 실측(지름 = 2 × [`MIDDLE_DOT_RADIUS_EM`] = 0.12 em ≈ 2.24px)의 절반이
+/// 안 됐다. 결과적으로 목차 점선이 점이 아니라 가는 실선으로 보였다.
+pub const TAB_DOT_LEADER_PITCH_EM: f64 = 0.248;
+
+/// 탭 점선 리더 한 점의 지름 / em — 가운뎃점과 **같은 실측 크기**를 쓴다.
+/// 둘 다 한글이 그리는 `·` 이므로 상수를 따로 두면 서로 어긋난다.
+pub const TAB_DOT_LEADER_DIAMETER_EM: f64 = MIDDLE_DOT_RADIUS_EM * 2.0;
+
+/// 점 하나를 찍기 위한 dash 길이(px). 0 길이 subpath 를 round cap 으로 그리는 것이
+/// 정공법이지만 렌더러마다 처리가 갈려, 눈에 안 띄는 최소 길이를 쓰고 간격에서 뺀다.
+pub const TAB_DOT_LEADER_DASH_PX: f64 = 0.1;
+
+/// 탭 점선 리더의 (선 두께, dash, gap) — 세 렌더 경로가 같은 값을 쓰도록 한 곳에서 낸다.
+pub fn tab_dot_leader_stroke(font_size: f64) -> (f64, f64, f64) {
+    let width = font_size * TAB_DOT_LEADER_DIAMETER_EM;
+    let pitch = font_size * TAB_DOT_LEADER_PITCH_EM;
+    let dash = TAB_DOT_LEADER_DASH_PX.min(pitch * 0.5);
+    (width, dash, (pitch - dash).max(0.1))
+}
+
+pub const REAL_PICTURE_WATERMARK_PAGE_OPACITY: f64 = 0.26;
+pub const REAL_PICTURE_WATERMARK_FILL_OPACITY: f64 = 0.15;
+pub const REAL_PICTURE_WATERMARK_OPACITY: f64 = REAL_PICTURE_WATERMARK_PAGE_OPACITY;
+pub const REAL_PICTURE_WATERMARK_SATURATION: f64 = 0.91646104;
+pub const REAL_PICTURE_WATERMARK_CONTRAST: f64 = 0.93125103;
+pub const REAL_PICTURE_WATERMARK_BRIGHTNESS: f64 = 1.80;
+pub const REAL_PICTURE_WATERMARK_CORRECTION_MATRIX: [[f64; 3]; 3] = [
+    [0.9897169325, 0.1297721480, -0.0666075849],
+    [0.0236280401, 1.0778421442, -0.0471323620],
+    [0.0002888270, -0.0075596780, 1.0728328592],
+];
+pub const REAL_PICTURE_WATERMARK_CORRECTION_BIAS: [f64; 3] =
+    [-0.0504989415, -0.0462952328, -0.0573305296];
+pub const REAL_PICTURE_WATERMARK_CHROMA_GAIN: f64 = 3.0;
+pub const REAL_PICTURE_WATERMARK_WHITE_BLEND: f64 = 0.0;
+pub const REAL_PICTURE_WATERMARK_FILL_CHROMA_GAIN: f64 = 0.42;
+pub const REAL_PICTURE_WATERMARK_FILL_WHITE_BLEND: f64 = 0.16;
+pub const LEGACY_IMAGE_WATERMARK_OPACITY: f64 = 0.17;
+
+/// 한컴 "워터마크 효과" 프리셋(밝기 70 · 대비 −50)인지.
+///
+/// [#6895] 인자는 **화면 순서**다. 종전에는 이진 저장 순서(`-50, 70`)로 적혀 있었는데,
+/// 그 자리에 값을 넘기는 두 소비자 중 `PageBackgroundImage` 는 이진 순서를 담고
+/// `ImageNode` 는 화면 순서를 담는다 — 채움 그림이 `ImageNode` 로 갈 때 이진 순서가
+/// 그대로 새던 시절에만 우연히 맞았다. 축을 화면 순서로 못박고 부르는 쪽이 맞춘다.
+pub fn is_real_picture_watermark_tone_preset(
+    effect: ImageEffect,
+    display_bright: i8,
+    display_contrast: i8,
+) -> bool {
+    matches!(effect, ImageEffect::RealPic) && display_bright == 70 && display_contrast == -50
+}
+
+/// 렌더 노드 고유 ID
+pub type NodeId = u32;
+
+/// Render-layer metadata shared by paper/page anchored Picture/Table/Shape nodes.
+///
+/// This is intentionally optional on `RenderNode`: ordinary flow nodes keep
+/// `None`, while out-of-flow object nodes can carry the original HWPX/HWP
+/// text-wrap and z-order contract without adding parallel fields to every leaf
+/// node type.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderLayerInfo {
+    /// Text wrapping mode that decides the coarse replay plane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_wrap: Option<TextWrap>,
+    /// Original object z-order. Smaller values are painted first.
+    pub z_order: i32,
+    /// Stable tie-breaker within the same z-order.
+    pub stable_index: u32,
+    /// 바탕쪽(master page) 유래 여부. 한컴 의미론에서 바탕쪽 개체의 text_wrap 은
+    /// 바탕쪽 내부 순서에만 적용되고 바탕쪽 전체는 본문 뒤에 깔리므로, replay plane
+    /// 분류는 이 플래그로 BehindText 상한을 적용한다 (#2318, SVG node_z_plane 계약).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub master_page: bool,
+}
+
+impl RenderLayerInfo {
+    pub fn new(text_wrap: Option<TextWrap>, z_order: i32, stable_index: u32) -> Self {
+        Self {
+            text_wrap,
+            z_order,
+            stable_index,
+            master_page: false,
+        }
+    }
+
+    /// 바탕쪽 유래 표시를 부여한 사본을 반환한다 (#2318).
+    pub fn for_master_page(mut self) -> Self {
+        self.master_page = true;
+        self
+    }
+}
+
+/// 렌더 노드 (페이지 내 렌더링 가능한 요소)
+#[derive(Debug, Clone, Serialize)]
+pub struct RenderNode {
+    /// 노드 ID
+    pub id: NodeId,
+    /// 노드 종류
+    pub node_type: RenderNodeType,
+    /// 박스 모델 (위치, 크기, 여백)
+    pub bbox: BoundingBox,
+    /// 원본 객체 레이어 정보 (paper/page anchored Picture/Table/Shape용)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<RenderLayerInfo>,
+    /// 자식 노드 목록
+    pub children: Vec<RenderNode>,
+    /// 가시성
+    pub visible: bool,
+    /// 문단 부호·투명 테두리처럼 편집 화면에서만 보여야 하는 보조 표시.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub editor_only: bool,
+    /// 원본 컨트롤의 식별 결과. 내부 레이아웃 노드 이름과 조판부호를 분리한다.
+    #[serde(skip)]
+    pub control_code: ControlCode,
+    /// Public source provenance, separate from header/footer layout cache keys.
+    #[serde(skip)]
+    pub header_footer_source: Option<(usize, HeaderFooterImageRef)>,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub enum ControlCode {
+    #[default]
+    Automatic,
+    Hidden,
+    Rectangle(RectangleControlKind),
+}
+
+impl RenderNode {
+    pub fn new(id: NodeId, node_type: RenderNodeType, bbox: BoundingBox) -> Self {
+        Self {
+            id,
+            node_type,
+            bbox,
+            layer: None,
+            children: Vec::new(),
+            visible: true,
+            editor_only: false,
+            control_code: ControlCode::Automatic,
+            header_footer_source: None,
+        }
+    }
+
+    /// 레이어 메타데이터를 부여한 노드를 반환한다.
+    pub fn with_layer(mut self, layer: RenderLayerInfo) -> Self {
+        self.layer = Some(layer);
+        self
+    }
+
+    /// 기존 노드에 레이어 메타데이터를 부여한다.
+    pub fn set_layer(&mut self, layer: RenderLayerInfo) {
+        self.layer = Some(layer);
+    }
+
+    /// 출력/인쇄 profile에서 제외할 편집 전용 노드로 표시한다.
+    pub fn with_editor_only(mut self) -> Self {
+        self.editor_only = true;
+        self
+    }
+
+    /// 사각형 컨트롤 하나에 부호 하나만 부여한다. 내부 TextBox는 편집 영역이지 새 컨트롤이 아니다.
+    pub fn set_rectangle_control_kind(&mut self, kind: RectangleControlKind) {
+        self.control_code = ControlCode::Rectangle(kind);
+        for child in &mut self.children {
+            if matches!(child.node_type, RenderNodeType::TextBox) {
+                child.control_code = ControlCode::Hidden;
+            }
+        }
+    }
+
+    pub fn control_code_label(&self) -> Option<&'static str> {
+        match self.control_code {
+            ControlCode::Hidden => return None,
+            ControlCode::Rectangle(RectangleControlKind::Rectangle) => return Some("[사각형]"),
+            ControlCode::Rectangle(RectangleControlKind::TextBox) => return Some("[글상자]"),
+            ControlCode::Automatic => {}
+        }
+        match self.node_type {
+            RenderNodeType::Table(_) => Some("[표]"),
+            RenderNodeType::Image(_) => Some("[그림]"),
+            RenderNodeType::TextBox => Some("[글상자]"),
+            RenderNodeType::Equation(_) => Some("[수식]"),
+            RenderNodeType::Header => Some("[머리말]"),
+            RenderNodeType::Footer => Some("[꼬리말]"),
+            RenderNodeType::FootnoteArea => Some("[각주]"),
+            _ => None,
+        }
+    }
+
+    /// 렌더 트리를 JSON 문자열로 직렬화한다.
+    pub fn to_json(&self) -> String {
+        let mut buf = String::with_capacity(4096);
+        self.write_json(&mut buf);
+        buf
+    }
+
+    fn write_json(&self, buf: &mut String) {
+        buf.push('{');
+        // type
+        let (type_str, extra) = match &self.node_type {
+            RenderNodeType::Page(_) => ("Page", String::new()),
+            RenderNodeType::PageBackground(_) => ("PageBg", String::new()),
+            RenderNodeType::MasterPage => ("MasterPage", String::new()),
+            RenderNodeType::Header => ("Header", String::new()),
+            RenderNodeType::Footer => ("Footer", String::new()),
+            RenderNodeType::Body { .. } => ("Body", String::new()),
+            RenderNodeType::Column(c) => ("Column", format!(",\"col\":{}", c)),
+            RenderNodeType::FootnoteArea => ("FootnoteArea", String::new()),
+            RenderNodeType::TextLine(tl) => {
+                let mut extra = format!(",\"pi\":{}", tl.para_index.unwrap_or(0));
+                if let Some(owner) = &tl.caption_owner {
+                    extra.push_str(",\"captionOwner\":");
+                    extra.push_str(&serde_json::to_string(owner).expect("integer caption address"));
+                }
+                ("TextLine", extra)
+            }
+            RenderNodeType::TextRun(tr) => {
+                let mut extra = format!(
+                    ",\"text\":{},\"pi\":{}",
+                    json_escape(&tr.text),
+                    tr.section_index
+                        .map(|_| tr.para_index.unwrap_or(0))
+                        .unwrap_or(0)
+                );
+                // `text`는 char_start와 같은 모델 좌표를 보존한다. 그러나 머리말/꼬리말
+                // 필드처럼 화면에 N자로 표시되는 marker는 displayText도 JSON에 노출해야
+                // render-tree 소비자가 실제 표시값을 검증·표시할 수 있다 (Task #3216).
+                if let Some(display_text) = &tr.display_text {
+                    extra.push_str(",\"displayText\":");
+                    extra.push_str(&json_escape(display_text));
+                }
+                ("TextRun", extra)
+            }
+            RenderNodeType::Table(tn) => (
+                "Table",
+                format!(
+                    ",\"rows\":{},\"cols\":{}{}{}",
+                    tn.row_count,
+                    tn.col_count,
+                    tn.para_index
+                        .map(|pi| format!(",\"pi\":{}", pi))
+                        .unwrap_or_default(),
+                    tn.control_index
+                        .map(|ci| format!(",\"ci\":{}", ci))
+                        .unwrap_or_default()
+                ),
+            ),
+            RenderNodeType::TableCell(tc) => {
+                ("Cell", format!(",\"row\":{},\"col\":{}", tc.row, tc.col))
+            }
+            RenderNodeType::Image(image) => {
+                let mut extra = String::new();
+                if let Some(para_index) = image.para_index {
+                    extra.push_str(&format!(",\"pi\":{para_index}"));
+                }
+                if let Some(control_index) = image.control_index {
+                    extra.push_str(&format!(",\"ci\":{control_index}"));
+                }
+                let text_wrap = image
+                    .text_wrap
+                    .or_else(|| self.layer.and_then(|layer| layer.text_wrap));
+                if let Some(text_wrap) = text_wrap {
+                    let name = match text_wrap {
+                        TextWrap::Square => "Square",
+                        TextWrap::Tight => "Tight",
+                        TextWrap::Through => "Through",
+                        TextWrap::TopAndBottom => "TopAndBottom",
+                        TextWrap::BehindText => "BehindText",
+                        TextWrap::InFrontOfText => "InFrontOfText",
+                    };
+                    extra.push_str(",\"textWrap\":");
+                    extra.push_str(&json_escape(name));
+                }
+                ("Image", extra)
+            }
+            RenderNodeType::TextBox => ("TextBox", String::new()),
+            RenderNodeType::Equation(_) => ("Equation", String::new()),
+            RenderNodeType::Line(_) => ("Line", String::new()),
+            RenderNodeType::Rectangle(_) => ("Rect", String::new()),
+            RenderNodeType::Ellipse(_) => ("Ellipse", String::new()),
+            RenderNodeType::Path(_) => ("Path", String::new()),
+            RenderNodeType::Group(_) => ("Group", String::new()),
+            RenderNodeType::FormObject(_) => ("Form", String::new()),
+            RenderNodeType::FootnoteMarker(_) => ("FnMarker", String::new()),
+            RenderNodeType::Placeholder(ph) => ("Placeholder", ph.control_ref_json_extra()),
+            RenderNodeType::RawSvg(raw) => ("RawSvg", raw.control_ref_json_extra()),
+        };
+        buf.push_str(&format!(
+            "\"type\":\"{}\",\"bbox\":{{\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}}}",
+            type_str, self.bbox.x, self.bbox.y, self.bbox.width, self.bbox.height
+        ));
+        buf.push_str(&extra);
+        if !self.children.is_empty() {
+            buf.push_str(",\"children\":[");
+            for (i, child) in self.children.iter().enumerate() {
+                if i > 0 {
+                    buf.push(',');
+                }
+                child.write_json(buf);
+            }
+            buf.push(']');
+        }
+        buf.push('}');
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c < '\x20' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 렌더 노드 종류
+#[derive(Debug, Clone, Serialize)]
+pub enum RenderNodeType {
+    /// 페이지 루트 노드
+    Page(PageNode),
+    /// 페이지 배경/테두리
+    PageBackground(PageBackgroundNode),
+    /// 바탕쪽 영역
+    MasterPage,
+    /// 머리말 영역
+    Header,
+    /// 꼬리말 영역
+    Footer,
+    /// 본문 영역
+    Body {
+        /// 콘텐츠 클리핑 영역 (페이지 경계 넘침 방지)
+        clip_rect: Option<BoundingBox>,
+    },
+    /// 단(Column) 영역
+    Column(u16),
+    /// 각주 영역
+    FootnoteArea,
+    /// 텍스트 줄
+    TextLine(TextLineNode),
+    /// 텍스트 런 (동일 글자 모양의 텍스트 조각)
+    TextRun(TextRunNode),
+    /// 표
+    Table(TableNode),
+    /// 표 셀
+    TableCell(TableCellNode),
+    /// 직선
+    Line(LineNode),
+    /// 사각형
+    Rectangle(RectangleNode),
+    /// 타원
+    Ellipse(EllipseNode),
+    /// 패스 (다각형, 곡선, 호)
+    Path(PathNode),
+    /// 이미지
+    Image(ImageNode),
+    /// 묶음 개체
+    Group(GroupNode),
+    /// 글상자 (텍스트가 포함된 그리기 개체)
+    TextBox,
+    /// 수식
+    Equation(EquationNode),
+    /// 양식 개체
+    FormObject(FormObjectNode),
+    /// 각주/미주 마커 (인라인 위첨자)
+    FootnoteMarker(FootnoteMarkerNode),
+    /// 차트/OLE placeholder (배경 rect + 중앙 텍스트 라벨) — Task #195
+    Placeholder(PlaceholderNode),
+    /// 이미 생성된 SVG 조각을 그대로 출력 (OOXML 차트 등) — Task #195 단계 8
+    RawSvg(RawSvgNode),
+}
+
+/// RawSvg/placeholder가 원본 문서 개체와 연결될 때 쓰는 상호작용 메타.
+#[derive(Debug, Clone, Serialize)]
+pub struct ObjectControlRef {
+    pub section_index: usize,
+    pub para_index: usize,
+    pub control_index: usize,
+    pub kind: &'static str,
+}
+
+impl ObjectControlRef {
+    pub fn ole(section_index: usize, para_index: usize, control_index: usize) -> Self {
+        Self {
+            section_index,
+            para_index,
+            control_index,
+            kind: "ole",
+        }
+    }
+
+    /// [Task #2230] 그림 미지정 placeholder 의 원본 Picture 컨트롤 참조.
+    pub fn picture(section_index: usize, para_index: usize, control_index: usize) -> Self {
+        Self {
+            section_index,
+            para_index,
+            control_index,
+            kind: "picture",
+        }
+    }
+
+    fn json_extra(&self) -> String {
+        format!(
+            ",\"kind\":\"{}\",\"si\":{},\"pi\":{},\"ci\":{}",
+            self.kind, self.section_index, self.para_index, self.control_index
+        )
+    }
+}
+
+/// 미리 렌더된 SVG 조각 (Task #195 단계 8)
+#[derive(Debug, Clone, Serialize)]
+pub struct RawSvgNode {
+    /// 삽입할 SVG 조각 (유효한 `<g>...</g>` 또는 개별 요소)
+    pub svg: String,
+    /// 원본 개체 참조. OLE RawSvg 선택/속성 진입에 사용한다.
+    pub control_ref: Option<ObjectControlRef>,
+    /// [#4694] 셀/글상자 안 ole 의 다단계 경로 — 컨트롤 레이아웃(hit-test 소스)의
+    /// cellPath 방출에 사용. 없으면 선택 ref 가 본문 직속과 구분되지 않아 같은 문단의
+    /// 다른 차트를 조용히 여는 오매칭이 성립한다(Image 노드의 #1151/#1161 과 동형).
+    /// 레이어 JSON 에는 불필요하므로 직렬화 제외.
+    #[serde(skip)]
+    pub cell_context: Option<crate::renderer::layout::CellContext>,
+}
+
+impl RawSvgNode {
+    pub fn new(svg: String) -> Self {
+        Self {
+            svg,
+            control_ref: None,
+            cell_context: None,
+        }
+    }
+
+    pub fn ole(
+        svg: String,
+        section_index: usize,
+        para_index: usize,
+        control_index: usize,
+        cell_context: Option<crate::renderer::layout::CellContext>,
+    ) -> Self {
+        Self {
+            svg,
+            control_ref: Some(ObjectControlRef::ole(
+                section_index,
+                para_index,
+                control_index,
+            )),
+            cell_context,
+        }
+    }
+
+    fn control_ref_json_extra(&self) -> String {
+        self.control_ref
+            .as_ref()
+            .map(ObjectControlRef::json_extra)
+            .unwrap_or_default()
+    }
+}
+
+/// 차트/OLE placeholder 렌더 노드 (Task #195)
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaceholderNode {
+    /// 배경 색상 (ARGB)
+    pub fill_color: u32,
+    /// 테두리 색상 (ARGB)
+    pub stroke_color: u32,
+    /// 표시할 라벨(중앙 정렬)
+    pub label: String,
+    /// 원본 개체 참조. OLE fallback placeholder 선택/속성 진입에 사용한다.
+    pub control_ref: Option<ObjectControlRef>,
+    /// [Task #2225] placeholder 종류 — 한컴은 그림 미지정 placeholder 를
+    /// 편집기에서만(점선 테두리+그림-없음 아이콘) 표시하고 인쇄·인쇄 등가
+    /// 출력에서는 미출력한다. 종류별로 백엔드가 표시/억제를 분기한다.
+    pub kind: PlaceholderKind,
+    /// [Task #2230] 셀 안 placeholder 의 다단계 경로 — 컨트롤 레이아웃
+    /// (hit-test 소스)의 cellPath 방출에 사용. 레이어 JSON 에는 불필요하므로
+    /// 직렬화 제외.
+    #[serde(skip)]
+    pub cell_context: Option<crate::renderer::layout::CellContext>,
+}
+
+/// [Task #2225] placeholder 의미 구분.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum PlaceholderKind {
+    /// 차트/OLE 등 폴백 표시 (기존 동작 — 전 컨텍스트 표시).
+    #[default]
+    Ole,
+    /// 그림 미지정 (bin 참조 실패, 외부 경로 없음) — 편집 뷰 전용 표시.
+    MissingPicture,
+}
+
+impl PlaceholderNode {
+    pub fn new(fill_color: u32, stroke_color: u32, label: String) -> Self {
+        Self {
+            fill_color,
+            stroke_color,
+            label,
+            control_ref: None,
+            kind: PlaceholderKind::default(),
+            cell_context: None,
+        }
+    }
+
+    /// [Task #2225] 그림 미지정 placeholder — 한컴 편집기식 점선 테두리 +
+    /// 그림-없음 아이콘으로 표시되고, 인쇄 등가 출력(svg/png/pdf)에서는
+    /// 미출력된다.
+    ///
+    /// [Task #2230] 원본 Picture 컨트롤 좌표(kind="picture")와 셀 경로를
+    /// 배선해 편집 뷰에서 클릭 선택·그림 지정이 가능하다. 문서 좌표가 없는
+    /// 호출처(머리말 등 좌표 미전파 경로)는 None 전달 — 표시만 되고 선택은
+    /// 불가(기존 #2225 동작 유지).
+    pub fn missing_picture(
+        section_index: Option<usize>,
+        para_index: Option<usize>,
+        control_index: Option<usize>,
+        cell_context: Option<crate::renderer::layout::CellContext>,
+    ) -> Self {
+        let control_ref = match (section_index, para_index, control_index) {
+            (Some(si), Some(pi), Some(ci)) => Some(ObjectControlRef::picture(si, pi, ci)),
+            _ => None,
+        };
+        Self {
+            fill_color: 0x00FFFFFF,
+            stroke_color: 0x00999999,
+            label: String::new(),
+            control_ref,
+            kind: PlaceholderKind::MissingPicture,
+            cell_context,
+        }
+    }
+
+    pub fn ole(
+        fill_color: u32,
+        stroke_color: u32,
+        label: String,
+        section_index: usize,
+        para_index: usize,
+        control_index: usize,
+        cell_context: Option<crate::renderer::layout::CellContext>,
+    ) -> Self {
+        Self {
+            fill_color,
+            stroke_color,
+            label,
+            control_ref: Some(ObjectControlRef::ole(
+                section_index,
+                para_index,
+                control_index,
+            )),
+            kind: PlaceholderKind::default(),
+            cell_context,
+        }
+    }
+
+    fn control_ref_json_extra(&self) -> String {
+        self.control_ref
+            .as_ref()
+            .map(ObjectControlRef::json_extra)
+            .unwrap_or_default()
+    }
+}
+
+/// 각주/미주 마커 렌더 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct FootnoteMarkerNode {
+    /// 각주 번호
+    pub number: u16,
+    /// 위첨자 텍스트 ("1)" 등)
+    pub text: String,
+    /// 기본 폰트 크기 (본문 크기, 위첨자는 이것의 55%)
+    pub base_font_size: f64,
+    /// 폰트 패밀리
+    pub font_family: String,
+    /// 글자 색
+    pub color: u32,
+    /// 소속 구역/문단 인덱스
+    pub section_index: usize,
+    pub para_index: usize,
+    /// 문단 내 컨트롤 인덱스
+    pub control_index: usize,
+}
+
+/// 양식 개체 렌더 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct FormObjectNode {
+    /// 양식 개체 타입
+    pub form_type: crate::model::control::FormType,
+    /// 캡션 (PushButton, CheckBox, RadioButton)
+    pub caption: String,
+    /// 텍스트 (ComboBox, Edit)
+    pub text: String,
+    /// 편집용 원문과 분리한 폼 표시 문자열(콤보 초기 항목/암호 마스킹).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
+    /// 문서 글자 속성과 출력 해상도에서 해소한 공통 폼 외형.
+    pub appearance: super::form_appearance::FormAppearance,
+    /// 글자 색 (CSS #rrggbb)
+    pub fore_color: String,
+    /// 배경 색 (CSS #rrggbb)
+    pub back_color: String,
+    /// 선택 상태 (CheckBox/RadioButton)
+    pub value: i32,
+    /// 활성화 여부
+    pub enabled: bool,
+    /// 문서 위치: 구역 인덱스
+    pub section_index: usize,
+    /// 문서 위치: 문단 인덱스 (셀 내부인 경우 셀 내 문단 인덱스)
+    pub para_index: usize,
+    /// 문서 위치: 컨트롤 인덱스
+    pub control_index: usize,
+    /// 양식 개체 이름
+    pub name: String,
+    /// 셀 내부 위치 (표 셀 안에 있는 경우)
+    /// (table_para_index, table_control_index, cell_index, cell_para_index)
+    pub cell_location: Option<(usize, usize, usize, usize)>,
+}
+
+impl FormObjectNode {
+    pub(crate) fn form_display_text(form: &crate::model::control::FormObject) -> Option<String> {
+        // 한컴 ComboBox의 빈 selectedValue는 첫 목록 값을 표시한다.
+        // HWP serializer의 ComboBox Text 규칙과 동일하며, 모델의 선택값은 유지한다.
+        if form.form_type == crate::model::control::FormType::ComboBox && form.text.is_empty() {
+            return form.properties.get("listItem0").cloned();
+        }
+        if form.form_type != crate::model::control::FormType::Edit {
+            return None;
+        }
+        let mask = form.properties.get("PasswordChar")?.chars().next()?;
+        Some(mask.to_string().repeat(form.text.chars().count()))
+    }
+
+    pub fn display_or_text(&self) -> &str {
+        self.display_text.as_deref().unwrap_or(&self.text)
+    }
+}
+
+/// 바운딩 박스 (위치 + 크기, 픽셀 단위)
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BoundingBox {
+    /// X 좌표 (페이지 내 절대 위치, px)
+    pub x: f64,
+    /// Y 좌표 (페이지 내 절대 위치, px)
+    pub y: f64,
+    /// 폭 (px)
+    pub width: f64,
+    /// 높이 (px)
+    pub height: f64,
+}
+
+impl BoundingBox {
+    pub fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// 다른 박스와 겹치는지 확인
+    pub fn intersects(&self, other: &BoundingBox) -> bool {
+        self.x < other.x + other.width
+            && self.x + self.width > other.x
+            && self.y < other.y + other.height
+            && self.y + self.height > other.y
+    }
+
+    /// 다른 박스를 포함하는지 확인
+    pub fn contains(&self, other: &BoundingBox) -> bool {
+        self.x <= other.x
+            && self.y <= other.y
+            && self.x + self.width >= other.x + other.width
+            && self.y + self.height >= other.y + other.height
+    }
+
+    /// HWPUNIT Rect를 픽셀 BoundingBox로 변환
+    pub fn from_hwpunit_rect(rect: &Rect, dpi: f64) -> Self {
+        let scale = dpi / super::HWPUNIT_PER_INCH;
+        Self {
+            x: rect.left as f64 * scale,
+            y: rect.top as f64 * scale,
+            width: rect.width() as f64 * scale,
+            height: rect.height() as f64 * scale,
+        }
+    }
+}
+
+/// 페이지 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct PageNode {
+    /// 페이지 번호 (0-based)
+    pub page_index: u32,
+    /// 페이지 폭 (px)
+    pub width: f64,
+    /// 페이지 높이 (px)
+    pub height: f64,
+    /// 소속 구역 인덱스
+    pub section_index: usize,
+}
+
+/// 페이지 배경 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct PageBackgroundNode {
+    /// 배경색
+    pub background_color: Option<ColorRef>,
+    /// 테두리 색상
+    pub border_color: Option<ColorRef>,
+    /// 테두리 두께
+    pub border_width: f64,
+    /// 그러데이션 채우기 (fill_color보다 우선)
+    pub gradient: Option<Box<GradientFillInfo>>,
+    /// 이미지 채우기 (gradient/fill_color보다 우선)
+    pub image: Option<PageBackgroundImage>,
+}
+
+/// 페이지 배경 이미지 정보
+#[derive(Debug, Clone, Serialize)]
+pub struct PageBackgroundImage {
+    /// 이미지 데이터 (JSON 직렬화 시 제외)
+    #[serde(skip)]
+    pub data: Vec<u8>,
+    /// 이미지 채우기 모드
+    pub fill_mode: ImageFillMode,
+    /// 밝기
+    pub brightness: i8,
+    /// 명암
+    pub contrast: i8,
+    /// 그림 효과
+    pub effect: ImageEffect,
+}
+
+impl PageBackgroundImage {
+    /// 공통 `ImageFill` 원시 저장값을 쪽 배경의 화면 색조 인자로 바꾼다.
+    ///
+    /// HWP5/HWPX/HWP3의 `ImageFill`은 IR에서 `(brightness, contrast)` 필드에
+    /// legacy binary 저장 순서를 보존한다. 쪽 배경 화면에서는 이 순서가 반대여서,
+    /// 원시값을 그대로 필터에 넘기면 HWPX `bright="50" contrast="-15"`가
+    /// `brightness=-15, contrast=50`으로 뒤집혀 보인다. parser·IR diff·round-trip
+    /// 계약은 건드리지 않고 renderer 경계에서만 의미 순서를 투영한다.
+    pub const fn display_brightness_contrast(&self) -> (i8, i8) {
+        (self.contrast, self.brightness)
+    }
+
+    /// 워터마크 효과 적용 여부 (Issue #1156).
+    ///
+    /// HWP/HWPX 에는 워터마크 적용 비트가 없다. 한컴 편집기는 "워터마크 효과"
+    /// 해제 시 밝기·대비를 모두 0 으로 되돌리므로, 밝기·대비가 둘 다 0 이 아닌
+    /// 경우 워터마크로 판정한다 (한쪽이라도 0 이면 워터마크 아님, effect 무관).
+    pub fn is_watermark(&self) -> bool {
+        self.brightness != 0 && self.contrast != 0
+    }
+
+    pub fn is_real_picture_watermark_tone_preset(&self) -> bool {
+        // 이 구조체는 이진 저장 순서를 담으므로 화면 순서로 바꿔 넘긴다(#6895).
+        let (bright, contrast) = self.display_brightness_contrast();
+        is_real_picture_watermark_tone_preset(self.effect, bright, contrast)
+    }
+}
+
+/// Source control address for a caption, independent of its text and placement.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionOwner {
+    pub sec_idx: usize,
+    pub para_idx: usize,
+    pub control_idx: usize,
+    pub control_kind: CaptionControlKind,
+    pub caption_ordinal: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptionControlKind {
+    Table,
+    Image,
+    Shape,
+}
+
+impl CaptionOwner {
+    /// Missing provenance must not become a fabricated zero address.
+    pub fn new(
+        section_index: Option<usize>,
+        para_index: Option<usize>,
+        control_index: Option<usize>,
+        control_kind: CaptionControlKind,
+    ) -> Option<Self> {
+        Some(Self {
+            sec_idx: section_index?,
+            para_idx: para_index?,
+            control_idx: control_index?,
+            control_kind,
+            caption_ordinal: 0,
+        })
+    }
+}
+
+/// 텍스트 줄 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct TextLineNode {
+    /// Optional source ownership; ordinary body lines keep their existing JSON.
+    #[serde(rename = "captionOwner", skip_serializing_if = "Option::is_none")]
+    pub caption_owner: Option<CaptionOwner>,
+    /// 줄 높이 (px)
+    pub line_height: f64,
+    /// 베이스라인 위치 (줄 상단으로부터, px)
+    pub baseline: f64,
+    /// 소속 구역 인덱스 (빈 문단 커서 위치 계산용)
+    pub section_index: Option<usize>,
+    /// 소속 문단 인덱스 (빈 문단 커서 위치 계산용)
+    pub para_index: Option<usize>,
+    /// 문단 내 줄 인덱스 (디버그 오버레이용)
+    pub line_index: Option<u32>,
+    /// LINE_SEG vertical_pos (HWPUNIT, 디버그 오버레이/vpos-reset 검출용)
+    pub vpos: Option<i32>,
+}
+
+impl TextLineNode {
+    /// 기본 생성 (문단 식별 정보 없음)
+    pub fn new(line_height: f64, baseline: f64) -> Self {
+        Self {
+            caption_owner: None,
+            line_height,
+            baseline,
+            section_index: None,
+            para_index: None,
+            line_index: None,
+            vpos: None,
+        }
+    }
+
+    /// 문단 식별 정보 포함 생성 (커서 위치 계산용)
+    pub fn with_para(
+        line_height: f64,
+        baseline: f64,
+        section_index: usize,
+        para_index: usize,
+    ) -> Self {
+        Self {
+            line_height,
+            baseline,
+            section_index: Some(section_index),
+            para_index: Some(para_index),
+            line_index: None,
+            vpos: None,
+            caption_owner: None,
+        }
+    }
+
+    /// 문단 식별 + LINE_SEG vpos 정보 포함 생성 (디버그 오버레이용)
+    pub fn with_para_vpos(
+        line_height: f64,
+        baseline: f64,
+        section_index: usize,
+        para_index: usize,
+        line_index: u32,
+        vpos: i32,
+    ) -> Self {
+        Self {
+            line_height,
+            baseline,
+            section_index: Some(section_index),
+            para_index: Some(para_index),
+            line_index: Some(line_index),
+            vpos: Some(vpos),
+            caption_owner: None,
+        }
+    }
+}
+
+/// 텍스트 런 노드 (동일 글자 모양의 연속 텍스트)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TextRunNode {
+    /// 텍스트 내용
+    pub text: String,
+    /// 텍스트 스타일
+    pub style: TextStyle,
+    /// 글자 모양 ID (서식 툴바용)
+    pub char_shape_id: Option<u32>,
+    /// 문단 모양 ID (서식 툴바용)
+    pub para_shape_id: Option<u16>,
+    /// 소속 구역 인덱스 (편집용)
+    pub section_index: Option<usize>,
+    /// 소속 문단 인덱스 (편집용)
+    pub para_index: Option<usize>,
+    /// 문단 내 문자 시작 오프셋 (편집용)
+    pub char_start: Option<usize>,
+    /// 표 셀 컨텍스트 (경로 기반, 중첩 표 지원)
+    pub cell_context: Option<CellContext>,
+    /// 문단 마지막 TextRun 여부 (문단부호 표시용)
+    pub is_para_end: bool,
+    /// 강제 줄 바꿈(Shift+Enter) 줄의 마지막 TextRun 여부
+    pub is_line_break_end: bool,
+    /// 글자 회전 각도 (도, 시계방향). 세로쓰기 괄호 등에 사용.
+    pub rotation: f64,
+    /// 세로쓰기 셀 내 글자 여부 (문단부호 위치 조정용)
+    pub is_vertical: bool,
+    /// 글자겹침 정보 (CharOverlap 컨트롤 렌더링용)
+    pub char_overlap: Option<CharOverlapInfo>,
+    /// 글자 테두리/배경 ID (1-based, 0이면 없음)
+    pub border_fill_id: u16,
+    /// 베이스라인 위치 (bbox.y로부터의 거리, px)
+    pub baseline: f64,
+    /// 누름틀 필드 마커: 이 TextRun 위치에 표시할 필드 경계 마커
+    pub field_marker: FieldMarkerType,
+    /// Layout owner가 확정한 run-relative 문자 경계값.
+    ///
+    /// 보이는 문자열 N개 scalar에 N+1개 값을 보존한다. exact kerning이 실제로
+    /// 적용된 K1 run 또는 cross-run 끝 탭의 advance를 확정한 run에서 `Some`이다.
+    /// 그 외 K0·미지원·fail-closed에서는 필드를 직렬화하지 않는다. Font payload나
+    /// source provenance는 이 필드에 들어가지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_positions: Option<Vec<f64>>,
+    /// 표시 텍스트 (`Some` 이면 그리기·폭 계산은 본 필드를 쓴다).
+    ///
+    /// `text` 는 모델과 같은 문자 수를 유지해 `char_start` 와 같은 공간에 있도록 한다.
+    /// 머리말/꼬리말 필드처럼 모델 1자가 화면에서 N자로 보이는 경우가 여기 해당한다
+    /// (`ComposedTextRun::display_text` 와 같은 규약, Task #3216).
+    pub display_text: Option<String>,
+}
+
+impl TextRunNode {
+    /// [#6801] 다음 블록 배치가 확정한 끝 탭 경계를 모든 replay 소비자에 전달한다.
+    /// 앞선 가시 문자의 폭은 보존하고 뒤 공백/탭만 남은 advance에 맞춘다.
+    pub(crate) fn resolve_trailing_tab_end(
+        &mut self,
+        requested_width: f64,
+        leader_limit_width: f64,
+    ) -> Option<f64> {
+        let text = self.display_or_text();
+        if !text.ends_with('\t')
+            || !requested_width.is_finite()
+            || requested_width < 0.0
+            || !leader_limit_width.is_finite()
+            || leader_limit_width < requested_width
+        {
+            return None;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut positions = self.replay_positions_for(text).into_owned();
+        super::validated_replay_positions(text, Some(&positions))?;
+        let visible_end = chars
+            .iter()
+            .rposition(|ch| !ch.is_whitespace())
+            .map_or(0, |index| index + 1);
+        // 실제 잉크가 다음 블록을 침범하면 그 겹침을 bbox 절단으로 숨기지 않는다.
+        let width = requested_width.max(positions[visible_end]);
+        for position in &mut positions[visible_end..] {
+            *position = position.min(width);
+        }
+        *positions.last_mut()? = width;
+        super::validated_replay_positions(text, Some(&positions))?;
+        self.layout_positions = Some(positions);
+        // 공백 carry-over의 논리 경계와 점선의 그리기 끝은 다르다.
+        // 기존 점선은 공백 구간을 지나갈 수 있지만 다음 가시 런을 침범하지 않는다.
+        // 저장된 점선 끝을 늘리지 않아 목차 번호 앞의 원래 간격도 보존한다.
+        for leader in &mut self.style.tab_leaders {
+            leader.start_x = leader.start_x.min(leader_limit_width);
+            leader.end_x = leader.end_x.min(leader_limit_width).max(leader.start_x);
+        }
+        Some(width)
+    }
+
+    /// 사람이 보게 될 텍스트 — 그리기·폭 계산, 그리고 **문자열을 만들어 내보내는**
+    /// 추출·직렬화(쪽 텍스트, 마크다운)가 이것을 쓴다.
+    ///
+    /// 오프셋·인덱싱에는 쓰지 않는다 — 그쪽은 `text` 다. 필드처럼 모델 1자가 표시
+    /// N자인 런에서 둘은 길이가 다르다.
+    pub fn display_or_text(&self) -> &str {
+        self.display_text.as_deref().unwrap_or(&self.text)
+    }
+
+    /// Replay 대상 문자열에 대해 layout positions가 안전한 경우에만 빌려준다.
+    ///
+    /// Backend가 PUA 확장·inline placeholder 제거 등으로 다른 문자열을 그리면
+    /// scalar 수가 달라져 `None`이 된다. 호출자는 이 경우 기존 scalar
+    /// `compute_char_positions` 경로로 fail-closed해야 한다.
+    pub(crate) fn validated_layout_positions_for(&self, replay_text: &str) -> Option<&[f64]> {
+        super::validated_replay_positions(replay_text, self.layout_positions.as_deref())
+    }
+
+    /// 검증된 layout positions를 우선하고, 없거나 손상됐으면 기존 K0 계산을 쓴다.
+    pub(crate) fn replay_positions_for<'a>(
+        &'a self,
+        replay_text: &str,
+    ) -> std::borrow::Cow<'a, [f64]> {
+        super::replay_positions_or_compute(
+            replay_text,
+            &self.style,
+            self.layout_positions.as_deref(),
+        )
+    }
+
+    /// Bounded sidecar가 전체 positions를 복제하지 않고 검증된 prefix만 빌린다.
+    ///
+    /// `prefix_replay_text`가 실제 replay 문자열의 scalar prefix가 아니거나 전체
+    /// positions가 손상됐으면 해당 sidecar만 기존 K0 계산으로 닫는다.
+    pub(crate) fn replay_positions_prefix_for<'a>(
+        &'a self,
+        full_replay_text: &str,
+        prefix_replay_text: &str,
+    ) -> std::borrow::Cow<'a, [f64]> {
+        let max_scalars = super::kerning::MAX_KERNING_RUN_CODE_POINTS;
+        let prefix_scalar_count = prefix_replay_text.chars().take(max_scalars + 1).count();
+        let prefix_matches = prefix_scalar_count <= max_scalars
+            && full_replay_text
+                .chars()
+                .take(prefix_scalar_count)
+                .eq(prefix_replay_text.chars());
+
+        if prefix_matches {
+            if let Some(positions) = self.validated_layout_positions_for(full_replay_text) {
+                if let Some(prefix) = positions.get(..=prefix_scalar_count) {
+                    return std::borrow::Cow::Borrowed(prefix);
+                }
+            }
+        }
+
+        std::borrow::Cow::Owned(super::layout::compute_char_positions(
+            prefix_replay_text,
+            &self.style,
+        ))
+    }
+}
+
+/// 누름틀 필드 조판부호 마커 유형
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+pub enum FieldMarkerType {
+    #[default]
+    None,
+    /// 누름틀 시작 ([누름틀 시작])
+    FieldBegin,
+    /// 누름틀 끝 ([누름틀 끝])
+    FieldEnd,
+    /// 시작+끝 동시 (빈 필드: start == end)
+    FieldBeginEnd,
+    /// 도형 조판부호 마커 — 인라인 컨트롤의 텍스트 위치
+    ShapeMarker(usize),
+}
+
+/// 표 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct TableNode {
+    /// 행 수
+    pub row_count: u16,
+    /// 열 수
+    pub col_count: u16,
+    /// 테두리/배경 ID
+    pub border_fill_id: u16,
+    /// 소속 구역 인덱스
+    pub section_index: Option<usize>,
+    /// 표 컨트롤을 소유한 문단 인덱스
+    pub para_index: Option<usize>,
+    /// 문단 내 컨트롤 인덱스
+    pub control_index: Option<usize>,
+    /// [#4334] 표 셀/글상자 안에 중첩된 표(TAC 포함)의 **전체 다단계 경로**.
+    /// `ImageNode.cell_context`(Task #1161)와 동일 메커니즘. 최외곽 표는 `None`.
+    #[serde(default)]
+    pub cell_context: Option<CellContext>,
+}
+
+/// 표 셀 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct TableCellNode {
+    /// 열 위치
+    pub col: u16,
+    /// 행 위치
+    pub row: u16,
+    /// 열 병합 수
+    pub col_span: u16,
+    /// 행 병합 수
+    pub row_span: u16,
+    /// 테두리/배경 ID
+    pub border_fill_id: u16,
+    /// 텍스트 방향 (0=가로, 1=세로/영문눕힘, 2=세로/영문세움)
+    pub text_direction: u8,
+    /// 셀 콘텐츠를 bounding box로 클리핑 (분할 행 셀에서 사용)
+    pub clip: bool,
+    /// [#5862] 이 셀이 **쪽 분할 조각**인가 (`table_partial` 경로에서 만든 셀).
+    ///
+    /// 조각 셀의 clip 은 괘선이 아니라 **쪽 컷**이 정한 값이라, 컷 부기와 실제
+    /// 조판이 어긋나면 조각이 이미 배치한 글줄이 clip 밖에 남는다. 일반 셀의
+    /// clip 은 괘선 그 자체이므로 같은 보정을 적용하면 글자가 아래 칸을 침범한다.
+    /// 두 경우를 렌더 트리에서 구분하려고 둔 표식이다.
+    pub page_fragment: bool,
+    /// 모델 cells 배열 내 인덱스 (getTableCellBboxes에서 resize용)
+    pub model_cell_index: Option<u32>,
+}
+
+/// 도형 변환 정보 (회전/대칭)
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ShapeTransform {
+    /// 회전각 (도, 시계방향)
+    pub rotation: f64,
+    /// 좌우 대칭
+    pub horz_flip: bool,
+    /// 상하 대칭
+    pub vert_flip: bool,
+}
+
+impl ShapeTransform {
+    /// 변환이 필요한지 여부
+    pub fn has_transform(&self) -> bool {
+        self.rotation != 0.0 || self.horz_flip || self.vert_flip
+    }
+
+    /// 그림 노드 한정: 회전각 90°/270° (±1° 톨러런스) 일 때 bbox extent 만 swap.
+    /// 그 외 각도(0/45/180 등)는 입력 bbox 그대로 반환.
+    ///
+    /// hwpx 의 `<hp:sz>` 는 회전 후 외접 사각형 치수라서 portrait → 90° 회전 시
+    /// bbox 가 landscape 로 들어온다. 그 위에 `rotate(90, cx, cy)` transform 을 다시
+    /// 적용하면 이중회전이 되어 페이지 밖으로 튀어 나간다. 회전 전 치수로 swap 한
+    /// bbox 위에 동일 rotation transform 을 적용하면 한컴 정답지와 정합한다.
+    /// cx, cy 는 swap 전후 동일하므로 rotate 식 자체는 그대로 둔다.
+    pub fn effective_image_bbox(&self, bbox: &BoundingBox) -> BoundingBox {
+        let r = self.rotation.rem_euclid(360.0);
+        let is_perpendicular = (r - 90.0).abs() < 1.0 || (r - 270.0).abs() < 1.0;
+        if !is_perpendicular {
+            return *bbox;
+        }
+        let cx = bbox.x + bbox.width / 2.0;
+        let cy = bbox.y + bbox.height / 2.0;
+        let new_w = bbox.height;
+        let new_h = bbox.width;
+        BoundingBox::new(cx - new_w / 2.0, cy - new_h / 2.0, new_w, new_h)
+    }
+}
+
+/// 직선 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct LineNode {
+    /// 시작점 (px)
+    pub x1: f64,
+    pub y1: f64,
+    /// 끝점 (px)
+    pub x2: f64,
+    pub y2: f64,
+    /// 선 스타일
+    pub style: LineStyle,
+    /// 소속 구역 인덱스
+    pub section_index: Option<usize>,
+    /// 도형 컨트롤을 소유한 문단 인덱스
+    pub para_index: Option<usize>,
+    /// 문단 내 컨트롤 인덱스
+    pub control_index: Option<usize>,
+    /// 변환 (회전/대칭)
+    pub transform: ShapeTransform,
+    /// [Task #1138] 표 셀 내 도형인 경우: 셀 인덱스
+    #[serde(default)]
+    pub cell_index: Option<usize>,
+    /// [Task #1138] 표 셀 내 도형인 경우: 셀 내 문단 인덱스
+    #[serde(default)]
+    pub cell_para_index: Option<usize>,
+    /// [Task #1138] 표 셀 내 도형인 경우: outer paragraph 의 표 control 인덱스
+    #[serde(default)]
+    pub outer_table_control_index: Option<usize>,
+}
+
+impl LineNode {
+    pub fn new(x1: f64, y1: f64, x2: f64, y2: f64, style: LineStyle) -> Self {
+        Self {
+            x1,
+            y1,
+            x2,
+            y2,
+            style,
+            section_index: None,
+            para_index: None,
+            control_index: None,
+            transform: ShapeTransform::default(),
+            cell_index: None,
+            cell_para_index: None,
+            outer_table_control_index: None,
+        }
+    }
+
+    /// 이 선이 실제로 칠하는 **잉크**의 경계 상자. (#6269)
+    ///
+    /// 백엔드(SVG·Canvas·Skia)는 `x1/y1`–`x2/y2` 를 경로로 삼아 획을 **중심 정렬**로
+    /// 칠하므로 잉크는 경로에서 획의 절반만큼 양쪽으로 번진다. bbox 를 경로 원점에서
+    /// 시작하게 잡으면(`[경로, 경로+획]`) 상자가 잉크보다 반 획 밀려, clip 확장·겹침
+    /// 판정처럼 bbox 를 소비하는 쪽이 경계에 붙은 선의 바깥 절반을 놓친다.
+    ///
+    /// 획 방향은 캡이 butt 라 경로 끝에서 더 번지지 않는다. 그래서 축 정렬 선은
+    /// **가로지르는 축으로만** 넓히고, 대각선만 두 축 모두 넓힌다.
+    pub fn ink_bbox(&self) -> BoundingBox {
+        let stroke = self.style.width.max(0.0);
+        let half = stroke / 2.0;
+        let x_min = self.x1.min(self.x2);
+        let y_min = self.y1.min(self.y2);
+        let dx = (self.x2 - self.x1).abs();
+        let dy = (self.y2 - self.y1).abs();
+        if dy <= LINE_AXIS_EPSILON_PX && dx > LINE_AXIS_EPSILON_PX {
+            BoundingBox::new(x_min, y_min - half, dx, stroke)
+        } else if dx <= LINE_AXIS_EPSILON_PX && dy > LINE_AXIS_EPSILON_PX {
+            BoundingBox::new(x_min - half, y_min, stroke, dy)
+        } else {
+            BoundingBox::new(x_min - half, y_min - half, dx + stroke, dy + stroke)
+        }
+    }
+}
+
+/// 선을 축 정렬로 볼지 가르는 허용치 (px). 저장 좌표가 정수 HWPUNIT 에서 오므로
+/// 변환 잔차만 흡수하면 된다.
+const LINE_AXIS_EPSILON_PX: f64 = 0.01;
+
+/// 사각형 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct RectangleNode {
+    /// 모서리 곡률 (px)
+    pub corner_radius: f64,
+    /// 도형 스타일
+    pub style: ShapeStyle,
+    /// 그라데이션 채우기 (style.fill_color보다 우선)
+    pub gradient: Option<Box<GradientFillInfo>>,
+    /// 소속 구역 인덱스
+    pub section_index: Option<usize>,
+    /// 도형 컨트롤을 소유한 문단 인덱스
+    pub para_index: Option<usize>,
+    /// 문단 내 컨트롤 인덱스
+    pub control_index: Option<usize>,
+    /// 변환 (회전/대칭)
+    pub transform: ShapeTransform,
+    /// [Task #1138] 표 셀 내 도형인 경우: 셀 인덱스
+    #[serde(default)]
+    pub cell_index: Option<usize>,
+    /// [Task #1138] 표 셀 내 도형인 경우: 셀 내 문단 인덱스
+    #[serde(default)]
+    pub cell_para_index: Option<usize>,
+    /// [Task #1138] 표 셀 내 도형인 경우: outer paragraph 의 표 control 인덱스
+    #[serde(default)]
+    pub outer_table_control_index: Option<usize>,
+}
+
+impl RectangleNode {
+    pub fn new(
+        corner_radius: f64,
+        style: ShapeStyle,
+        gradient: Option<Box<GradientFillInfo>>,
+    ) -> Self {
+        Self {
+            corner_radius,
+            style,
+            gradient,
+            section_index: None,
+            para_index: None,
+            control_index: None,
+            transform: ShapeTransform::default(),
+            cell_index: None,
+            cell_para_index: None,
+            outer_table_control_index: None,
+        }
+    }
+}
+
+/// 타원 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct EllipseNode {
+    /// 도형 스타일
+    pub style: ShapeStyle,
+    /// 그라데이션 채우기 (style.fill_color보다 우선)
+    pub gradient: Option<Box<GradientFillInfo>>,
+    /// 소속 구역 인덱스
+    pub section_index: Option<usize>,
+    /// 도형 컨트롤을 소유한 문단 인덱스
+    pub para_index: Option<usize>,
+    /// 문단 내 컨트롤 인덱스
+    pub control_index: Option<usize>,
+    /// 변환 (회전/대칭)
+    pub transform: ShapeTransform,
+    /// [Task #1138] 표 셀 내 도형인 경우: 셀 인덱스
+    #[serde(default)]
+    pub cell_index: Option<usize>,
+    /// [Task #1138] 표 셀 내 도형인 경우: 셀 내 문단 인덱스
+    #[serde(default)]
+    pub cell_para_index: Option<usize>,
+    /// [Task #1138] 표 셀 내 도형인 경우: outer paragraph 의 표 control 인덱스
+    #[serde(default)]
+    pub outer_table_control_index: Option<usize>,
+}
+
+impl EllipseNode {
+    pub fn new(style: ShapeStyle, gradient: Option<Box<GradientFillInfo>>) -> Self {
+        Self {
+            style,
+            gradient,
+            section_index: None,
+            para_index: None,
+            control_index: None,
+            transform: ShapeTransform::default(),
+            cell_index: None,
+            cell_para_index: None,
+            outer_table_control_index: None,
+        }
+    }
+}
+
+/// 패스 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct PathNode {
+    /// 패스 커맨드 목록
+    pub commands: Vec<PathCommand>,
+    /// 도형 스타일
+    pub style: ShapeStyle,
+    /// 그라데이션 채우기 (style.fill_color보다 우선)
+    pub gradient: Option<Box<GradientFillInfo>>,
+    /// 소속 구역 인덱스
+    pub section_index: Option<usize>,
+    /// 도형 컨트롤을 소유한 문단 인덱스
+    pub para_index: Option<usize>,
+    /// 문단 내 컨트롤 인덱스
+    pub control_index: Option<usize>,
+    /// 변환 (회전/대칭)
+    pub transform: ShapeTransform,
+    /// 연결선 시작/끝 좌표 (선 선택 방식용, None이면 일반 도형)
+    pub connector_endpoints: Option<(f64, f64, f64, f64)>,
+    /// 연결선 화살표 (LineStyle 포함, None이면 화살표 없음)
+    pub line_style: Option<LineStyle>,
+    /// [Task #1138] 표 셀 내 도형인 경우: 셀 인덱스
+    #[serde(default)]
+    pub cell_index: Option<usize>,
+    /// [Task #1138] 표 셀 내 도형인 경우: 셀 내 문단 인덱스
+    #[serde(default)]
+    pub cell_para_index: Option<usize>,
+    /// [Task #1138] 표 셀 내 도형인 경우: outer paragraph 의 표 control 인덱스
+    #[serde(default)]
+    pub outer_table_control_index: Option<usize>,
+}
+
+impl PathNode {
+    pub fn new(
+        commands: Vec<PathCommand>,
+        style: ShapeStyle,
+        gradient: Option<Box<GradientFillInfo>>,
+    ) -> Self {
+        Self {
+            commands,
+            style,
+            gradient,
+            section_index: None,
+            para_index: None,
+            control_index: None,
+            transform: ShapeTransform::default(),
+            connector_endpoints: None,
+            line_style: None,
+            cell_index: None,
+            cell_para_index: None,
+            outer_table_control_index: None,
+        }
+    }
+}
+
+/// 이미지 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageNode {
+    /// BinData ID 참조
+    pub bin_data_id: u16,
+    /// 이미지 데이터 (캐시용, JSON 직렬화 시 제외)
+    #[serde(skip)]
+    pub data: Option<Vec<u8>>,
+    /// 소속 구역 인덱스
+    pub section_index: Option<usize>,
+    /// 이미지 컨트롤을 소유한 문단 인덱스
+    pub para_index: Option<usize>,
+    /// 문단 내 컨트롤 인덱스
+    pub control_index: Option<usize>,
+    /// 이미지 채우기 모드 (채우기 이미지용, Picture 컨트롤은 None)
+    pub fill_mode: Option<ImageFillMode>,
+    /// 이미지 원본 크기 (HWPUNIT 기반, SVG 좌표 변환 후)
+    /// fill_mode가 배치 모드일 때 사용 (원래 크기대로 배치)
+    pub original_size: Option<(f64, f64)>,
+    /// 변환 (회전/대칭)
+    pub transform: ShapeTransform,
+    /// 그림 자르기: "자르기 한 후 사각형" 원본 좌표 (left, top, right, bottom)
+    /// 렌더러에서 이미지 원본 px 크기와 비교하여 source rect 계산
+    /// None이면 전체 이미지 표시
+    pub crop: Option<(i32, i32, i32, i32)>,
+    /// 그림 자르기 좌표의 전체 범위 — HWP/HWPX `imgDim`.
+    /// crop 좌표를 디코딩된 이미지 픽셀로 변환할 때 축별 스케일 계산에 사용한다.
+    /// None이면 표준 75 HU/px로 폴백한다.
+    pub original_size_hu: Option<(u32, u32)>,
+    /// 그림 효과 (실사/그레이스케일/흑백/패턴)
+    pub effect: ImageEffect,
+    /// 밝기 (-100 ~ +100)
+    pub brightness: i8,
+    /// 명암(대비) (-100 ~ +100)
+    pub contrast: i8,
+    /// 그림 개체 전체 불투명도. 1.0=불투명, 0.0=완전 투명.
+    pub opacity: f64,
+    /// 텍스트 흐름 wrap 모드 (Task #516, 다층 레이어 분리용).
+    /// `None` 또는 `Some(Square/TopAndBottom/Tight/Through)` 는 본문 layer 에 포함되고,
+    /// `Some(BehindText)` / `Some(InFrontOfText)` 는 overlay layer 로 분리 후보.
+    /// 기본값 `None` 은 기존 동작 유지.
+    pub text_wrap: Option<TextWrap>,
+    /// [Task #741] 외부 file path 그림 (HWP3 spec offset 74 그림 종류 0=외부 파일,
+    /// 1=OLE, 2=Embedded Image / offset 83~339 그림 파일 이름).
+    /// `data` 가 `None` 이고 `external_path` 가 `Some` 인 경우 placeholder 표시
+    /// (점선 사각형 + 깨진 image 아이콘) — 한컴 한글 2024 viewer 정합.
+    #[serde(default)]
+    pub external_path: Option<String>,
+    /// [Task #825] 머리말/꼬리말 그림 식별 marker.
+    /// `Some(ref)` 일 때 본 ImageNode 는 머리말 또는 꼬리말 안에 위치하며,
+    /// `para_index` / `control_index` 는 `Header.paragraphs[]` / `Footer.paragraphs[]`
+    /// 의 inner 인덱스를 가리킨다. `outer` 는 본문 paragraph 의 Header/Footer 컨트롤
+    /// 위치 (body_para_idx + header_ctrl_idx) 를 보존.
+    /// `None` 일 때 본문 그림 (현행 동작).
+    #[serde(default)]
+    pub header_footer_ref: Option<HeaderFooterImageRef>,
+    /// [Task #1151 v4] 표 셀 안 inline picture (tac=true) 인 경우: 셀 인덱스.
+    /// Rectangle/Ellipse/Path 의 [Task #1138] 패턴 정합. `None` 이면 셀 외부 picture.
+    #[serde(default)]
+    pub cell_index: Option<usize>,
+    /// [Task #1151 v4] 표 셀 안 inline picture 인 경우: 셀 내 문단 인덱스.
+    #[serde(default)]
+    pub cell_para_index: Option<usize>,
+    /// [Task #1151 v4] 표 셀 안 inline picture 인 경우: outer paragraph 의 표 control 인덱스.
+    #[serde(default)]
+    pub outer_table_control_index: Option<usize>,
+    /// [Task #1161] 표 셀/글상자 안 picture 의 **전체 다단계 경로**(중첩 표/글상자 지원).
+    /// `TextRunNode.cell_context` 와 동일 메커니즘. 위 단일 레벨 스칼라
+    /// (cell_index/cell_para_index/outer_table_control_index)는 이 경로의 innermost
+    /// 투영(`CellContext::last_image_indices`)으로 유지(하위호환). 본문 picture 는 `None`.
+    #[serde(default)]
+    pub cell_context: Option<CellContext>,
+    /// [#7193] 그림 안쪽 여백 — 노드 bbox(개체 틀) 크기에 대한 비율
+    /// `[left, top, right, bottom]`. 틀은 흐름·선택 기준으로 그대로 두고, 그림 자체는
+    /// 이 여백을 뺀 자리에 그린다. 페인터는 [`ImageNode::paint_bbox`] 로 소비한다.
+    /// `None` 이면 틀 전체에 그린다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_inset: Option<[f64; 4]>,
+}
+
+/// [Task #825] 머리말/꼬리말 안 그림의 outer 위치 + 종류.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HeaderFooterImageRef {
+    /// 본문 paragraph 인덱스 (Header/Footer 컨트롤 소속 paragraph)
+    pub outer_para_index: usize,
+    /// 본문 paragraph 안 Header/Footer 컨트롤 인덱스
+    pub outer_control_index: usize,
+    /// "header" or "footer"
+    pub kind: HeaderFooterKind,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HeaderFooterKind {
+    Header,
+    Footer,
+}
+
+impl ImageNode {
+    /// 워터마크 효과 적용 여부 (Issue #1156).
+    /// 밝기·대비가 둘 다 0 이 아닌 경우 워터마크 (한쪽이라도 0 이면 아님, effect 무관).
+    /// HWP/HWPX 에 워터마크 비트는 없으며 한컴은 해제 시 밝기·대비를 0/0 으로 되돌린다.
+    pub fn is_watermark(&self) -> bool {
+        self.brightness != 0 && self.contrast != 0
+    }
+
+    pub fn is_real_picture_watermark_tone_preset(&self) -> bool {
+        // `ImageNode` 의 두 필드는 이미 화면 순서다(#6895).
+        is_real_picture_watermark_tone_preset(self.effect, self.brightness, self.contrast)
+    }
+
+    pub fn new(bin_data_id: u16, data: Option<Vec<u8>>) -> Self {
+        Self {
+            bin_data_id,
+            data,
+            section_index: None,
+            para_index: None,
+            control_index: None,
+            fill_mode: None,
+            original_size: None,
+            transform: ShapeTransform::default(),
+            crop: None,
+            original_size_hu: None,
+            effect: ImageEffect::RealPic,
+            brightness: 0,
+            contrast: 0,
+            opacity: 1.0,
+            text_wrap: None,
+            external_path: None,
+            header_footer_ref: None,
+            cell_index: None,
+            cell_para_index: None,
+            outer_table_control_index: None,
+            cell_context: None,
+            content_inset: None,
+        }
+    }
+
+    /// [#7193] 개체 틀(`frame`) 안에서 그림이 실제로 그려질 사각형.
+    ///
+    /// 한/글은 그림 틀(`hp:sz`) 안쪽 여백(`hp:inMargin`)을 뺀 자리에 그림을 그린다.
+    /// 모든 페인터가 이 한 계산을 거쳐야 백엔드마다 그리는 자리가 갈리지 않는다.
+    pub fn paint_bbox(&self, frame: &BoundingBox) -> BoundingBox {
+        let Some([left, top, right, bottom]) = self.content_inset else {
+            return *frame;
+        };
+        BoundingBox::new(
+            frame.x + frame.width * left,
+            frame.y + frame.height * top,
+            frame.width * (1.0 - left - right),
+            frame.height * (1.0 - top - bottom),
+        )
+    }
+}
+
+/// 묶음 개체 노드
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupNode {
+    /// 소속 구역 인덱스
+    pub section_index: Option<usize>,
+    /// 묶음 개체 컨트롤을 소유한 문단 인덱스
+    pub para_index: Option<usize>,
+    /// 문단 내 컨트롤 인덱스
+    pub control_index: Option<usize>,
+}
+
+/// 각주/미주 내부에 있는 컨트롤의 원본 위치.
+#[derive(Debug, Clone, Serialize)]
+pub struct NoteControlRef {
+    /// `footnote` 또는 `endnote`
+    pub kind: String,
+    /// 원본 각주/미주 컨트롤이 있는 구역 인덱스
+    pub section_index: usize,
+    /// 원본 각주/미주 컨트롤이 있는 본문 문단 인덱스
+    pub para_index: usize,
+    /// 본문 문단 내 각주/미주 컨트롤 인덱스
+    pub control_index: usize,
+    /// 각주/미주 내부 문단 인덱스
+    pub note_para_index: usize,
+    /// 각주/미주 내부 문단 내 컨트롤 인덱스
+    pub inner_control_index: usize,
+}
+
+/// 수식 노드 (SVG 인라인 렌더링)
+#[derive(Debug, Clone, Serialize)]
+pub struct EquationNode {
+    /// 수식 SVG 조각 (viewBox 기준 상대 좌표)
+    pub svg_content: String,
+    /// 수식 레이아웃 트리 (Canvas 렌더링용)
+    pub layout_box: crate::renderer::equation::layout::LayoutBox,
+    /// 수식 색상 문자열 (#rrggbb)
+    pub color_str: String,
+    /// 수식 글자 색상 (0x00BBGGRR → #RRGGBB)
+    pub color: u32,
+    /// 수식 글자 크기 (HWPUNIT → px 변환 후)
+    pub font_size: f64,
+    /// 원본 수식 스크립트(HWP 수식 편집기 문법, 예 `sqrt {3} of {5}`).
+    ///
+    /// [#3413] 텍스트 추출 표면(`extract_page_text_native` 등)이 수식 내용을 방출할 수
+    /// 있도록 노드에 보존한다. 이 값이 없으면 수식은 렌더에만 존재하고 평문에서는
+    /// 조용히 사라진다(수학 문서에서 선택지·발문이 통째로 비는 원인).
+    #[serde(default)]
+    pub script: String,
+    /// 소속 구역 인덱스
+    pub section_index: Option<usize>,
+    /// 수식 컨트롤을 소유한 문단 인덱스
+    pub para_index: Option<usize>,
+    /// 문단 내 컨트롤 인덱스
+    pub control_index: Option<usize>,
+    /// 표 셀 내 수식인 경우: 셀 인덱스
+    pub cell_index: Option<usize>,
+    /// 표 셀 내 수식인 경우: 셀 내 문단 인덱스
+    pub cell_para_index: Option<usize>,
+    /// 각주/미주 내부 수식인 경우 원본 위치
+    pub note_ref: Option<NoteControlRef>,
+}
+
+/// 인라인 Shape 좌표 맵 키. 섹션 단위 + 셀 경로로 셀 내 paragraph/control
+/// 인덱스 충돌(예: 서로 다른 셀이 cp_idx=0 + ctrl_idx=N 동일)을 방지한다.
+///
+/// `cell_path` 는 외→내 nesting 순서로 `(control_index, cell_index, cell_para_index)`
+/// 튜플 목록. 섹션 단위(셀 외부)는 빈 Vec.
+pub type InlineShapeKey = (usize, usize, usize, Vec<(usize, usize, usize)>);
+
+/// [Issue #4334 stableIndex 서수화] 노드의 **문서 위치** — `next_id()` 카운터가
+/// 아니라 `(section, para, cell 경로…, control)` 에서 유도한 정수 배열. 사전식
+/// (lexicographic) 비교로 정렬한다 — `Vec<u32>` 의 `Ord` 구현이 그대로 이 의미다
+/// (공통 접두사까지 원소별 비교, 그 다음 길이).
+///
+/// [`InlineShapeKey`]/[`CellContext::path`](crate::renderer::layout::CellContext) 와
+/// 같은 좌표계를 재사용한다 — 새 이름공간을 만들지 않는다. `paper_node_sort_key` 가
+/// 이 값을 `RenderLayerInfo.stable_index`(레이어 있는 노드) 와 `node.id` 폴백(레이어
+/// 없는 inline 노드) 을 모두 대신해 쓴다.
+///
+/// # 사전식 비교가 뜻하는 것 — 조상은 자손보다 작다
+///
+/// 경로 길이는 항상 `3k+3`(`[section, para]` + 셀 3원소 × k + `control`)이라, 어떤
+/// 경로가 다른 경로의 진접두사(strict prefix)가 되는 경우는 **한쪽이 다른 쪽을 담고
+/// 있을 때**뿐이다: 표 자체가 `[0,0,2]`, 그 셀 안 개체가 `[0,0,2,5,1,0]`. 사전식
+/// 비교는 짧은 쪽(조상)을 작다고 본다 — 정렬키에서 "작다"는 "먼저 그린다 = 아래"이고,
+/// 담는 표가 담긴 개체보다 아래인 것이 렌더 순서상 옳으므로 의도한 관계다.
+///
+/// # 동률(tie)
+///
+/// `Vec<u32>` 의 순서 자체는 전순서지만 **서로 다른 노드가 같은 경로를 받을 수는
+/// 있다**. 두 경우다.
+///
+/// 1. 문서 위치를 못 만드는 노드([`doc_path_for_node`] 가 `None`) — 호출부가 빈
+///    경로로 폴백하면 서로 전부 동률이고, 빈 배열은 사전식 최솟값이라 같은
+///    plane/zOrder 안에서 항상 맨 아래다.
+/// 2. [`doc_path_single_cell_level`] 을 쓰는 타입(Rectangle/Line/Ellipse/Path/
+///    Equation)의 2중 이상 중첩 — 그 필드들이 애초에 단일 레벨 근사라 바깥 레벨이
+///    구분되지 않는다.
+///
+/// 두 경우 모두 `sort_paper_render_nodes` 의 `sort_by_key`(std 안정 정렬)가 동률
+/// 노드의 삽입 순서를 보존한다.
+pub(crate) type DocPath = Vec<u32>;
+
+fn push_cell_path(path: &mut DocPath, cell_path: &[crate::renderer::layout::CellPathEntry]) {
+    for entry in cell_path {
+        path.push(entry.control_index as u32);
+        path.push(entry.cell_index as u32);
+        path.push(entry.cell_para_index as u32);
+    }
+}
+
+/// 전체 다단계 셀 경로(`CellContext`, Task #1161)를 갖는 노드(Table/Image)용.
+fn doc_path_full(
+    section_index: Option<usize>,
+    para_index: Option<usize>,
+    cell_context: Option<&CellContext>,
+    control_index: Option<usize>,
+) -> Option<DocPath> {
+    let (si, pi, ci) = (section_index?, para_index?, control_index?);
+    let mut path: DocPath = vec![si as u32, pi as u32];
+    if let Some(ctx) = cell_context {
+        push_cell_path(&mut path, &ctx.path);
+    }
+    path.push(ci as u32);
+    Some(path)
+}
+
+/// 단일 레벨 셀 스칼라(`cell_index`/`cell_para_index`/`outer_table_control_index`,
+/// Task #1138/#1151)만 갖는 노드(Rectangle/Line/Ellipse/Path/Equation)용. 2중 이상
+/// 중첩은 가장 안쪽 한 단계만 반영하는 근사다 — 해당 필드들 자체가 이미 이 근사를
+/// 전제로 설계되어 있다(다단계 `cell_context` 가 없음).
+#[allow(clippy::too_many_arguments)]
+fn doc_path_single_cell_level(
+    section_index: Option<usize>,
+    para_index: Option<usize>,
+    outer_table_control_index: Option<usize>,
+    cell_index: Option<usize>,
+    cell_para_index: Option<usize>,
+    control_index: Option<usize>,
+) -> Option<DocPath> {
+    let (si, pi, ci) = (section_index?, para_index?, control_index?);
+    let mut path: DocPath = vec![si as u32, pi as u32];
+    if let Some(cell_idx) = cell_index {
+        path.push(outer_table_control_index.unwrap_or(0) as u32);
+        path.push(cell_idx as u32);
+        path.push(cell_para_index.unwrap_or(0) as u32);
+    }
+    path.push(ci as u32);
+    Some(path)
+}
+
+/// 노드가 이미 갖고 있는 필드에서 [`DocPath`] 를 유도한다 — `next_id()`/`node.id`
+/// 를 전혀 참조하지 않는다. 해당 타입이 문서 위치 필드를 아예 갖지 않거나(예:
+/// `TextLine`/`Body` 같은 구조 노드), 필드는 있지만 값이 없으면(#4334 stage3 가 실측한
+/// 42개 노드류) `None` — 호출부가 무엇으로 대체할지 결정한다(`node.id` 로 되돌아가지
+/// 않는 것이 이 이슈의 목적이다).
+pub(crate) fn doc_path_for_node(node: &RenderNode) -> Option<DocPath> {
+    match &node.node_type {
+        RenderNodeType::Table(t) => doc_path_full(
+            t.section_index,
+            t.para_index,
+            t.cell_context.as_ref(),
+            t.control_index,
+        ),
+        RenderNodeType::Image(i) => doc_path_full(
+            i.section_index,
+            i.para_index,
+            i.cell_context.as_ref(),
+            i.control_index,
+        ),
+        RenderNodeType::Equation(e) => doc_path_single_cell_level(
+            e.section_index,
+            e.para_index,
+            None,
+            e.cell_index,
+            e.cell_para_index,
+            e.control_index,
+        ),
+        RenderNodeType::Rectangle(r) => doc_path_single_cell_level(
+            r.section_index,
+            r.para_index,
+            r.outer_table_control_index,
+            r.cell_index,
+            r.cell_para_index,
+            r.control_index,
+        ),
+        RenderNodeType::Line(l) => doc_path_single_cell_level(
+            l.section_index,
+            l.para_index,
+            l.outer_table_control_index,
+            l.cell_index,
+            l.cell_para_index,
+            l.control_index,
+        ),
+        RenderNodeType::Ellipse(el) => doc_path_single_cell_level(
+            el.section_index,
+            el.para_index,
+            el.outer_table_control_index,
+            el.cell_index,
+            el.cell_para_index,
+            el.control_index,
+        ),
+        RenderNodeType::Path(p) => doc_path_single_cell_level(
+            p.section_index,
+            p.para_index,
+            p.outer_table_control_index,
+            p.cell_index,
+            p.cell_para_index,
+            p.control_index,
+        ),
+        RenderNodeType::Group(g) => {
+            doc_path_full(g.section_index, g.para_index, None, g.control_index)
+        }
+        _ => None,
+    }
+}
+
+/// 레이아웃 재귀가 들고 다니는 흐름 상태 (paint 출력 아님).
+///
+/// [#4277] 레이아웃 재귀는 `PageRenderTree` 를 **출력**으로 쓰지 않는다 — 노드는 호출자가
+/// 넘긴 `col_node` 에 붙고, 트리에서 실제로 쓰이던 건 id 카운터와 인라인 Shape 좌표
+/// 레지스트리(둘 다 `#[serde(skip)]`, 즉 직렬화되는 산출물이 아님)뿐이었다. 그 둘을 여기로
+/// 분리해, 높이만 필요한 측정 호출부가 paint 트리를 만들지 않고도 재귀에 진입할 수 있게 한다.
+///
+/// # 불변식 — 페이지 기하는 `PageRenderTree.root` 와 반드시 일치해야 한다
+///
+/// `page_index`/`page_bbox` 는 재귀가 예전에 `root.node_type` 의 `PageNode` 와 `root.bbox`
+/// 에서 직접 읽던 값의 사본이다. `PageRenderTree::new` 가 프레임을 같은 인자로 만들므로
+/// 생성 시점에는 항상 일치하고, 레이아웃 도중에는 양쪽 다 변경되지 않는다.
+///
+/// **두 곳을 갈라놓지 말 것.** `root.bbox`/`root.node_type` 를 나중에 바꾸면서 프레임을
+/// 갱신하지 않으면 `page_bbox()`/`page_size()` 가 조용히 낡은 값을 준다. 실제로
+/// `svg_layer.rs` 의 layer→render 변환은 `root.bbox` 만 덮어쓰는데, 그 트리는 레이아웃
+/// 재귀에 들어가지 않으므로 오늘은 무해하다 — 그 전제가 깨지면 이 불변식도 깨진다.
+///
+/// 또한 프레임은 **항상 하나의 페이지를 나타낸다**. 종전 코드가 `root` 가 `PageNode` 인지
+/// 런타임에 확인하던 자리(`shape_layout.rs` 의 hmapsi 미리보기 게이트)는, 프레임이 페이지
+/// 기하 없이는 생성될 수 없다는 이 구성 불변식으로 대체됐다.
+#[derive(Debug, Clone)]
+pub struct PageLayoutContext {
+    /// 다음 노드 ID 카운터
+    next_id: NodeId,
+    /// 인라인 Shape 좌표 맵: (section, para, control, cell_path) → (x, y)
+    inline_shape_positions: std::collections::HashMap<InlineShapeKey, (f64, f64)>,
+    /// 페이지 인덱스. 재귀가 페인트 root 의 `PageNode` 에서 읽던 값 (#4277).
+    page_index: u32,
+    /// 페이지 bbox. 재귀가 페인트 root 의 bbox 에서 읽던 값 — 레이아웃 도중 불변이다.
+    page_bbox: BoundingBox,
+    /// Q2-D horizontal shaping terminal decisions. PageRenderTree.frame 전체가 직렬화 제외된다.
+    horizontal_shaping_sidecars: HorizontalShapingPageSidecars,
+    /// Q4-D2 bounded HWP5 vertical table-cell owners. Paint publication is D3-only.
+    vertical_shaping_sidecars: VerticalShapingPageSidecars,
+}
+
+impl PageLayoutContext {
+    /// 새 흐름 상태. id 는 root(0) 다음부터 발급한다.
+    pub fn new(page_index: u32, width: f64, height: f64) -> Self {
+        Self {
+            next_id: 1,
+            inline_shape_positions: std::collections::HashMap::new(),
+            page_index,
+            page_bbox: BoundingBox::new(0.0, 0.0, width, height),
+            horizontal_shaping_sidecars: HorizontalShapingPageSidecars::default(),
+            vertical_shaping_sidecars: VerticalShapingPageSidecars::default(),
+        }
+    }
+
+    /// 페이지 인덱스
+    pub fn page_index(&self) -> u32 {
+        self.page_index
+    }
+
+    /// 페이지 bbox (실제 clip 기준)
+    pub fn page_bbox(&self) -> BoundingBox {
+        self.page_bbox
+    }
+
+    /// 페이지 폭/높이
+    pub fn page_size(&self) -> (f64, f64) {
+        (self.page_bbox.width, self.page_bbox.height)
+    }
+
+    /// `CellContext` 를 InlineShapeKey 의 cell_path 부분으로 변환.
+    fn cell_path_from_ctx(
+        cell_ctx: Option<&crate::renderer::layout::CellContext>,
+    ) -> Vec<(usize, usize, usize)> {
+        cell_ctx
+            .map(|ctx| {
+                ctx.path
+                    .iter()
+                    .map(|e| (e.control_index, e.cell_index, e.cell_para_index))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 인라인 Shape 좌표 등록 (셀 컨텍스트 포함).
+    /// [Task #1151 v4] 셀 안인 경우 InlineShapeKey 의 para 는 호출자가 전달한
+    /// cell paragraph idx 가 아닌 **outer paragraph idx** (`cell_ctx.parent_para_index`)
+    /// 로 정규화한다. cursor_rect 의 hit-test 가 `section.paragraphs.get(pi)` 로
+    /// outer paragraph 에서 table → cell → cell paragraph 경로로 resolve 하기 위해
+    /// 정합 필요.
+    pub fn set_inline_shape_position(
+        &mut self,
+        sec: usize,
+        para: usize,
+        ctrl: usize,
+        cell_ctx: Option<&crate::renderer::layout::CellContext>,
+        x: f64,
+        y: f64,
+    ) {
+        let cell_path = Self::cell_path_from_ctx(cell_ctx);
+        let para_for_key = cell_ctx.map(|c| c.parent_para_index).unwrap_or(para);
+        self.inline_shape_positions
+            .insert((sec, para_for_key, ctrl, cell_path), (x, y));
+    }
+
+    /// 인라인 Shape 좌표 조회 (셀 컨텍스트 포함).
+    /// [Task #1151 v4] `set_inline_shape_position` 과 동일한 para 정규화.
+    pub fn get_inline_shape_position(
+        &self,
+        sec: usize,
+        para: usize,
+        ctrl: usize,
+        cell_ctx: Option<&crate::renderer::layout::CellContext>,
+    ) -> Option<(f64, f64)> {
+        let cell_path = Self::cell_path_from_ctx(cell_ctx);
+        let para_for_key = cell_ctx.map(|c| c.parent_para_index).unwrap_or(para);
+        self.inline_shape_positions
+            .get(&(sec, para_for_key, ctrl, cell_path))
+            .copied()
+    }
+
+    /// 인라인 Shape 좌표 전체 참조 (hitTest용)
+    pub fn inline_shape_positions(&self) -> &std::collections::HashMap<InlineShapeKey, (f64, f64)> {
+        &self.inline_shape_positions
+    }
+
+    /// 새 노드 ID 할당
+    pub fn next_id(&mut self) -> NodeId {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Read-only node-id preview for a transaction that must prepare every
+    /// render node before changing the page frame.
+    pub(crate) fn preview_node_ids(
+        &self,
+        count: u32,
+    ) -> Result<NodeId, VerticalShapingSidecarRejectReason> {
+        if count == 0 {
+            return Err(VerticalShapingSidecarRejectReason::NodeSequenceMismatch);
+        }
+        self.next_id
+            .checked_add(count)
+            .ok_or(VerticalShapingSidecarRejectReason::NodeSequenceOverflow)?;
+        Ok(self.next_id)
+    }
+
+    /// Q4-D2 atomic frame commit. Sidecar validation and every fallible ID
+    /// check precede mutation; after attach succeeds, advancing the counter is
+    /// infallible and the caller may append its already-built node batch.
+    pub(crate) fn commit_bounded_vertical_hwp5_table_cell_frame(
+        &mut self,
+        expected_first_id: NodeId,
+        node_count: u32,
+        sidecar: std::sync::Arc<BoundedVerticalHwp5TableCellSidecar>,
+    ) -> Result<(), VerticalShapingSidecarRejectReason> {
+        if expected_first_id != self.next_id || sidecar.line_node_id() != expected_first_id {
+            return Err(VerticalShapingSidecarRejectReason::NodeSequenceMismatch);
+        }
+        let next_id = self
+            .next_id
+            .checked_add(node_count)
+            .ok_or(VerticalShapingSidecarRejectReason::NodeSequenceOverflow)?;
+        self.vertical_shaping_sidecars
+            .attach_bounded_hwp5_table_cell_atomic(sidecar)?;
+        self.next_id = next_id;
+        Ok(())
+    }
+
+    /// Attach one terminal shaping decision to the final emitted node without publishing it.
+    pub(crate) fn attach_horizontal_shaping_sidecar(
+        &mut self,
+        node_id: NodeId,
+        expected_range: HorizontalShapingRunRange,
+        decision: std::sync::Arc<HorizontalShapingRunDecision>,
+    ) -> Result<(), HorizontalShapingSidecarRejectReason> {
+        self.horizontal_shaping_sidecars
+            .attach(node_id, expected_range, decision)
+    }
+
+    /// Q2-D5-N1 no-LineSeg publication boundary. The transaction owns every
+    /// geometry consumer already; only a successful page-sidecar attach may
+    /// turn it into a product publication.
+    pub(crate) fn publish_horizontal_shaping_no_lineseg_owner_transaction(
+        &mut self,
+        transaction: crate::renderer::shaping_composition::HorizontalShapingNoLineSegOwnerTransaction,
+    ) -> Result<
+        crate::renderer::shaping_composition::HorizontalShapingNoLineSegPublication,
+        crate::renderer::shaping_composition::HorizontalShapingNoLineSegOwnerRejection,
+    > {
+        crate::renderer::shaping_composition::publish_horizontal_shaping_no_lineseg_owner_transaction(
+            &mut self.horizontal_shaping_sidecars,
+            transaction,
+        )
+    }
+
+    pub(crate) fn horizontal_shaping_sidecar(
+        &self,
+        node_id: NodeId,
+    ) -> Option<&std::sync::Arc<HorizontalShapingRunDecision>> {
+        self.horizontal_shaping_sidecars.get(node_id)
+    }
+
+    /// LayerBuilder가 최종 RenderNode의 source id와 page-local decision을
+    /// 대사할 때만 사용하는 읽기 전용 경계다. sidecar owner는 계속 frame이다.
+    pub(crate) fn horizontal_shaping_sidecars(&self) -> &HorizontalShapingPageSidecars {
+        &self.horizontal_shaping_sidecars
+    }
+
+    pub(crate) fn horizontal_shaping_sidecar_count(&self) -> usize {
+        self.horizontal_shaping_sidecars.len()
+    }
+
+    pub(crate) fn horizontal_shaping_sidecar_registry_generation(&self) -> Option<u64> {
+        self.horizontal_shaping_sidecars.registry_generation()
+    }
+
+    pub(crate) fn vertical_shaping_sidecar(
+        &self,
+        node_id: NodeId,
+    ) -> Option<&std::sync::Arc<BoundedVerticalHwp5TableCellSidecar>> {
+        self.vertical_shaping_sidecars.get(node_id)
+    }
+
+    pub(crate) fn vertical_shaping_sidecar_count(&self) -> usize {
+        self.vertical_shaping_sidecars.len()
+    }
+
+    pub(crate) fn vertical_shaping_sidecar_registry_generation(&self) -> Option<u64> {
+        self.vertical_shaping_sidecars.registry_generation()
+    }
+}
+
+#[deprecated(note = "use PageLayoutContext")]
+pub type LayoutFrame = PageLayoutContext;
+
+/// 한 페이지의 렌더 트리
+#[derive(Debug, Clone, Serialize)]
+pub struct PageRenderTree {
+    /// 루트 노드
+    pub root: RenderNode,
+    /// 레이아웃 흐름 상태 (id 카운터 + 인라인 Shape 레지스트리). 직렬화 대상 아님.
+    #[serde(skip)]
+    pub(crate) frame: PageLayoutContext,
+}
+
+/// `clip_overlapping_same_bin_images` 전용 대략적 replay plane 분류.
+///
+/// `src/paint/replay_order.rs` (`paint_op_replay_plane_with_layer`,
+/// `cap_master_page_plane`) 가 실제 페인트 backend 에서 적용하는 재생 순서는
+/// Background → BehindText → Flow → InFrontOfText 로, **트리 순서와 무관하게
+/// plane 별로 별도 재생**된다. 즉 트리 순서상 `BehindText` 개체가 `Flow`
+/// 개체보다 뒤에 있어도 실제로는 `BehindText` 가 먼저(더 아래에) 그려진다.
+/// clip 함수는 "트리 순서 = z 순서(먼저 그려짐 = 아래)"를 가정하므로, plane
+/// 이 다른 페어는 이 가정이 성립하지 않아 clip 방향을 잘못 판단할 수 있다
+/// (아래에 깔릴 그림이 아니라 위에 그려질 그림이 잘리는 역방향 clip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipReplayPlane {
+    BehindText,
+    Flow,
+    InFrontOfText,
+}
+
+impl ClipReplayPlane {
+    fn from_text_wrap(wrap: Option<TextWrap>) -> Self {
+        match wrap {
+            Some(TextWrap::BehindText) => Self::BehindText,
+            Some(TextWrap::InFrontOfText) => Self::InFrontOfText,
+            _ => Self::Flow,
+        }
+    }
+}
+
+impl PageRenderTree {
+    /// 새 페이지 렌더 트리 생성
+    pub fn new(page_index: u32, width: f64, height: f64) -> Self {
+        let root = RenderNode::new(
+            0,
+            RenderNodeType::Page(PageNode {
+                page_index,
+                width,
+                height,
+                section_index: 0,
+            }),
+            BoundingBox::new(0.0, 0.0, width, height),
+        );
+        Self {
+            root,
+            frame: PageLayoutContext::new(page_index, width, height),
+        }
+    }
+
+    /// 레이아웃 흐름 상태 가변 참조 — 재귀 진입 시 `&mut tree.frame` 으로 넘긴다.
+    pub(crate) fn frame_mut(&mut self) -> &mut PageLayoutContext {
+        &mut self.frame
+    }
+
+    /// 인라인 Shape 좌표 등록 (셀 컨텍스트 포함).
+    /// [Task #1151 v4] 셀 안인 경우 InlineShapeKey 의 para 는 호출자가 전달한
+    /// cell paragraph idx 가 아닌 **outer paragraph idx** (`cell_ctx.parent_para_index`)
+    /// 로 정규화한다. cursor_rect 의 hit-test 가 `section.paragraphs.get(pi)` 로
+    /// outer paragraph 에서 table → cell → cell paragraph 경로로 resolve 하기 위해
+    /// 정합 필요.
+    pub fn set_inline_shape_position(
+        &mut self,
+        sec: usize,
+        para: usize,
+        ctrl: usize,
+        cell_ctx: Option<&crate::renderer::layout::CellContext>,
+        x: f64,
+        y: f64,
+    ) {
+        self.frame
+            .set_inline_shape_position(sec, para, ctrl, cell_ctx, x, y);
+    }
+
+    /// 인라인 Shape 좌표 조회 (셀 컨텍스트 포함). `PageLayoutContext` 위임.
+    pub fn get_inline_shape_position(
+        &self,
+        sec: usize,
+        para: usize,
+        ctrl: usize,
+        cell_ctx: Option<&crate::renderer::layout::CellContext>,
+    ) -> Option<(f64, f64)> {
+        self.frame
+            .get_inline_shape_position(sec, para, ctrl, cell_ctx)
+    }
+
+    /// 인라인 Shape 좌표 전체 참조 (hitTest용)
+    pub fn inline_shape_positions(&self) -> &std::collections::HashMap<InlineShapeKey, (f64, f64)> {
+        self.frame.inline_shape_positions()
+    }
+
+    /// 새 노드 ID 할당
+    pub fn next_id(&mut self) -> NodeId {
+        self.frame.next_id()
+    }
+
+    /// 한컴 PDF가 현대 글리프로 인쇄하는 닫힌 레거시 제품명 어휘를 최종 화면
+    /// 문자열에만 투영한다.
+    ///
+    /// 본문은 composer에서 이미 처리하지만, 표 셀·머리말처럼 `TextRunNode`를
+    /// 직접 만드는 경로는 composer를 거치지 않는다. 렌더 트리 완성 뒤 한 번
+    /// 순회하면 두 경로가 같은 표시 계약을 지키면서도 `text`/offset은 원문대로
+    /// 보존한다. 일반 옛한글이나 CharOverlap 런은 건드리지 않는다.
+    pub(crate) fn apply_legacy_hancom_product_display_projection(&mut self) {
+        fn visit(node: &mut RenderNode) {
+            if let RenderNodeType::TextRun(run) = &mut node.node_type {
+                if run.char_overlap.is_none() {
+                    // PUA `U+F53A`처럼 실제 옛한글을 display_text에서 `ᄒᆞᆫ`으로
+                    // 확장한 경우는 product convention이 아니다. raw model text에
+                    // 닫힌 제품명이 있을 때만 기존 화면 문자열(있다면 PUA 확장본)을
+                    // 다시 투영한다.
+                    if legacy_hancom_product_display_text(&run.text).is_some() {
+                        let source = run.display_or_text();
+                        if let Some(display) = legacy_hancom_product_display_text(source) {
+                            run.display_text = Some(display);
+                        }
+                    }
+                }
+            }
+            for child in &mut node.children {
+                visit(child);
+            }
+        }
+
+        visit(&mut self.root);
+    }
+
+    /// 동일 `bin_data_id` 를 가진 ImageNode 가 세로로 인접 겹칠 때,
+    /// 트리 순서상 먼저 그려지는 (z 가 작은) 쪽의 bbox/crop 을 위에 덮는
+    /// (z 가 큰) 쪽의 top 까지 축소한다.
+    ///
+    /// Task #1154: 동일 이미지를 두 Pic 컨트롤로 겹쳐 박스 효과를 만든 경우
+    /// 두 그림의 세로 스케일이 미세하게 달라 안티엘리어싱/리샘플링 시 잔상
+    /// (이중 라인) 이 노출되는 문제를 해결한다.
+    ///
+    /// 적용 조건 (모두 만족 시 clip):
+    /// 1. `A.bin_data_id == B.bin_data_id`
+    /// 2. `|A.x - B.x| <= 1.0` (수평 위치 동일)
+    /// 3. `|A.width - B.width| <= 1.0` (수평 폭 동일)
+    /// 4. A 가 트리 순서상 먼저 + `A.y < B.y` (A 가 위에 있음)
+    /// 5. `A.y + A.height > B.y` (세로 겹침)
+    ///
+    /// 조건 2/3 은 의도적 시각 효과 (test-image, 3-10월_교육_통합 의 대각선
+    /// 오프셋 등) 를 보호하기 위한 strict 가드.
+    pub fn clip_overlapping_same_bin_images(&mut self) {
+        // Phase 1: 트리 순서대로 ImageNode 의 (id, bbox, bin_id, crop, plane) 수집
+        let mut images: Vec<(
+            NodeId,
+            BoundingBox,
+            u16,
+            Option<(i32, i32, i32, i32)>,
+            ClipReplayPlane,
+        )> = Vec::new();
+        Self::collect_image_nodes(&self.root, &mut images);
+
+        if images.len() < 2 {
+            return;
+        }
+
+        // Phase 2: 페어 검출 + 각 LOWER 노드별 최종 clip 결정
+        // 한 노드가 여러 UPPER 와 겹치면 가장 위쪽 UPPER 를 기준으로 가장 작은 height 적용
+        let mut clips: std::collections::HashMap<NodeId, (f64, Option<(i32, i32, i32, i32)>)> =
+            std::collections::HashMap::new();
+
+        for i in 0..images.len() {
+            for j in (i + 1)..images.len() {
+                let (id_a, bbox_a, bin_a, crop_a, plane_a) = &images[i];
+                let (_id_b, bbox_b, bin_b, _crop_b, plane_b) = &images[j];
+                // 조건 1: 같은 bin_id
+                if bin_a != bin_b {
+                    continue;
+                }
+                // 조건 0 (#paint/replay_order.rs plane 분리 재생 정합):
+                // BehindText/InFrontOfText 는 Flow 와 별도 plane 으로 재생되어
+                // 실제 페인트 순서가 트리 순서와 반대일 수 있다. 서로 다른
+                // plane 페어는 clip 방향을 트리 순서만으로 확정할 수 없으므로
+                // 건너뛴다 (트리 순서가 곧 페인트 순서인 동일 plane 내에서만
+                // 이 함수의 z 가정이 성립한다).
+                if plane_a != plane_b {
+                    continue;
+                }
+                // 조건 2/3: x, width 동일 (1px tolerance)
+                if (bbox_a.x - bbox_b.x).abs() > 1.0 {
+                    continue;
+                }
+                if (bbox_a.width - bbox_b.width).abs() > 1.0 {
+                    continue;
+                }
+                // 조건 4: A 가 위 (A.y < B.y)
+                if bbox_a.y >= bbox_b.y {
+                    continue;
+                }
+                // 조건 5: 세로 겹침 (A.y + A.height > B.y)
+                let a_bottom = bbox_a.y + bbox_a.height;
+                if a_bottom <= bbox_b.y {
+                    continue;
+                }
+                // Clip 계산: A 의 new_height = B.y - A.y
+                let new_height = bbox_b.y - bbox_a.y;
+                if new_height <= 0.0 || new_height >= bbox_a.height {
+                    continue;
+                }
+                let ratio = new_height / bbox_a.height;
+                let new_crop = crop_a.map(|(cl, ct, cr, cb)| {
+                    let span = (cb - ct) as f64;
+                    let new_cb = ct + (span * ratio).round() as i32;
+                    (cl, ct, cr, new_cb)
+                });
+                // 여러 UPPER 와 겹칠 때 가장 작은 new_height 채택
+                let entry = clips.entry(*id_a).or_insert((new_height, new_crop));
+                if new_height < entry.0 {
+                    *entry = (new_height, new_crop);
+                }
+            }
+        }
+
+        if clips.is_empty() {
+            return;
+        }
+
+        // Phase 3: 트리 walk 하여 mutation 적용
+        Self::apply_image_clips(&mut self.root, &clips);
+    }
+
+    fn collect_image_nodes(
+        node: &RenderNode,
+        out: &mut Vec<(
+            NodeId,
+            BoundingBox,
+            u16,
+            Option<(i32, i32, i32, i32)>,
+            ClipReplayPlane,
+        )>,
+    ) {
+        if let RenderNodeType::Image(img) = &node.node_type {
+            out.push((
+                node.id,
+                node.bbox,
+                img.bin_data_id,
+                img.crop,
+                ClipReplayPlane::from_text_wrap(img.text_wrap),
+            ));
+        }
+        for child in &node.children {
+            Self::collect_image_nodes(child, out);
+        }
+    }
+
+    fn apply_image_clips(
+        node: &mut RenderNode,
+        clips: &std::collections::HashMap<NodeId, (f64, Option<(i32, i32, i32, i32)>)>,
+    ) {
+        if let Some((new_height, new_crop)) = clips.get(&node.id) {
+            node.bbox.height = *new_height;
+            if let RenderNodeType::Image(ref mut img) = &mut node.node_type {
+                if let Some(c) = new_crop {
+                    img.crop = Some(*c);
+                }
+            }
+        }
+        for child in &mut node.children {
+            Self::apply_image_clips(child, clips);
+        }
+    }
+}
+
+impl Deref for PageRenderTree {
+    type Target = PageLayoutContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.frame
+    }
+}
+
+impl DerefMut for PageRenderTree {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.frame
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bounding_box_intersects() {
+        let a = BoundingBox::new(0.0, 0.0, 100.0, 100.0);
+        let b = BoundingBox::new(50.0, 50.0, 100.0, 100.0);
+        let c = BoundingBox::new(200.0, 200.0, 50.0, 50.0);
+        assert!(a.intersects(&b));
+        assert!(!a.intersects(&c));
+    }
+
+    #[test]
+    fn test_bounding_box_contains() {
+        let outer = BoundingBox::new(0.0, 0.0, 200.0, 200.0);
+        let inner = BoundingBox::new(10.0, 10.0, 50.0, 50.0);
+        assert!(outer.contains(&inner));
+        assert!(!inner.contains(&outer));
+    }
+
+    #[test]
+    fn test_page_render_tree() {
+        let mut tree = PageRenderTree::new(0, 793.7, 1122.5);
+        assert_eq!(tree.next_id(), 1);
+        assert_eq!(tree.next_id(), 2);
+    }
+
+    #[test]
+    fn legacy_hancom_product_projection_covers_direct_text_runs_only() {
+        fn text_run(id: NodeId, text: &str) -> RenderNode {
+            RenderNode::new(
+                id,
+                RenderNodeType::TextRun(TextRunNode {
+                    text: text.to_owned(),
+                    style: TextStyle::default(),
+                    char_shape_id: None,
+                    para_shape_id: None,
+                    section_index: None,
+                    para_index: None,
+                    char_start: None,
+                    cell_context: None,
+                    is_para_end: false,
+                    is_line_break_end: false,
+                    rotation: 0.0,
+                    is_vertical: false,
+                    char_overlap: None,
+                    border_fill_id: 0,
+                    baseline: 0.0,
+                    field_marker: FieldMarkerType::None,
+                    layout_positions: None,
+                    display_text: None,
+                }),
+                BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+            )
+        }
+
+        let mut tree = PageRenderTree::new(0, 100.0, 100.0);
+        let product_id = tree.next_id();
+        tree.root.children.push(text_run(product_id, "ᄒᆞᆫ글 97"));
+        let general_old_hangul_id = tree.next_id();
+        tree.root
+            .children
+            .push(text_run(general_old_hangul_id, "ᄒᆞᆫ겨울은 일반 옛한글이다"));
+
+        tree.apply_legacy_hancom_product_display_projection();
+
+        let RenderNodeType::TextRun(product) = &tree.root.children[0].node_type else {
+            panic!("expected product text run");
+        };
+        assert_eq!(product.text, "ᄒᆞᆫ글 97", "원문/offset 공간은 보존한다");
+        assert_eq!(product.display_text.as_deref(), Some("한글 97"));
+
+        let RenderNodeType::TextRun(general_old_hangul) = &tree.root.children[1].node_type else {
+            panic!("expected general old-Hangul text run");
+        };
+        assert_eq!(general_old_hangul.display_text, None);
+    }
+
+    #[test]
+    fn legacy_hancom_product_projection_does_not_rewrite_pua_old_hangul() {
+        let mut tree = PageRenderTree::new(0, 100.0, 100.0);
+        let id = tree.next_id();
+        tree.root.children.push(RenderNode::new(
+            id,
+            RenderNodeType::TextRun(TextRunNode {
+                text: "\u{f53a}글".to_owned(),
+                style: TextStyle::default(),
+                char_shape_id: None,
+                para_shape_id: None,
+                section_index: None,
+                para_index: None,
+                char_start: None,
+                cell_context: None,
+                is_para_end: false,
+                is_line_break_end: false,
+                rotation: 0.0,
+                is_vertical: false,
+                char_overlap: None,
+                border_fill_id: 0,
+                baseline: 0.0,
+                field_marker: FieldMarkerType::None,
+                layout_positions: None,
+                display_text: Some("ᄒᆞᆫ글".to_owned()),
+            }),
+            BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+        ));
+
+        tree.apply_legacy_hancom_product_display_projection();
+
+        let RenderNodeType::TextRun(pua_old_hangul) = &tree.root.children[0].node_type else {
+            panic!("expected PUA old-Hangul text run");
+        };
+        assert_eq!(pua_old_hangul.text, "\u{f53a}글");
+        assert_eq!(pua_old_hangul.display_text.as_deref(), Some("ᄒᆞᆫ글"));
+    }
+
+    #[test]
+    fn test_bounding_box_from_hwpunit() {
+        use crate::model::Rect;
+        let rect = Rect {
+            left: 0,
+            top: 0,
+            right: 7200,
+            bottom: 7200,
+        };
+        let bbox = BoundingBox::from_hwpunit_rect(&rect, 96.0);
+        assert!((bbox.width - 96.0).abs() < 0.01);
+        assert!((bbox.height - 96.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn render_tree_json_exposes_image_owner_and_text_wrap() {
+        let mut tree = PageRenderTree::new(0, 100.0, 100.0);
+        let mut image = ImageNode::new(9, None);
+        image.para_index = Some(1355);
+        image.control_index = Some(0);
+        image.text_wrap = Some(TextWrap::Square);
+        let image_id = tree.next_id();
+        tree.root.children.push(RenderNode::new(
+            image_id,
+            RenderNodeType::Image(image),
+            BoundingBox::new(10.0, 20.0, 30.0, 40.0),
+        ));
+
+        let json = tree.root.to_json();
+
+        assert!(json.contains("\"type\":\"Image\""));
+        assert!(json.contains("\"pi\":1355"));
+        assert!(json.contains("\"ci\":0"));
+        assert!(json.contains("\"textWrap\":\"Square\""));
+    }
+
+    // === Task #1154: clip_overlapping_same_bin_images 단위 테스트 ===
+
+    fn make_image_node(
+        id: NodeId,
+        bbox: BoundingBox,
+        bin_id: u16,
+        crop: Option<(i32, i32, i32, i32)>,
+    ) -> RenderNode {
+        let img = ImageNode {
+            crop,
+            ..ImageNode::new(bin_id, None)
+        };
+        RenderNode::new(id, RenderNodeType::Image(img), bbox)
+    }
+
+    fn image_bbox(node: &RenderNode) -> BoundingBox {
+        node.bbox
+    }
+
+    fn image_crop(node: &RenderNode) -> Option<(i32, i32, i32, i32)> {
+        match &node.node_type {
+            RenderNodeType::Image(img) => img.crop,
+            _ => None,
+        }
+    }
+
+    /// exam_eng.hwp 페이지 2 의 정확한 케이스 (수평 동일 + 세로 인접)
+    /// → LOWER 의 bbox.height 와 crop.bottom 이 UPPER 의 top 까지 축소되어야 한다.
+    #[test]
+    fn test_clip_exam_eng_pattern() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        let lower = make_image_node(
+            tree.next_id(),
+            BoundingBox::new(597.15, 243.59, 408.19, 256.09),
+            5,
+            Some((0, 0, 189900, 120958)),
+        );
+        let upper = make_image_node(
+            tree.next_id(),
+            BoundingBox::new(597.15, 463.17, 408.19, 70.0),
+            5,
+            Some((0, 105958, 189900, 138540)),
+        );
+        let lower_id = lower.id;
+        let upper_id = upper.id;
+        tree.root.children.push(lower);
+        tree.root.children.push(upper);
+
+        tree.clip_overlapping_same_bin_images();
+
+        let l = &tree.root.children[0];
+        assert_eq!(l.id, lower_id);
+        // 새 height = 463.17 - 243.59 = 219.58
+        let bbox = image_bbox(l);
+        assert!(
+            (bbox.height - 219.58).abs() < 0.01,
+            "lower height={}",
+            bbox.height
+        );
+        // 새 crop.bottom = 0 + 120958 * (219.58/256.09) = 103716 (round)
+        let crop = image_crop(l).unwrap();
+        assert_eq!(crop.0, 0);
+        assert_eq!(crop.1, 0);
+        assert_eq!(crop.2, 189900);
+        let expected_cb = (120958_f64 * (219.58 / 256.09)).round() as i32;
+        assert_eq!(crop.3, expected_cb);
+
+        // UPPER 은 변경되지 않음
+        let u = &tree.root.children[1];
+        assert_eq!(u.id, upper_id);
+        let u_bbox = image_bbox(u);
+        assert!((u_bbox.height - 70.0).abs() < 0.01);
+        let u_crop = image_crop(u).unwrap();
+        assert_eq!(u_crop, (0, 105958, 189900, 138540));
+    }
+
+    /// 다른 bin_id 페어는 무시되어야 한다.
+    #[test]
+    fn test_clip_different_bin_id_no_clip() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 100.0, 200.0, 200.0),
+            1,
+            Some((0, 0, 100, 100)),
+        ));
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 250.0, 200.0, 100.0),
+            2, // 다른 bin
+            Some((0, 0, 100, 100)),
+        ));
+
+        tree.clip_overlapping_same_bin_images();
+
+        // 둘 다 원래 크기 유지
+        assert_eq!(image_bbox(&tree.root.children[0]).height, 200.0);
+        assert_eq!(image_bbox(&tree.root.children[1]).height, 100.0);
+    }
+
+    /// 세로 겹침이 없으면 무시되어야 한다.
+    #[test]
+    fn test_clip_no_vertical_overlap_no_clip() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 100.0, 200.0, 100.0), // 100-200
+            1,
+            Some((0, 0, 100, 100)),
+        ));
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 250.0, 200.0, 100.0), // 250-350 (gap)
+            1,
+            Some((0, 0, 100, 100)),
+        ));
+
+        tree.clip_overlapping_same_bin_images();
+
+        assert_eq!(image_bbox(&tree.root.children[0]).height, 100.0);
+        assert_eq!(image_bbox(&tree.root.children[1]).height, 100.0);
+    }
+
+    /// x 가 다르면 (의도적 대각선 오프셋) 무시되어야 한다.
+    /// 회귀 보호: test-image.hwp / 3-10월_교육_통합_2022 패턴
+    #[test]
+    fn test_clip_different_x_no_clip() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 100.0, 200.0, 200.0),
+            1,
+            Some((0, 0, 100, 100)),
+        ));
+        // x 가 8px 다른 (의도적 그림자 효과 가정)
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(108.0, 150.0, 200.0, 200.0),
+            1,
+            Some((0, 0, 100, 100)),
+        ));
+
+        tree.clip_overlapping_same_bin_images();
+
+        assert_eq!(image_bbox(&tree.root.children[0]).height, 200.0);
+        assert_eq!(image_bbox(&tree.root.children[1]).height, 200.0);
+    }
+
+    /// width 가 다르면 (서로 다른 크기 그림) 무시되어야 한다.
+    /// 회귀 보호: pic2.hwp 패턴 (같은 이미지를 다른 크기로 배치)
+    #[test]
+    fn test_clip_different_width_no_clip() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 100.0, 200.0, 200.0),
+            1,
+            Some((0, 0, 100, 100)),
+        ));
+        // width 가 100px 다른 (다른 크기 그림)
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 150.0, 100.0, 200.0),
+            1,
+            Some((0, 0, 100, 100)),
+        ));
+
+        tree.clip_overlapping_same_bin_images();
+
+        assert_eq!(image_bbox(&tree.root.children[0]).height, 200.0);
+        assert_eq!(image_bbox(&tree.root.children[1]).height, 200.0);
+    }
+
+    /// 트리 순서가 반대 (A.y > B.y) 일 때는 무시되어야 한다.
+    /// (clip 대상은 항상 위에 깔리는 = 트리 순서상 먼저 + y 작은 쪽)
+    #[test]
+    fn test_clip_reversed_order_no_clip() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        // 먼저 그려지는 노드가 아래쪽 (y 큰) — clip 안 함
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 250.0, 200.0, 100.0),
+            1,
+            Some((0, 0, 100, 100)),
+        ));
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 100.0, 200.0, 200.0),
+            1,
+            Some((0, 0, 100, 100)),
+        ));
+
+        tree.clip_overlapping_same_bin_images();
+
+        // 둘 다 원래 크기 유지
+        assert_eq!(image_bbox(&tree.root.children[0]).height, 100.0);
+        assert_eq!(image_bbox(&tree.root.children[1]).height, 200.0);
+    }
+
+    /// crop=None 인 경우에도 bbox 만 축소 적용.
+    #[test]
+    fn test_clip_without_crop() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 100.0, 200.0, 200.0),
+            1,
+            None,
+        ));
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 250.0, 200.0, 100.0),
+            1,
+            None,
+        ));
+
+        tree.clip_overlapping_same_bin_images();
+
+        // LOWER 의 height 가 250-100 = 150 으로 축소
+        assert!((image_bbox(&tree.root.children[0]).height - 150.0).abs() < 0.01);
+        assert!(image_crop(&tree.root.children[0]).is_none());
+        // UPPER 은 변경 없음
+        assert!((image_bbox(&tree.root.children[1]).height - 100.0).abs() < 0.01);
+    }
+
+    /// 3 개 이미지 중첩: 가장 위 → 중간 → 아래 (A < B < C)
+    /// A 는 B 의 top 까지, B 는 C 의 top 까지 축소.
+    #[test]
+    fn test_clip_three_overlapping_chain() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        // A: y=0 height=200 (0-200)
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 0.0, 200.0, 200.0),
+            1,
+            Some((0, 0, 1000, 2000)),
+        ));
+        // B: y=100 height=150 (100-250) — overlaps A
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 100.0, 200.0, 150.0),
+            1,
+            Some((0, 1000, 1000, 2500)),
+        ));
+        // C: y=180 height=100 (180-280) — overlaps both A and B
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 180.0, 200.0, 100.0),
+            1,
+            Some((0, 1800, 1000, 2800)),
+        ));
+
+        tree.clip_overlapping_same_bin_images();
+
+        // A: 가장 가까운 upper(B) 의 top=100 까지 → height=100
+        assert!((image_bbox(&tree.root.children[0]).height - 100.0).abs() < 0.01);
+        // B: 가장 가까운 upper(C) 의 top=180 → height=80
+        assert!((image_bbox(&tree.root.children[1]).height - 80.0).abs() < 0.01);
+        // C: 변경 없음
+        assert!((image_bbox(&tree.root.children[2]).height - 100.0).abs() < 0.01);
+    }
+
+    /// 자식 노드 (e.g., Body > Column > Image) 깊이에서도 동작.
+    #[test]
+    fn test_clip_nested_children() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        let mut body = RenderNode::new(
+            tree.next_id(),
+            RenderNodeType::Body { clip_rect: None },
+            BoundingBox::new(0.0, 0.0, 1000.0, 1500.0),
+        );
+        let _id = tree.next_id();
+        body.children.push(make_image_node(
+            _id,
+            BoundingBox::new(597.15, 243.59, 408.19, 256.09),
+            5,
+            Some((0, 0, 189900, 120958)),
+        ));
+        let _id = tree.next_id();
+        body.children.push(make_image_node(
+            _id,
+            BoundingBox::new(597.15, 463.17, 408.19, 70.0),
+            5,
+            Some((0, 105958, 189900, 138540)),
+        ));
+        tree.root.children.push(body);
+
+        tree.clip_overlapping_same_bin_images();
+
+        let body = &tree.root.children[0];
+        let lower = &body.children[0];
+        assert!((image_bbox(lower).height - 219.58).abs() < 0.01);
+    }
+
+    /// Task #M100: BehindText 와 Flow 처럼 서로 다른 재생 plane 에 걸친 페어는
+    /// clip 대상에서 제외해야 한다. `src/paint/replay_order.rs` 의 plane 분리
+    /// 재생 규약상 BehindText 는 트리 순서와 무관하게 Flow 보다 먼저(더 아래)
+    /// 그려지므로, 트리 순서만 보고 clip 방향을 정하면 실제로는 위에 그려질
+    /// Flow 그림이 잘못 잘릴 수 있다.
+    #[test]
+    fn test_clip_skips_cross_plane_pairs() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        // 트리 순서상 먼저 (Flow, y=100~300)
+        let mut flow = make_image_node(
+            tree.next_id(),
+            BoundingBox::new(100.0, 100.0, 200.0, 200.0),
+            9,
+            Some((0, 0, 1000, 2000)),
+        );
+        if let RenderNodeType::Image(ref mut img) = flow.node_type {
+            img.text_wrap = Some(TextWrap::Square);
+        }
+        // 트리 순서상 나중 (BehindText, y=150~350) — 실제 재생 순서는 Flow 보다 먼저(더 아래)
+        let mut behind = make_image_node(
+            tree.next_id(),
+            BoundingBox::new(100.0, 150.0, 200.0, 200.0),
+            9,
+            Some((0, 0, 1000, 2000)),
+        );
+        if let RenderNodeType::Image(ref mut img) = behind.node_type {
+            img.text_wrap = Some(TextWrap::BehindText);
+        }
+        tree.root.children.push(flow);
+        tree.root.children.push(behind);
+
+        tree.clip_overlapping_same_bin_images();
+
+        // 두 그림 모두 원래 크기 유지 — plane 이 다르므로 clip 미적용
+        assert_eq!(image_bbox(&tree.root.children[0]).height, 200.0);
+        assert_eq!(image_bbox(&tree.root.children[1]).height, 200.0);
+    }
+
+    /// 단일 이미지만 있는 경우 변경 없음 (no-op).
+    #[test]
+    fn test_clip_single_image_no_op() {
+        let mut tree = PageRenderTree::new(0, 1122.5, 1587.4);
+        let _id = tree.next_id();
+        tree.root.children.push(make_image_node(
+            _id,
+            BoundingBox::new(100.0, 100.0, 200.0, 200.0),
+            1,
+            Some((0, 0, 100, 100)),
+        ));
+
+        tree.clip_overlapping_same_bin_images();
+
+        assert_eq!(image_bbox(&tree.root.children[0]).height, 200.0);
+        assert_eq!(image_crop(&tree.root.children[0]), Some((0, 0, 100, 100)));
+    }
+}
