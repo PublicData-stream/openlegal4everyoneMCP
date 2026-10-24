@@ -258,6 +258,12 @@ async fn guard(
     {
         return response;
     }
+    let modern = parts.method == http::Method::POST
+        && parts
+            .headers
+            .get("mcp-protocol-version")
+            .and_then(|v| v.to_str().ok())
+            == Some("2026-07-28");
     let response = match tokio::time::timeout(
         Duration::from_secs(context.limits.call_timeout_secs),
         next.run(Request::from_parts(parts, Body::from(bytes))),
@@ -267,6 +273,16 @@ async fn guard(
         Ok(response) => response,
         Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
     };
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(context.limits.call_timeout_secs);
+    let response = crate::http_status::preserve_invalid_params_status(
+        response,
+        modern,
+        response_limit,
+        deadline,
+        &context.shutdown,
+    )
+    .await;
     let (mut parts, body) = response.into_parts();
     parts.headers.insert(
         header::CACHE_CONTROL,
@@ -275,8 +291,6 @@ async fn guard(
     parts
         .headers
         .insert("x-accel-buffering", http::HeaderValue::from_static("no"));
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(context.limits.call_timeout_secs);
     let state = (
         body.into_data_stream(),
         request_permit,

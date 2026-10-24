@@ -22,7 +22,8 @@ use tantivy::{
     schema::{Field, IndexRecordOption, STORED, STRING, Schema, Value},
 };
 use tokio_util::sync::CancellationToken;
-const INDEX_FORMAT: u32 = 2;
+// Tantivy 0.27 generations require an explicit rebuild from retained evidence.
+const INDEX_FORMAT: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexTextField {
@@ -137,8 +138,13 @@ impl CorpusIndex {
         std::fs::create_dir_all(path).map_err(err)?;
         let directory = tantivy::directory::MmapDirectory::open(path).map_err(err)?;
         let existing = Index::exists(&directory).map_err(err)?;
-        let index = Index::open_or_create(directory, schema).map_err(err)?;
-        if existing {
+        let index = if existing {
+            // Open metadata only: validate compatibility before readers, writer locks,
+            // or background merges can touch a retained generation.
+            let index = Index::open(directory).map_err(err)?;
+            if index.schema() != schema {
+                return Err(E::StorageCorrupt);
+            }
             let meta = index.load_metas().map_err(err)?;
             let meta: IndexMetadata =
                 serde_json::from_str(meta.payload.as_deref().ok_or(E::StorageCorrupt)?)
@@ -147,7 +153,15 @@ impl CorpusIndex {
             {
                 return Err(E::StorageCorrupt);
             }
-        }
+            index
+        } else {
+            // Missing metadata in a populated directory is corruption, not a new
+            // index. Only a fresh destination may be initialized.
+            if std::fs::read_dir(path).map_err(err)?.next().is_some() {
+                return Err(E::StorageCorrupt);
+            }
+            Index::create_in_dir(path, schema).map_err(err)?
+        };
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -740,8 +754,10 @@ mod tests {
             .apply_capture(capture("a", "r1", "대한민국"), true, 4)
             .unwrap();
         drop(index);
+        let before = directory_contents(&path);
         assert!(CorpusIndex::open(&path, analyzer.clone()).is_err());
         assert!(CorpusIndex::create_rebuild(&path, analyzer.clone()).is_err());
+        assert_eq!(directory_contents(&path), before);
 
         let ready = directory.path().join("ready");
         let index = CorpusIndex::create_rebuild(&ready, analyzer.clone()).unwrap();
@@ -758,26 +774,106 @@ mod tests {
         );
         drop(index);
         for payload in [
-            "4".to_string(),
-            "broken".to_string(),
-            serde_json::to_string(&IndexMetadata {
-                format: INDEX_FORMAT,
-                analyzer: "different-dictionary".into(),
-                generation: 4,
-                complete: true,
-            })
-            .unwrap(),
+            Some("4".to_string()),
+            Some("broken".to_string()),
+            None,
+            Some(
+                serde_json::to_string(&IndexMetadata {
+                    format: 2,
+                    analyzer: analyzer.identity().into(),
+                    generation: 4,
+                    complete: true,
+                })
+                .unwrap(),
+            ),
+            Some(
+                serde_json::to_string(&IndexMetadata {
+                    format: INDEX_FORMAT,
+                    analyzer: "different-dictionary".into(),
+                    generation: 4,
+                    complete: true,
+                })
+                .unwrap(),
+            ),
         ] {
             let raw = Index::open_in_dir(&ready).unwrap();
             let mut writer = raw
                 .writer_with_num_threads::<tantivy::TantivyDocument>(1, 32 * 1024 * 1024)
                 .unwrap();
             let mut commit = writer.prepare_commit().unwrap();
-            commit.set_payload(&payload);
+            if let Some(payload) = payload {
+                commit.set_payload(&payload);
+            }
             commit.commit().unwrap();
             drop(writer);
-            assert!(CorpusIndex::open(&ready, analyzer.clone()).is_err());
+            drop(raw);
+            let before = directory_contents(&ready);
+            assert!(matches!(
+                CorpusIndex::open(&ready, analyzer.clone()),
+                Err(E::StorageCorrupt)
+            ));
+            assert_eq!(directory_contents(&ready), before);
         }
+    }
+    fn directory_contents(path: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn visit(root: &Path, path: &Path, files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().into(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(path, path, &mut files);
+        files
+    }
+    #[test]
+    fn opening_incompatible_schema_does_not_modify_retained_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let analyzer = KoreanAnalyzer::fixture();
+        let mut schema = Schema::builder();
+        schema.add_text_field("unexpected", STRING | STORED);
+        let raw = Index::create_in_dir(directory.path(), schema.build()).unwrap();
+        let mut writer = raw
+            .writer_with_num_threads::<tantivy::TantivyDocument>(1, 32 * 1024 * 1024)
+            .unwrap();
+        let mut commit = writer.prepare_commit().unwrap();
+        commit.set_payload(
+            &serde_json::to_string(&IndexMetadata {
+                format: INDEX_FORMAT,
+                analyzer: analyzer.identity().into(),
+                generation: 0,
+                complete: true,
+            })
+            .unwrap(),
+        );
+        commit.commit().unwrap();
+        drop(writer);
+        drop(raw);
+        let before = directory_contents(directory.path());
+        assert!(matches!(
+            CorpusIndex::open(directory.path(), analyzer),
+            Err(E::StorageCorrupt)
+        ));
+        assert_eq!(directory_contents(directory.path()), before);
+    }
+    #[test]
+    fn populated_directory_without_index_metadata_is_not_initialized() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("retained-evidence"), b"keep").unwrap();
+        let before = directory_contents(directory.path());
+        assert!(matches!(
+            CorpusIndex::open(directory.path(), KoreanAnalyzer::fixture()),
+            Err(E::StorageCorrupt)
+        ));
+        assert_eq!(directory_contents(directory.path()), before);
     }
     pub(super) fn capture(id: &str, revision: &str, text: &str) -> Capture {
         Capture {

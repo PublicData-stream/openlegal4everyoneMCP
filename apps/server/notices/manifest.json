@@ -153,112 +153,112 @@
       "revision": "3e636cab26c013eca5131103c03d20237f12c4df",
       "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
     },
-    "tantivy-bitpacker@0.10.0": {
+    "tantivy-bitpacker@0.27.0": {
       "files": [
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "path": "files/quickwit-oss_tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/LICENSE",
           "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/LICENSE"
         },
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "path": "files/quickwit-oss_tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/AUTHORS",
           "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/AUTHORS"
         }
       ],
       "path_in_vcs": "bitpacker",
       "repository": "https://github.com/quickwit-oss/tantivy",
-      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision": "50ac63df66084b8f77bfd067b81b5b8076b8a905",
       "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
     },
-    "tantivy-columnar@0.7.0": {
+    "tantivy-columnar@0.27.0": {
       "files": [
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "path": "files/quickwit-oss_tantivy/67889269cae67063c372bc236b102d632a021568/LICENSE",
           "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/67889269cae67063c372bc236b102d632a021568/LICENSE"
         },
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "path": "files/quickwit-oss_tantivy/67889269cae67063c372bc236b102d632a021568/AUTHORS",
           "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/67889269cae67063c372bc236b102d632a021568/AUTHORS"
         }
       ],
       "path_in_vcs": "columnar",
       "repository": "https://github.com/quickwit-oss/tantivy",
-      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision": "67889269cae67063c372bc236b102d632a021568",
       "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
     },
-    "tantivy-common@0.11.0": {
+    "tantivy-common@0.27.0": {
       "files": [
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "path": "files/quickwit-oss_tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/LICENSE",
           "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/LICENSE"
         },
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "path": "files/quickwit-oss_tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/AUTHORS",
           "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/AUTHORS"
         }
       ],
       "path_in_vcs": "common",
       "repository": "https://github.com/quickwit-oss/tantivy",
-      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision": "50ac63df66084b8f77bfd067b81b5b8076b8a905",
       "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
     },
-    "tantivy-query-grammar@0.26.0": {
+    "tantivy-query-grammar@0.27.0": {
       "files": [
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "path": "files/quickwit-oss_tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/LICENSE",
           "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/LICENSE"
         },
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "path": "files/quickwit-oss_tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/AUTHORS",
           "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/AUTHORS"
         }
       ],
       "path_in_vcs": "query-grammar",
       "repository": "https://github.com/quickwit-oss/tantivy",
-      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision": "50ac63df66084b8f77bfd067b81b5b8076b8a905",
       "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
     },
-    "tantivy-sstable@0.7.0": {
+    "tantivy-sstable@0.27.0": {
       "files": [
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "path": "files/quickwit-oss_tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/LICENSE",
           "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/LICENSE"
         },
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "path": "files/quickwit-oss_tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/AUTHORS",
           "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/50ac63df66084b8f77bfd067b81b5b8076b8a905/AUTHORS"
         }
       ],
       "path_in_vcs": "sstable",
       "repository": "https://github.com/quickwit-oss/tantivy",
-      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision": "50ac63df66084b8f77bfd067b81b5b8076b8a905",
       "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
     },
-    "tantivy-stacker@0.7.0": {
+    "tantivy-stacker@0.27.0": {
       "files": [
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE",
+          "path": "files/quickwit-oss_tantivy/67889269cae67063c372bc236b102d632a021568/LICENSE",
           "sha256": "acacd14bebbffdb30d62443c282fb4da3e81915a9f69c63d5d745a029f44de8a",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/LICENSE"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/67889269cae67063c372bc236b102d632a021568/LICENSE"
         },
         {
-          "path": "files/quickwit-oss_tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS",
+          "path": "files/quickwit-oss_tantivy/67889269cae67063c372bc236b102d632a021568/AUTHORS",
           "sha256": "141e25490cf9e0d3a05374171cb0a42c91a0cf0fb2041ba4c010f466e89b596d",
-          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/AUTHORS"
+          "source": "https://raw.githubusercontent.com/quickwit-oss/tantivy/67889269cae67063c372bc236b102d632a021568/AUTHORS"
         }
       ],
       "path_in_vcs": "stacker",
       "repository": "https://github.com/quickwit-oss/tantivy",
-      "revision": "9e63fc508153ef770f9ff980c8fa2f11e8e2e6db",
+      "revision": "67889269cae67063c372bc236b102d632a021568",
       "revision_evidence": "Published crate .cargo_vcs_info.json git.sha1"
     },
     "tantivy-tokenizer-api@0.7.0": {

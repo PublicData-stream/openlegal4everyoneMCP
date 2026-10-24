@@ -29,8 +29,9 @@ adding compilers, Node or language package managers to runtime images.
 The worker uses Alpine's Tesseract, Leptonica and Fontconfig packages and their
 development headers, with Clang for generated bindings and OpenSSL headers for
 the existing native dependency graph. Distribution musl builds avoid adding a
-glibc compatibility loader. The selected Rust parsers, OCR models and font assets
-retain their existing versions, licenses and admission policy.
+glibc compatibility loader. The Rust parser updates and vendored rhwp source are
+recorded in [document processing](document-sandbox.md#image-and-dependency-admission);
+OCR model and font assets retain their pinned versions and licenses.
 
 Server and worker builds share `scripts/install-alpine-packages.sh`, using only
 verified HTTPS Alpine v3.24 main/community repositories. This deliberately replaces
@@ -83,7 +84,7 @@ admission. Rebuilds against moving native packages require the same image gates.
 
 | Dependency | Purpose, choice and boundary considerations |
 | --- | --- |
-| rmcp 3.3.0 | Official MCP Rust SDK; handles both chosen revisions and HTTP protocol translation. Prefer its maintained protocol implementation over a new JSON-RPC stack. Public input reaches this code; host-level admission, strict Origin checks and bounded framing supplement its defaults. Disable its payload logging in the binary. Apache-2.0. |
+| rmcp 3.7.0 | Official MCP Rust SDK; handles both chosen revisions and HTTP protocol translation. Prefer its maintained protocol implementation over a new JSON-RPC stack. Public input reaches this code; host-level admission, strict Origin checks and bounded framing supplement its defaults. Disable its payload logging in the binary. Apache-2.0. |
 | wtransport 0.7.2 | Native WebTransport endpoint over Quinn/Rustls. Enables `ring` and `quinn` for TLS and explicit QUIC bounds; default self-signed and dangerous-configuration features remain off. Alternative lower-level H3/Quinn wiring would duplicate session mechanics. Upstream still cautions about production readiness; the pinned OxiBelt interoperability gate and independent boundary review are required, and broader deployment validation remains operator work. MIT OR Apache-2.0. |
 | tokio-rustls 0.26 | Adds optional TLS to the existing bounded HTTP listener, using the same Rustls 0.23 graph as WebTransport. A separate TLS sidecar would add another trusted hop and configuration surface. Client certificates are required only by the opt-in edge mTLS policy; handshake work is bounded by connection admission and timeout. MIT OR Apache-2.0. |
 | x509-parser 0.18 | Reads only the verified client leaf's DNS SAN so the edge CA cannot by itself grant the alternate rate budget to another certificate. The Rustls chain verifier still owns path and signature validation; parsing failure denies the handshake. This existing transitive graph becomes a direct dependency, with no new runtime download or build script. MIT OR Apache-2.0. |
@@ -170,6 +171,57 @@ with application data. Existing native transport, OxiBelt, and PostgreSQL TLS ga
 cover their integration. The separately pinned OxiBelt edge build has its own
 dependency graph; this lockfile update does not upgrade that project. See the
 [maintenance review](rustls-review.md) for reproduction and validation evidence.
+
+## Transport and search maintenance (2026-10-23)
+
+The serving and standalone worker lockfiles receive targeted updates to the
+related TLS, QUIC, runtime, cryptographic and certificate-data families. Stable
+serving targets are rmcp 3.7.0, Quinn 0.11.12 / quinn-proto 0.11.19,
+Rustls 0.23.46 / rustls-webpki 0.103.16 / rustls-platform-verifier 0.7.1,
+webpki-roots and webpki-root-certs 1.0.11, Tokio 1.54.1 / tokio-util 0.7.20 /
+tokio-rustls 0.26.6, ctutils 0.4.5, sha2 0.11.1, ureq 3.5.0,
+and yoke / yoke-derive 0.8.4. Existing reqwest 0.13.5 and wtransport 0.7.2 remain
+current. Sources remain crates.io, existing feature selections remain unchanged,
+and the new MSRVs remain below Rust 1.98.1. These versions preserve their existing
+MIT/Apache-2.0/ISC/Unicode license choices; certificate datasets retain their exact
+CDLA-Permissive-2.0 admission. Tantivy's internal crates and transitive compression,
+sketch and cache libraries move with its admitted 0.27 family; these are not new
+application services or enabled parser capabilities.
+
+The [ctutils advisory](https://rustsec.org/advisories/RUSTSEC-2026-0385.html),
+[Quinn advisories](https://rustsec.org/advisories/RUSTSEC-2026-0340.html),
+[Rustls advisories](https://rustsec.org/advisories/RUSTSEC-2026-0349.html),
+[WebPKI distrust advisory](https://rustsec.org/advisories/RUSTSEC-2026-0382.html),
+[root-dataset advisory](https://rustsec.org/advisories/RUSTSEC-2026-0381.html), and
+[Tokio I/O-safety advisory](https://rustsec.org/advisories/RUSTSEC-2026-0386.html)
+require current patched dependencies rather than advisory suppression. Tokio
+1.54.0 and yoke-derive 0.8.3 are yanked and are not selected. Relevant source
+review, current audit/license admission and both native/musl integration checks
+remain required; this dependency record alone is not acceptance evidence.
+The SDK upgrade preserves the application's explicit protocol revisions,
+HTTP preflight, bounded framing, logging exclusions and certificate verification.
+A bounded probe of SDK-generated SSE preserves the previous modern HTTP mapping
+for a first-message JSON-RPC invalid-parameters error (HTTP 400 with JSON), while
+legacy requests and streams beginning with progress keep HTTP 200. It borrows
+only the compact JSON error header and replays other output bytes unchanged,
+under the existing response ceiling, four-copy admission, cancellation and
+absolute response deadline. It is not a general client-supplied SSE parser.
+The existing two-provider TLS regression remains applicable.
+
+Tantivy moves to 0.27.0 to use fixed lru rather than retain its expired exception.
+Only mmap and LZ4 features remain enabled; no search analyzer or dictionary is
+upgraded. Its [release](https://github.com/quickwit-oss/tantivy/releases/tag/0.27.0)
+requires Rust 1.88 and introduces APIs outside the selected index schema. Although
+both upstream versions declare Tantivy disk format 7, the repository intentionally
+advances its own generation format from 2 to 3. Existing indexes require the
+[explicit offline rebuild](database.md#offline-index-rebuild) into fresh storage;
+old directories are rejected before readers or writers can modify them. The
+six upgraded internal Tantivy packages have renewed exact-version supplemental
+LICENSE/AUTHORS bindings from their published immutable VCS revisions; see
+[supplemental notice provenance](../apps/server/notices/README.md). The
+analyzer identity, source evidence, normalization, matching and public search
+contracts remain unchanged. Rollback requires the previous binary and its
+compatible complete index, subject to monotonic outbox acknowledgment.
 
 ## License and build policy
 
@@ -290,7 +342,7 @@ and the explicit distinction between digest integrity and source authentication.
 
 ## Corpus search admission (2026-09-16)
 
-- **Tantivy 0.26.2** provides immutable local index readers, atomic commits and
+- **Tantivy 0.27.0** provides immutable local index readers, atomic commits and
   rebuildable storage. Only mmap and LZ4 compression features are enabled; no
   external search service or caller-provided index path is introduced. Corpus
   publication remains PostgreSQL-owned. Source: crates.io, MIT. Writer buffers,
@@ -354,24 +406,16 @@ Analyzer/dictionary changes invalidate index compatibility and require the
 
 ### Narrow dependency exceptions
 
-Tantivy 0.26.2 depends on lru 0.16.4, affected by
+Tantivy 0.27.0 resolves lru 0.18.5, fixing
 [RUSTSEC-2026-0253](https://rustsec.org/advisories/RUSTSEC-2026-0253.html).
-The advisory requires `pop` to unwind through a panicking key destructor. Source
-and reverse-dependency review found one consumer: Tantivy's
-`store/reader.rs::BlockCache`, an `LruCache<usize, Block>` using new/get/put/len.
-It does not call `pop`; `usize` has no destructor. This is an unreachable
-precondition in the selected graph, not a fix to lru itself. `deny.toml` records the
-specific advisory exception. Owner: PiQuark6046; review by **2026-10-16**, on any
-Tantivy/lru update, or if another consumer appears. Independent review:
-`text_review`, actual dependency graph and source, 2026-09-16. Prefer an upstream
-Tantivy release using fixed lru >=0.18.2 when available.
+The earlier Tantivy 0.26.2 / lru 0.16.4 exception is removed rather than renewed.
 
-`webpki-roots 1.0.9`, used by Lindera's build/download support, adds
-CDLA-Permissive-2.0 licensed root-certificate data. The exception is scoped to that
-exact package/version; preserve its accompanying license when redistributing the
-data. Owner/review deadline: PiQuark6046, 2026-10-16. Other licenses retain their
-existing admission policy. No blanket license or advisory suppression is added.
-
+`webpki-roots 1.0.11`, used by Lindera's build/download support, retains the
+CDLA-Permissive-2.0 licensed root-certificate data. The reviewed crates.io source
+and [upstream root dataset](https://github.com/rustls/webpki-roots) retain their
+license; preserve it in image notices. `deny.toml` admits this exact package/version,
+not the license globally. Owner: PiQuark6046; review by **2026-11-23** or on
+certificate-data changes. Other licenses retain their existing admission policy.
 
 `notify 6.1.1` is an unconditional crates.io dependency of `mecab-ko-dict 0.7.2`,
 even with default features disabled. Its CC0-1.0 license is admitted only for this

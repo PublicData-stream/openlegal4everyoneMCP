@@ -14,8 +14,8 @@ use rmcp::{
     RoleServer, ServiceExt,
     model::{
         ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorData, GetMeta, ProgressToken,
-        ProtocolVersion, RequestId, ServerInfo, ServerJsonRpcMessage, ServerNotification,
-        ServerResult,
+        ProtocolVersion, RequestId, ServerConfig as McpServerConfig, ServerJsonRpcMessage,
+        ServerNotification, ServerResult,
     },
     service::{NotificationContext, RequestContext, Service},
     transport::Transport,
@@ -563,7 +563,7 @@ impl Service<RoleServer> for TrackedHandler {
     ) -> Result<(), ErrorData> {
         self.inner.handle_notification(notification, context).await
     }
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> McpServerConfig {
         self.inner.get_info()
     }
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {

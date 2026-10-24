@@ -27,6 +27,15 @@ htmlescape-authored file, and no copyright statement has been invented.
 `LICENSES/Apache-2.0.txt` and `LICENSES/MIT.txt`. Collectors must include notice
 directories as well as conventional notice basenames.
 
+The six Tantivy internal packages upgraded to 0.27.0 retain exact supplemental
+bindings to their published VCS revisions: bitpacker/common/query-grammar/sstable
+use `50ac63df66084b8f77bfd067b81b5b8076b8a905`, while columnar/stacker use
+`67889269cae67063c372bc236b102d632a021568`. The immutable upstream trees contain
+root `LICENSE` and its referenced `AUTHORS`, with no additional notices under the
+six package directories. Both files are retained and SHA-256 checked for each
+revision. The unchanged tokenizer-api supplement retains its own older revision.
+Inactive Android verifier packages are not added to the compiled Linux inventory.
+
 When dependencies change, inspect the exact locked package archive and its source
 revision. Preserve relevant root and package-specific licenses, notices and
 referenced attribution files. Add or update explicit version bindings and source

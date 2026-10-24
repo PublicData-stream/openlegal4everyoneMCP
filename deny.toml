@@ -6,9 +6,6 @@ all-features = false
 [advisories]
 unmaintained = "all"
 unsound = "all"
-# Exact graph and unreachable advisory precondition reviewed in docs/dependencies.md.
-# Owner: PiQuark6046. Review by 2026-10-16 and whenever Tantivy/lru change.
-ignore = [{ id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only via Tantivy 0.26.2 BlockCache<usize,Block>; no pop call or panicking key Drop; review 2026-10-16" }]
 
 [licenses]
 confidence-threshold = 0.93
@@ -21,7 +18,9 @@ exceptions = [
     # MeCab-Ko's mandatory watcher dependency; runtime hot reload is never enabled.
     # Owner: PiQuark6046. Review by 2026-12-19 or on MeCab-Ko/notify changes.
     { crate = "notify@6.1.1", allow = ["CC0-1.0"] },
-    { crate = "webpki-roots@1.0.9", allow = ["CDLA-Permissive-2.0"] },
+    # Certificate-data license/source reviewed in docs/dependencies.md.
+    # Owner: PiQuark6046. Review by 2026-11-23 or on certificate-data changes.
+    { crate = "webpki-roots@1.0.11", allow = ["CDLA-Permissive-2.0"] },
     { crate = "openlegal-server@0.0.0", allow = ["AGPL-3.0-only"] },
     { crate = "openlegal-domain@0.0.0", allow = ["AGPL-3.0-only"] },
     { crate = "openlegal-normalization@0.0.0", allow = ["AGPL-3.0-only"] },

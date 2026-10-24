@@ -389,6 +389,14 @@ Analyzer identity includes both engine versions, dictionary digests, normalizati
 and matching policy. Legacy, mismatched, malformed or incomplete indexes cannot be
 served. Responses report the identity from the validated retained index snapshot.
 
+The Tantivy 0.27 maintenance upgrade advances the repository generation format
+from **2 to 3**, even though Tantivy's underlying disk-format number is unchanged.
+Existing format-2 indexes are rejected without modifying their retained files;
+startup does not convert or replace them. Rebuild into a fresh index directory
+using the sequence below. The Korean analyzer identity and dictionaries remain
+unchanged. Empty fresh installations use format 3 directly; a populated directory
+with missing index metadata is an integrity failure and is never initialized over.
+
 To upgrade an existing index:
 
 1. Stop the sole backend, including its ingestion and retention maintenance.
@@ -408,8 +416,9 @@ final acknowledgment fails after index completion, resolve the failure before
 serving; rebuild again into a fresh directory to retry the complete operation.
 Rebuilding does not rewrite retained legal evidence.
 
-Restart expires search cursors. Rollback requires the previous binary, its dictionary
-and a compatible complete index generation. If acknowledgment advanced beyond the
+Restart expires search cursors. The old binary rejects format-3 generations;
+rollback requires the previous binary, its dictionary and the preserved compatible
+complete index generation. If acknowledgment advanced beyond the
 old index, simply pointing at that directory is insufficient. This command writes
 only the new dual-engine format, not the legacy Lindera-only format. Such a downgrade
 requires version-specific rebuilding tooling; otherwise repair forward with the

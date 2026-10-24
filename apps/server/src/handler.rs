@@ -265,8 +265,8 @@ impl ServerHandler for McpHandler {
         ])
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities = if self.resources.resources.is_empty() && self.citations.is_none() {
             ServerCapabilities::builder().enable_tools().build()
         } else {
