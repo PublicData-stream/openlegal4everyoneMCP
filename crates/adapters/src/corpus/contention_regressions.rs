@@ -865,7 +865,10 @@ async fn pool_acquisition_timeout_before_begin_yields_without_sql_or_commit() {
     let (_fixture, base, _) = setup().await;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .acquire_timeout(Duration::from_millis(50))
+        // SQLx also applies this deadline to the initial database connection. Allow
+        // fixture startup while still forcing acquisition to expire with its
+        // only connection held; production acquisition limits are unchanged.
+        .acquire_timeout(Duration::from_secs(1))
         .connect_with((*base.pool().connect_options()).clone())
         .await
         .unwrap();
