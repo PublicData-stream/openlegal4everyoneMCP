@@ -83,7 +83,8 @@ and the official `@modelcontextprotocol/ext-apps` SDK (MIT), chosen instead of a
 custom postMessage protocol. The SDK handles the host handshake and RPC boundary;
 the widget additionally validates bounded synthetic result shapes and invokes only
 the two read-only demo data tools. The SDK is bundled locally without runtime CDN
-loading. Its protocol dependencies are also MIT licensed.
+loading. Its client/core protocol dependencies declare Apache-2.0 and retain the
+upstream license-transition notice, including legacy MIT terms.
 
 TypeScript and Playwright (Apache-2.0) provide static checks and a real Chromium
 bridge test; esbuild (MIT) replaces a larger development server framework and
@@ -98,18 +99,24 @@ and enforces the reviewed license set. Advisory-network failure fails the check;
 it is not interpreted as a clean audit. The lockfile is the reproducible baseline,
 not evidence that future advisories cannot arise.
 
-The 2026-10-06 maintenance update pins the SDK's `client` and `core` peers to
-2.2.0, the first patched release for
-[GHSA-6qxp-vccf-f47h](https://github.com/modelcontextprotocol/typescript-sdk/security/advisories/GHSA-6qxp-vccf-f47h).
-Range-scoped pnpm overrides preserve the existing Apps SDK and other dependency
-versions instead of upgrading the entire peer graph. Sources remain the official
-npm SDK packages; package manifests still declare MIT, and `THIRD_PARTY_NOTICES.md`
-preserves their complete upstream license and transition text. No new dependencies
-or install scripts are enabled. The widget uses the SDK's host-mediated postMessage protocol and does not
-configure OAuth providers, HTTP authorization, or stored OAuth credentials. The
-upstream OAuth-provider migration instructions therefore do not apply to its
-current callers. Existing type, model, build, browser, advisory and license checks
-cover admission of the changed protocol packages.
+The 2026-10-23 maintenance update pins the Apps SDK to 2.0.3 and its `client`
+and `core` peers to 2.4.0. Range-scoped pnpm overrides also pin Zod to 4.6.7,
+covering [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5)
+and the client's
+[GHSA-6prh-2h8m-c8cw](https://github.com/modelcontextprotocol/typescript-sdk/security/advisories/GHSA-6prh-2h8m-c8cw).
+These compatible stable releases retain the existing React and build-tool versions.
+Exact release-age exclusions admit the two SDK 2.4.0 packages published on the
+maintenance date so the graph uses the latest stable SDK, including the patched
+client; other packages retain pnpm's release-age checks. Owner: PiQuark6046; review
+the two exact exclusions by 2026-10-30.
+Sources remain the official npm SDK and Zod packages. The Apps SDK and Zod declare
+MIT; client/core declare Apache-2.0. `THIRD_PARTY_NOTICES.md` preserves the complete
+upstream SDK license and transition text. No new install scripts are enabled.
+The widget uses the SDK's host-mediated postMessage protocol and does not configure
+OAuth providers, HTTP authorization, or stored OAuth credentials. SDK 2.4's optional
+OAuth-refresh and skills APIs are not enabled by this update. Existing type, model,
+build, browser, advisory and license checks cover admission of the changed protocol
+packages.
 
 
 ## Supplied-text comparison

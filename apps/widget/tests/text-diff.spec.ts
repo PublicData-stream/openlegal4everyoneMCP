@@ -29,7 +29,7 @@ test('compares exact pasted text through the host, renders the actual diff, and 
   await widget.getByRole('button', { name: 'Get source code' }).click();
   await expect.poll(async () => JSON.parse(await page.locator('#links').textContent() || '[]')).toEqual(['https://source.example/release']);
   await widget.getByText('Third-party dependency notices', { exact: true }).click();
-  await expect(widget.locator('#dependency-notices')).toContainText('@modelcontextprotocol/ext-apps@2.0.0 (MIT)');
+  await expect(widget.locator('#dependency-notices')).toContainText('@modelcontextprotocol/ext-apps@2.0.3 (MIT)');
 });
 test('existing handles load source chunks in order for editing, preserving CR until explicit LF conversion', async ({ page }) => {
   const widget = await open(page, '?initial');
