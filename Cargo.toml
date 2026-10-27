@@ -7,7 +7,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.98.1"
 license = "AGPL-3.0-only"
-repository = "https://github.com/piquark6046/openlegal4everyoneMCP"
+repository = "https://github.com/PublicData-stream/openlegal4everyoneMCP"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
