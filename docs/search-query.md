@@ -2,8 +2,10 @@
 
 ## Status and API
 
-The standalone Rust processor parses supplied search text into a typed expression
-tree. It performs no matching, provider requests, database operations, or other I/O.
+The Rust processor parses supplied search text into a typed expression tree. The
+processor itself performs no matching, provider requests, database operations, or
+other I/O. The managed [`database.query`](database.md#search) executor uses it to
+match the legal corpus; see the [integration boundary](#validation-and-integration-boundary).
 The existing synthetic MCP search still accepts literal text with its original
 256-byte limit. Its query validation, cache keys, stored history, payload processors,
 and widget behavior are unchanged.
@@ -44,9 +46,10 @@ There is no serialization contract or configuration change for the running serve
 Negating the single-quoted example excludes records containing **both** words;
 either word alone does not satisfy that excluded group. Double quotes encode an
 exact text sequence; ordinary terms and prefixes preserve input text without
-choosing an analyzer. Future executors must explicitly define ordinary-term matching
-and honor these distinct intents. This module does not claim any search engine or
-legal provider implements the language.
+choosing an analyzer. Each executor must explicitly define ordinary-term matching
+and honor these distinct intents. This module alone does not claim that a search
+engine or legal provider implements the language; `database.query` documents its
+own analyzer behavior.
 
 ### Precedence, grouping, and fields
 
@@ -159,7 +162,7 @@ existing index generations need no rebuild to gain these searches. Search result
 still cover only captured objects, and `index_lag: 0` does not establish complete
 provider coverage.
 
-Other future executors must specify analyzer behavior, admission before expensive
+Any additional executor must specify analyzer behavior, admission before expensive
 work, field capabilities, result completeness/pagination, and search-semantics versioning.
 Do not add this syntax validation to the existing `Query::validate` without a
 compatibility design: existing retained query identities can contain literal text

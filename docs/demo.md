@@ -34,7 +34,9 @@ cargo run --locked -p openlegal-server -- deploy/demo/server.toml
 
 Every configuration requires `[source].url`; replace the example placeholder with
 the actual source offer before hosting. See [source offers](server.md#source-offers-and-migration).
-Remove both `[demo]` and `[cache]` to disable synthetic retrieval.
+Remove `[demo]` to disable synthetic retrieval. Without `[database]`, also remove
+`[cache]`, which requires a registered retrieval source; keep it when `[database]`
+is configured, because the legal corpus requires persistent `[cache]` storage.
 The independent `[text_diff]` feature remains enabled until its section is also
 removed; without either feature only registered foundation tools remain. The demo
 additionally requires its bounded local widget asset before listeners bind. Paths

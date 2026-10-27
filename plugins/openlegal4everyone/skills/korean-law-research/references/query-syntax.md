@@ -23,15 +23,18 @@
   regex syntax, line oriented and case sensitive by default.
 - Pages default to 20 results, at most 100. Continue with `cursor`; cursors
   expire after ten minutes.
+- A `query` may contain at most 4,096 bytes. `context_lines` accepts at most 3,
+  and `sections` at most 32 names. Larger values are rejected as invalid input.
 
 ## Filters
 
-`filters` accepts `datasets`, `authority`, `object_id`, `document_type`,
-`date_kind` (`publication`, `effective`, `judgment`), `date_from` and `date_to`
-(`YYYYMMDD`). Datasets include `national_statute`, `administrative_rule`,
-`ordinance`, `treaty`, `precedent`, `constitutional_decision`,
-`legal_interpretation` and `administrative_appeal`; which ones are populated
-depends on the deployment.
+`filters` accepts `datasets` (at most three), `authority`, `object_id`,
+`document_type`, `date_kind` (`publication`, `effective`, `judgment`), `date_from`
+and `date_to` (`YYYYMMDD`). `date_from` or `date_to` requires `date_kind`, and
+`date_from` must not be later than `date_to`. Datasets include
+`national_statute`, `administrative_rule`, `ordinance`, `treaty`, `precedent`,
+`constitutional_decision`, `legal_interpretation` and `administrative_appeal`;
+which ones are populated depends on the deployment.
 
 `include_history: true` also searches retained historical revisions.
 `include_ocr: true` adds OCR text, which is excluded by default.

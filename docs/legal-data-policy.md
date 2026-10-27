@@ -106,17 +106,18 @@ semantics and qualification that support them.
 ## Retained evidence and fixtures
 
 The optional [retained-source citation interface](citations.md) pins links to an
-exact capture and text projection. The LAW corpus permanently retains permitted
-current and historical bodies, attachments and observations of corrected bytes,
-including multiple captures of the same official revision. Renewable short leases
-still coordinate readers and index generations; they do not authorize eviction of
-archived evidence. Withdrawal overrides public access and leases while preserving
+exact capture and text projection. Each provider profile states which permitted
+bodies, attachments and corrected observations it archives; the
+[Korean provider profile](providers/kr-law-go-kr.md#local-freshness-and-resource-policy)
+archives them permanently, including multiple captures of one official revision.
+Renewable short leases still coordinate readers and index generations; they do
+not authorize eviction of archived evidence. Withdrawal overrides public access and leases while preserving
 qualified capture metadata and retained evidence. Extracted and OCR text remain
 visibly distinguished from provider text across tools, resources and browser pages.
 
 Keep source payload, digest, normalization version and record linked. An optional
 positive raw-byte cap stops additional publication without deleting old captures;
-the default is `"unlimited"`. Staging, responses and processing retain finite bounds.
+the provider profile states its default. Staging, responses and processing retain finite bounds.
 Storage exhaustion pauses collection and resumes after capacity becomes available.
 Previously deleted bytes cannot be reconstructed merely by changing retention:
 recollection produces a new observation, never the old capture identity.

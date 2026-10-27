@@ -184,6 +184,10 @@ article labels keep the existing Hangul format; source heading labels, paths and
 article text remain unchanged. Synthetic fixture tests cover these marker forms;
 they do not establish new provider identity or full-corpus acceptance.
 
+Verified primary article units seed provision-history and term relations from
+explicit numeric article and branch fields (JO: four plus two digits). Article
+keys and missing branch fields never supply inferred JO identifiers.
+
 The adapter downloads documented national PDF/HWP attachment-link fields through
 an exact host/path allowlist. Ordinance attachment filenames alone do not justify
 inventing a download URL. Retained primary and attachment bytes are immutable
@@ -243,22 +247,42 @@ observation; geographic filtering has not been established as its cause.
 These code-established restrictions have not
 been validated against live provider responses.
 
+### Transport evidence and separately licensed material
+
+Approved primary legal-information API responses are retained privately as
+transport evidence before parsing, including when parsing fails. The only permitted
+transport redaction replaces only the exact active credential in a law.go.kr
+link's `OC` query value in documented XML fields. Retained evidence is exact after
+that disclosed transformation. This implements
+the requested permanent audit archive under the service's
+[legal-information reuse guidance](https://open.law.go.kr/LSO/information/guide.do)
+and [copyright policy](https://www.law.go.kr/lawPetitionForm.do?menuId=13&subMenuId=79).
+Treating the API envelope as transport evidence is an implementation interpretation;
+it does not verify reuse rights for every embedded third-party work. Unknown
+inline supplementary content is excluded from body projection, and its containing
+original response is not exported through source-file. Unknown separate attachments
+are metadata-only and never trigger an extra body download. Unknown source families
+also retain metadata only. Primary transport evidence is never automatically promoted
+to a public resource when supplementary rights remain unresolved.
+
 ## Local freshness and resource policy
 
 Validly projected provider text can exceed the unchanged local Korean analyzer
 or serialized index bounds. Managed collection then records `index_input_limit`
 as a visible detail gap, retaining the permitted original observation and any
 older HEAD without publishing that candidate. This is not `source_data_invalid`
-and does not prove provider absence. The existing future gap retry cycle owns
-later work; limits, segmentation, analyzer identity, charged provider usage, and
+and does not prove provider absence. The detail gap becomes eligible one hour
+after it is recorded and is requeued on a later continuous inventory pass, subject
+to queue capacity; limits, segmentation, analyzer identity, charged provider usage, and
 previous `processing_failed` jobs remain unchanged. Such gaps prevent a full
 clone claim even when inventory traversal has completed.
 
 These are application choices, not claimed upstream service guarantees:
 
-- HEAD is fresh for one hour; disclosed stale serving ends at 24 hours after
-  validation. An observed replacement immediately makes HEAD processing-pending,
-  including when the durable job queue is full.
+- HEAD freshness and disclosed stale serving follow the
+  [legal corpus freshness contract](../database.md#content-and-metadata). An
+  observed replacement immediately makes HEAD processing-pending, including when
+  the durable job queue is full.
 - Permitted current and historical bodies, attachments and corrected captures
   remain permanently archived, including multiple captures of one official
   revision. Withdrawal still blocks public access; archived evidence does not
@@ -298,9 +322,9 @@ These are application choices, not claimed upstream service guarantees:
   A pass can take longer while provider admission or processing is busy.
   The 128-job queue applies backpressure,
   and a current-page cursor advances only after each listed HEAD revision has
-  published or has a durable, explicitly incomplete gap. Due page and detail gaps
-  keep their existing retry eligibility and are revisited in a later scan under
-  the same request budget. It
+  published or has a durable, explicitly incomplete gap. Continuous ingestion
+  requeues due detail gaps under the same request budget; a page gap is resolved
+  only when a later traversal observes that page again. It
   alternates a front-page refresh with one-page overlap to reduce
   moving-offset omissions. This is incremental
   collection, not a stabilized full inventory. It never marks date-selector
@@ -317,7 +341,9 @@ These are application choices, not claimed upstream service guarantees:
   and `max_in_flight` (1..16). Select `requests_per_second` (1..1000, evenly
   paced and rounded up to milliseconds) or legacy `min_interval_secs` (1..3600);
   selecting both is invalid. Omission defaults to five starts per second, no
-  burst, unlimited continuous attempts and 1,000 explicit attempts per UTC day.
+  burst, unlimited continuous attempts and 1,000 on-demand attempts per UTC day;
+  the on-demand budget covers request Jobs for explicit and automatic demand
+  collection.
   Daily limits accept 1..1,000,000 or `"unlimited"`, and unlimited attempts remain
   charged. The committed collection template selects these same defaults.
   Daily limits use UTC calendar days, not rolling windows. Lists, details,
@@ -397,25 +423,3 @@ fixtures still require authorized verification. Preserve this distinction in
 release notes and coverage reporting. Ordinary tests must not make live provider
 requests. See the [legal-data policy](../legal-data-policy.md),
 [upstream policy](../upstream-policy.md) and [database contract](../database.md).
-
-### Transport evidence and separately licensed material
-
-Approved primary legal-information API responses are retained privately as
-transport evidence before parsing, including when parsing fails. The only permitted
-transport redaction replaces only the exact active credential in a law.go.kr
-link's `OC` query value in documented XML fields. Retained evidence is exact after
-that disclosed transformation. This implements
-the requested permanent audit archive under the service's
-[legal-information reuse guidance](https://open.law.go.kr/LSO/information/guide.do)
-and [copyright policy](https://www.law.go.kr/lawPetitionForm.do?menuId=13&subMenuId=79).
-Treating the API envelope as transport evidence is an implementation interpretation;
-it does not verify reuse rights for every embedded third-party work. Unknown
-inline supplementary content is excluded from body projection, and its containing
-original response is not exported through source-file. Unknown separate attachments
-are metadata-only and never trigger an extra body download. Unknown source families
-also retain metadata only. Primary transport evidence is never automatically promoted
-to a public resource when supplementary rights remain unresolved.
-
-Verified primary article units seed provision-history and term relations from
-explicit numeric article and branch fields (JO: four plus two digits). Article
-keys and missing branch fields never supply inferred JO identifiers.

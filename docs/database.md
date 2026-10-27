@@ -1,13 +1,13 @@
 # Legal corpus tools
 
-The optional `[database]` configuration registers `database.query`, `database.rg`,
-`database.get`, `database.get_metadata`, `database.object_status`, `database.history`, `database.diff`, and
-`database.show` on both existing MCP transports. It requires PostgreSQL persistence
-and the text comparison service. The synthetic demo remains a separate dataset.
-The same configuration registers the [legal reference tools](legal-reference.md)
-`law.resolve_name`, `citation.verify` and `law.in_force_at`, and the
-[legal analysis tools](legal-analysis.md) `law.watch`, `law.lineage`,
-`precedent.citing`, `article.impact` and `law.article`.
+The optional `[database]` configuration registers the `database.*` corpus tools,
+the [legal reference tools](legal-reference.md) and the
+[legal analysis tools](legal-analysis.md) on both existing MCP transports. The
+[MCP tool inventory](server.md#mcp-tool-inventory) lists every tool with its
+enabling table and annotation. This document owns the corpus tool semantics,
+search, collection receipts and corpus freshness. The configuration requires
+PostgreSQL persistence and the text comparison service. The synthetic demo
+remains a separate dataset.
 
 The implementation has offline fixtures and local integration gates. An enabled
 provider adapter or a successful build does not establish a complete national
@@ -16,8 +16,9 @@ The document sandbox has a separate operator acceptance gate.
 
 ## Identity, revisions and evidence
 
-An object is `{jurisdiction, provider, dataset, id}`. Initial datasets are
-`national_statute`, `ordinance`, and `precedent`, with `law_go_kr` as provider.
+An object is `{jurisdiction, provider, dataset, id}`. Datasets are the 69 closed
+source families of the [Korean provider profile](providers/kr-law-go-kr.md#implementation-and-evidence-status),
+such as `national_statute`, `ordinance` and `precedent`, with `law_go_kr` as provider.
 A revision is a provider checkpoint; a capture is a particular retained observation.
 They are separate identifiers. National effective-view revisions include both MST
 and efYd. Identical observations can refresh validation timing without creating an
@@ -57,8 +58,9 @@ restart traversal from its first page.
 
 ## Content and metadata
 
-`database.get` accepts object, selector, `fresh_only`, optional section, offset,
-section-catalog offset, and content-session bearer. Its result contains a bounded
+`database.get` accepts `object`, `selector`, `fresh_only`, optional `section`,
+`offset`, section-catalog offset `sections_offset`, and content-session bearer
+`session`. Its result contains a bounded
 text page, metadata, section catalog page, and session. Continue with the returned
 capture ID, session, same section, and `next_offset`. Section catalogs also have a
 continuation offset. Sessions last ten minutes and do not extend on access. They
@@ -137,6 +139,14 @@ SQL. Filters include dataset, authority, object ID, document type and typed date
 bounds. Default page size is 20; maximum is 100. Results use stable object/revision/
 capture/section ordering and retain one index reader for ten minutes.
 
+Both methods reject as invalid input a `query` over 4,096 bytes, more than three
+`filters.datasets`, more than 32 `sections` or a section name that is empty or over
+256 bytes, and a cursor over 1,024 bytes. `database.rg` rejects `context_lines`
+above 3; `database.query` does not accept that field. Authority,
+object ID and document-type filters accept at most 256 bytes without control
+characters. `date_from` and `date_to` must be valid dates, require `date_kind`, and
+`date_from` must not follow `date_to`.
+
 `database.query` uses the existing [query DSL](search-query.md): words, prefixes,
 Boolean expressions, grouping, and `in:title:`, `in:body:`, and
 `in:case_number:` fields. Bare `title:`, `body:`, and `case_number:` are invalid;
@@ -196,8 +206,9 @@ new HEAD and then block the ordered index stream.
 Managed collection records a version-fenced failed detail job and an
 `index_input_limit` gap for these deterministic bounds, retaining the permitted
 original source observation and the previously published HEAD. No publication
-or index outbox event is created. The existing one-hour future gap cycle owns
-any later attempt; there is no inline retry or change to text segmentation,
+or index outbox event is created. The detail gap becomes eligible one hour after it
+is recorded and is requeued on a later continuous inventory pass, subject to queue
+capacity; there is no inline retry or change to text segmentation,
 normalization, tokenizer identity, or limits. Busy analyzer slots, deadlines,
 cancellation, and storage failures retain their existing handling. Query and
 selected-text callers retain the existing `resource_limit` response.
@@ -248,7 +259,35 @@ it never makes direct provider calls from serving.
 
 ## Explicit collection outcomes
 
-`database.request_collection` coalesces equivalent requests, and
+`database.request_collection` explicitly queues bounded provider collection for a
+verified national-statute ID, exact precedent case number with optional expected
+provider ID, or a simple term and dataset selection. It does not return an
+upstream search result. Equivalent requests coalesce for 24 hours; use
+`database.collection_status` and then rerun the ordinary local lookup/search.
+Failed, partial or skipped requests can be resubmitted one hour after completion;
+successful requests continue to coalesce for 24 hours. Quota-deferred requests are
+retried when admission becomes eligible; healthy capacity contention is rechecked
+after five seconds while their 24-hour request window remains open.
+New requests require a fresh collection-scheduler heartbeat; without the optional
+ingestion overlay the tool returns a resource-limit error and leaves no queued
+request. A cached HEAD with another revision is replaced only when the provider
+list has a later comparable date and that HEAD has not changed since the list
+began. Equal or missing dates are skipped conservatively.
+
+Deferred receipts include a bounded `reason` when classified: `provider_daily_limit`,
+`provider_suspended`, `provider_response_uncertain`, `provider_retry_after`,
+`operation_attempt_limit`, or `provider_admission_wait`; resource capacity uses
+`capacity_wait`. Older receipts may omit the reason. `retry_after_seconds` is the
+remaining time until the stored retry lease, clamped to zero when it is due;
+queued/launching/running receipts retain their ten-second polling hint. A retry
+time is a recheck hint, not a promise that collection will succeed. Suspension and
+uncertain-response evidence require operator review rather than automatic clearing.
+The original request ID remains readable until its expiry after a retry. A search
+request can report `done` with a provider failure reason when some candidates
+published and other bounded source attempts failed; `skipped` with that reason
+means none published. Current provider admission diagnostics are described in the
+[server contract](server.md#current-provider-admission-diagnostics).
+
 `database.collection_status` returns the same bounded receipt, including an
 optional terminal `reason`. A new skipped attempt reports its observed cause:
 `collection_pending`, `already_fresh`, `collection_already_in_progress`,
@@ -258,7 +297,7 @@ Old receipts with no reason retain that uncertainty.
 An index input rejection reports `skipped` with `index_input_limit` when nothing
 publishes, or `done` with that partial-result reason when another item publishes.
 Like provider failures, the first observed failure reason retains precedence.
-Migration 25 only extends the constrained reason vocabulary; it neither infers
+Migration `0025` only extends the constrained reason vocabulary; it neither infers
 causes for existing `processing_failed` jobs nor requeues them. Rollback must
 retain this vocabulary while any receipt or gap references the new reason.
 
@@ -318,7 +357,7 @@ checks the exact migration set, so an older binary cannot open an upgraded schem
 For a behavior rollback, use a revert build retaining these additive migrations;
 do not remove migration history or infer reasons for old NULL receipts.
 
-Migration 26 adds a stored generated `clone_body_complete` flag to each retained
+Migration `0026` adds a stored generated `clone_body_complete` flag to each retained
 capture. It derives the existing clone-progress attachment/body predicates from
 the immutable payload so status aggregation need not read or decompress bodies.
 Missing/null metadata keeps its existing meaning. Public status fields, evidence,
@@ -330,21 +369,30 @@ coordinated database/blob backup, and reserve rewrite and WAL space. PostgreSQL
 documents [temporary space of up to twice the table/index size for rewrites](https://www.postgresql.org/docs/18/sql-altertable.html#SQL-ALTERTABLE-NOTES); WAL
 and backup capacity need additional headroom. Run the matching binary's `--migrate`
 with the migration credential during the maintenance window, verify success, then
-restart the matching services. Migration 26 alone uses transaction-local limits of
+restart the matching services. Migration `0026` alone uses transaction-local limits of
 30 minutes per statement and 35 minutes per transaction, retaining the one-second
 lock timeout; a timeout fails the upgrade and must be investigated before retry.
 The PostgreSQL 18 transaction timer is explicitly re-armed before the rewrite.
 Normal serving retains its two-second statement and five-second transaction limits.
-For rollback, use a revert build that retains migration 26 and its exact checksum;
-an older schema-25 binary cannot open the upgraded schema. Do not delete migration
+For rollback, use a revert build that retains migration `0026` and its exact checksum;
+an older binary at schema `0025` cannot open the upgraded schema. Do not delete migration
 history, disable capture immutability, or rewrite retained source evidence.
 
 Serving retained data requires neither provider credentials nor Kubernetes.
-Coverage is reported complete only after all three current datasets have matching
-consecutive full inventory traversals, their desired HEADs are available within the
-24-hour policy, and the selected index generation has caught up. This is observed
-provider coverage, not an upstream atomic-snapshot guarantee. Restart clears this
-claim until inventories are verified again.
+Search-response coverage requires a verified-inventory flag, matching consecutive
+full inventory traversals of all registered datasets, desired HEADs available within
+the 24-hour policy, and a caught-up selected index generation. No current ingestion
+mode sets that flag, so `corpus_complete` remains false; restart and each continuous
+or pilot pass also clear it. This would describe observed provider coverage, not an
+upstream atomic-snapshot guarantee.
+
+`database.corpus_status` reads durable clone progress without contacting LAW.
+`initial_canonical_clone_complete` requires two stable inventory traversals of
+every clone view, all required verified bodies, no unfinished jobs or gaps, and
+index acknowledgement. `full_available_clone_complete` additionally requires
+supplemental coverage and no unresolved guide contracts. An English response
+retained with unverified identity cannot satisfy required-body coverage.
+Completion describes a stable observed traversal, not an atomic provider snapshot.
 
 Background ingestion requires explicit `[database.ingestion]` configuration with
 `enabled = true`, a credential environment variable name, absolute kubectl and
@@ -352,7 +400,8 @@ kubeconfig paths, an explicit context/namespace, and a worker image pinned by di
 `detail_timeout_secs` controls provider/detail processing (default 3600 seconds,
 valid range 60–7200). The job lease adds 120 seconds for index admission and
 publication. Deterministic source/access/format failures are terminal for that attempt;
-transient failures have at most three attempts and honor provider Retry-After.
+transient failures are limited to `max_job_attempts` total executions (default 3)
+and honor provider Retry-After.
 No live provider calls occur in ordinary tests. Refer to the
 [Korean provider profile](providers/kr-law-go-kr.md) and
 [document sandbox](document-sandbox.md) for evidence and deployment gates.
@@ -360,7 +409,9 @@ The [Kubernetes ingestion overlay](deployment-kubernetes.md#optional-ingestion-i
 supplies the optional image, projected identity and network templates. Its enabled
 startup initiates background traffic in a separate scheduler Pod; applying it
 requires separate operator authorization after sandbox acceptance. The serving
-Pod has no provider credential and its lookups do not schedule collection.
+Pod has no provider credential and makes no direct provider calls. When
+`auto_collection` is enabled, eligible lookups may enqueue collection that the
+separate scheduler performs; see [automatic collection](#automatic-demand-collection).
 
 Current and historical bodies, attachments and corrected captures are archived
 permanently, including older captures of the same official revision. Revision
@@ -424,25 +475,6 @@ only the new dual-engine format, not the legacy Lindera-only format. Such a down
 requires version-specific rebuilding tooling; otherwise repair forward with the
 new analyzer. Never rewind acknowledgment or discard corpus evidence to downgrade.
 
-## Validation
-
-The full standard-dictionary gate is `scripts/test-korean-tokenization.sh`. It
-provisions its own artifact unless `OPENLEGAL_TEST_MECAB_DICTIONARY` is supplied.
-It exercises both engines and reports reproducible synthetic-input measurements;
-these are not legal accuracy or production capacity claims. The PostgreSQL gate
-also provisions a dictionary unless that variable names an existing artifact.
-Ordinary unit tests do not require the external MeCab-Ko artifact.
-The [implementation review](korean-tokenization-review.md) records independent
-review, local validation, dictionary identity and measured resource use.
-
-Required baseline and PostgreSQL/OxiBelt gates are in [CONTRIBUTING](../CONTRIBUTING.md).
-Fixtures label fictional legal records explicitly. Tests cover exact/ambiguous date
-selection, capture lineage, publication fencing, raw evidence verification, retained
-reader/session behavior, withdrawal, patch round trips and bounded MCP results.
-Live upstream coverage and hardened-cluster acceptance are separate opt-in checks.
-The [endpoint review](mcp-endpoints-review.md) records compatibility, independent
-review scope, local verification and remaining deployment gates.
-
 ## Original observations and durable clone work
 
 Migrations 0019–0021 retain original source observations, independent inventory
@@ -457,3 +489,24 @@ Global roots and record-derived requests share a durable fair queue. An unknown
 reuse license records metadata without authorizing a body download. Missing
 source contracts, unsupported change-date universes, unavailable attachments,
 and unverified identities stay visible as incomplete coverage.
+
+## Validation
+
+The full standard-dictionary gate is `scripts/test-korean-tokenization.sh`. It
+provisions its own artifact unless `OPENLEGAL_TEST_MECAB_DICTIONARY` is supplied.
+It exercises both engines and reports reproducible synthetic-input measurements;
+these are not legal accuracy or production capacity claims. The PostgreSQL gate
+also provisions a dictionary unless that variable names an existing artifact.
+Ordinary unit tests do not require the external MeCab-Ko artifact.
+The [implementation review](korean-tokenization-review.md) records independent
+review, local validation, dictionary identity and measured resource use.
+The optional [corpus contention soak](../test-support/corpus-contention-soak.md)
+extends the PostgreSQL gate with a bounded concurrent-publication observation.
+
+Required baseline and PostgreSQL/OxiBelt gates are in [CONTRIBUTING](../CONTRIBUTING.md).
+Fixtures label fictional legal records explicitly. Tests cover exact/ambiguous date
+selection, capture lineage, publication fencing, raw evidence verification, retained
+reader/session behavior, withdrawal, patch round trips and bounded MCP results.
+Live upstream coverage and hardened-cluster acceptance are separate opt-in checks.
+The [endpoint review](mcp-endpoints-review.md) records compatibility, independent
+review scope, local verification and remaining deployment gates.

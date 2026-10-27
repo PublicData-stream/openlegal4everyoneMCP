@@ -6,7 +6,9 @@ The backend is a responsible client of public legal-data services. Repeated
 equivalent MCP/API requests must reuse cached results or shared in-flight work;
 they must not independently trigger an equivalent number of upstream requests.
 The synthetic framework implements these controls as documented in the
-[retrieval contract](retrieval.md). Real providers still require separate onboarding.
+[retrieval contract](retrieval.md). The opt-in LAW OPEN DATA adapter is onboarded
+under its [Korean provider profile](providers/kr-law-go-kr.md); live-provider
+acceptance remains pending, and other real providers require separate onboarding.
 
 ## Provider onboarding
 
@@ -103,6 +105,19 @@ If these capabilities are unavailable, use bounded scheduled or demand-driven
 refresh. Do not perform full-corpus refresh for each user request or repeatedly
 download details already available under a valid cache identity.
 
+Negative-cache confirmed absence or valid empty searches only when the provider's
+meaning is understood and a bounded lifetime is defined. Never turn authentication
+errors, throttling, timeouts, transport failures, or parser failures into absence.
+An explicit incomplete collection gap may record one failed item for a later
+bounded retry without claiming that the legal item is absent.
+Deterministic local index input bounds use `index_input_limit`, preserving
+permitted original observations and any older HEAD without publication or an
+outbox event. Continuous ingestion requeues them later as a due detail gap, never through an
+inline analyzer retry, a quota refund, or a blanket retry of `Capacity`.
+Busy analyzer slots and elapsed deadlines are not input-limit evidence.
+An HTTP status alone may not establish dataset-level absence. Keep temporary
+failure backoff distinct from a negative legal-data result.
+
 For the Korean corpus, `[database].auto_collection` defaults to `true`. Eligible
 HEAD lookups and local searches may enqueue bounded demand collection; they
 return local data and a receipt rather than waiting for provider results.
@@ -110,13 +125,14 @@ return local data and a receipt rather than waiting for provider results.
 dedicated collection Job path; `database.collection_status` only reads its state.
 Disable automatic collection to retain local-only lookup/search behavior.
 The scheduler and request Jobs share provider spacing and bounded parallel
-admission. Operator configuration selects independent continuous and explicit
+admission. Operator configuration selects independent continuous and on-demand
 daily caps, each accepting a positive limit or `"unlimited"`, and shared request
-pacing. These are UTC calendar-day caps, not rolling 24-hour windows. Continuous
-collection defaults to `"unlimited"`, explicit collection to 1,000 reserved
-attempts per day, and the shared rate to five starts per second without burst.
-`max_in_flight` defaults to four shared HTTP attempts and accepts 1..16. The
-ingestion template uses these defaults and a five-minute busy recheck interval.
+pacing. The on-demand cap covers request Jobs for both explicit and automatic
+demand collection. These are UTC calendar-day caps, not rolling 24-hour windows.
+Defaults and ranges, including the `[database.ingestion.provider_requests].max_in_flight`
+bound on shared HTTP attempts, are in the
+[server configuration table](server.md#canonical-text-and-corpus-tools) and the
+[Korean provider profile](providers/kr-law-go-kr.md#local-freshness-and-resource-policy).
 These are operator choices, not evidence of provider permission or throughput.
 All clients use the same durable policy and charged counters after restarts.
 Increasing an exhausted budget may advance only budget-wait leases; it preserves
@@ -225,10 +241,9 @@ retains its exact launching epoch and lease; its Pod may settle that fenced clai
 while reconciliation derives the same Job name. This yield never repeats Job
 creation. Scheduler heartbeat or lease failures remain fatal.
 
-LAW accepts `requests_per_second = 1..1000` instead of an explicitly selected
-`min_interval_secs`; specifying both is invalid. Start spacing is rounded up to
-milliseconds and all concurrent slots share it. This is an upper bound, not a
-throughput guarantee. Daily exhaustion never clears a provider pause.
+Start spacing is shared by all concurrent slots of a provider. A configured rate
+is an upper bound, not a throughput guarantee. Daily exhaustion never clears a
+provider pause.
 
 Synthetic retrieval has its own `[demo.provider_requests]` policy. Its daily cap
 defaults to `"unlimited"` and its rate defaults to two starts per second with burst
@@ -241,27 +256,14 @@ reserves before DNS. Admission storage failure prevents the fetch and never fall
 back to memory accounting. Quota exhaustion returns a non-retryable local admission
 error through the existing MCP `rate_limited` contract.
 
-Optional attempt caps do not disable finite deadlines or retry budgets. LAW pilot
-and explicit-operation caps default to 100 and 32 respectively; each also accepts
-`"unlimited"`. Pilot and explicit timeouts default to 1800 and 7200 seconds, with
-60..86400 supported. LAW `max_job_attempts` defaults to three total processing
-executions, including the first; its HTTP transport does not add retries. Demo
-`max_attempts` defaults to two total fetches. Both maxima accept 1..10. Scheduled
-collection-gap cycles remain distinct future work, not inline retry loops.
-
-
-Negative-cache confirmed absence or valid empty searches only when the provider's
-meaning is understood and a bounded lifetime is defined. Never turn authentication
-errors, throttling, timeouts, transport failures, or parser failures into absence.
-An explicit incomplete collection gap may record one failed item for a later
-bounded retry without claiming that the legal item is absent.
-Deterministic local index input bounds use `index_input_limit`, preserving
-permitted original observations and any older HEAD without publication or an
-outbox event. They use the existing one-hour future detail-gap cycle, never an
-inline analyzer retry, a quota refund, or a blanket retry of `Capacity`.
-Busy analyzer slots and elapsed deadlines are not input-limit evidence.
-An HTTP status alone may not establish dataset-level absence. Keep temporary
-failure backoff distinct from a negative legal-data result.
+Optional attempt caps do not disable finite deadlines or retry budgets. Processing
+retry maxima (`[database.ingestion.provider_requests].max_job_attempts` and
+`[demo.provider_requests].max_attempts`) count total executions, including the
+first; the HTTP transport does not add retries. Their defaults, and the LAW pilot
+and on-demand operation caps and timeouts, are in the
+[server configuration tables](server.md#canonical-text-and-corpus-tools).
+Continuous ingestion requeues due detail gaps instead of retrying inline; page gaps
+have no separate retry and are resolved when a later traversal observes the page.
 
 ## Coordination and request budgets
 

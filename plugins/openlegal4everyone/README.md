@@ -88,14 +88,19 @@ aggregate call, failure and rate-limit counts, not request payloads; see the
 attachments expire ten minutes after the initial upload, and comparisons and
 generated attachments expire ten minutes after publication; see
 [text comparison](../../docs/text-diff.md).
-The operator's public privacy policy URL, covering collection, use, storage,
-third-party sharing, retention and contact, is still to be published.
+Both manifests declare privacy policy, terms and support URLs under
+`https://publicdata.stream/servers/openlegal4everyonemcp/`. This repository does
+not establish that those pages are published or that they cover collection, use,
+storage, third-party sharing, retention and contact.
 
 ## Remaining work
 
-- Publish privacy policy, terms and support URLs, then add them to
-  `plugin.json` `interface` (`privacyPolicyURL`, `termsOfServiceURL`).
-- Add an icon, logo and 3–5 widget screenshots under `assets/`.
+- Confirm that the privacy policy, terms and support URLs declared in
+  `plugin.json` (`privacyPolicyURL`, `termsOfServiceURL`, `supportURL`) and
+  `.claude-plugin/plugin.json` (`privacyPolicyUrl`, `termsOfServiceUrl`,
+  `supportUrl`) are live and cover the required topics.
+- Add 3–5 widget screenshots. `plugin.json` already uses `logo.svg` as the
+  icon and logo; `.claude-plugin/plugin.json` uses it as the icon.
 - Test every tool through Claude custom connectors and ChatGPT developer mode,
   including dotted tool names such as `database.query`, and record the results.
 - Submit the server as a Claude MCP connector and this folder as a Claude

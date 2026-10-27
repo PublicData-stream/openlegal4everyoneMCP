@@ -63,6 +63,8 @@ into TLS with `[http.tls]`. WebTransport `/mcp-wt/v1` always uses TLS/QUIC.
 When `[edge_mtls]` is configured, both listeners require a client certificate
 issued by `client_ca_file` with the exact `required_client_dns_san`; HTTP must
 also configure TLS. Both must bind successfully before readiness becomes true.
+Empty certificate chains and mismatched private keys are reported as startup
+errors.
 Keep health `/live`, `/ready`, and `/metrics` private; they have no authentication.
 `/metrics` exposes aggregate tool call/failure and rate-rejection counts and, when configured, bounded
 application retrieval metrics, not request payloads.
@@ -79,10 +81,12 @@ No plugin directory submission or deployment is automated here. The
 
 ## Source offers and migration
 
-The September 12, 2026 AGPL-3.0-only migration requires `[source].url` in every
+The 2026-09-12 AGPL-3.0-only migration requires `[source].url` in every
 configuration, including servers without the demo. Old configurations must add
 this table before upgrading; there is no implicit link to upstream `main`.
 The example URLs are isolated placeholders, not working source offers.
+Validation records: the [server foundation review](implementation-review.md) and
+the [AGPL migration validation](licensing-review.md).
 
 `SourceOffer` validates an absolute HTTPS URL with a hostname, no credentials,
 leading/trailing whitespace, control characters or backslashes, and at most 2,048 bytes before and
@@ -124,8 +128,8 @@ to `ServerBuilder::new(registry, limits, source)`, where `source` is a validated
 implements Serde deserialization and Schemars JSON Schema. The asynchronous handler
 receives typed input and `ToolContext`, returning `Result<Value, ToolError>`.
 `register_with_annotations` supplies accurate MCP annotations; public registration
-accepts only read-only modules. A crate-private registration path permits only the
-built-in comparison deletion aliases, managed attachment upload/deletion operations,
+accepts only read-only modules. A crate-private registration path permits only
+`text.diff.delete`, the managed attachment upload/deletion operations,
 and `database.request_collection`, plus a narrow built-in registration path for
 eligible automatic corpus lookup/search tools. With `auto_collection = true`
 (the default), `database.get`, `database.get_metadata`, `database.query`,
@@ -380,6 +384,57 @@ Comparison summaries optionally carry server-derived `origin` metadata. These
 additions apply equally to both transports. Existing widget resources and source
 metadata requirements remain unchanged.
 
+## MCP tool inventory
+
+This is the complete list of registered MCP tools. Each tool is registered only
+when its configuration tables are present; owning documents define behavior.
+"Mutating" means the tool advertises `readOnlyHint: false`. Tools marked
+"Auto-collection" advertise `readOnlyHint: false` while `[database].auto_collection`
+is `true` (the default) and read-only annotations when it is `false`.
+
+| Tool | Enabled by | Annotation | Contract |
+| --- | --- | --- | --- |
+| `server_info` | Always | Read-only | [Source offers](#source-offers-and-migration) |
+| `text.diff` | `[text_diff]` | Read-only | [Text comparison](text-diff.md) |
+| `text.apply_patch` | `[text_diff]` | Read-only | [Text comparison](text-diff.md) |
+| `text.diff.show` | `[text_diff]` | Read-only | [Text comparison](text-diff.md) |
+| `text.diff.page` | `[text_diff]` | Read-only | [Text comparison](text-diff.md) |
+| `text.diff.delete` | `[text_diff]` | Mutating, destructive, idempotent | [Text comparison](text-diff.md) |
+| `text.attachment.upload` | `[text_diff]` | Mutating, non-destructive | [Text comparison](text-diff.md) |
+| `text.attachment.read` | `[text_diff]` | Read-only | [Text comparison](text-diff.md) |
+| `text.attachment.delete` | `[text_diff]` | Mutating, destructive, idempotent | [Text comparison](text-diff.md) |
+| `database.query` | `[database]` | Auto-collection | [Legal corpus](database.md#search) |
+| `database.rg` | `[database]` | Auto-collection | [Legal corpus](database.md#search) |
+| `database.get` | `[database]` | Auto-collection | [Legal corpus](database.md#content-and-metadata) |
+| `database.get_metadata` | `[database]` | Auto-collection | [Legal corpus](database.md#content-and-metadata) |
+| `database.object_status` | `[database]` | Read-only | [Legal corpus](database.md#content-and-metadata) |
+| `database.history` | `[database]` | Read-only | [Legal corpus](database.md#identity-revisions-and-evidence) |
+| `database.diff` | `[database]` | Read-only | [Legal corpus](database.md#content-and-metadata) |
+| `database.show` | `[database]` | Read-only | [Legal corpus browser](../apps/widget/README.md#legal-corpus-browser) |
+| `database.corpus_status` | `[database]` | Read-only | [Legal corpus](database.md#operator-configuration) |
+| `database.request_collection` | `[database]` | Mutating, non-destructive, idempotent | [Legal corpus](database.md#explicit-collection-outcomes) |
+| `database.collection_status` | `[database]` | Read-only | [Legal corpus](database.md#explicit-collection-outcomes) |
+| `law.resolve_name` | `[database]` | Auto-collection | [Legal reference](legal-reference.md) |
+| `citation.verify` | `[database]` | Read-only | [Legal reference](legal-reference.md) |
+| `law.in_force_at` | `[database]` | Read-only | [Legal reference](legal-reference.md) |
+| `law.watch` | `[database]` | Read-only | [Legal analysis](legal-analysis.md) |
+| `law.lineage` | `[database]` | Read-only | [Legal analysis](legal-analysis.md) |
+| `precedent.citing` | `[database]` | Read-only | [Legal analysis](legal-analysis.md) |
+| `article.impact` | `[database]` | Read-only | [Legal analysis](legal-analysis.md) |
+| `law.article` | `[database]` | Read-only | [Legal analysis](legal-analysis.md) |
+| `search` | `[database]` and `[citations]` | Auto-collection | [Citations](citations.md) |
+| `fetch` | `[database]` and `[citations]` | Read-only | [Citations](citations.md) |
+| `demo_search_records` | `[demo]` | Read-only | [Demo guide](demo.md) |
+| `demo_get_record` | `[demo]` | Read-only | [Demo guide](demo.md) |
+| `demo_show_records` | `[demo]` | Read-only | [Demo guide](demo.md) |
+| `demo_list_snapshots` | `[demo]` with `[cache].mode = "persistent"` | Read-only | [Persistence](persistence.md#history-and-comparisons) |
+| `demo_get_snapshot` | `[demo]` with `[cache].mode = "persistent"` | Read-only | [Persistence](persistence.md#history-and-comparisons) |
+| `demo_compare_record_snapshots` | `[demo]` with persistent `[cache]` and `[text_diff]` | Read-only | [Persistence](persistence.md#history-and-comparisons) |
+
+`[database]` itself requires `[text_diff]` and persistent `[cache]` storage, and
+`[citations]` requires `[database]`. The widget-opening tools `text.diff.show`,
+`database.show` and `demo_show_records` reference the UI resources described in the
+[widget README](../apps/widget/README.md).
 
 ## Canonical text and corpus tools
 
@@ -394,78 +449,44 @@ result and use `text.diff.delete` for cleanup. See
 [text comparison](text-diff.md) for the migration mapping, algorithms, patch
 restrictions and budgets.
 
-`[database]` additionally registers the six database operations, `database.show`,
-`database.request_collection`, `database.collection_status`, and the read-only
-`database.object_status`. Shared HTTP/WebTransport handlers use the same application services,
-result/error contracts and limits. Details, configuration, freshness, body/catalog
-paging and provider acceptance boundaries are in [legal corpus](database.md).
-`database.request_collection` explicitly queues bounded provider collection for a
-verified national-statute ID, exact precedent case number with optional expected provider ID, or a simple term and dataset selection. It does not
-return an upstream search result. Equivalent requests coalesce for 24 hours; use
-`database.collection_status` and then rerun the ordinary local lookup/search.
-Failed, partial or skipped requests can be resubmitted one hour after completion; successful requests
-continue to coalesce for 24 hours. Quota-deferred requests are retried when
-admission becomes eligible; healthy capacity contention is rechecked after five
-seconds while their 24-hour
-request window remains open.
-Deferred receipts include a bounded `reason` when classified: `provider_daily_limit`,
-`provider_suspended`, `provider_response_uncertain`, `provider_retry_after`,
-`operation_attempt_limit`, or `provider_admission_wait`; resource capacity uses
-`capacity_wait`. Older receipts may omit the reason. `retry_after_seconds` is the
-remaining time until the stored retry lease, clamped to zero when it is due;
-queued/launching/running receipts retain their ten-second polling hint. A retry
-time is a recheck hint, not a promise that collection will succeed. Suspension and
-uncertain-response evidence require operator review rather than automatic clearing.
-The original request ID remains readable until its expiry after a retry. A search
-request can report `done` with a provider failure reason when some candidates
-published and other bounded source attempts failed; `skipped` with that reason
-means none published.
-New requests require a fresh collection-scheduler heartbeat; without the optional
-overlay the tool returns a resource-limit error and leaves no queued request.
-A cached HEAD with another revision is replaced only when the provider list has
-a later comparable date and that HEAD has not changed since the list began.
-Equal or missing dates are skipped conservatively.
+`[database]` registers the corpus, legal reference and legal analysis tools listed
+in the [MCP tool inventory](#mcp-tool-inventory). Shared HTTP/WebTransport handlers
+use the same application services, result/error contracts and limits. Tool
+semantics, freshness, body/catalog paging, collection receipts and provider
+acceptance boundaries are in [legal corpus](database.md); collection request and
+receipt behavior is in
+[explicit collection outcomes](database.md#explicit-collection-outcomes).
 No public arbitrary URL, SQL, filesystem search, or direct corpus mutation tool is registered.
 Operator ingestion configuration is a separate startup decision.
-`[database.ingestion.provider_requests]` selects shared durable LAW admission.
-`continuous_daily_limit` and `on_demand_daily_limit` each accept 1..1,000,000 or
-`"unlimited"`. Automatic collection defaults to `"unlimited"`; explicit collection
-retains a 1,000-attempt daily default. Usage resets at UTC midnight. Unlimited usage
-is still charged; configuration changes preserve counts and safety pauses.
-
-Use `requests_per_second` (1..1,000) for evenly paced starts, or the existing
-`min_interval_secs` (1..3,600). Explicitly specifying both fails validation.
-Omitting both selects **five starts per second**, with a minimum 200ms interval
-and no burst. `max_in_flight` defaults to **4** and accepts 1..16 simultaneous
-HTTP attempts across every client sharing the LAW PostgreSQL ledger. The collector
-example uses these defaults and 300-second busy rechecks. Rate is an admission
-ceiling, not a promise of achieved throughput or provider permission to increase it.
+`[database.ingestion.provider_requests]` selects shared durable LAW admission:
 
 | LAW policy field | Default | Accepted values |
 | --- | --- | --- |
+| `continuous_daily_limit` | `"unlimited"` | 1..1,000,000 or `"unlimited"` |
+| `on_demand_daily_limit` | 1,000 | 1..1,000,000 or `"unlimited"` |
+| `requests_per_second` | 5 when `min_interval_secs` is also omitted | 1..1,000 evenly paced starts |
+| `min_interval_secs` | None | 1..3,600; specifying it with `requests_per_second` fails validation |
 | `max_in_flight` | 4 | 1..16 shared HTTP attempts |
 | `pilot_attempt_limit` | 100 | 1..1,000,000 or `"unlimited"` |
 | `on_demand_attempt_limit` | 32 | 1..1,000,000 or `"unlimited"` |
 | `pilot_timeout_secs` | 1800 | 60..86400 |
 | `on_demand_timeout_secs` | 7200 | 60..86400 |
-| `max_job_attempts` | 3 | 1..10 total Job executions |
+| `max_job_attempts` | 3 | 1..10 total job executions |
 
-Pilot start/window evidence survives restarts. Explicit operations snapshot their
-limits when launched, so configuration changes do not shorten an active deadline.
-Shared provider admission still honors current daily/rate policy and safety pauses.
-The existing `detail_timeout_secs`, network and document-worker bounds are separate.
-`adaptive_polling` defaults to `true`: idle inventory cycles continue immediately,
-while `scan_interval_secs` bounds busy rechecks and notifications wake them earlier.
-A five-second readiness fallback does not start extra scans while busy. Disable
-adaptive polling to retain the original fixed delay after inventory passes.
-Neither setting defines freshness or collection-gap retry eligibility.
+This `[database.ingestion.provider_requests].max_in_flight` bounds provider HTTP
+attempts and is unrelated to `[limits].max_in_flight`. `[database.ingestion]` also
+accepts `adaptive_polling` (default `true`), `scan_interval_secs` (default 3,600;
+60..86,400) and `detail_timeout_secs` (default 3,600; 60..7,200). Daily-cap,
+pacing, pause and polling semantics are in the
+[upstream policy](upstream-policy.md#refresh-and-negative-caching); LAW behavior,
+including pilot and on-demand operation limits, is in the
+[provider profile](providers/kr-law-go-kr.md#local-freshness-and-resource-policy).
+Neither polling setting defines freshness or collection-gap retry eligibility.
 
 `[database].max_raw_bytes` defaults to `"unlimited"` and optionally accepts a
-positive byte count. A finite cap stops further publication when reached; it
-never evicts historical evidence. Current and historical bodies, attachments and
-corrected captures remain archived permanently. The staging cap and individual
-response/document limits remain finite; withdrawal still blocks public access.
-`retain_history_bodies` defaults to `true` in enabled ingestion.
+positive byte count. `[database.ingestion].retain_history_bodies` defaults to
+`true`. Archive and cap semantics are in
+[legal corpus](database.md#operator-configuration).
 
 Registered source families are a closed operator-maintained catalog; callers
 cannot add arbitrary provider targets or URLs. Materials carry independent reuse
@@ -534,14 +555,8 @@ its capture and evidence; decoded records are bounded to 64 MiB and the exact
 original response remains bounded to 100 MiB. A smaller original budget is
 invalid, and simultaneous downloads share this budget.
 
-`database.corpus_status` reads durable clone progress without contacting LAW.
-`initial_canonical_clone_complete` requires two stable inventory traversals,
-all required verified bodies, no unfinished jobs or gaps, and index acknowledgement.
-`full_available_clone_complete` additionally requires supplemental coverage and
-no unresolved guide contracts. An English response retained with unverified
-identity cannot satisfy required-body coverage. Completion describes a stable
-observed traversal, not an atomic provider snapshot.
-
+`database.corpus_status` clone-completion fields are defined in
+[legal corpus](database.md#operator-configuration).
 
 ## Current provider admission diagnostics
 

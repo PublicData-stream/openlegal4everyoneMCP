@@ -114,7 +114,7 @@ applicable worker/smoke checks. Fixture results, emulated ARM64, hosted native C
 public endpoint checks and ChatGPT UI observations are separate evidence.
 Independently review citation identity, retention and public trust boundaries.
 
-Run the registered citation-lease migration before the new server; grant the
+Run citation-lease migration `0014` before the new server; grant the
 restricted runtime role rights on the new table through the existing migration
 arrangement. Snapshot before activation. Update serving, scheduler, collection
 Job template and worker references together while preserving collection state.

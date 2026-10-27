@@ -4,8 +4,10 @@ Persistent mode combines PostgreSQL 18.x with a provider-neutral `BlobStore` ben
 the process-local memory cache. This is the only supported persistent architecture.
 The initial blob adapter uses a dedicated filesystem directory; it is an immutable
 object store, not a filesystem database. Explicit memory mode is non-persistent.
-All current captures are synthetic observations. A cache observation is not an
-authoritative legal revision, a legal applicability decision, or a permanent archive.
+Retrieval-cache captures are synthetic observations. A cache observation is not
+an authoritative legal revision, a legal applicability decision, or a permanent
+archive. The [legal corpus](database.md) uses the same PostgreSQL migrations with
+its own tables, blob directory, search index and permanent archive.
 
 ## Configuration and startup
 
@@ -283,35 +285,6 @@ size/line/NUL limits, paging, cancellation, deletion and ten-minute random-handl
 lifetime are unchanged. The transient comparison can outlive source retention;
 that does not claim continued availability of the original source evidence.
 
-## Deployment boundaries and validation
-
-The supported operating shape is one service process, PostgreSQL 18 and one dedicated
-blob store. Native SQL constraints, per-query sequences, explicit provenance and
-stable snapshot UUIDs permit later compute replicas without a history-format
-migration. Multi-instance upstream rate coordination, distributed refresh leases,
-regional L1 invalidation, edge routing, replication orchestration, NFS deployment,
-S3 SDKs, legal search/PGroonga and authoritative legal-domain tables are deferred.
-Future legal/search tables can reference snapshot UUIDs and provenance without
-making cache observations authoritative legal revisions.
-
-A dedicated NFS mount can later replace the local blob mount only after verifying
-its durability, exclusive publication, ownership and failure behavior against the
-same adapter contract. No NFS orchestration is included. A future S3-compatible
-adapter can implement the same immutable location contract and preserve the existing
-storage keys while copying bytes; neither PostgreSQL history nor `RetrievalService`
-needs redesign. Backend replacement is an operator data-copy/verification procedure,
-not permission to serve missing objects during a move.
-
-The mandatory `scripts/test-postgres.sh` gate provisions real PostgreSQL 18 with
-isolated databases and synthetic fixtures. Ordinary workspace tests cover pure
-identity and application policy without a database. The OxiBelt gate independently
-provisions PostgreSQL and a blob volume and exercises both transports, both MCP
-revisions, exact history and comparison origins. Widget unit/browser tests preserve
-client contract validation. See [contributor checks](../CONTRIBUTING.md#testing-and-ci)
-and [review evidence](persistence-review.md). No legal provider or live ChatGPT
-acceptance is implied by these synthetic checks.
-
-
 ## Request-policy schema upgrade
 
 Migration 0013 adds nullable unlimited LAW caps, bigint charged usage, millisecond
@@ -477,3 +450,30 @@ migration role. Missing hold-read grants fail closed at admission; diagnostic
 reads report unknown. Upgrade all restartable collectors before applying recovery;
 old binaries do not recognize the hold. Follow the coordinated restore procedure
 for rollback rather than removing new schema or retained audit records.
+
+## Deployment boundaries and validation
+
+The supported operating shape is one service process, PostgreSQL 18 and one dedicated
+blob store. Native SQL constraints, per-query sequences, explicit provenance and
+stable snapshot UUIDs permit later compute replicas without a history-format
+migration. Multi-instance upstream rate coordination, distributed refresh leases,
+regional L1 invalidation, edge routing, replication orchestration, NFS deployment
+and S3 SDKs are deferred. The separate [legal corpus](database.md) tables and
+search index do not make cache observations authoritative legal revisions.
+
+A dedicated NFS mount can later replace the local blob mount only after verifying
+its durability, exclusive publication, ownership and failure behavior against the
+same adapter contract. No NFS orchestration is included. A future S3-compatible
+adapter can implement the same immutable location contract and preserve the existing
+storage keys while copying bytes; neither PostgreSQL history nor `RetrievalService`
+needs redesign. Backend replacement is an operator data-copy/verification procedure,
+not permission to serve missing objects during a move.
+
+The mandatory `scripts/test-postgres.sh` gate provisions real PostgreSQL 18 with
+isolated databases and synthetic fixtures. Ordinary workspace tests cover pure
+identity and application policy without a database. The OxiBelt gate independently
+provisions PostgreSQL and a blob volume and exercises both transports, both MCP
+revisions, exact history and comparison origins. Widget unit/browser tests preserve
+client contract validation. See [contributor checks](../CONTRIBUTING.md#testing-and-ci)
+and [review evidence](persistence-review.md). No legal provider or live ChatGPT
+acceptance is implied by these synthetic checks.

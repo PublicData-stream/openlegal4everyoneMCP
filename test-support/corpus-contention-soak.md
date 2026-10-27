@@ -1,7 +1,7 @@
 # Disposable corpus contention soak
 
-Run only on the selected SSH-MCP `dev` host; Docker networks on the local
-workspace conflict with SSH routing. No legal provider is contacted. Use the same
+Run on a dedicated host where the gate's disposable Docker networks cannot
+conflict with remote-access routing. No legal provider is contacted. Use the same
 validated dictionary as the PostgreSQL gate, or let the gate explicitly provision
 its pinned dictionary source.
 
@@ -42,5 +42,5 @@ the soak uses the same 1-second pool/lock, 2-second statement and 5-second trans
 budgets as serving. The corpus raw archive has a 512 MiB admission cap. The Rust
 process also needs dictionary/index memory and temporary index/PostgreSQL space;
 reserve at least 2 GiB process headroom and 4 GiB free disk for the two-hour run,
-and monitor them on `dev`. These are preparation allowances, not measured peaks.
+and monitor them on that host. These are preparation allowances, not measured peaks.
 The gate removes the database containers and Rust fixture directory on completion.

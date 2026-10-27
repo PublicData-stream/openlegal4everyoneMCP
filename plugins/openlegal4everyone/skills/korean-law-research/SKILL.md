@@ -48,7 +48,8 @@ Do not replace a selected historical capture with a new `search` result.
    skill needs. `unsupported_jurisdiction` lists the codes the server supports.
 1. **Search.** Call `database.query` with the query DSL in
    [query-syntax.md](references/query-syntax.md). Narrow with `filters.datasets`
-   (`national_statute`, `ordinance`, `precedent`, …) and typed date bounds. Use
+   (at most three, such as `national_statute`, `ordinance`, `precedent`) and
+   typed date bounds. Use
    `literal: true` or `database.rg` when the user gives an exact phrase or a
    pattern such as `제750조`.
 2. **Check coverage.** Read `corpus_complete`, `index_lag` and any
@@ -59,7 +60,9 @@ Do not replace a selected historical capture with a new `search` result.
    `{"kind":"head"}`, or `{"kind":"capture","id":<hit capture_id>}` for exactly
    the matched capture. To continue a long document, pass
    `{"kind":"capture","id":<metadata.capture_id>}`, the returned `session`, the
-   same `section` and `next_offset`. Use `sections` to jump to an article.
+   same `section` and `next_offset`. The result's `sections` catalog lists
+   section IDs; pass one as `section` to jump to an article, and page a long
+   catalog with `sections_offset` set to `next_sections_offset`.
    For a long statute, administrative rule or ordinance, prefer `law.article`:
    pass `article` (with `context` for neighbours), `chapter` (`제2장`),
    `keyword` or `annex` (`별표 1`), or nothing to get the outline first. Add

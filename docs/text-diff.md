@@ -57,7 +57,8 @@ styles and license locally, with no external origins allowed by their MCP CSP.
 ## MCP contract
 
 The `text` tools share one application service across HTTP and native WebTransport.
-Object outputs carry `schema_version: 1`.
+Object outputs carry `schema_version: 1`. This table lists every `[text_diff]`
+tool; the [MCP tool inventory](server.md#mcp-tool-inventory) gives their annotations.
 
 | Tool | Input and output |
 | --- | --- |
@@ -65,6 +66,10 @@ Object outputs carry `schema_version: 1`.
 | `text.diff.show` | Either `{}`, a before/after pair with optional labels, or `comparison_id` alone. Returns `{schema_version, comparison}`; null comparison opens an empty editor. Only this tool advertises the UI resource. |
 | `text.diff.page` | `comparison_id`, zero-based `page`, and `view` (`changes`, `before`, `after`). Returns numbered changes or original text chunks, with `total_pages`. |
 | `text.diff.delete` | `comparison_id`. Returns `{schema_version: 1, deleted: true}` even when the well-formed handle is already absent. |
+| `text.apply_patch` | `target` and `patch`, each inline, an ID-only attachment handle, or a complete returned attachment object. Returns `result` (a sealed text attachment) and `info`. See [patch application](#canonical-text-tools-and-temporary-attachments). |
+| `text.attachment.upload` | First call: `kind` (`text` or `patch`), `total_bytes`, `chunk`, `final`, and optional zero `offset`. Later calls: `attachment_id`, byte `offset`, `chunk`, `final`; omit kind/total. Alternatively, send the complete returned attachment object plus `resume: true`, `offset`, `chunk`, and `final`. |
+| `text.attachment.read` | `attachment_id` or a complete returned attachment object, plus optional zero `offset`; returns `attachment` metadata, `text`, `next_offset` and `complete`. Only sealed attachments are readable. |
+| `text.attachment.delete` | `attachment_id` or a complete returned attachment object; repeated deletion of a well-formed absent handle succeeds. |
 
 The resource URI is `ui://openlegal/text-diff-v1.html`, MIME
 `text/html;profile=mcp-app`. Missing/expired handles have the same sanitized read
@@ -76,8 +81,8 @@ page when completeness matters.
 ## Exactness and paging
 
 Each text permits at most 1 MiB UTF-8, 100,000 LF-delimited lines and 16 KiB per
-line. NUL is rejected. Display labels are bounded to 128 UTF-8 bytes and never
-become file paths. Empty strings are valid. Whitespace, BOMs, CRLF/LF, lone CR and
+line. NUL is rejected. Supplied display labels must be nonempty, at most 128 UTF-8
+bytes and free of control characters; they never become file paths. Empty strings are valid. Whitespace, BOMs, CRLF/LF, lone CR and
 final-newline differences are preserved; there is no Unicode normalization or
 ignore-whitespace mode.
 
@@ -178,22 +183,6 @@ annotations described below. Generic
 extension registration still requires read-only behavior. This exception does not
 authorize repository changes, provider writes, or general administration.
 
-## Validation and limitations
-
-The [contributor checks](../CONTRIBUTING.md#testing-and-ci) apply.
-See the [Rust worker migration review](similar-review.md) for implementation evidence. Run the complete
-edge gate with both built assets:
-
-```sh
-DEMO_WIDGET_HTML=apps/widget/dist/index.html \
-TEXT_DIFF_WIDGET_HTML=apps/widget/dist/text-diff.html scripts/test-oxibelt.sh
-```
-
-Fixtures are synthetic or supplied text; routine tests never contact legal providers.
-Browser tests use a local MCP Apps host. Passing these gates does not establish live
-ChatGPT rendering or a particular host's support for maximum-size tool arguments.
-No deployment or publication is included.
-
 ## Comparisons from retained snapshots
 
 With PostgreSQL + BlobStore persistence enabled, the record history tool can resolve two retained
@@ -257,13 +246,8 @@ The target and result retain the existing 1 MiB/line-count/line-size text limits
 patch inputs permit up to 8 MiB. This parser is a pure transformation in normalization;
 the same killable two-worker pool enforces the ten-second/caller deadline.
 
-Three built-in tools manage memory-only attachments:
-
-| Tool | Contract |
-| --- | --- |
-| `text.attachment.upload` | First call: `kind` (`text` or `patch`), `total_bytes`, `chunk`, `final`, and optional zero `offset`. Later calls: `attachment_id`, byte `offset`, `chunk`, `final`; omit kind/total. Alternatively, send the complete returned attachment object plus `resume: true`, `offset`, `chunk`, and `final`. |
-| `text.attachment.read` | `attachment_id` or a complete returned attachment object, plus optional zero `offset`; returns `attachment` metadata, `text`, `next_offset` and `complete`. Only sealed attachments are readable. |
-| `text.attachment.delete` | `attachment_id` or a complete returned attachment object; repeated deletion of a well-formed absent handle succeeds. |
+The three `text.attachment.*` tools in the [MCP contract](#mcp-contract) manage
+memory-only attachments.
 
 A complete object includes all seven returned metadata fields; partial or unknown
 metadata fields are rejected. The server checks its `kind` against stored state and
@@ -301,3 +285,20 @@ keeps CR/BOM bytes, uploads only on Apply patch, reads the complete result in bo
 chunks and deletes its temporary handles. Clear patch retries any failed cleanup.
 The local result preview remains until cleared. A closed host may prevent cleanup;
 fixed expiry remains the fallback. No live ChatGPT compatibility is established.
+
+## Validation and limitations
+
+The [contributor checks](../CONTRIBUTING.md#testing-and-ci) apply.
+See the [Rust worker migration review](similar-review.md) for implementation evidence.
+Validation record: [original Git text comparison review](text-diff-review.md). Run the complete
+edge gate with both built assets:
+
+```sh
+DEMO_WIDGET_HTML=apps/widget/dist/index.html \
+TEXT_DIFF_WIDGET_HTML=apps/widget/dist/text-diff.html scripts/test-oxibelt.sh
+```
+
+Fixtures are synthetic or supplied text; routine tests never contact legal providers.
+Browser tests use a local MCP Apps host. Passing these gates does not establish live
+ChatGPT rendering or a particular host's support for maximum-size tool arguments.
+No deployment or publication is included.

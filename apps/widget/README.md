@@ -1,8 +1,10 @@
 # MCP Apps widgets
 
-An optional React MCP Apps resource for the synthetic upstream demo. Search and
-detail actions call the server through the host bridge; the widget makes no direct
-network requests. Source text is rendered as text, with a synthetic label and each
+Three optional React MCP Apps resources: the synthetic record browser for the
+upstream demo, the [supplied-text comparison](#supplied-text-comparison), and the
+[legal corpus browser](#legal-corpus-browser). Each calls the server only through
+the host bridge and makes no direct network requests. In the record browser,
+search and detail actions call the synthetic demo tools. Source text is rendered as text, with a synthetic label and each
 record's freshness snapshot when returned, never a continuously updated current
 freshness claim. Detail views expose bounded source reference, payload digest,
 processor version, and retrieval/validation timestamps in a collapsed section. Tool errors are sanitized and malformed results rejected.
@@ -27,12 +29,23 @@ pnpm --dir apps/widget test:browser
 pnpm --dir apps/widget check:dependencies
 ```
 
-The build emits self-contained `apps/widget/dist/index.html`, capped at 1 MiB, and
-`apps/widget/dist/text-diff.html`, capped at 3 MiB.
+The build emits three self-contained assets, each checked against a build-time cap
+in `scripts/build.mjs`:
+
+| Asset | Widget | Build cap | Configured by |
+| --- | --- | --- | --- |
+| `apps/widget/dist/index.html` | Synthetic record browser | 1 MiB | `[demo].widget_html` |
+| `apps/widget/dist/text-diff.html` | Text comparison | 3 MiB | `[text_diff].widget_html` |
+| `apps/widget/dist/database.html` | Legal corpus browser | 3 MiB | `[database].widget_html` |
+
+The server separately enforces a raw limit on the configured file and again after
+source-offer substitution (`apps/server/src/widget.rs`): 1 MiB for the record and
+legal corpus browsers and 3 MiB for the text comparison. A database asset between those two sizes passes
+the build but fails server startup.
 Build output, dependencies and browser artifacts are ignored. The server reads
-this asset once during explicitly configured demo startup; ordinary Rust builds
-do not invoke frontend tools. See the repository demo configuration for its asset
-path. Do not publish the offline test harness as the widget resource.
+each configured asset once during startup; ordinary Rust builds do not invoke
+frontend tools. See the repository configurations for asset paths. Do not publish
+the offline test harness as a widget resource.
 
 Rebuild the widget when adopting source offers. The build contains exactly one
 inert `openlegal-source-url` metadata placeholder. Server startup substitutes its
@@ -49,12 +62,13 @@ Browser tests cover bridge requests, source selection, pagination, keyboard deta
 navigation, text rendering, freshness, malformed data, errors, loading, licensing,
 and source offers with successful, unsupported, disconnected, and refusing hosts.
 The harness inserts a fictional HTTPS source URL and records navigation requests
-without following them.
+without following them. It also serves the comparison host at `/diff` and the
+legal corpus host at `/database`, both with fictional fixtures.
 The harness does not establish live ChatGPT compatibility.
 
 ## Contract
 
-Search calls `demo_search_records` with `source`, literal `query` (at most 256
+This section describes the synthetic record browser. Search calls `demo_search_records` with `source`, literal `query` (at most 256
 UTF-8 bytes), zero-based `page`, `page_size: 5`, and `fresh_only`. Detail calls
 `demo_get_record` with the selected record's source and ID, preserving namespaced
 identity. Both return `structuredContent` envelopes containing `data`, `synthetic:
@@ -64,14 +78,18 @@ true`, and `freshness: {state, age_seconds}`. Search data contains `records`, `p
 
 Initial host results from `demo_show_records` contain
 `{records: [recordEnvelope, ...], synthetic: true}` so mixed-source records retain
-individual freshness. Only this render tool advertises the versioned `ui://`
-resource through `_meta.ui.resourceUri`; the MIME type is
+individual freshness. Only this render tool advertises the versioned
+`ui://openlegal-demo/records-v1.html` resource through `_meta.ui.resourceUri`; the MIME type is
 `text/html;profile=mcp-app`. CSP resource and connection allowlists stay empty.
 The source button uses `App.openLink` only after a user click and only when the
 host advertises `openLinks`. The widget revalidates the HTTPS source metadata
 before display or navigation and always provides a selectable URL, including
 when the bridge is unavailable or navigation is refused. No direct navigation
 or network request is performed by the widget.
+With persistent history enabled, the record browser also calls
+`demo_list_snapshots`, `demo_get_snapshot` and `demo_compare_record_snapshots`,
+then pages and deletes the resulting comparison with `text.diff.page` and
+`text.diff.delete`; see the [persistence contract](../../docs/persistence.md#history-and-comparisons).
 See [official OpenAI UI documentation](https://developers.openai.com/plugins/build/chatgpt-ui)
 for the MCP Apps bridge contract and the separate manual host acceptance step.
 
@@ -81,8 +99,8 @@ All direct dependencies use exact versions and the pnpm lockfile records registr
 integrity. The runtime is React/React DOM (MIT), chosen for the approved React UI,
 and the official `@modelcontextprotocol/ext-apps` SDK (MIT), chosen instead of a
 custom postMessage protocol. The SDK handles the host handshake and RPC boundary;
-the widget additionally validates bounded synthetic result shapes and invokes only
-the two read-only demo data tools. The SDK is bundled locally without runtime CDN
+each widget additionally validates bounded result shapes and invokes only the
+tools named in its contract section. The SDK is bundled locally without runtime CDN
 loading. Its client/core protocol dependencies declare Apache-2.0 and retain the
 upstream license-transition notice, including legacy MIT terms.
 
@@ -117,7 +135,6 @@ OAuth providers, HTTP authorization, or stored OAuth credentials. SDK 2.4's opti
 OAuth-refresh and skills APIs are not enabled by this update. Existing type, model,
 build, browser, advisory and license checks cover admission of the changed protocol
 packages.
-
 
 ## Supplied-text comparison
 
@@ -210,3 +227,18 @@ retains notices for the current runtime packages; bundled JavaScript also retain
 license comments. Updates must rerun model/browser tests, resource-size checks,
 current npm advisories, and installed license checks. No new package install
 scripts are enabled.
+
+## Legal corpus browser
+
+`database.html` is the legal corpus MCP App, registered as
+`ui://openlegal/database-v1.html` with MIME `text/html;profile=mcp-app` when
+`[database]` is configured. Only `database.show` advertises it. The browser searches
+through `database.query` or `database.rg`, reads paged content with
+`database.get`, lists checkpoints with `database.history`, compares two
+checkpoints with `database.diff`, and pages and deletes that comparison with
+`text.diff.page` and `text.diff.delete`. It displays freshness, collection notices
+and the provider admission diagnostics described in the
+[server contract](../../docs/server.md#current-provider-admission-diagnostics);
+it does not poll automatically. Tool semantics are in the
+[legal corpus contract](../../docs/database.md). The offline `/database` harness
+uses fictional records and does not establish live provider or ChatGPT behavior.

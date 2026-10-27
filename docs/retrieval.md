@@ -1,9 +1,11 @@
 # Upstream retrieval and synthetic processing
 
-This implementation is an extension framework with fictional demonstration data.
-It does not retrieve Korean law or establish legal identity, dates, applicability,
-or citations. The [upstream policy](upstream-policy.md) remains the owner of shared
-retrieval invariants; real providers require their own evidence-backed onboarding.
+This document covers the `RetrievalService` cache path: an extension framework
+with fictional demonstration data. That path does not retrieve Korean law or
+establish legal identity, dates, applicability, or citations. Korean legal data is
+collected and served separately by the [legal corpus](database.md). The
+[upstream policy](upstream-policy.md) remains the owner of shared retrieval
+invariants; real providers require their own evidence-backed onboarding.
 
 ## Extension and responsibility contracts
 
@@ -28,7 +30,7 @@ use those same tools through the MCP Apps host. No transport owns another cache
 or retry loop. Processing modules are trusted code and must honor work limits;
 a Rust trait or asynchronous timeout does not isolate a malicious module.
 
-## Initial local policy
+## Synthetic provider policy
 
 These numbers are conservative demonstration policy, not documented provider
 quotas. A real source must choose and review its own policy before onboarding.
@@ -124,3 +126,4 @@ The private health listener exports fixed aggregate metrics for cache reuse,
 coalescing, upstream attempts, stale responses, failures, retries, and saturation.
 Labels do not contain queries, identifiers, URLs, or credentials. Routine tests
 use controlled clocks and local mocks; no live legal-data requests are required.
+Validation record: [retrieval and MCP Apps validation](retrieval-review.md).
