@@ -1,5 +1,12 @@
 # Phase 9 serving acceptance record
 
+> **Historical record.** Recorded in commit `d1dbfc4` on 2026-09-22; base revision `885af34`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Kubernetes operator
+> runbook](deployment-kubernetes.md). Later changes: `d443ea6` (2026-09-28) moved the OxiBelt pin
+> from `72564d1` to 0.10.0 (`e879ac7`) and added edge mTLS. Index: [Review and validation
+> records](records.md).
+
 This record covers the Phase 9 patch built on
 `885af347183a0e211ceb2689929f203a22aa3fd8`, exercised on 2026-09-22.
 It is synthetic deployment evidence, not production or legal-provider acceptance.

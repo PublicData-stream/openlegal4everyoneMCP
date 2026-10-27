@@ -1,5 +1,12 @@
 # Collection deferral and scheduler contention validation
 
+> **Historical record.** Recorded in commit `43231b6` on 2026-10-05; validated checkout `e17ed97`.
+> Not updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Korean provider: LAW
+> OPEN DATA](../../../docs/providers/kr-law-go-kr.md). Later changes: `8f01be5` fixed the `lru`
+> advisory ([admission](../../../docs/dependencies.md#narrow-dependency-exceptions)). Index: [Review
+> and validation records](../../../docs/records.md).
+
 Validation date: 2026-10-05. This records the code and disposable test gates for
 the collection recovery changes. Production queue recovery and provider
 acceptance are separate operations.

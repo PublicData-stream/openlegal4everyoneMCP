@@ -1,5 +1,11 @@
 # Rust line and character comparison migration
 
+> **Historical record.** Recorded in commit `461b690` on 2026-09-13; base revision `2900784`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Supplied-text
+> comparison](text-diff.md). Later changes: none recorded. Index: [Review and validation
+> records](records.md).
+
 The migration replaces the Git CLI with `similar` 3.2.0 in a killable mode of the
 server executable. Both MCP revisions retain version 1 patches and add Unicode
 scalar highlight ranges. React renders those ranges without calculating a second

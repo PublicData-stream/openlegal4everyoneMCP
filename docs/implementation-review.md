@@ -1,5 +1,11 @@
 # Server foundation validation and independent review
 
+> **Historical record.** Recorded in commit `ff98d38` on 2026-09-11; base revision `f4e69de`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Server and extension
+> contract](server.md). Later changes: none recorded. Index: [Review and validation
+> records](records.md).
+
 Validation date: 2026-09-11. Base revision:
 `f4e69de533c352d6918e605effa6ba1643786586`.
 

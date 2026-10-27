@@ -1,5 +1,13 @@
 # Search-query processor implementation review
 
+> **Historical record.** Recorded in commit `e6f7125` on 2026-09-15; base revision `313fc03`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Search-query syntax
+> processor](search-query.md). Later changes: `database.query` executes this syntax
+> ([search](database.md#search)); `8f01be5` moved `Cargo.lock` to Rustls 0.23.46
+> ([maintenance](dependencies.md#transport-and-search-maintenance-2026-10-23)). Index: [Review and
+> validation records](records.md).
+
 Review date: 2026-09-15. Base revision:
 `313fc03a4052189b7f2a355d5adca3a08c4b7dfe`.
 

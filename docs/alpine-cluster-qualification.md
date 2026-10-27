@@ -1,5 +1,13 @@
 # Alpine cluster qualification status
 
+> **Historical record.** Recorded in commit `a227b80` on 2026-09-22; base revision not recorded. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Kubernetes operator
+> runbook](deployment-kubernetes.md), [sandbox status](document-sandbox.md#current-status). Later
+> changes: the blocked status was superseded on 2026-09-26 by the same-host `runc` decision
+> (`2a4b98c`, [`namespace.yaml`](../deploy/document-sandbox/namespace.yaml)). Index: [Review and
+> validation records](records.md).
+
 The Alpine image migration does not qualify the document sandbox. The existing
 serving fixture can still exercise the server images, but document and synthetic
 controller integration remain blocked by the runtime compatibility issue below.

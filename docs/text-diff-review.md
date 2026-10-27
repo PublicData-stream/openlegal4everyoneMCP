@@ -1,8 +1,11 @@
 # Original Git text comparison implementation review
 
-Historical review date: 2026-09-13. Reviewed revision:
-`290078409573f7b6f52d571d8be9912f9f6b1a1f`. The Rust worker and character-highlight
-migration has separate [review evidence](similar-review.md).
+> **Historical record.** Recorded in commit `2900784` on 2026-09-13; reviewed revision
+> `290078409573f7b6f52d571d8be9912f9f6b1a1f`. Title, header and digest wording revised in `461b690`;
+> reproduce scripts at the recorded commit (for example in a `git worktree`) when they read the
+> working tree or `HEAD`. Current behavior: [Supplied-text comparison](text-diff.md). Later changes:
+> the Rust worker and character-highlight migration has separate [review
+> evidence](similar-review.md). Index: [Review and validation records](records.md).
 
 Independent reviewer: Codex agent `independent_diff_review`, separate from the
 implementers. Categories: MCP/API Boundary and Security, including shared

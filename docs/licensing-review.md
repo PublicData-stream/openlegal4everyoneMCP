@@ -1,5 +1,12 @@
 # AGPL migration validation
 
+> **Historical record.** Recorded in commit `22ead58` on 2026-09-12; base revision `adef9b6`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [README
+> license](../README.md#license) and [source offers](server.md#source-offers-and-migration). Later
+> changes: `47dd725` added `apps/document-worker/LICENSE`, a sixth package symlink. Index: [Review
+> and validation records](records.md).
+
 Validation date: 2026-09-12. Base revision:
 `adef9b6cb994bdaf47b2fc57b286b2bbe26d4517`.
 

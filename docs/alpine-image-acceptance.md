@@ -1,5 +1,12 @@
 # Alpine 3.24 migration acceptance (2026-09-22)
 
+> **Historical record.** Recorded in commit `7c8354e` on 2026-09-23; base revision `4ad6c8b`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Kubernetes operator
+> runbook](deployment-kubernetes.md). Later changes: `d443ea6` (2026-09-28) moved the OxiBelt pin
+> from `72564d1` to 0.10.0 (`e879ac7`) and added edge mTLS. Index: [Review and validation
+> records](records.md).
+
 This record covers the change from Debian to Alpine for the server, ingestion
 server and amd64 document-worker images. It does not qualify production deployment
 or live legal-provider ingestion. Existing captures and corpus formats are unchanged.

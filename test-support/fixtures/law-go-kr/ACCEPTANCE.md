@@ -1,5 +1,14 @@
 # Permanent LAW clone validation
 
+> **Historical record.** Recorded in commit `8d127c1` on 2026-10-04; base revision not recorded. Not
+> updated after recording except a closing link in `43231b6`; reproduce scripts at the recorded
+> commit (for example in a `git worktree`) when they read the working tree or `HEAD`. Current
+> behavior: [Korean provider: LAW OPEN DATA](../../../docs/providers/kr-law-go-kr.md). Later
+> changes: `8f01be5` fixed the `lru` advisory. The npm commands differ from the [pnpm
+> baseline](../../../CONTRIBUTING.md#react-mcp-apps-widget), and `cargo audit --no-fetch` is not a
+> [current advisory check](../../../CONTRIBUTING.md#rust-baseline). Index: [Review and validation
+> records](../../../docs/records.md).
+
 Validation date: 2026-10-04. This document records implementation validation,
 bounded provider observations and the remaining deployment gates separately.
 It does not assert that an operational corpus has finished cloning.

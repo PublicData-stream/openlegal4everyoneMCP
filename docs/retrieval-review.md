@@ -1,5 +1,11 @@
 # Retrieval and MCP Apps validation
 
+> **Historical record.** Recorded in commit `adef9b6` on 2026-09-12; base revision `ff98d38`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Upstream retrieval
+> and synthetic processing](retrieval.md). Later changes: none recorded. Index: [Review and
+> validation records](records.md).
+
 Validation date: 2026-09-12. Base revision:
 `ff98d3802193657bfc9f28347688d04425c3135c`.
 

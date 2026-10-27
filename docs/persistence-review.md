@@ -1,5 +1,11 @@
 # PostgreSQL and BlobStore implementation review
 
+> **Historical record.** Recorded in commit `a57829a` on 2026-09-13; base revision `fd5479f`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [PostgreSQL 18 and
+> immutable blob persistence](persistence.md). Later changes: none recorded. Index: [Review and
+> validation records](records.md).
+
 This records the replacement of the disposable filesystem database with PostgreSQL
 18 and immutable blobs. The review baseline is
 `fd5479f55325f2348d199ebdf70921c721040ec8`. Public snapshot IDs and MCP contracts remain

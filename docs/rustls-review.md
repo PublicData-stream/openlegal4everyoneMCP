@@ -1,5 +1,12 @@
 # Rustls 0.23.45 maintenance review
 
+> **Historical record.** Recorded in commit `0df11ff` on 2026-09-15; base revision `313fc03`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Rust dependency
+> admission](dependencies.md). Later changes: `8f01be5` moved `Cargo.lock` to Rustls 0.23.46
+> ([maintenance](dependencies.md#transport-and-search-maintenance-2026-10-23)). Index: [Review and
+> validation records](records.md).
+
 Date: 2026-09-15. Base revision:
 `313fc03a4052189b7f2a355d5adca3a08c4b7dfe`.
 

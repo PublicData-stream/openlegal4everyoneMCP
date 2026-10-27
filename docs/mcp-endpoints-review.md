@@ -1,5 +1,13 @@
 # MCP corpus and text endpoint review
 
+> **Historical record.** Recorded in commit `47dd725` on 2026-09-16; base revision `e6f7125`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Legal corpus
+> tools](database.md) and [Supplied-text comparison](text-diff.md). Later changes: search pairs
+> Lindera with MeCab-Ko ([search](database.md#search)); `8f01be5` removed the `lru` exception
+> ([admission](dependencies.md#narrow-dependency-exceptions)). Index: [Review and validation
+> records](records.md).
+
 This review covers the implementation following base commit
 `e6f7125cb9a624cf2b4dd726f87c53a282f662e7`: the text attachment/patch lifecycle,
 legal domain and migration `0002_legal_corpus.sql`, corpus persistence and provider

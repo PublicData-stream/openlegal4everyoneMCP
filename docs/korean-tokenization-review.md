@@ -1,5 +1,12 @@
 # Korean tokenization implementation review
 
+> **Historical record.** Recorded in commit `7ecb95e` on 2026-09-19; base revision `47dd725`. Not
+> updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [Legal corpus
+> tools](database.md#search). Later changes: `8f01be5` removed the `lru` advisory exception
+> ([dependency admission](dependencies.md#narrow-dependency-exceptions)). Index: [Review and
+> validation records](records.md).
+
 ## Result and evidence boundary
 
 Reviewed on 2026-09-19 against base `47dd725aa38275e533b7fafb26cecf4eaac01cc0`.

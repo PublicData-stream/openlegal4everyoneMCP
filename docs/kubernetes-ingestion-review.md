@@ -1,5 +1,13 @@
 # Kubernetes ingestion integration review
 
+> **Historical record.** Recorded in commit `0acf2ff` (Phase 7) on 2026-09-22; base revision
+> `fab54a6`. Not updated after recording; reproduce scripts at the recorded commit (for example in a
+> `git worktree`) when they read the working tree or `HEAD`. Current behavior: [optional ingestion
+> integration](deployment-kubernetes.md#optional-ingestion-integration). Later changes: the gVisor
+> sandbox gate was replaced by the 2026-09-26 same-host `runc`
+> [qualification](document-sandbox.md#current-status). Index: [Review and validation
+> records](records.md).
+
 ## Result and boundary
 
 Phase 7 builds on `fab54a6e3241c04c68def42606fde2617cb0df5f` on 2026-09-22.
