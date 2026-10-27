@@ -30,13 +30,12 @@ Both profiles run the same protocol and rejection checks, and both run in CI.
 Neither profile creates a cluster or verifies Kubernetes NodePort translation,
 node reachability, firewall enforcement or production certificates.
 
-The first run downloads the pinned OxiBelt source and Docker runtime image and
-builds the server, native client, and OxiBelt with locked dependencies. The
+The first run downloads the pinned OxiBelt source, Docker runtime image and
+PostgreSQL image, and builds the server, native client, and OxiBelt with locked dependencies. The
 harness gives the unoptimized OxiBelt executable a 64 MiB process-stack limit;
 its main future overflows the default stack in a debug build. OxiBelt's
 build also needs its native dependency toolchain, including a C/C++ compiler,
 CMake, Perl, and pkg-config. Builds can use several GiB of disk and memory.
-Run Cargo through the privileged command channel when using a shared local cache.
 The harness uses an Ubuntu 26.04 runtime because its binaries are built on the
 host; host architecture must match Docker's architecture and its glibc must be
 compatible with that runtime. It is an integration image, not a release image.
@@ -71,9 +70,13 @@ separate edge-client CA and client leaf with the exact
 `oxibelt.openlegal.internal` DNS SAN.
 Configuration and disposable leaf keys are streamed into a temporary Docker
 volume, mounted read-only by serving containers. Keys are excluded from the
-Docker build context and cache. The script removes its containers, network,
-fixture volume, temporary image, and local key directory on completion or
-failure. CA private keys remain only in the temporary host directory.
+Docker build context and cache. The backend runs in persistent cache mode: the
+harness starts a digest-pinned PostgreSQL 18 container on the internal network
+with a generated password, runs the server's `--migrate` command, and mounts a
+separate disposable blob volume owned by the serving user. The script removes its
+containers, including the database, network, fixture and blob volumes, temporary
+image, and local key directory on completion or failure. CA private keys remain
+only in the temporary host directory.
 
 The test fails unless all of these checks pass:
 

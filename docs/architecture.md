@@ -26,7 +26,8 @@ and exact quoted source matching; synthetic search retains its separate semantic
 
 - Support multiple jurisdictions without imposing one provider's identity or
   date semantics on all records.
-- Start provider coverage with Korean national legislation and history.
+- Current provider coverage is the Korean LAW OPEN DATA adapter; its
+  [provider profile](providers/kr-law-go-kr.md) defines the covered families.
 - Serve hosted MCP first, with a possible public HTTP API sharing application services.
 - Start with one hosted backend instance. Multiple replicas require the
   [coordination design](upstream-policy.md#coordination-and-request-budgets).
@@ -37,17 +38,19 @@ and exact quoted source matching; synthetic search retains its separate semantic
 The server, domain, normalization, application, and adapters contain working
 implementations. Synthetic retrieval and the optional legal corpus have separate
 models; live-provider acceptance remains a separate gate. A standalone CLI remains
-planned; the server binary already provides storage administration commands.
+planned and `apps/cli` does not exist; the server binary provides the current
+administration commands.
 
 | Component | Responsibility | Project dependencies |
 | --- | --- | --- |
 | `crates/domain` | Synthetic record/query types, legal identity/revision/capture models, search-syntax expressions, supplied-text comparison contracts, provenance, freshness and errors | No other project layer |
 | `crates/normalization` | Pure parsing, search-query syntax processing, and provider-specific normalization modules | Domain |
 | `crates/application` | Retrieval use cases and supplied-text comparisons; freshness, refresh, coalescing, retention and budgets; operation interfaces | Domain |
-| `crates/adapters` | Separate modules for upstream HTTP, cache storage, and bounded Rust comparison workers | Application interfaces, domain, normalization |
-| `apps/server` | Configuration, immutable tool/resource registries, worker/endpoint supervision, HTTP/WebTransport and private health | Application/adapters/normalization through demo composition; domain for typed tool results |
+| `crates/adapters` | Separate modules for upstream HTTP and per-upstream proxy routing, the LAW OPEN DATA provider, memory cache, PostgreSQL persistence and legal corpus storage, blob storage, the rebuildable search index and Korean analysis, disposable document jobs, collection events, and bounded Rust comparison workers | Application interfaces, domain, normalization |
+| `apps/server` | Configuration and startup composition, immutable tool/resource registries, worker/endpoint supervision, HTTP/WebTransport, private health, and administration commands for migration, maintenance, index rebuild, collection scheduling/jobs and offline provider recovery | Application, adapters and normalization through startup composition; domain for typed tool results |
 | `apps/widget` | React presentation and MCP Apps host bridge; no source fetching or cache policy | MCP wire contracts |
-| `apps/cli` | Future CLI/admin commands and composition | Application and adapters; not server routing |
+| `apps/document-worker` | Standalone workspace for XML/HTML/PDF/HWP/OCR parsing in disposable Pods, outside the serving executable's dependency graph | Application document contract only |
+| `apps/cli` (planned, not present) | Standalone CLI/admin commands and composition | Application and adapters; not server routing |
 
 Within adapters, keep each provider's transport and each storage implementation in
 responsibility-focused modules. The adapters crate is not a general utility crate.
@@ -97,7 +100,7 @@ environmental dependencies to policy logic so it can be tested deterministically
 flowchart LR
     MCP[MCP tools] --> App[Application retrieval service]
     HTTP[Future HTTP API] --> App
-    CLI[Future CLI/admin] --> App
+    CLI[Server admin commands] --> App
     App --> Cache[Cache storage adapter]
     App --> Upstream[Upstream client adapter]
     Upstream --> Parse[Pure parsing and normalization]
@@ -149,29 +152,17 @@ application policy.
 ## Tests and fixtures
 
 Place unit tests with their owning modules and integration tests in the owning
-crate's `tests/` directory. Introduce `tests/fixtures/` for genuinely shared source
-fixtures, organized by provider and dataset. A virtual workspace root does not
-automatically execute loose integration tests: attach cross-component tests to an
-owning package or introduce a dedicated test package when justified.
+crate's `tests/` directory. Genuinely shared source fixtures live under
+`test-support/fixtures/`, organized by provider and dataset; the standalone
+document worker keeps its own fixtures in `apps/document-worker/tests/fixtures/`.
+A virtual workspace root does not automatically execute loose integration tests:
+attach cross-component tests to an owning package or introduce a dedicated test
+package when justified.
 
 Pure transformations use deterministic fixtures. Retrieval/cache tests use mock
 upstreams, controlled clocks, and isolated storage. Fixture provenance and
 sanitization follow the [legal-data policy](legal-data-policy.md#retained-evidence-and-fixtures).
 Execution requirements live in [Contributing](../CONTRIBUTING.md#testing-and-ci).
-
-## Evolving the structure
-
-Extract a crate when independent dependencies, feature isolation, reuse, ownership,
-or deployment needs justify it. Separate provider clients, storage, MCP, HTTP, or
-CLI crates are options as their responsibilities grow, not bootstrap requirements.
-Do not force unrelated responsibilities into an existing module or introduce
-dispatch, boxed futures, tasks, locks, channels, or unconditional cloning solely
-to cross a new module boundary. Choose those mechanisms for an explained need.
-
-Changes to dependency direction or shared public contracts update this document
-and explain the tradeoff. Introduce a separate decision record only when the
-decision warrants more history than this document and the PR can usefully hold.
-
 
 ## Legal corpus and document processing
 
@@ -203,3 +194,16 @@ The composition remains one backend instance. A second replica requires shared
 provider admission and compatible job/index coordination; a separate index directory
 does not provide that coordination automatically. Deployment resource and isolation
 requirements are documented in [document sandbox](document-sandbox.md).
+
+## Evolving the structure
+
+Extract a crate when independent dependencies, feature isolation, reuse, ownership,
+or deployment needs justify it. Separate provider clients, storage, MCP, HTTP, or
+CLI crates are options as their responsibilities grow, not bootstrap requirements.
+Do not force unrelated responsibilities into an existing module or introduce
+dispatch, boxed futures, tasks, locks, channels, or unconditional cloning solely
+to cross a new module boundary. Choose those mechanisms for an explained need.
+
+Changes to dependency direction or shared public contracts update this document
+and explain the tradeoff. Introduce a separate decision record only when the
+decision warrants more history than this document and the PR can usefully hold.

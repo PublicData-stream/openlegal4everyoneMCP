@@ -5,9 +5,11 @@ changes from future architecture or documentation-only requirements.
 
 ## Evidence and validation
 
-- Relevant tests/checks and outcomes:
+- Exact commands run and their outcomes:
 - Checks not run, failures, and reasons:
 - For data changes: source/record/revision evidence and unresolved uncertainty:
+- For legal-data investigation: separate code-established fact, authoritative
+  upstream evidence, inference, and unresolved uncertainty:
 
 ## Affected contracts
 
@@ -17,14 +19,13 @@ Include invalidation/migration/rollback implications where relevant.
 
 ## Independent review
 
-When required by [Contributing](https://github.com/piquark6046/openlegal4everyoneMCP/blob/main/CONTRIBUTING.md#review-gates), record reviewer,
+When required by [Contributing](https://github.com/PublicData-stream/openlegal4everyoneMCP/blob/main/CONTRIBUTING.md#review-gates), record reviewer,
 reviewed revision/patch, categories covered, findings addressed, and outstanding
 items. A change awaiting required review is not ready.
 
 ## Remaining limitations
 
-Record unresolved risks or prerequisites. For the governance bootstrap, verify
-private reporting before publishing the operational security-reporting policy.
+Record unresolved risks or prerequisites.
 
 <!-- Remove inapplicable sections. Canonical requirements are in CONTRIBUTING.md.
 Do not disclose private vulnerabilities, credentials, or sensitive raw payloads. -->

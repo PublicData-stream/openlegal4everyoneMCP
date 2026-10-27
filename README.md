@@ -6,8 +6,11 @@ open legal-information infrastructure project with a Rust MCP server foundation.
 The intended backend retrieves authoritative upstream legal data, normalizes it
 without inventing legal facts, preserves source references, and shares cached
 results across hosted MCP requests. A public HTTP API and administrative tooling
-may follow. The architecture supports multiple jurisdictions; the first provider adapter covers Korean national legislation, ordinances and precedents
-through LAW OPEN DATA, with live acceptance and deployment still separate gates.
+may follow. The architecture supports multiple jurisdictions. The first provider
+adapter covers Korean legal-information families from LAW OPEN DATA, including
+statutes, administrative rules, ordinances, treaties, precedents, constitutional
+decisions, interpretations and appeals; the [Korean provider profile](docs/providers/kr-law-go-kr.md)
+defines its source registry. Live acceptance and deployment remain separate gates.
 
 ## Development status
 
@@ -18,8 +21,11 @@ for package inventories and the rebuild/rollback boundary, and the
 [Alpine acceptance record](docs/alpine-image-acceptance.md) for executed checks and
 remaining qualification limits.
 
-The Rust server exposes pluggable read-only tools through Streamable HTTP and
-WebTransport, with `server_info` as its initial diagnostic tool. Both transports
+The Rust server exposes module tools through Streamable HTTP and WebTransport,
+with `server_info` as its initial diagnostic tool. Generic module tools are
+read-only; the bounded mutations are temporary comparison and attachment handles,
+explicit legal collection requests, and configured demand collection from eligible
+corpus lookups and searches. Both transports
 support MCP `2026-07-28` and `2025-11-25`. Tools and endpoint adapters register as
 Rust modules at startup. WebTransport uses a documented custom binding and a native
 Rust reference client; ChatGPT uses the HTTPS Streamable HTTP endpoint.
@@ -66,8 +72,9 @@ for DNS pinning, secret injection and egress configuration.
 
 Each upstream has independent request settings. LAW daily and per-operation caps
 can explicitly select `"unlimited"`; its shared rate supports `requests_per_second`.
-Synthetic demo has its own daily/rate/time/retry settings. Existing defaults remain
-unchanged; see [provider request configuration](docs/server.md).
+Synthetic demo has its own daily/rate/time/retry settings. The [server contract](docs/server.md)
+lists the request settings and their defaults; the [upstream policy](docs/upstream-policy.md)
+defines the shared budget, refresh and retry semantics.
 
 Install the pinned Rust toolchain, prepare the configuration and TLS certificate
 paths from the [server guide](docs/server.md), then run:
@@ -88,6 +95,11 @@ For the runnable fictional provider and interactive widget, follow the
 Node or a widget build. Enabling the legal corpus requires a provisioned MeCab-Ko
 dictionary; see [corpus setup and index upgrades](docs/database.md#operator-configuration).
 
+Optional [PostgreSQL 18 + BlobStore persistence and snapshot history](docs/persistence.md)
+adds restart reuse, bounded captured history, MCP history tools, and record-widget
+snapshot comparison. The [combined synthetic demo](docs/demo.md) enables L2 and
+comparison together; all source data remains fictional.
+
 For hosting, start with the [Kubernetes operator runbook](docs/deployment-kubernetes.md#first-deployment)
 and its [operator handoff](docs/deployment-kubernetes.md#operator-handoff).
 The [recorded serving fixture](docs/deployment-acceptance.md#failures-and-remaining-boundaries)
@@ -98,27 +110,29 @@ backend-only upgrades remain unaccepted.
 
 - [Contributing](CONTRIBUTING.md): workflow, checks, security engineering, and review.
 - [Agent orientation](AGENTS.md): where coding agents should begin.
-- [Architecture](docs/architecture.md): server, legal-data and document-processing responsibilities.
-- [Server contract](docs/server.md): configuration, extension API and transport behavior.
+- [Rust architecture](docs/architecture.md): server, legal-data and document-processing responsibilities.
+- [Server and extension contract](docs/server.md): configuration, extension API, transport behavior and MCP tool inventory.
+- [OxiBelt edge integration](docs/oxibelt.md): edge configuration, NodePort handoff and the pinned integration harness.
 - [Kubernetes operator runbook](docs/deployment-kubernetes.md): topology, prerequisites, first deployment, upgrades, storage and index administration, rollback, optional ingestion and operator handoff.
-- [GHCR image releases](CONTRIBUTING.md#ghcr-image-publication): tag and release commands, publication gates, and first-publication checks.
-- [Serving acceptance](docs/deployment-kubernetes.md#phase-9-serving-acceptance): bounded explicit-endpoint smoke, a disposable Kubernetes fixture, and [executed evidence and remaining limits](docs/deployment-acceptance.md).
-- [Dependencies](docs/dependencies.md): admission rationale and check tooling.
-- [Retrieval framework](docs/retrieval.md): processors, caching, evidence and resource limits.
-- [Search-query syntax](docs/search-query.md): standalone parser, operators, diagnostics, and bounds.
-- [Legal corpus](docs/database.md): search, checkpoint retrieval, history, freshness and ingestion.
+- [GHCR image publication](CONTRIBUTING.md#ghcr-image-publication): tag and release commands, publication gates, and first-publication checks.
+- [Phase 9 serving acceptance](docs/deployment-kubernetes.md#phase-9-serving-acceptance): bounded explicit-endpoint smoke, a disposable Kubernetes fixture, and [executed evidence and remaining limits](docs/deployment-acceptance.md).
+- [Rust dependency admission](docs/dependencies.md): admission rationale and check tooling.
+- [Upstream retrieval and synthetic processing](docs/retrieval.md): processors, caching, evidence and resource limits.
+- [PostgreSQL 18 and immutable blob persistence](docs/persistence.md): durable storage, snapshot history, migrations and offline provider recovery.
+- [Search-query syntax processor](docs/search-query.md): standalone parser, operators, diagnostics, and bounds.
+- [Legal corpus tools](docs/database.md): search, checkpoint retrieval, history, freshness and ingestion.
 - [Legal reference tools](docs/legal-reference.md): law-name resolution, citation checks and date-based revision selection.
 - [Retained-source citations](docs/citations.md): ChatGPT search/fetch, exact MCP references and browser evidence pages.
 - [Legal analysis tools](docs/legal-analysis.md): batch change watching, lineage and repeal mentions, citing decisions, article impact and article or annex reads.
-- [Document sandbox](docs/document-sandbox.md): isolated XML/HTML/PDF/HWP/OCR processing and acceptance.
-- [Text comparison](docs/text-diff.md): Rust line/character engine, input limits, paging, retention and editable widget.
-- [Synthetic browser](docs/demo.md): local setup, tools, progress and ChatGPT manual checks.
-- [Claude and ChatGPT plugin](plugins/openlegal/README.md): shared end-user skills, plugin manifests and remaining listing work.
-- [Retrieval validation](docs/retrieval-review.md): independent reviews, checks and remaining limits.
+- [Disposable document processing](docs/document-sandbox.md): isolated XML/HTML/PDF/HWP/OCR processing and acceptance.
+- [Supplied-text comparison](docs/text-diff.md): Rust line/character engine, input limits, paging, retention and editable widget.
+- [Synthetic record browser](docs/demo.md): local setup, tools, progress and ChatGPT manual checks.
+- [openlegal4everyone plugin](plugins/openlegal4everyone/README.md): shared Claude and ChatGPT end-user skills, plugin manifests and remaining listing work.
+- [Records index](docs/records.md): dated independent reviews, validation and acceptance records with their checks and remaining limits.
 - [Legal-data policy](docs/legal-data-policy.md): identity, dates, normalization, and citations.
-- [Upstream policy](docs/upstream-policy.md): caching, refresh, and service protection.
-- [Korean provider profile](docs/providers/kr-law-go-kr.md): sources, scope, and unresolved capabilities.
-- [Security policy draft](SECURITY.md): private reporting and its publication prerequisite.
+- [Upstream and cache policy](docs/upstream-policy.md): caching, refresh, and service protection.
+- [Korean provider: LAW OPEN DATA](docs/providers/kr-law-go-kr.md): sources, scope, and unresolved capabilities.
+- [Security policy](SECURITY.md): draft private reporting and its publication prerequisite.
 
 ## License
 
@@ -131,7 +145,7 @@ that license. It is provided without warranty, including implied warranties of
 merchantability or fitness for a particular purpose. The license's appendix is
 illustrative; this project's grant does not include later versions.
 
-The September 12, 2026 migration applies from its commit onward. Earlier versions
+The 2026-09-12 migration applies from its commit onward. Earlier versions
 remain available under their original Apache-2.0 terms; previously granted rights
 are not revoked. Third-party dependencies retain their licenses and notices.
 Upstream legal data has its own provenance and applicable reuse conditions; the
@@ -143,8 +157,3 @@ Every server configuration requires a public HTTPS corresponding-source URL for
 the running server and widget. MCP clients and widget users can discover this
 offer; operators must maintain the matching source and its availability. See
 [source offers and migration](docs/server.md#source-offers-and-migration).
-
-Optional [PostgreSQL 18 + BlobStore persistence and snapshot history](docs/persistence.md)
-adds restart reuse, bounded captured history, MCP history tools, and record-widget
-snapshot comparison. The [combined synthetic demo](docs/demo.md) enables L2 and
-comparison together; all source data remains fictional.

@@ -14,11 +14,19 @@ alternate versions.
 
 | Canonical document | Owns |
 | --- | --- |
-| This document | Contributor duties, required checks, secure development, review gates, and readiness |
+| This document | Contributor duties, required checks, GHCR image publication, secure development, review gates, and readiness |
 | [Architecture](docs/architecture.md) | Responsibilities, dependency direction, and side-effect boundaries |
+| [Server contract](docs/server.md) | Configuration keys, defaults and ranges, transports, extension API, and the complete MCP tool inventory |
+| [Legal corpus tools](docs/database.md) | Legal corpus tool semantics, search, collection receipts, and corpus freshness |
+| [Persistence](docs/persistence.md) | PostgreSQL and blob storage |
+| [Text comparison](docs/text-diff.md) | Supplied-text comparison and attachment tools |
+| [Dependency admission](docs/dependencies.md) | Dependency admission rationale and check tooling |
+| [Document sandbox](docs/document-sandbox.md) | Document worker contract and the current sandbox status |
+| [Kubernetes operator runbook](docs/deployment-kubernetes.md) | Operator procedures and the current edge-blocker status |
+| [Records index](docs/records.md) | Index of dated review and acceptance records |
 | [Legal-data policy](docs/legal-data-policy.md) | Identity, dates, normalization, provenance, citations, and evidence |
-| [Upstream policy](docs/upstream-policy.md) | Cache semantics, freshness, refresh, coalescing, and request budgets |
-| [Provider profiles](docs/providers/kr-law-go-kr.md) | Evidence-backed provider-specific mappings, capabilities, and unresolved items |
+| [Upstream policy](docs/upstream-policy.md) | Provider-neutral cache semantics, freshness, refresh, coalescing, and request budgets |
+| [Provider profiles](docs/providers/kr-law-go-kr.md) | Evidence-backed provider-specific mappings, provider-specific values other than configuration defaults, capabilities, and unresolved items |
 | [Security policy](SECURITY.md) | Private reporting, disclosure, and development-stage security support |
 | [AGENTS.md](AGENTS.md) | Agent orientation and navigation |
 | [Delegation skill](.agents/skills/subagent-delegation/SKILL.md) | Assignment, supervision, escalation, and synthesis of delegated work |
@@ -80,7 +88,7 @@ compatibility context in the body or PR, using portable evidence.
 
 ## Rust engineering
 
-When Rust is introduced, follow the [architecture](docs/architecture.md).
+Rust code follows the [architecture](docs/architecture.md).
 Use responsibility-focused modules; do not put unrelated helpers in `utils` or
 `common` merely because they are shared. Review responsibility and dependencies
 when a module grows rather than enforcing an arbitrary line-count limit.
@@ -91,8 +99,8 @@ results. Avoid input-triggered `unwrap`, `expect`, `panic!`, `todo!`, or unjusti
 `unreachable!` on externally reachable paths. Do not suppress errors to make a
 result appear complete.
 
-Choose the Rust toolchain/MSRV, dependency versions, supported feature combinations,
-and lint configuration during backend bootstrap and track them in the repository.
+Track the Rust toolchain/MSRV, dependency versions, supported feature combinations,
+and lint configuration in the repository.
 Workspace lints must be inherited by member packages; declare equivalent policy
 for any later standalone test/probe packages. Commit the application workspace
 lockfile and use locked dependency resolution in checks.
@@ -102,8 +110,8 @@ alternatives, source, relevant features/build scripts, maintenance, and license
 considerations. Explain security implications for boundary-critical dependencies.
 Run admission checks for manifest, lockfile, or dependency-policy changes.
 Exceptions must identify the exact affected dependency/advisory or rule, rationale,
-owner, and review deadline; avoid blanket or indefinite suppression. Introduce a
-reviewed `deny.toml` with the dependency baseline, not an invented allowlist now.
+owner, and review deadline; avoid blanket or indefinite suppression. Keep each
+reviewed `deny.toml` matched to its dependency baseline, not an invented allowlist.
 
 ## Testing and CI
 
@@ -196,8 +204,8 @@ remove their fixture containers, volumes and network on exit. A devcontainer run
 does not by itself validate the host runner's port-publication path.
 
 Use focused tests while developing, then run the applicable workspace baseline
-before a Rust change is ready. Bootstrap must enumerate supported feature
-combinations and add explicit checks for them. Use `--all-features` only when all
+before a Rust change is ready. Supported feature combinations must be enumerated
+and have explicit checks. Use `--all-features` only when all
 features are intended to coexist. Preserve doctest coverage; selecting all targets
 alone is not a substitute for running documentation tests.
 
@@ -205,9 +213,10 @@ Changes to document processing also require `scripts/test-document-worker.sh`.
 This Docker gate validates the standalone worker's locked native dependency graph,
 formatting, linting and tests, then exercises fictional XML/HTML/PDF/HWP5/HWPX/OCR
 fixtures with the worker's seccomp and resource limits. It runs in CI, including
-the scheduled advisory checks. It does not establish Kubernetes, gVisor or
-AppArmor acceptance; the separately configured real-cluster gate and its deployment
-prerequisites are documented in [document processing](docs/document-sandbox.md).
+the scheduled advisory checks. It does not establish Kubernetes, sandbox-runtime or
+AppArmor acceptance; see the [document sandbox status](docs/document-sandbox.md#current-status).
+The separately configured real-cluster gate and its deployment prerequisites are
+documented in [document processing](docs/document-sandbox.md).
 The dedicated hosted worker job removes unused preinstalled Android/.NET SDKs and
 requires at least 20 GiB free build space; local runs must provision that space
 without deleting unrelated host data.
@@ -294,13 +303,15 @@ The OxiBelt gate
 executes the bounded deployed-endpoint profile against its synthetic fixture.
 The Python checks also run in the deployment CI job. Explicit-endpoint smoke
 is an operator action, not a default CI connection to a deployed service.
-Disposable Kubernetes serving acceptance is separately opt-in; its setup, evidence
-requirements and cleanup are in [deployment acceptance](docs/deployment-kubernetes.md#phase-9-serving-acceptance).
+Disposable Kubernetes serving acceptance is separately opt-in; its checklist and
+evidence requirements are in the [Phase 9 serving acceptance runbook](docs/deployment-kubernetes.md#phase-9-serving-acceptance),
+and fixture setup and cleanup are in the
+[disposable serving acceptance fixture](test-support/kubernetes-acceptance/README.md).
 Credential files, raw workload dumps and unsanitized test output are never
-acceptance evidence for publication. Apply independent Security and MCP/API
-Boundary review to changes in smoke endpoint, parser and reporting boundaries.
+acceptance evidence for publication. Apply independent Security Review and MCP/API
+Boundary Review to changes in smoke endpoint, parser and reporting boundaries.
 
-CI introduced with Rust must match these documented checks and test supported
+CI must match these documented checks and test supported
 feature combinations on a declared toolchain/platform baseline. Run advisory checks
 on a schedule as well as relevant changes. Failures, cancellations, and unexpected
 skips must not be reported as successful validation. Make checks reproducible from
@@ -427,8 +438,9 @@ capabilities exist.
 ## Secure development
 
 The implemented HTTP and WebTransport boundaries accept untrusted input. Apply
-these requirements to their changes and to future providers; authentication, tenancy,
-and live deployment remain unimplemented unless explicitly introduced.
+these requirements to their changes and to future providers; public caller
+authentication, tenancy, and live deployment remain unimplemented unless explicitly
+introduced.
 
 | Boundary | Required consideration |
 | --- | --- |
@@ -453,7 +465,7 @@ as needed; a full-repository scan is not an automatic gate for every change.
 
 ### Unsafe Rust
 
-First-party Rust denies unsafe code by default. At Rust bootstrap, set workspace
+First-party Rust denies unsafe code by default. The workspace sets
 `unsafe_code = "deny"` and `unsafe_op_in_unsafe_fn = "deny"`, with lint inheritance
 for member packages. Require safety documentation for public unsafe contracts and
 operation-specific `SAFETY` comments for any admitted unsafe blocks. First-party
@@ -499,6 +511,16 @@ Passing tests or self-review does not waive the requirement. Agent evidence is n
 a fabricated human GitHub approval, and review does not authorize merging,
 publishing, deployment, or live-service actions outside the task's scope.
 
+### Review and validation records
+
+The PR still records review as described above. In-repository dated records live
+under `docs/` (fixture acceptance records under `test-support/`) and are indexed in
+the [records index](docs/records.md). New records record the date, base or reviewed
+revision or exact patch identity, reviewer identity without session aliases or
+absolute host paths, the exact review category names, exact checks and outcomes,
+and remaining limits. Records are not maintained after the fact; note later
+changes only in a header that points to the living document.
+
 ## Pull request readiness
 
 Use the [PR template](.github/pull_request_template.md), removing inapplicable
@@ -529,6 +551,6 @@ termination, HTTP/3, Person Proof, deployment, release, directory, and model-ali
 policies do not apply here. Later reuse should record meaningful provenance without
 copying unrelated obligations. The maintainer authorized relicensing the adapted
 first-party documentation under the repository's [GNU AGPL version 3 only](LICENSE)
-as part of the September 12, 2026 migration. This does not change OxiBelt's license
+as part of the 2026-09-12 migration. This does not change OxiBelt's license
 or the referenced historical snapshot; upstream data reuse is handled in provider
 profiles.
