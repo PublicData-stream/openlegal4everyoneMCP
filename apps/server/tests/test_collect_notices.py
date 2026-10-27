@@ -27,6 +27,7 @@ class NoticeCollection(unittest.TestCase):
         dictionary.mkdir()
         (dictionary / "NOTICE.txt").write_text("Synthetic embedded dictionary notice\n")
         self.metadata = {
+            "workspace_members": ["openlegal-server"],
             "packages": [
                 self.pkg("openlegal-server", self.root, source=None),
                 self.pkg("fixture", self.package),
@@ -101,6 +102,72 @@ class NoticeCollection(unittest.TestCase):
                          "Synthetic attributed authors\n")
         inventory = json.loads((self.output / "inventory.json").read_text())
         self.assertEqual({p["name"] for p in inventory}, {"fixture", "lindera-ko-dic"})
+
+    def test_built_local_dependency_preserves_licenses_and_patch_notice(self):
+        self.metadata["packages"][1]["source"] = None
+        notices = {
+            "LICENSE-MIT": "Synthetic MIT license\n",
+            "LICENSE-APACHE": "Synthetic Apache license\n",
+            "NOTICE.local-patch.md": "Synthetic local patch provenance\n",
+        }
+        for name, data in notices.items():
+            (self.package / name).write_text(data)
+        result = self.run_collector()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inventory = json.loads((self.output / "inventory.json").read_text())
+        fixture = next(package for package in inventory if package["name"] == "fixture")
+        self.assertEqual({notice["source"] for notice in fixture["notices"]},
+                         {"local crate: " + name for name in notices})
+        for name, data in notices.items():
+            self.assertEqual((self.output / "fixture-1.0.0" / name).read_text(), data)
+        dictionary = next(package for package in inventory if package["name"] == "lindera-ko-dic")
+        self.assertEqual(dictionary["notices"][0]["source"], "published crate: NOTICE.txt")
+
+    def test_built_local_dependency_without_notice_fails(self):
+        self.metadata["packages"][1]["source"] = None
+        result = self.run_collector()
+        self.assert_collection_rejected(result)
+        self.assertIn("Missing dependency notices: fixture@1.0.0", result.stderr)
+
+    def test_unbuilt_local_dependency_is_excluded(self):
+        self.with_packaged_notice()
+        self.metadata["packages"].append(self.pkg("unbuilt-local", self.root / "absent", source=None))
+        result = self.run_collector()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inventory = json.loads((self.output / "inventory.json").read_text())
+        self.assertEqual({package["name"] for package in inventory}, {"fixture", "lindera-ko-dic"})
+
+    def test_built_workspace_members_are_excluded(self):
+        self.with_packaged_notice()
+        self.metadata["packages"].append(self.pkg("first-party", self.root / "absent", source=None))
+        self.metadata["workspace_members"].append("first-party")
+        self.messages.insert(0, self.artifact("first-party"))
+        result = self.run_collector()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inventory = json.loads((self.output / "inventory.json").read_text())
+        self.assertEqual({package["name"] for package in inventory}, {"fixture", "lindera-ko-dic"})
+
+    def test_missing_or_invalid_workspace_membership_fails(self):
+        self.with_packaged_notice()
+        self.metadata["packages"].append(self.pkg("other-member", self.root / "absent", source=None))
+        invalid_members = {
+            "missing": None,
+            "not a list": "openlegal-server",
+            "empty": [],
+            "nonstring": [None],
+            "unhashable": [[]],
+            "unknown package": ["unknown"],
+            "registry package": ["openlegal-server", "fixture"],
+            "duplicate": ["openlegal-server", "openlegal-server"],
+            "server absent": ["other-member"],
+        }
+        for scenario, members in invalid_members.items():
+            with self.subTest(scenario=scenario):
+                if members is None:
+                    self.metadata.pop("workspace_members", None)
+                else:
+                    self.metadata["workspace_members"] = members
+                self.assert_collection_rejected(self.run_collector())
 
     def supplement(self):
         data = b"Synthetic supplemental notice\n"

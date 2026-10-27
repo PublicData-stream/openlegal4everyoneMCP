@@ -20,9 +20,16 @@ manifest = json.loads((supplements / "manifest.json").read_text())
 if manifest["version"] != 1:
     raise SystemExit("Unsupported supplemental notice manifest")
 packages = {package["id"]: package for package in metadata["packages"]}
+workspace_members = metadata.get("workspace_members")
+if (not isinstance(workspace_members, list) or not workspace_members
+        or any(not isinstance(member, str) or member not in packages
+               or packages[member]["source"] is not None for member in workspace_members)
+        or len(set(workspace_members)) != len(workspace_members)):
+    raise SystemExit("Invalid Cargo workspace membership")
+workspace_members = set(workspace_members)
 server_ids = [p["id"] for p in metadata["packages"] if p["name"] == "openlegal-server"]
-if len(server_ids) != 1:
-    raise SystemExit("Expected exactly one server package")
+if len(server_ids) != 1 or server_ids[0] not in workspace_members:
+    raise SystemExit("Expected exactly one server workspace package")
 resolved = set()
 finished = False
 server_binary = False
@@ -64,9 +71,10 @@ if not server_binary:
     raise SystemExit("Missing server binary artifact")
 inventory = []
 for package in metadata["packages"]:
-    if package["id"] not in resolved or package["source"] is None:
+    if package["id"] not in resolved or package["id"] in workspace_members:
         continue
     root = Path(package["manifest_path"]).parent
+    provenance = "local crate: " if package["source"] is None else "published crate: "
     output = destination / f'{package["name"]}-{package["version"]}'
     notices = []
     for path in sorted(root.rglob("*")):
@@ -79,7 +87,7 @@ for package in metadata["packages"]:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, target)
         notices.append({"path": str(target.relative_to(destination)),
-                        "source": "published crate: " + str(path.relative_to(root))})
+                        "source": provenance + str(path.relative_to(root))})
 
     supplement = manifest["packages"].get(f'{package["name"]}@{package["version"]}')
     if supplement:
