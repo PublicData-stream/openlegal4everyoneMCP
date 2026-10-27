@@ -1,7 +1,7 @@
 # Disposable serving acceptance fixture
 
 This fixture prepares one real Kubernetes node with an enforcing Calico CNI.
-Its default profile fits the 7 GiB `dev` host budget; the explicit expanded
+Its default profile fits a 7 GiB host budget; the explicit expanded
 profile requires the approved 21 GiB allocation and guest RAM preflight below. It does not
 qualify production storage, cross-node routing, document-worker isolation or live
 legal providers. The serving checklist belongs to
@@ -9,11 +9,25 @@ legal providers. The serving checklist belongs to
 
 `cluster.sh` creates or deletes only its owned cluster/network. It does not build
 images, apply serving workloads, generate production credentials, alter the host
-firewall, or run the disruptive acceptance checks. Use a dedicated `dev` session;
+firewall, or run the disruptive acceptance checks. Use a dedicated host session;
 run builds and acceptance sequentially. The Docker daemon must support kind's
 privileged node container, cgroup delegation and the native host architecture.
 Use rootless Docker where supported by the configured host; lack of those kernel
 features is a failed prerequisite, not permission to disable isolation.
+
+## Edge mTLS gap
+
+This fixture predates edge mTLS (2026-09-28) and is not currently expected to start
+the committed serving template or complete the edge handoff. `prepare-workloads.py`
+renders `deploy/kubernetes/serving`, whose Deployment mounts the non-optional Secret
+`openlegal-edge-client-ca` and whose configuration requires the client DNS SAN
+`oxibelt.openlegal.internal` (`deploy/kubernetes/config/server.toml`). The preparer
+creates neither that Secret nor an OxiBelt client certificate. The
+[edge inputs](#edge-inputs-and-acceptance) below stage no `openlegal-client.pem`
+or `openlegal-client-key.pem`, although `deploy/oxibelt/kubernetes-upstream.example.toml`
+requires both. Updating the fixture is a pending maintainer item. Until then, a
+serving start or edge failure from these steps does not by itself indicate a
+serving regression, and these steps provide no edge mTLS acceptance evidence.
 
 ## Dependency admission
 
@@ -93,7 +107,7 @@ on the existing 7 GiB guest. Swap and ballooned memory do not count. The script
 does not resize the VM or adjust ballooning. Deletion remains available even if
 the selected profile or guest capacity changes.
 
-Bootstrap relies on the enclosing dev VM's physical RAM limit. This script does
+Bootstrap relies on the enclosing VM's physical RAM limit. This script does
 not enforce an aggregate cgroup ceiling. Record VM memory and peak usage, bound external edge/client
 containers, run sequentially, and do not raise the approved host budget to force
 a passing result.
@@ -138,7 +152,7 @@ docker exec "$accept_name-control-plane" sh -ec '
 
 `cluster.sh` prepares the volume roots as root:10004 2770 and private writable
 `data` directories as 10004:10004 with permission bits 0700 (the setgid bit may
-be inherited from the volume root; the dev run observed 2700). Preserve those root permissions when
+be inherited from the volume root; an earlier run observed 2700). Preserve those root permissions when
 copying the dictionary; serving mounts it read-only. The separate
 `competing-index/data` directory is for the competing-lease check; never point
 the competing process at the live index. These directories reside inside the
@@ -220,6 +234,8 @@ label in its separate namespace. Confirm the observed CNI enforcement addresses
 and node-local firewall behavior before interpreting connectivity results.
 
 ## Edge inputs and acceptance
+
+These inputs predate edge mTLS; see the [edge mTLS gap](#edge-mtls-gap).
 
 OxiBelt resolves certificate filenames through a `cert/` directory beside its
 `config/` directory. Stage only `oxibelt.toml` in `config/`, and only `edge.pem`,

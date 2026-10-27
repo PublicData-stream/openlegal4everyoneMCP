@@ -13,13 +13,47 @@ the Pod. Unit tests use explicitly fictional supplied fixtures. Provider identit
 and legal-date mapping happen separately: parser success does not establish
 identity, authoritative legal applicability, or complete text.
 
+## Current status
+
+This section is the single status statement for the document sandbox; other
+documents link here.
+
+- **Passed:** on 2026-09-26 the real-cluster synthetic gate passed for disposable
+  worker Pods on one single-node K3s 1.36.4 cluster with containerd 2.3.4, the
+  node's `runc` 1.4.2 handler and one recorded worker image digest; see the
+  [same-host K3s qualification](#same-host-k3s-qualification-2026-09-26) for the
+  exact controls. Independent Security Review of that same-host boundary found no
+  confirmed Pod isolation bypass; the design accepts the identified shared-kernel
+  escape impact and resource-pressure risks.
+- **Not covered by that run:** the committed 16-Pod namespace quota
+  (`deploy/document-sandbox/namespace.yaml`, raised on 2026-09-28; the qualified
+  quota admitted two Pods), the tmpfs scratch volume (added on 2026-09-30) and any
+  other worker image digest. Same-host requalification at the current quota is a
+  maintainer decision.
+- **Remaining:** this repository has no recorded evidence yet of synthetic
+  controller integration with the real Kubernetes API, projected rotating
+  credentials, the namespace-scoped controller Role and the production
+  `KubernetesDocumentProcessor`; that integration remains required before
+  enabling ingestion (the earlier
+  [gVisor-era conditions](alpine-cluster-qualification.md#conditions-for-continuing)
+  are historical);
+  concurrent OCR load and eviction observation; live documents and live-provider
+  acceptance. Default serving enables neither the controller nor ingestion.
+
+The 2026-09-22 [Alpine qualification record](alpine-cluster-qualification.md)
+found an AppArmor incompatibility in the inspected gVisor release. That is
+historical background: the RuntimeClass now uses the node's `runc` handler.
+
 ## Input, output and lifecycle
 
 The trusted controller requires explicit absolute `kubectl` and kubeconfig paths,
 an explicit context and namespace, and an image pinned by SHA-256 digest. There is
-no ambient-context or mutable-image fallback. Configure one controller process;
-the namespace quota additionally limits live Pods to the configured pool limit
-across controller crashes. The default is two.
+no ambient-context or mutable-image fallback. Configure one controller process.
+It refuses work unless the namespace has one unscoped quota whose `pods` value
+equals its configured pool limit and whose CPU, memory and ephemeral-storage
+values equal that limit times the per-Pod limits, so the quota also limits live
+Pods across controller crashes. The built-in pool limit
+is two; the committed namespace quota and the ingestion template select 16.
 
 Each `kubectl` subprocess starts with a cleared environment and only fixed
 `PATH=/usr/local/bin:/usr/bin:/bin`, `HOME=/tmp` and `TMPDIR=/tmp`. This includes
@@ -98,16 +132,13 @@ Neither source content nor extracted content is sent to container logs.
 
 ## Image and dependency admission
 
-The release pipeline publishes the amd64-only worker at
-`ghcr.io/publicdata-stream/openlegal-document-worker`. Stable `X.Y.Z` and beta
-`X.Y.Z-beta.N` versions follow a published GitHub Release; build candidates use
-`X.Y.Z-build.<8-hex-commit-prefix>` annotated tags. It publishes the image that
-passed the native smoke gate and records its digest and provenance in the
-`ghcr-release-digests` artifact. There is no `latest` or major-version alias.
+[GHCR image publication](../CONTRIBUTING.md#ghcr-image-publication) owns the
+release workflow. It publishes the amd64-only worker at
+`ghcr.io/publicdata-stream/openlegal-document-worker` and records its digest in
+the `ghcr-release-digests` artifact.
 Use the accepted `ghcr.io/publicdata-stream/openlegal-document-worker@sha256:<digest>`
 reference for `DOCUMENT_IMAGE` and the ingestion overlay; the worker requires an
-amd64 node with x86-64-v3 support. The first public release also requires package
-visibility and anonymous-pull verification. Publication alone does not qualify
+amd64 node with x86-64-v3 support. Publication alone does not qualify
 the worker's real-cluster sandbox or authorize provider traffic; follow the
 [release image procedure](deployment-kubernetes.md#ghcr-release-images) and the
 cluster gate below.
@@ -205,7 +236,7 @@ graph still requires these versions; upgrading the directly used resvg does not 
 exceptions were renewed after reviewing that graph; no vulnerability or unsoundness
 exception is added. Owner PiQuark6046 must review replacement/update
 options by **2026-11-23** and whenever parser dependencies change. These exceptions
-require independent parser/security review and do not suppress vulnerability or
+require independent Security Review of the parsers and do not suppress vulnerability or
 unsoundness advisories. The root serving policy is unchanged.
 
 `undoc` and `office_oxide` were considered for broader Office extraction, but the
@@ -213,9 +244,9 @@ implemented format set uses rhwp and Xberg instead of adding redundant parsers.
 
 ## Cluster preparation and acceptance
 
-The [Alpine qualification record](alpine-cluster-qualification.md) identifies an
-AppArmor incompatibility in the inspected gVisor release. The requirements below
-remain mandatory; Alpine image acceptance does not qualify that runtime.
+The requirements below remain mandatory for every target node; Alpine image
+acceptance does not qualify a runtime. [Current status](#current-status) records
+what has been qualified and what remains.
 
 Provision a dedicated namespace with `deploy/document-sandbox/namespace.yaml` and
 bind `controller-role.yaml` to a separately managed trusted controller identity.
@@ -226,9 +257,9 @@ read access. The acceptance harness's operator needs log read access to verify
 that source bytes do not reach logs.
 
 The selected same-host K3s worker Pod uses the node's existing `runc` handler.
-This shares the host kernel with serving and therefore requires independent
-security review of the changed isolation boundary and the complete real-cluster
-acceptance gate below before live documents are processed:
+This shares the host kernel with serving. Its Security Review is summarized in
+[current status](#current-status); each target node still requires the complete
+real-cluster acceptance gate below before live documents are processed:
 
 - Verify the generated containerd `runc` handler and require actual
   `hostUsers: false` user-namespace support. Do not label the node based on the
@@ -269,7 +300,9 @@ scripts/test-document-sandbox.sh
 ```
 
 `DOCUMENT_IMAGE` must equal `worker_image` in the selected ingestion TOML. Omit
-`DOCUMENT_SERVER_CONFIG` only when testing the default resource profile.
+`DOCUMENT_SERVER_CONFIG` only when testing the default resource profile. That
+profile uses a pool limit of two, so its quota check does not match the committed
+16-Pod namespace quota.
 
 The gate creates/deletes synthetic worker Pods and checks user mapping,
 privilege/capability restrictions, AppArmor/seccomp, network EPERM/EACCES (not mere unreachability),
@@ -328,7 +361,7 @@ framing, empty logs, memory exhaustion, deadline and cleanup all passed.
 
 The worker-ready node label was removed after the test; no worker Pod remains.
 This establishes the listed controls for a disposable synthetic Pod, not
-live-provider parsing. Independent security review found no confirmed Pod isolation
+live-provider parsing. Independent Security Review found no confirmed Pod isolation
 bypass and identified the shared-kernel escape impact and resource-pressure risks;
 the selected same-host design accepts that kernel boundary, subject to the
 resource and policy checks below.
@@ -343,4 +376,5 @@ SHA-256 `8f6579dad3e99efdb1734c76af035dac7afbe1159aaa42d43fe5f0beff30dc3f`.
 On this 40-core, 251 GiB node, Kubernetes reported no memory or disk pressure,
 2,779 MiB node memory use and 1.7 TiB free on the kubelet filesystem. These
 point-in-time measurements establish ample current headroom for the two 4 GiB
-worker limits, but do not replace concurrent OCR load and eviction observation.
+worker limits admitted by the quota at that time, but do not replace concurrent
+OCR load and eviction observation. They do not cover the later 16-Pod quota.

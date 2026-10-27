@@ -1,11 +1,16 @@
 # Disposable serving acceptance operations
 
-These manual checks extend [fixture preparation](README.md), on its owned `dev`
+These manual checks extend [fixture preparation](README.md), on its owned disposable
 cluster only. Complete preparation and wait for serving readiness first. Run
 blocks in order from the repository root in one Bash session, stopping on any
 unexpected result. They interrupt serving and change only the owned node's
 firewall, fixture trust material and disposable Kubernetes resources. They do not
 qualify production firewall/storage, cross-node routing or document isolation.
+
+The fixture predates edge mTLS: its prepared inputs include no edge-client CA
+Secret or OxiBelt client certificate, so these blocks are not currently expected
+to run against the committed serving template. See the README's
+[edge mTLS gap](README.md#edge-mtls-gap); a fixture update is pending.
 
 ## Private prerequisites and bounded helpers
 

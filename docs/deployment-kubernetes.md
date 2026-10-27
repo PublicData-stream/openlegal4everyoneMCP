@@ -10,18 +10,20 @@ suspended administrative Jobs, opt-in ingestion and deterministic validation are
 implemented. Production deployment and acceptance remain pending.
 
 **Production acceptance blocker:** the [Phase 9 execution record](deployment-acceptance.md)
-reports intermittent public HTTP failures through the pinned OxiBelt, including
-after backend replacement. Restarting the edge restored a full smoke run, but the
-cause and lasting fix remain unresolved. Public HTTP stability and seamless
-backend-only upgrades are not accepted. Reassess this issue before accepting
-production traffic or upgrades; backend readiness alone cannot clear it.
+reports intermittent public HTTP failures through OxiBelt revision `72564d1`, the
+revision pinned at that time, including after backend replacement. Restarting the
+edge restored a full smoke run, but the cause and lasting fix remain unresolved.
+The current pin, OxiBelt 0.10.0 at `e879ac7` (`scripts/test-oxibelt.sh`), has no
+recorded cluster or public-edge evidence in this repository. Public HTTP stability and seamless backend-only upgrades are not
+accepted. Reassess this issue before accepting production traffic or upgrades;
+backend readiness alone cannot clear it.
 
 | Evidence | Established boundary |
 | --- | --- |
 | Repository and Docker checks | Implemented gates and recorded local outcomes; configured CI jobs do not establish observed hosted CI success |
 | Disposable Kubernetes serving acceptance | The recorded single-node synthetic topology only; see each passed, failed and unexecuted case in the execution record |
 | Production ZFS, firewall and routing | Operator qualification pending; disposable ext4 paths and node firewall rules do not qualify production infrastructure |
-| Document sandbox and live provider | Same-host `runc` synthetic sandbox and independent security review completed on 2026-09-26; shared-kernel residual risk and live-provider acceptance remain; default serving enables neither |
+| Document sandbox and live provider | Sandbox: see [current status](document-sandbox.md#current-status). Live-provider acceptance remains pending; default serving enables neither |
 | Production traffic, browser WebTransport and ChatGPT | Not established by native clients or fixture results |
 
 The [architecture](architecture.md), [server contract](server.md),
@@ -218,7 +220,7 @@ values, raw workload dumps and private host details out of shared evidence.
    imply corpus coverage. For existing retained data, compare known capture identities
    and bounded search results. Fictional fixture seeding is not a production step.
 8. Leave ingestion disabled for retained serving. If ingestion is required, follow
-   [optional activation](#network-preparation-activation-and-rollback): complete
+   [optional activation](#optional-ingestion-integration): complete
    sandbox acceptance and independent review, prepare identity/RBAC/networking,
    then use `mode = "pilot"` for the bounded first live pass. Enabling the overlay
    immediately initiates provider traffic. The durable pilot ledger allows 100
@@ -296,9 +298,9 @@ transports pass from the actual OxiBelt container. A previous image that accepts
 plaintext HTTP is not a safe standalone rollback while TCP 30080 is reachable.
 
 When private/NodePort serving succeeds but public HTTP fails, preserve the failed
-result and consult the [observed edge recovery](#acceptance-checklist-and-evidence-boundaries).
-The recorded disposable edge restart is a workaround, not a proven diagnosis or
-stable production fix. Production recovery belongs to an explicitly authorized
+result, apply the [public HTTP blocker](#status-and-baseline) and use the
+[observed edge recovery](#acceptance-checklist-and-evidence-boundaries) workaround.
+Production recovery belongs to an explicitly authorized
 maintenance window and requires renewed acceptance.
 
 ## Observability and acceptance
@@ -329,23 +331,13 @@ sandbox, provider and platform acceptance separately.
 
 ### GHCR release images
 
-The [release pipeline](../CONTRIBUTING.md#ghcr-image-publication) publishes
+[GHCR image publication](../CONTRIBUTING.md#ghcr-image-publication) owns the
+release workflow, tag forms and CI prerequisites. It publishes
 `ghcr.io/publicdata-stream/openlegal-server` and
 `ghcr.io/publicdata-stream/openlegal-server-ingestion` for amd64 and arm64, and
-`ghcr.io/publicdata-stream/openlegal-document-worker` for amd64 only. Stable
-`X.Y.Z` and beta `X.Y.Z-beta.N` tags follow publication of a GitHub Release;
-`X.Y.Z-build.<8-hex-commit-prefix>` tags follow an annotated tag push. There
-are no `latest` or major-version aliases. Each architecture is smoke-tested
-before its tested image is pushed; a final server or ingestion multi-platform
-reference is assembled only after both native gates pass. The workflow uses
-a complete recent main-push CI attempt for the exact release commit, or runs
-full CI when that evidence is unavailable; both check the committed `0.0.0`
-Rust placeholder. It then stamps the validated full tag into each image job's
-Rust build inputs before locked compilation and smoke testing. The tagged
-source includes the stamping script needed to reproduce those build inputs.
-The workflow attests platform and final digests, and uploads
-`ghcr-release-digests` with exact digest references and the matching public
-corresponding-source URL.
+`ghcr.io/publicdata-stream/openlegal-document-worker` for amd64 only. There are
+no `latest` or major-version aliases. Its `ghcr-release-digests` artifact lists
+exact digest references and the matching public corresponding-source URL.
 
 Use the digest from that release artifact and verify the registry manifest before
 replacing the non-pullable image sentinel in an operator copy. For example:
@@ -477,8 +469,9 @@ Ordinary tests never contact legal providers. An absent dictionary is an incompl
 gate, not a skipped success.
 
 The ordinary CI image jobs use native `ubuntu-26.04` and `ubuntu-26.04-arm` runners
-with read-only permissions. The separate release jobs publish the same images
-after full CI succeeds. Label local ARM emulation and native CI evidence separately.
+with read-only permissions. The separate release jobs rerun the native image
+gates and push only the tested images after the CI evidence required by
+[GHCR image publication](../CONTRIBUTING.md#ghcr-image-publication). Label local ARM emulation and native CI evidence separately.
 Docker acceptance does not establish kubelet ownership behavior, real-cluster
 isolation, live provider or public transport acceptance. Existing PostgreSQL,
 Korean analyzer, OxiBelt and document-worker gates remain separate. Record actual
@@ -898,8 +891,8 @@ alone does not prove network denial. Use fresh connections after policy converge
 
 The [document namespace](document-sandbox.md) remains a separate trust boundary:
 its deny-all ingress/egress, configured Pod/resource quota and qualified `runc` RuntimeClass
-remain required. No serving policy grants parser access or a fetch role. Its existing
-real-cluster sandbox acceptance remains independently pending. Offline manifests,
+remain required. No serving policy grants parser access or a fetch role. Its
+qualification is tracked in the [sandbox status](document-sandbox.md#current-status). Offline manifests,
 Docker OxiBelt tests and synthetic controls do not establish completed production,
 live-provider, browser or ChatGPT acceptance.
 
@@ -907,8 +900,7 @@ live-provider, browser or ChatGPT acceptance.
 
 ```sh
 scripts/setup-deployment-tools.sh
-scripts/test-kubernetes-serving.sh --profile retained
-scripts/test-kubernetes-serving.sh --profile text-only
+scripts/test-kubernetes-serving.sh
 scripts/test-oxibelt.sh --profile fixture
 scripts/test-oxibelt.sh --profile kubernetes
 scripts/test-server-image.sh --platform linux/amd64
@@ -944,7 +936,7 @@ fail without a network fallback. To repair a corrupt installation, remove only
 `schema-validation/` inside the selected deployment-tools directory and rerun setup.
 Do not remove unrelated caches or data.
 
-The current 47 resource documents cover 14 Kubernetes resource types. Storage
+The current 54 resource documents cover 14 Kubernetes resource types. Storage
 examples first pass their existing exact placeholder checks. Only temporary schema
 copies replace their five PV/PVC capacity pairs with `1Gi`, five local paths with
 distinct `/var/lib/openlegal/schema-fixture/` paths and node affinity with
@@ -1002,8 +994,8 @@ The independent [admin roots](../deploy/kubernetes/admin/) each render one
 `batch/v1` Job and the shared ConfigMap, without a Deployment, Service, Secret,
 namespace or PVC. They require **Kubernetes 1.34 or later** for
 `podReplacementPolicy: Failed`. Serving does not include them. Use an operator-owned
-copy preserving the `config`, `serving`, `admin`, `network` and `storage` directory
-relationships.
+copy preserving the `config`, `serving`, `admin`, `network`, `storage` and optional
+`ingestion` directory relationships.
 Replace image references in serving and every selected Job with the same immutable
 image digest for the intended release. Render and compare the images and generated
 configuration before applying. Do not use a ConfigMap from a different release.
@@ -1232,7 +1224,10 @@ eligible reads preserve local results and expose unavailable status until the
 scheduler is ready. Set `[database].auto_collection = false` for local-only reads.
 The scheduler's ServiceAccount can create request Jobs in the serving namespace;
 request Job Pods use a separate ServiceAccount with only the document-controller
-permission required for disposable processing Pods.
+permission required for disposable processing Pods. The
+[Kubernetes ingestion review](kubernetes-ingestion-review.md) records the original
+Phase 7 overlay review from 2026-09-22, which predates this scheduler and request
+Job design.
 
 Build and publish the digest-pinned `runtime-ingestion` target from
 `apps/server/Dockerfile` for the scheduler and request Jobs. Stamp the same exact
@@ -1257,7 +1252,7 @@ healthy runtime at each stage, with provider usage, queue progress, Pod capacity
 and error rates checked before each change.
 
 `[database.ingestion.provider_requests]` selects unlimited continuous attempts,
-1,000 explicit attempts per UTC day, five request starts per second without burst
+1,000 on-demand (explicit and automatic) attempts per UTC day, five request starts per second without burst
 and `max_in_flight = 4`. These are also the omitted-table defaults. Rate accepts
 1..1000 starts/second; shared concurrency accepts 1..16. A legacy explicit
 `min_interval_secs` remains supported but cannot coexist with
@@ -1378,12 +1373,37 @@ proxy's actual upstream egress IP with the provider. Verify approved access with
 a bounded request separately; offline fixtures do not establish geographic
 filtering or acceptance of a particular proxy.
 
+### Offline provider recovery rollout
+
+For the protected recovery state migration, stop and drain all provider request
+initiators, including scheduler, request/detail collection Pods and late response
+parsing callbacks. Apply the matching migration, provision the named database
+function grants, and replace every restartable collector with a binary that
+honors `provider_recovery_hold` before any recovery or collector restart. Old
+binaries do not understand the new hold; a runtime table grant is not a guarantee
+that an old collector follows the new policy. Do not mount the provider-admin
+credential in serving, scheduler or collection Job templates.
+
+Use the [offline provider recovery commands](persistence.md#offline-provider-recovery)
+with operator evidence that writers stopped and in-flight requests drained. The
+CLI revalidates database ownership but does not scale Kubernetes or prove remote
+HTTP completion. Its default apply leaves a durable recovery hold. Explicit
+resumption releases admission globally: only reviewed IDs get earlier leases,
+but unselected work can proceed at its existing due times. Authentication pauses,
+quotas and Retry-After remain in force. Restart collectors only after examining
+the audit result and current admission diagnostics.
+
+This migration does not prune captures or archives. An old binary will reject the
+new schema; rollback requires the coordinated database/retained-storage recovery
+procedure rather than deleting the new migration or audit rows. Code, disposable
+fixture verification, production deployment and actual recovery are separate
+acceptance claims.
+
 ### Offline acceptance
 
 ```sh
 scripts/setup-deployment-tools.sh
 scripts/test-kubernetes-serving.sh
-scripts/test-kubernetes-serving.sh --profile text-only
 scripts/test-server-image.sh --platform linux/amd64 --target runtime-ingestion
 scripts/test-server-image.sh --platform linux/arm64 --target runtime-ingestion
 ```
@@ -1478,9 +1498,13 @@ Execute disruptive cases only against the prepared disposable fixture or within
 a separately authorized operator maintenance window. The
 [fixture guide](../test-support/kubernetes-acceptance/README.md) owns pinned
 tool preparation and cluster cleanup; its [operations appendix](../test-support/kubernetes-acceptance/OPERATIONS.md)
-provides manual disruptive checks and restoration commands. Build and load images before running the
-single-node cluster; keep the whole dev workload within 7 GiB and run expensive
-checks sequentially. The server retains its canonical 4 GiB container limit.
+provides manual disruptive checks and restoration commands. The fixture predates
+edge mTLS; see its [edge mTLS gap](../test-support/kubernetes-acceptance/README.md#edge-mtls-gap)
+before relying on it. Build and load images before running the single-node
+cluster; keep the whole workload within the fixture's default 7 GiB budget, or
+select its explicit expanded profile (18 GiB node within an approved 21 GiB
+allocation), and run expensive checks sequentially. The server retains its
+canonical 4 GiB container limit.
 Use the fictional retained seed, full pinned dictionary and distinct migration
 and runtime credentials from the existing image fixture. Never copy a production
 database or enable ingestion for these checks.
@@ -1514,23 +1538,23 @@ Watch termination through completion so a fast replacement does not erase exit
 evidence. Never start the competing-instance test against the live index: give it
 a separate empty index path while preserving the same runtime-lease database.
 
-The Phase 9 dev run observed HTTP failures with `channel closed` in the pinned
-OxiBelt after backend replacement and again without another backend replacement.
-The cause remains unresolved. Do not treat backend readiness as restored
-public transport acceptance. Verify retained data through the trusted NodePort,
-restart the disposable edge to discard stale upstream connections, and rerun
+The Phase 9 run observed HTTP failures with `channel closed`; the
+[public HTTP blocker](#status-and-baseline) owns their status. Do not treat
+backend readiness as restored public transport acceptance. Verify retained data
+through the trusted NodePort, restart the disposable edge to discard stale upstream connections, and rerun
 both public transports. Record the original failed public request as well as
 recovery; this is an operator workaround, not a proxy fix or seamless-upgrade
-claim. Reassess HTTP stability before accepting production traffic or backend upgrades.
+claim.
 
 Record every checklist row individually in a new dated operator acceptance record,
 including exact commands, version/digest identities and failed or unexecuted cases.
 Use the [Phase 9 evidence record](deployment-acceptance.md) as a historical example;
 do not overwrite it with later results. Keep raw private run artifacts outside Git. Distinguish implemented, executed in
 Docker, executed against PostgreSQL, executed on the disposable Kubernetes cluster,
-and observed CI results. Document sandbox, production ZFS/firewall, live LAW OPEN
-DATA, browser/ChatGPT and production traffic remain independently pending until
-their own gates are performed. Do not infer CI success from a configured job.
+and observed CI results. Production ZFS/firewall, live LAW OPEN DATA,
+browser/ChatGPT and production traffic remain independently pending until their
+own gates are performed; the [document sandbox status](document-sandbox.md#current-status)
+is recorded separately. Do not infer CI success from a configured job.
 
 ## Validation boundary
 
@@ -1541,87 +1565,33 @@ rendering and offline schema coverage. These checks do not establish target-clus
 admission, enforcement, scheduling, resource sizing or production acceptance.
 
 The [Phase 9 record](deployment-acceptance.md) reports separately executed disposable
-serving-cluster observations and their unresolved public HTTP failure. It does not
-qualify production or the document sandbox. Phase 10 reorganizes documentation and
-operator sequencing; it adds no runtime, image, manifest, hosted CI, cluster or live
-provider validation evidence. Publication, deployment and live provider calls remain
-separate operator actions.
+serving-cluster observations; the resulting [public HTTP blocker](#status-and-baseline)
+remains open. It does not qualify production or the document sandbox. Publication,
+deployment and live provider calls remain separate operator actions.
 
 ## Implementation history
 
-Phase 0 records the selected deployment design and existing server contracts.
-Phase 1 adds the production server image, local image acceptance and native
-amd64/ARM64 CI jobs. Phase 2 established hardened text-only serving and offline
-manifest checks. Phase 3 makes retained-corpus serving the default template, adds
-operator-managed storage examples and extends image acceptance to retained data.
-Phase 4 adds the TCP/UDP NodePort Service and a tested OxiBelt handoff example.
-Phase 5 adds suspended migration, cache-maintenance and offline index-rebuild Jobs
-with separate credentials and an operator-controlled maintenance window. Phase 6
-adds namespace-wide default deny, separately selected allow policies and a network
-acceptance runbook. The text-only profile remains a separate test fixture without
-a Service or NetworkPolicy. Phase 7 adds an opt-in ingestion image, projected
-controller identity, separate RBAC/egress templates and offline controller checks.
-Phase 8 adds source-inventory checks and pinned offline Kubernetes 1.36.0/1.37.0
-schema validation to the existing deployment and four native image CI jobs.
-Phase 9 adds a bounded explicit-endpoint smoke client and separately provisioned
-disposable Kubernetes serving acceptance. See the [checklist](#phase-9-serving-acceptance)
-and its [execution record](deployment-acceptance.md) for scoped disposable-cluster
-outcomes and unresolved HTTP stability. Complete production acceptance remains
-pending; no production deployment, live-provider, browser WebTransport or ChatGPT
-acceptance is established.
+The initial deployment phases landed on 2026-09-22 in commits `84be8ce..c8634e5`. The
+[records index](records.md) lists the dated review and acceptance records.
 
-The original Phase 0 inventory was recorded on `main` at
-`79a8a852916d6fb18f306e5d7541115e1bab87d8`. The earlier design baseline,
-`f4bf5899caa1cc04491b68ddeb7c516b58f93387`, differs only by the commit ignoring
-`.agents/temp/`; those two revisions have identical runtime code. Phase 3 builds
-on the clean Phase 2 revision `f18751caadf2eec490841980a0ee94ba2d9cbaac`.
-The configured `GitHub` remote is
-`https://github.com/PublicData-stream/openlegal4everyoneMCP` for fetch and push;
-this records local configuration, not a remote synchronization check. Recheck with:
+- Phase 0: deployment design and inventory of existing server contracts.
+- Phase 1: production server image, local image acceptance and native amd64/ARM64 CI jobs.
+- Phase 2: hardened text-only serving and offline manifest checks; text-only is now a test fixture.
+- Phase 3: retained-corpus serving template, storage examples and retained image acceptance.
+- Phase 4: TCP/UDP NodePort Service and OxiBelt handoff example.
+- Phase 5: suspended migration, cache-maintenance and offline index-rebuild Jobs.
+- Phase 6: namespace-wide default deny, selected allow policies and the network acceptance runbook.
+- Phase 7: opt-in ingestion image, projected controller identity and separate RBAC/egress
+  templates; see the [ingestion review](kubernetes-ingestion-review.md).
+- Phase 8: source-inventory checks and pinned offline Kubernetes 1.36.0/1.37.0 schema validation.
+- Phase 9: bounded explicit-endpoint smoke client and disposable serving acceptance; see the
+  [execution record](deployment-acceptance.md).
+- Phase 10: documentation and operator-sequencing reorganization, with no new runtime,
+  image, manifest, hosted CI, cluster or live-provider evidence.
 
-```sh
-git rev-parse HEAD
-git status --short
-git remote -v
-```
-
-The [architecture](architecture.md), [server contract](server.md),
-[corpus contract](database.md), [persistence contract](persistence.md) and
-[document sandbox](document-sandbox.md) remain authoritative for their behavior.
-Phase 0 changed documentation only. Phase 1 changes packaging and the Rust CPU
-baseline; public MCP schemas, configuration types and legal-data semantics remain
-unchanged. Phase 2 also rejects empty certificate chains and mismatched TLS keys
-as normal startup errors instead of panicking in the TLS dependency. Valid TLS
-configuration retains ring, TLS 1.3, WebTransport ALPN and existing QUIC limits.
-Phase 3 preserves Rust configuration types and MCP schemas; its default template
-now requires migrated PostgreSQL, prepared storage and a provisioned dictionary.
-Phase 5 preserves production Rust behavior and the configuration contents; serving
-and administration import the same content-hashed ConfigMap from the
-[shared configuration base](../deploy/kubernetes/config/).
-
-
-### Offline provider recovery rollout
-
-For the protected recovery state migration, stop and drain all provider request
-initiators, including scheduler, request/detail collection Pods and late response
-parsing callbacks. Apply the matching migration, provision the named database
-function grants, and replace every restartable collector with a binary that
-honors `provider_recovery_hold` before any recovery or collector restart. Old
-binaries do not understand the new hold; a runtime table grant is not a guarantee
-that an old collector follows the new policy. Do not mount the provider-admin
-credential in serving, scheduler or collection Job templates.
-
-Use the [offline provider recovery commands](persistence.md#offline-provider-recovery)
-with operator evidence that writers stopped and in-flight requests drained. The
-CLI revalidates database ownership but does not scale Kubernetes or prove remote
-HTTP completion. Its default apply leaves a durable recovery hold. Explicit
-resumption releases admission globally: only reviewed IDs get earlier leases,
-but unselected work can proceed at its existing due times. Authentication pauses,
-quotas and Retry-After remain in force. Restart collectors only after examining
-the audit result and current admission diagnostics.
-
-This migration does not prune captures or archives. An old binary will reject the
-new schema; rollback requires the coordinated database/retained-storage recovery
-procedure rather than deleting the new migration or audit rows. Code, disposable
-fixture verification, production deployment and actual recovery are separate
-acceptance claims.
+Later work includes the [Alpine image migration](alpine-image-acceptance.md) and its
+[cluster qualification status](alpine-cluster-qualification.md),
+[GHCR image publication](../CONTRIBUTING.md#ghcr-image-publication), the same-host
+[document sandbox qualification](document-sandbox.md#current-status), edge mTLS,
+isolated collection Jobs and [offline provider recovery](#offline-provider-recovery-rollout).
+The sections above describe their current operator procedures.
