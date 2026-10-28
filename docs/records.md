@@ -25,3 +25,4 @@ Earlier record bodies keep their original reviewer labels and category wording.
 | 2026-09-23 | [Alpine 3.24 migration acceptance](alpine-image-acceptance.md) | Alpine production images | [Kubernetes operator runbook](deployment-kubernetes.md) |
 | 2026-10-04 | [Permanent LAW clone validation](../test-support/fixtures/law-go-kr/ACCEPTANCE.md) | LAW clone implementation and bounded provider probe | [LAW OPEN DATA profile](providers/kr-law-go-kr.md) |
 | 2026-10-05 | [Collection deferral and scheduler contention validation](../test-support/fixtures/law-go-kr/COLLECTION-RECOVERY.md) | Collection deferral reasons and scheduler retries | [LAW OPEN DATA profile](providers/kr-law-go-kr.md) |
+| 2026-10-28 | [MeCab zstd security maintenance](zstd-review.md) | Fixed compression dependencies, local-source notices and dictionary compatibility | [Dependency admission](dependencies.md) |

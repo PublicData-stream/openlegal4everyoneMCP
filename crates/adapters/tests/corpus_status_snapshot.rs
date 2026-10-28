@@ -52,26 +52,38 @@ async fn status_counts_twenty_thousand_bodies_without_job_or_history_join_duplic
     empty_stable_views(&store, &pool).await;
     // Synthetic retained rows exercise status aggregation independently of the
     // publication engine. Their keys and payloads are not legal source evidence.
-    sqlx::query("INSERT INTO openlegal.corpus_object(object_key,identity) SELECT repeat(md5(n::text),2),'{}'::jsonb FROM generate_series(1,20000) n")
-        .execute(&pool).await.unwrap();
-    sqlx::query(r#"INSERT INTO openlegal.corpus_capture(id,object_key,revision_id,sequence,captured_at,event_sequence,payload,payload_sha256,raw_sha256,raw_size,storage_key)
+    // Keep bulk fixture writes under the same 2s deadline as the status reads.
+    for first in (1_i32..=20_000).step_by(1_000) {
+        let last = (first + 999).min(20_000);
+        sqlx::query("INSERT INTO openlegal.corpus_object(object_key,identity) SELECT repeat(md5(n::text),2),'{}'::jsonb FROM generate_series($1::integer,$2::integer) n")
+            .bind(first).bind(last).execute(&pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO openlegal.corpus_capture(id,object_key,revision_id,sequence,captured_at,event_sequence,payload,payload_sha256,raw_sha256,raw_size,storage_key)
         SELECT repeat(md5('capture:'||n),2),repeat(md5(n::text),2),'r1',1,100,n,
         jsonb_build_object('record',jsonb_build_object('body',repeat('synthetic retained body ',400),'metadata',
             jsonb_build_object('attachment_status',CASE WHEN n%11=0 THEN 'incomplete' ELSE 'complete' END,
             'body_status',CASE WHEN n%13=0 THEN 'response_identity_unverified_metadata_only' ELSE 'complete' END))),
-        decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),0,'fixture:'||n FROM generate_series(1,20000) n"#)
-        .execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,last_sequence,captured_at) SELECT object_key,revision_id,id,sequence,captured_at FROM openlegal.corpus_capture")
-        .execute(&pool).await.unwrap();
+        decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),0,'fixture:'||n FROM generate_series($1::integer,$2::integer) n"#)
+            .bind(first).bind(last).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,last_sequence,captured_at) SELECT object_key,revision_id,id,sequence,captured_at FROM openlegal.corpus_capture WHERE event_sequence BETWEEN $1 AND $2")
+            .bind(i64::from(first)).bind(i64::from(last)).execute(&pool).await.unwrap();
+    }
     for historical in [false, true] {
-        sqlx::query("INSERT INTO openlegal.provider_clone_member(view_key,object_key,revision_id,seen_cycle,required_body) SELECT $1,repeat(md5(n::text),2),'r1',CASE WHEN n%7=0 THEN 1 ELSE 2 END,true FROM generate_series(1,20000) n WHERE NOT $2 OR n%2=0")
-            .bind(statute_view(historical).key().unwrap()).bind(historical)
-            .execute(&pool).await.unwrap();
+        // Fixture loading must also fit the unchanged 2s statement deadline.
+        // Preserve all 20,000 candidates and historical membership filtering.
+        for first in (1_i32..=20_000).step_by(1_000) {
+            let last = (first + 999).min(20_000);
+            sqlx::query("INSERT INTO openlegal.provider_clone_member(view_key,object_key,revision_id,seen_cycle,required_body) SELECT $1,repeat(md5(n::text),2),'r1',CASE WHEN n%7=0 THEN 1 ELSE 2 END,true FROM generate_series($3::integer,$4::integer) n WHERE NOT $2 OR n%2=0")
+                .bind(statute_view(historical).key().unwrap()).bind(historical)
+                .bind(first).bind(last).execute(&pool).await.unwrap();
+        }
     }
     // Different effective-date jobs for one object/revision must still count
     // one missing body. Failure in an obsolete member must not count at all.
-    sqlx::query("INSERT INTO openlegal.corpus_job(object_key,revision_id,effective_date,expected_version,status,created_at) SELECT repeat(md5(n::text),2),'r1',d,0,'failed',100 FROM generate_series(1,20000) n CROSS JOIN (VALUES('date-a'),('date-b')) dates(d) WHERE n%17=0")
-        .execute(&pool).await.unwrap();
+    for first in (1_i32..=20_000).step_by(1_000) {
+        let last = (first + 999).min(20_000);
+        sqlx::query("INSERT INTO openlegal.corpus_job(object_key,revision_id,effective_date,expected_version,status,created_at) SELECT repeat(md5(n::text),2),'r1',d,0,'failed',100 FROM generate_series($1::integer,$2::integer) n CROSS JOIN (VALUES('date-a'),('date-b')) dates(d) WHERE n%17=0")
+            .bind(first).bind(last).execute(&pool).await.unwrap();
+    }
     for request in supplements::global_requests(1).unwrap() {
         store.enqueue_supplement(&request, 100).await.unwrap();
     }
@@ -197,16 +209,22 @@ async fn status_reads_sixteen_thousand_toasted_bodies_without_copying_record_pay
             .execute(&pool).await.unwrap();
         first = last + 1;
     }
-    sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,last_sequence,captured_at) SELECT object_key,revision_id,id,sequence,captured_at FROM openlegal.corpus_capture")
-        .execute(&pool).await.unwrap();
+    for first in (1_i32..=(MATCHED + UNRELATED_HISTORY) as i32).step_by(1_000) {
+        let last = (first + 999).min((MATCHED + UNRELATED_HISTORY) as i32);
+        sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,latest_capture,last_sequence,captured_at) SELECT object_key,revision_id,id,sequence,captured_at FROM openlegal.corpus_capture WHERE event_sequence BETWEEN $1 AND $2")
+            .bind(i64::from(first)).bind(i64::from(last)).execute(&pool).await.unwrap();
+    }
     // One missing revision and one revision without an accepted capture must
     // remain missing; an obsolete cycle member must not affect either count.
     sqlx::query("INSERT INTO openlegal.corpus_revision(object_key,revision_id,last_sequence) VALUES(repeat(md5('toast-object:'||$1::text),2),'r1',1)")
         .bind((MATCHED + 2) as i32).execute(&pool).await.unwrap();
     for historical in [false, true] {
-        sqlx::query("INSERT INTO openlegal.provider_clone_member(view_key,object_key,revision_id,seen_cycle,required_body) SELECT $1,repeat(md5('toast-object:'||n),2),'r1',CASE WHEN n=$3 THEN 1 ELSE 2 END,true FROM generate_series(1,$3::integer) n WHERE NOT $2 OR n%2=0")
-            .bind(statute_view(historical).key().unwrap()).bind(historical)
-            .bind((MATCHED + 3) as i32).execute(&pool).await.unwrap();
+        for first in (1_i32..=(MATCHED + 3) as i32).step_by(1_000) {
+            let last = (first + 999).min((MATCHED + 3) as i32);
+            sqlx::query("INSERT INTO openlegal.provider_clone_member(view_key,object_key,revision_id,seen_cycle,required_body) SELECT $1,repeat(md5('toast-object:'||n),2),'r1',CASE WHEN n=$3 THEN 1 ELSE 2 END,true FROM generate_series($4::integer,$5::integer) n WHERE NOT $2 OR n%2=0")
+                .bind(statute_view(historical).key().unwrap()).bind(historical)
+                .bind((MATCHED + 3) as i32).bind(first).bind(last).execute(&pool).await.unwrap();
+        }
     }
     sqlx::query("INSERT INTO openlegal.corpus_job(object_key,revision_id,effective_date,expected_version,status,created_at) SELECT repeat(md5('toast-object:'||n),2),'r1',d,0,'failed',100 FROM generate_series(1,$1::integer) n CROSS JOIN (VALUES('date-a'),('date-b')) dates(d) WHERE n%11=0")
         .bind(MATCHED as i32).execute(&pool).await.unwrap();
