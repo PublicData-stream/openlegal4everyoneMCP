@@ -1,6 +1,12 @@
 [workspace]
 members = ["apps/server", "crates/domain", "crates/normalization", "crates/application", "crates/adapters"]
+exclude = ["vendor/mecab-ko-dict-0.7.2", "vendor/mecab-ko-dict-builder-0.7.2"]
 resolver = "3"
+
+[patch.crates-io]
+# Published 0.7.2 sources with only the zstd security update; see vendor/README.md.
+mecab-ko-dict = { path = "vendor/mecab-ko-dict-0.7.2" }
+mecab-ko-dict-builder = { path = "vendor/mecab-ko-dict-builder-0.7.2" }
 
 [workspace.package]
 version = "0.0.0"

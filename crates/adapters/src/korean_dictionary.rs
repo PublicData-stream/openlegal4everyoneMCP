@@ -129,6 +129,29 @@ pub fn admit(path: &Path) -> Result<String, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressed_dictionary_trie_roundtrip_and_invalid_frames() {
+        use mecab_ko_dict::trie::{Trie, TrieBuilder};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let compressed = temporary.path().join("sys.dic.zst");
+        let entries = [("개인정보", 0), ("보호법", 1)];
+        let bytes = TrieBuilder::build(&entries).unwrap();
+        TrieBuilder::save_to_compressed_file(&bytes, &compressed, 3).unwrap();
+        let trie = Trie::from_compressed_file(&compressed).unwrap();
+        for (surface, index) in entries {
+            assert_eq!(trie.exact_match(surface), Some(index));
+        }
+        assert_eq!(trie.exact_match("없는말"), None);
+
+        let frame = fs::read(&compressed).unwrap();
+        fs::write(&compressed, &frame[..frame.len() / 2]).unwrap();
+        assert!(Trie::from_compressed_file(&compressed).is_err());
+        fs::write(&compressed, b"not a zstd frame").unwrap();
+        assert!(Trie::from_compressed_file(&compressed).is_err());
+    }
+
     #[test]
     fn missing_corrupt_and_miniature_artifacts_fail_closed() {
         use mecab_ko_dict_builder::{

@@ -20,6 +20,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock LICENSE ./
 COPY .cargo/config.toml ./.cargo/config.toml
 COPY crates ./crates
+COPY vendor ./vendor
 COPY apps/server/Cargo.toml ./apps/server/
 COPY apps/server/src ./apps/server/src
 COPY apps/server/collect-notices.py ./apps/server/

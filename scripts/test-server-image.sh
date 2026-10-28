@@ -164,6 +164,9 @@ docker run --rm --name "$probe" --platform "$platform" --network none "${hardeni
     test -s /opt/openlegal/notices/WIDGET-NOTICES.md
     test -s /opt/openlegal/notices/dependencies/inventory.json
     test -s /opt/openlegal/notices/dependencies/supplemental-sources.json
+    for notice in LICENSE-MIT LICENSE-APACHE NOTICE-OPENLEGAL-PATCH.md; do
+        test -s "/opt/openlegal/notices/dependencies/mecab-ko-dict-0.7.2/$notice"
+    done
     test -s /opt/openlegal/notices/dependencies/rust-standard-library/COPYRIGHT-library.html
     test -n "$(find /opt/openlegal/notices/dependencies -path "*/lindera-ko-dic-*/NOTICE.txt" -type f -print -quit)"
     test -z "$(find /opt/openlegal /usr/local/bin/openlegal-server \( -perm -020 -o -perm -002 \) -print)"

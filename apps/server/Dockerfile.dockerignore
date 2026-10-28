@@ -9,6 +9,8 @@
 !.cargo/config.toml
 !crates/
 !crates/**
+!vendor/
+!vendor/**
 !apps/
 !apps/server/
 !apps/server/Cargo.toml

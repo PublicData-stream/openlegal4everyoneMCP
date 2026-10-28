@@ -377,6 +377,28 @@ alongside Lindera, using the exact crates.io `mecab-ko =0.7.2` release and
 used by the provisioning example, outside the serving dependency graph.
 These published release sources
 must not be confused with later repository commits carrying the same version.
+The dictionary and dictionary-builder packages now use a
+[local patch of these exact published sources](../vendor/README.md): their
+normalized manifests require `zstd 0.14.3` instead of `0.13`. This removes the
+vulnerable zstd graph without replacing the tokenizer or dictionary implementation.
+The root lockfile selects `zstd-safe 8.2.0` and `zstd-sys 2.1.2+zstd.1.5.7`,
+addressing RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403,
+RUSTSEC-2026-0410 and the related zstd-safe unsoundness warnings. A lockfile-only
+update cannot cross the old `zstd ^0.13` requirement, and no newer MeCab release
+was published when the patch was prepared on 2026-10-27.
+Verified archive checksums, preserved upstream licenses and exact local changes
+are recorded beside each package. No Git source or advisory exception is added.
+The existing dictionary build script and features are preserved; the zstd family
+remains BSD-3-Clause and the two patched packages remain MIT OR Apache-2.0.
+The server image includes the patched runtime package's licenses and patch notice,
+selected from actual successful Cargo build artifacts, including local third-party
+packages outside the first-party workspace. The development-only builder remains
+outside the production notice inventory. Replace the patch when an official
+release admits the fixed dependencies and passes the same compatibility and
+admission gates. Compression and dictionary parser behavior require independent
+Security Review, full-dictionary and PostgreSQL tests, and all four server image
+target/platform gates. Existing dictionary and analyzer identities remain valid
+only with verified artifact and tokenization compatibility.
 Source: crates.io; MIT OR Apache-2.0. This is the Rust reimplementation, not C++
 MeCab FFI. Retaining Lindera preserves a separate analysis stream; neither engine
 is treated as a semantic authority for legal text.
