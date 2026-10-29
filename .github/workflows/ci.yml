@@ -202,6 +202,10 @@ jobs:
         run: scripts/test-kubernetes-serving.sh
       - name: Test bounded serving smoke without external endpoints
         run: python3 -m unittest discover -s scripts/tests -p 'test_serving_smoke.py'
+      - name: Test collector isolation decisions without external endpoints
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -m unittest discover -s scripts/tests -p 'test_collection_guard.py'
       - name: Test disposable acceptance preparation without a cluster
         run: target/deployment-tools/bin/python -m unittest discover -s test-support/kubernetes-acceptance -p 'test_*.py'
   server-image:

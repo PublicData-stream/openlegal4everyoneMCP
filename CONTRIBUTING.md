@@ -303,6 +303,10 @@ The OxiBelt gate
 executes the bounded deployed-endpoint profile against its synthetic fixture.
 The Python checks also run in the deployment CI job. Explicit-endpoint smoke
 is an operator action, not a default CI connection to a deployed service.
+Collector-isolation guard changes also require
+`python3 -m unittest discover -s scripts/tests -p 'test_collection_guard.py'`.
+These synthetic evidence checks run in the deployment CI job without contacting
+a cluster, a deployed endpoint or a legal-data provider.
 Disposable Kubernetes serving acceptance is separately opt-in; its checklist and
 evidence requirements are in the [Phase 9 serving acceptance runbook](docs/deployment-kubernetes.md#phase-9-serving-acceptance),
 and fixture setup and cleanup are in the
