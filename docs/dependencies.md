@@ -33,6 +33,16 @@ glibc compatibility loader. The Rust parser updates and vendored rhwp source are
 recorded in [document processing](document-sandbox.md#image-and-dependency-admission);
 OCR model and font assets retain their pinned versions and licenses.
 
+The isolated document-worker lockfile selects `pulldown-cmark` 0.13.5 through
+Xberg 1.3.10, replacing 0.13.4 to address
+[RUSTSEC-2026-0414](https://rustsec.org/advisories/RUSTSEC-2026-0414/).
+The [upstream patch release](https://github.com/pulldown-cmark/pulldown-cmark/releases/tag/v0.13.5)
+fixes exponential event growth when parsing empty-display wikilinks. This retains
+the existing crates.io source, MIT license and feature selection, adds no package
+or build script, and requires no advisory exception. The worker continues to
+admit only its existing XML, HTML, PDF, HWP5 and HWPX inputs; this update does not
+add Markdown input or change the serving dependency graph.
+
 Server and worker builds share `scripts/install-alpine-packages.sh`, using only
 verified HTTPS Alpine v3.24 main/community repositories. This deliberately replaces
 the dated Debian snapshot with moving stable packages. Base digests and Rust/Node
