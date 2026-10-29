@@ -179,7 +179,11 @@ async fn serve_connection(
         request.forbidden().await;
         return Ok(());
     }
-    let connection = timeout(io_timeout, request.accept()).await??;
+    let connection = timeout(
+        io_timeout,
+        request.accept_with_headers([("sec-webtransport-http3-draft", "draft02")]),
+    )
+    .await??;
     let cancel = context.shutdown.child_token();
     let result = async {
         let (send, recv) = tokio::select! {

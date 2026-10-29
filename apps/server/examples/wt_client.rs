@@ -16,6 +16,17 @@ use wtransport::{
     tls::{Certificate, rustls},
 };
 
+fn webtransport_connect_options(endpoint: &str, origin: Option<&str>) -> ConnectOptions {
+    // wtransport 0.7 implements draft02 but does not emit its HTTP marker.
+    // Strict intermediaries require it before admitting the CONNECT request.
+    let mut options =
+        ConnectOptions::builder(endpoint).add_header("sec-webtransport-http3-draft02", "1");
+    if let Some(origin) = origin {
+        options = options.add_header("origin", origin);
+    }
+    options.build()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -57,11 +68,8 @@ async fn main() -> Result<(), ServerError> {
             .with_custom_tls(tls)
             .build(),
     )?;
-    let mut options = ConnectOptions::builder(&args[0]);
-    if let Some(origin) = args.get(3) {
-        options = options.add_header("origin", origin);
-    }
-    let connection = timeout(Duration::from_secs(10), endpoint.connect(options.build())).await??;
+    let options = webtransport_connect_options(&args[0], args.get(3).map(String::as_str));
+    let connection = timeout(Duration::from_secs(10), endpoint.connect(options)).await??;
     let (mut send, recv) = timeout(Duration::from_secs(10), async {
         Ok::<_, ServerError>(connection.open_bi().await?.await?)
     })

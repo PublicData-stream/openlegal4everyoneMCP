@@ -11,6 +11,11 @@ Its [upstream client identity and rate-limit syntax](https://github.com/OxiBelt/
 is used by both profiles.
 The reference repository is not modified by the harness.
 
+The native draft02 client sends `sec-webtransport-http3-draft02: 1` on CONNECT.
+An accepted backend session answers `sec-webtransport-http3-draft: draft02`;
+the request and response marker names differ. Path, authority, Origin and mTLS
+validation run before the successful session response.
+
 ## Run the isolated integration test
 
 From a Linux checkout with the pinned Rust toolchain, Git, OpenSSL, Python 3,

@@ -312,7 +312,7 @@ impl Server {
         }
     }
 
-    fn client(&self, trusted: bool) -> QuicEndpoint<wtransport::endpoint::endpoint_side::Client> {
+    fn client_tls(&self, trusted: bool) -> rustls::ClientConfig {
         let mut roots = rustls::RootCertStore::empty();
         if trusted {
             roots
@@ -327,10 +327,14 @@ impl Server {
         .with_root_certificates(roots)
         .with_no_client_auth();
         tls.alpn_protocols = vec![wtransport::tls::WEBTRANSPORT_ALPN.to_vec()];
+        tls
+    }
+
+    fn client(&self, trusted: bool) -> QuicEndpoint<wtransport::endpoint::endpoint_side::Client> {
         QuicEndpoint::client(
             ClientConfig::builder()
                 .with_bind_default()
-                .with_custom_tls(tls)
+                .with_custom_tls(self.client_tls(trusted))
                 .build(),
         )
         .unwrap()
@@ -369,6 +373,103 @@ impl Server {
             self.context.buffers.available_permits(),
             self.context.limits.max_buffer_bytes
         );
+    }
+}
+
+async fn connect_response_headers(
+    server: &Server,
+    url: &str,
+    origin: &str,
+) -> std::collections::HashMap<String, String> {
+    use wtransport::proto::{
+        bytes::BufferReader,
+        frame::{Frame, FrameKind},
+        headers::Headers,
+        session::SessionRequest,
+        settings::Settings,
+    };
+
+    timeout(Duration::from_secs(3), async {
+        let crypto =
+            wtransport::quinn::crypto::rustls::QuicClientConfig::try_from(server.client_tls(true))
+                .unwrap();
+        let mut client =
+            wtransport::quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(wtransport::quinn::ClientConfig::new(Arc::new(crypto)));
+        let connection = client
+            .connect(server.address, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let mut control = connection.open_uni().await.unwrap();
+        // HTTP/3 control-stream type followed by the library's actual SETTINGS.
+        let mut control_bytes = vec![0];
+        Settings::builder()
+            .enable_connect_protocol()
+            .enable_webtransport()
+            .enable_h3_datagrams()
+            .webtransport_max_sessions(wtransport::VarInt::from_u32(1))
+            .build()
+            .generate_frame()
+            .write_async(&mut control_bytes)
+            .await
+            .unwrap();
+        control.write_all(&control_bytes).await.unwrap();
+
+        let mut request = SessionRequest::new(url).unwrap();
+        request.insert("origin", origin).unwrap();
+        request
+            .insert("sec-webtransport-http3-draft02", "1")
+            .unwrap();
+        let mut bytes = Vec::new();
+        request
+            .headers()
+            .generate_frame()
+            .write_async(&mut bytes)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(&bytes).await.unwrap();
+        let mut received = Vec::new();
+        loop {
+            let chunk = recv
+                .read_chunk(4096, true)
+                .await
+                .unwrap()
+                .expect("CONNECT response");
+            received.extend_from_slice(&chunk.bytes);
+            assert!(received.len() <= 8192, "bounded CONNECT response headers");
+            if let Some(frame) = Frame::read(&mut BufferReader::new(&received)).unwrap() {
+                assert!(matches!(frame.kind(), FrameKind::Headers));
+                let headers = Headers::with_frame(&frame).unwrap().as_ref().clone();
+                connection.close(0_u32.into(), b"CONNECT response checked");
+                return headers;
+            }
+        }
+    })
+    .await
+    .expect("CONNECT response deadline")
+}
+
+#[tokio::test]
+async fn connect_success_identifies_response_draft_without_marking_rejections() {
+    let server = Server::start().await;
+    let wrong_authority = format!("https://wrong.invalid:{}{PATH}", server.address.port());
+    for (url, origin, status) in [
+        (server.url(PATH), "https://allowed.test", "200"),
+        (server.url("/wrong"), "https://allowed.test", "404"),
+        (server.url(PATH), "https://denied.test", "403"),
+        (wrong_authority, "https://allowed.test", "403"),
+    ] {
+        let headers = connect_response_headers(&server, &url, origin).await;
+        assert_eq!(headers.get(":status").map(String::as_str), Some(status));
+        assert_eq!(
+            headers
+                .get("sec-webtransport-http3-draft")
+                .map(String::as_str),
+            (status == "200").then_some("draft02")
+        );
+        assert!(!headers.contains_key("sec-webtransport-http3-draft02"));
     }
 }
 

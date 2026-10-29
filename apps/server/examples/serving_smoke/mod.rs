@@ -14,9 +14,9 @@ use tokio::{
     time::timeout,
 };
 use url::Url;
-use wtransport::{
-    ClientConfig, Endpoint, endpoint::ConnectOptions, error::ConnectingError, tls::rustls,
-};
+use wtransport::{ClientConfig, Endpoint, error::ConnectingError, tls::rustls};
+
+use super::webtransport_connect_options;
 
 const LIMIT: usize = 16 * 1024 * 1024;
 const OPERATION: Duration = Duration::from_secs(10);
@@ -223,11 +223,10 @@ async fn execute(raw: &[String], report: &mut Value) -> Result<()> {
     }
     let connected = timeout(OPERATION, async {
         let connection = endpoint
-            .connect(
-                ConnectOptions::builder(args.endpoint)
-                    .add_header("origin", args.origin)
-                    .build(),
-            )
+            .connect(webtransport_connect_options(
+                args.endpoint,
+                Some(args.origin),
+            ))
             .await
             .map_err(|_| "connection_failed")?;
         let streams = connection
@@ -273,11 +272,10 @@ async fn execute(raw: &[String], report: &mut Value) -> Result<()> {
     if positive.is_ok() {
         let rejected = timeout(
             OPERATION,
-            endpoint.connect(
-                ConnectOptions::builder(args.endpoint)
-                    .add_header("origin", DENIED_ORIGIN)
-                    .build(),
-            ),
+            endpoint.connect(webtransport_connect_options(
+                args.endpoint,
+                Some(DENIED_ORIGIN),
+            )),
         )
         .await;
         let result = match rejected {
