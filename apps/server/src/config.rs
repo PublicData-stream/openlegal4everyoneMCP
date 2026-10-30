@@ -1107,12 +1107,20 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub max_raw_bytes: ArchiveByteLimit,
     pub blob_path: PathBuf,
+    /// Per-operation caller deadline for corpus blobs, including durability probes.
+    #[serde(default = "default_blob_operation_timeout_secs")]
+    pub blob_operation_timeout_secs: u64,
     pub index_path: PathBuf,
     /// Operator-provisioned, pinned MeCab-Ko dictionary. Never downloaded at runtime.
     pub mecab_dictionary_path: PathBuf,
     pub widget_html: PathBuf,
     pub ingestion: Option<IngestionConfig>,
 }
+
+fn default_blob_operation_timeout_secs() -> u64 {
+    5
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestionConfig {
@@ -1283,6 +1291,9 @@ pub enum IngestionMode {
 }
 impl DatabaseConfig {
     pub fn validate(&self) -> Result<(), ServerError> {
+        if !(1..=60).contains(&self.blob_operation_timeout_secs) {
+            return Err("blob_operation_timeout_secs must be between 1 and 60".into());
+        }
         if [
             &self.blob_path,
             &self.index_path,
@@ -1394,6 +1405,98 @@ mod database_config_tests {
         ))
         .unwrap();
         configured.validate().unwrap();
+    }
+
+    #[test]
+    fn corpus_blob_operation_timeout_defaults_and_bounds() {
+        let base = concat!(
+            "blob_path='blobs'\nindex_path='index'\nwidget_html='widget'\n",
+            "mecab_dictionary_path='dictionary'\n",
+        );
+        let defaults: DatabaseConfig = toml::from_str(base).unwrap();
+        defaults.validate().unwrap();
+        assert_eq!(defaults.blob_operation_timeout_secs, 5);
+        assert!(defaults.auto_collection);
+        assert!(defaults.ingestion.is_none());
+        for seconds in [1, 5, 30, 60] {
+            let configured: DatabaseConfig =
+                toml::from_str(&format!("{base}blob_operation_timeout_secs={seconds}\n")).unwrap();
+            configured.validate().unwrap();
+            assert_eq!(configured.blob_operation_timeout_secs, seconds);
+        }
+        for seconds in [0, 61, u64::MAX] {
+            let mut invalid = defaults.clone();
+            invalid.blob_operation_timeout_secs = seconds;
+            assert!(invalid.validate().is_err(), "{seconds}");
+        }
+    }
+
+    #[test]
+    fn corpus_blob_operation_timeout_rejects_invalid_toml_values() {
+        let base = concat!(
+            "blob_path='blobs'\nindex_path='index'\nwidget_html='widget'\n",
+            "mecab_dictionary_path='dictionary'\n",
+        );
+        for value in ["-1", "1.5", "'30'", "true"] {
+            assert!(
+                toml::from_str::<DatabaseConfig>(&format!(
+                    "{base}blob_operation_timeout_secs={value}\n"
+                ))
+                .is_err(),
+                "{value}"
+            );
+        }
+        for seconds in [0, 61] {
+            let invalid: DatabaseConfig =
+                toml::from_str(&format!("{base}blob_operation_timeout_secs={seconds}\n")).unwrap();
+            assert!(invalid.validate().is_err(), "{seconds}");
+        }
+    }
+
+    #[test]
+    fn corpus_blob_operation_timeout_roundtrips_without_changing_cache_or_call_limits() {
+        for raw in [
+            include_str!("../../../deploy/kubernetes/config/server.toml"),
+            include_str!("../../../deploy/kubernetes/ingestion/server.toml"),
+        ] {
+            let original: Config = toml::from_str(raw).unwrap();
+            original.validate_storage().unwrap();
+            assert_eq!(
+                original
+                    .database
+                    .as_ref()
+                    .unwrap()
+                    .blob_operation_timeout_secs,
+                5
+            );
+            let mut value: toml::Value = toml::from_str(raw).unwrap();
+            let cache = value["cache"].clone();
+            value["database"].as_table_mut().unwrap().insert(
+                "blob_operation_timeout_secs".into(),
+                toml::Value::Integer(30),
+            );
+            let encoded = toml::to_string(&value).unwrap();
+            let configured: Config = toml::from_str(&encoded).unwrap();
+            configured.validate_storage().unwrap();
+            assert_eq!(
+                configured
+                    .database
+                    .as_ref()
+                    .unwrap()
+                    .blob_operation_timeout_secs,
+                30
+            );
+            let roundtrip: toml::Value = toml::from_str(&encoded).unwrap();
+            assert_eq!(roundtrip["cache"], cache);
+            assert_eq!(
+                configured.limits.call_timeout_secs,
+                original.limits.call_timeout_secs
+            );
+            assert_eq!(
+                configured.limits.shutdown_timeout_secs,
+                original.limits.shutdown_timeout_secs
+            );
+        }
     }
 
     #[test]

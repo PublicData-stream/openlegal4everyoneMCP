@@ -488,6 +488,19 @@ positive byte count. `[database.ingestion].retain_history_bodies` defaults to
 `true`. Archive and cap semantics are in
 [legal corpus](database.md#operator-configuration).
 
+`[database].blob_operation_timeout_secs` optionally selects the corpus filesystem
+blob caller deadline in whole seconds, from 1 through 60; omission preserves five
+seconds. It applies to corpus blob startup, each operation, durability health
+probes and close/drain, including background collection and offline index rebuild.
+It does not change retrieval-cache blob deadlines, PostgreSQL deadlines, MCP call
+limits or document-worker budgets. Enclosing MCP, collection and shutdown limits
+remain independent, as does Kubernetes termination grace. Operators must provision
+matching termination grace for the selected blob drain and other shutdown phases.
+Timed-out or cancelled blocking work retains its owned admission permit until the
+filesystem call actually ends; the setting does
+not interrupt kernel I/O or weaken durable publication and recovery fences. See
+[persistence](persistence.md#configuration-and-startup).
+
 Registered source families are a closed operator-maintained catalog; callers
 cannot add arbitrary provider targets or URLs. Materials carry independent reuse
 evidence and warnings. Verified noncommercial materials expose

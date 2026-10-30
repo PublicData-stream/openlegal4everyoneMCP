@@ -82,6 +82,7 @@ async fn corpus_tools_preserve_provenance_paging_search_and_checkpoint_diff() {
         &DatabaseConfig {
             max_raw_bytes: Default::default(),
             auto_collection: true,
+            blob_operation_timeout_secs: 5,
             blob_path: fixture.directory.path().join("corpus-blobs"),
             index_path: fixture.directory.path().join("corpus-index"),
             mecab_dictionary_path: std::env::var_os("OPENLEGAL_TEST_MECAB_DICTIONARY")

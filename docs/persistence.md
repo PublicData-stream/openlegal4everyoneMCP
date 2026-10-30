@@ -66,7 +66,20 @@ Connection URLs accept only identity/address query parameters (`host`, `port`,
 are rejected before driver parsing. Pool acquisition and lock waits are limited
 to one second, statements to two seconds, transactions to five seconds, and a
 persistent operation to twenty seconds. Blob operations have a five-second caller
-deadline. These deadlines do not claim to interrupt a blocked filesystem syscall.
+deadline by default. These retrieval-cache bounds remain independent of the
+optional corpus setting `[database].blob_operation_timeout_secs`: whole seconds
+from 1 through 60, default five. The corpus setting covers its blob startup,
+individual operations, shared durability probes and close/drain in serving,
+background collection and offline index rebuilding. It does not change the cache
+adapter, SQL transaction limits or outer MCP/document-worker budgets. A longer
+corpus blob allowance does not extend an enclosing caller deadline.
+
+These deadlines do not interrupt a blocked filesystem syscall. A caller timeout
+or cancellation leaves the owned watchdog and physical job responsible for its
+admission permit until actual completion. Successful health recovery still
+requires the matching failure generation and older jobs to have drained;
+publication still waits for durable blob acknowledgment before its final SQL
+commit. SQL outcome uncertainty and deletion durability are unchanged.
 
 The initial migration uses the `openlegal` schema and SQLx's migration ledger in
 `public`. The runtime role needs `USAGE` on `openlegal`, `SELECT` on
@@ -203,7 +216,8 @@ have bounded admission and retain their slots until actual filesystem completion
 even after caller cancellation or deadline. A blocked mount cannot create an
 unbounded detached-work backlog. Sixteen ordinary filesystem jobs and one reserved
 health probe may run concurrently. Up to sixteen concurrent health callers share
-the in-progress probe and its five-second watchdog; completed results are not
+the in-progress probe and its configured watchdog (five seconds by default);
+completed results are not
 cached for later calls. Cancelling or dropping one caller does not cancel the
 probe for others. Only a still-waiting, uncancelled caller may reopen health after
 checking shutdown, the failure generation and recovery drainage; an abandoned or

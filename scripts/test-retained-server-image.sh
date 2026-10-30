@@ -89,7 +89,15 @@ cp scripts/server-image-smoke.mjs "$scratch/fixture/"
 python3 - "$scratch/fixture" <<'PY'
 import json, pathlib, sys, tomllib
 root = pathlib.Path(sys.argv[1])
-c = tomllib.loads((root / 'config/server.toml').read_text())
+config_path = root / 'config/server.toml'
+raw = config_path.read_text()
+# Exercise an explicit corpus budget in the native image gates; the text-only
+# profile and committed deployment configuration retain their defaults.
+assert raw.count('[database]\n') == 1
+raw = raw.replace('[database]\n', '[database]\nblob_operation_timeout_secs = 30\n', 1)
+c = tomllib.loads(raw)
+assert c['database']['blob_operation_timeout_secs'] == 30
+config_path.write_text(raw)
 (root / 'client.json').write_text(json.dumps({'source': c['source']['url'], 'authority': c['http']['allowed_hosts'][0], 'retained': True}))
 PY
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \

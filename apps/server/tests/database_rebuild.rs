@@ -28,6 +28,7 @@ fn config(fixture: &postgres::TestDatabase, destination: &str) -> DatabaseConfig
     DatabaseConfig {
         max_raw_bytes: Default::default(),
         auto_collection: true,
+        blob_operation_timeout_secs: 5,
         blob_path: fixture.directory.path().join("corpus-blobs"),
         index_path: fixture.directory.path().join(destination),
         mecab_dictionary_path: std::env::var_os("OPENLEGAL_TEST_MECAB_DICTIONARY")

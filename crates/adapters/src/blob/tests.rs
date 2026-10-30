@@ -753,3 +753,225 @@ async fn newer_probe_does_not_block_completed_recovery_acknowledgement() {
     newer.await.unwrap();
     blobs.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn configured_timeout_bounds_are_checked_before_creating_a_root() {
+    let parent = root();
+    let path = parent.path().join("not-created");
+    for operation_timeout in [
+        Duration::ZERO,
+        Duration::from_secs(60) + Duration::from_nanos(1),
+        Duration::MAX,
+    ] {
+        assert!(matches!(
+            FsBlobStore::open_with_limit_and_timeout(&path, 1024, operation_timeout).await,
+            Err(Error::InvalidInput)
+        ));
+        assert!(!path.exists());
+    }
+    let blobs = FsBlobStore::open_with_limit_and_timeout(&path, 1024, Duration::from_secs(60))
+        .await
+        .unwrap();
+    blobs.health(token()).await.unwrap();
+    blobs.close().await.unwrap();
+}
+
+async fn configured_jobs_drain(blobs: &FsBlobStore) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let completed = blobs.shared.completed.notified();
+            tokio::pin!(completed);
+            completed.as_mut().enable();
+            if blobs.metrics().active_jobs == 0 {
+                return;
+            }
+            completed.await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn configured_health_budgets_are_independent_and_late_success_stays_unhealthy() {
+    let short_root = root();
+    let long_root = root();
+    let short = FsBlobStore::open_with_limit_and_timeout(
+        short_root.path(),
+        1024,
+        Duration::from_millis(250),
+    )
+    .await
+    .unwrap();
+    let long =
+        FsBlobStore::open_with_limit_and_timeout(long_root.path(), 1024, Duration::from_secs(2))
+            .await
+            .unwrap();
+    let (short_release, mut short_entered) = pause_health(&short);
+    let (long_release, mut long_entered) = pause_health(&long);
+    let short_probe = tokio::spawn(short.health(token()));
+    short_entered.recv().await.unwrap();
+    let long_probe = tokio::spawn(long.health(token()));
+    long_entered.recv().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), short_probe)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err(),
+        Error::StorageUnavailable
+    );
+    assert!(!long_probe.is_finished());
+    assert_eq!(short.metrics().active_jobs, 1);
+    assert_eq!(long.metrics().active_jobs, 1);
+    drop(short_release);
+    drop(long_release);
+    long_probe.await.unwrap().unwrap();
+    configured_jobs_drain(&short).await;
+    assert!(!short.shared.healthy.load(Ordering::Acquire));
+    assert_eq!(
+        short.job(token(), false, |_, _, _| Ok(())).await,
+        Err(Error::StorageUnavailable)
+    );
+    *short.shared.health_hook.lock().unwrap() = None;
+    short.health(token()).await.unwrap();
+    assert!(short.shared.healthy.load(Ordering::Acquire));
+    short.close().await.unwrap();
+    long.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_watchdog_survives_ordinary_waiter_cancellation_and_drop() {
+    for cancel in [true, false] {
+        let root = root();
+        let blobs =
+            FsBlobStore::open_with_limit_and_timeout(root.path(), 1024, Duration::from_millis(250))
+                .await
+                .unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = ReleaseOnDrop(gate.clone());
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let cancellation = token();
+        let waiter = tokio::spawn(blobs.job(cancellation.clone(), false, move |_, _, _| {
+            entered.send(()).unwrap();
+            let (lock, ready) = &*gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+            Ok(())
+        }));
+        entry.await.unwrap();
+        let failure = blobs.shared.completed.notified();
+        tokio::pin!(failure);
+        failure.as_mut().enable();
+        if cancel {
+            cancellation.cancel();
+            assert_eq!(waiter.await.unwrap(), Err(Error::Cancelled));
+        } else {
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+        }
+        tokio::time::timeout(Duration::from_secs(1), failure)
+            .await
+            .unwrap();
+        assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+        assert_eq!(blobs.metrics().active_jobs, 1);
+        assert_eq!(blobs.health(token()).await, Err(Error::Busy));
+        drop(release);
+        configured_jobs_drain(&blobs).await;
+        assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+        blobs.health(token()).await.unwrap();
+        blobs.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn configured_close_budget_does_not_release_a_blocked_jobs_admission() {
+    let root = root();
+    let blobs =
+        FsBlobStore::open_with_limit_and_timeout(root.path(), 1024, Duration::from_millis(250))
+            .await
+            .unwrap();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = ReleaseOnDrop(gate.clone());
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(blobs.job(token(), false, move |_, _, _| {
+        entered.send(()).unwrap();
+        let (lock, ready) = &*gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = ready.wait(released).unwrap();
+        }
+        Ok(())
+    }));
+    entry.await.unwrap();
+    let closing = blobs.close();
+    tokio::pin!(closing);
+    assert!(futures::poll!(closing.as_mut()).is_pending());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), closing)
+            .await
+            .unwrap(),
+        Err(Error::StorageUnavailable)
+    );
+    assert_eq!(blobs.metrics().active_jobs, 1);
+    assert_eq!(blobs.shared.slots.available_permits(), JOBS - 1);
+    assert_eq!(
+        blobs.job(token(), false, |_, _, _| Ok(())).await,
+        Err(Error::Shutdown)
+    );
+    drop(release);
+    assert_eq!(waiter.await.unwrap(), Err(Error::StorageUnavailable));
+    configured_jobs_drain(&blobs).await;
+    assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+    blobs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_health_watchdog_survives_every_waiter_leaving() {
+    for cancel in [true, false] {
+        let root = root();
+        let blobs =
+            FsBlobStore::open_with_limit_and_timeout(root.path(), 1024, Duration::from_millis(250))
+                .await
+                .unwrap();
+        failed(&blobs.shared, Error::StorageUnavailable);
+        let (release, mut entered) = pause_health(&blobs);
+        let cancellation = token();
+        let mut first = blobs.health(cancellation.clone());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        entered.recv().await.unwrap();
+        let mut outcome = blobs
+            .shared
+            .health_flight
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .outcome
+            .clone();
+        if cancel {
+            cancellation.cancel();
+            assert_eq!(first.await, Err(Error::Cancelled));
+        } else {
+            drop(first);
+        }
+        tokio::time::timeout(Duration::from_secs(1), outcome.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome.borrow().as_ref().unwrap().result,
+            Err(Error::StorageUnavailable)
+        );
+        assert_eq!(blobs.metrics().active_jobs, 1);
+        assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+        drop(release);
+        configured_jobs_drain(&blobs).await;
+        assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+        *blobs.shared.health_hook.lock().unwrap() = None;
+        blobs.health(token()).await.unwrap();
+        blobs.close().await.unwrap();
+    }
+}

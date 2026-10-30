@@ -52,6 +52,7 @@ struct HealthFlight {
 struct Shared {
     files: Filesystem,
     max_object_bytes: usize,
+    operation_timeout: Duration,
     slots: Arc<Semaphore>,
     probe_slots: Arc<Semaphore>,
     health_waiters: Semaphore,
@@ -91,14 +92,30 @@ impl FsBlobStore {
 
     /// A separate dedicated corpus root may hold larger evidence objects.
     pub async fn open_with_limit(path: &Path, max_object_bytes: usize) -> Result<Arc<Self>, Error> {
-        if !(1..=100 * 1024 * 1024).contains(&max_object_bytes) {
+        Self::open_with_limit_and_timeout(path, max_object_bytes, DEADLINE).await
+    }
+
+    /// Opens a dedicated root with a positive operation budget of at most 60 seconds.
+    ///
+    /// The budget covers startup, each owned blocking job (including health), and
+    /// close drainage. Expiry does not interrupt kernel I/O or release its admission
+    /// permit; late completion cannot restore health without a successful probe.
+    pub async fn open_with_limit_and_timeout(
+        path: &Path,
+        max_object_bytes: usize,
+        operation_timeout: Duration,
+    ) -> Result<Arc<Self>, Error> {
+        if !(1..=100 * 1024 * 1024).contains(&max_object_bytes)
+            || operation_timeout.is_zero()
+            || operation_timeout > Duration::from_secs(60)
+        {
             return Err(Error::InvalidInput);
         }
         let path = path.to_owned();
         let startup = STARTUPS.try_acquire().map_err(|_| Error::Busy)?;
         // Bootstrap is one owned job, independent of the application runtime locks.
         let files = tokio::time::timeout(
-            DEADLINE,
+            operation_timeout,
             tokio::task::spawn_blocking(move || {
                 let _startup = startup;
                 let files = Filesystem::open_with_limit(&path, max_object_bytes)?;
@@ -113,6 +130,7 @@ impl FsBlobStore {
             shared: Arc::new(Shared {
                 files,
                 max_object_bytes,
+                operation_timeout,
                 slots: Arc::new(Semaphore::new(JOBS)),
                 probe_slots: Arc::new(Semaphore::new(1)),
                 health_waiters: Semaphore::new(HEALTH_WAITERS),
@@ -195,7 +213,7 @@ impl FsBlobStore {
             // The deadline supervisor is owned independently of the requesting
             // future, so dropping a waiter cannot disable its health watchdog.
             tokio::spawn(async move {
-                let result = match tokio::time::timeout(DEADLINE, task).await {
+                let result = match tokio::time::timeout(shared.operation_timeout, task).await {
                     Ok(Ok(result)) => result,
                     Ok(Err(_)) | Err(_) => {
                         token.cancel();
@@ -418,7 +436,7 @@ impl BlobStore for FsBlobStore {
             Err(_) => return Box::pin(async { Err(Error::Internal) }),
         }
         Box::pin(async move {
-            tokio::time::timeout(DEADLINE, async {
+            tokio::time::timeout(shared.operation_timeout, async {
                 loop {
                     let notified = shared.completed.notified();
                     tokio::pin!(notified);

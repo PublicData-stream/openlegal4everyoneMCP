@@ -63,6 +63,7 @@ async fn setup() -> (
     let config = DatabaseConfig {
         max_raw_bytes: Default::default(),
         auto_collection: true,
+        blob_operation_timeout_secs: 5,
         blob_path: fixture.directory.path().join("inventory-blobs"),
         index_path: fixture.directory.path().join("inventory-index"),
         mecab_dictionary_path: std::env::var_os("OPENLEGAL_TEST_MECAB_DICTIONARY")

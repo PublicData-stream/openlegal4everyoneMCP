@@ -515,9 +515,12 @@ pub async fn rebuild_corpus_index(
     cancel: CancellationToken,
 ) -> Result<u64, ServerError> {
     config.validate()?;
-    let blobs =
-        FsBlobStore::open_with_limit(&std::path::absolute(&config.blob_path)?, 100 * 1024 * 1024)
-            .await?;
+    let blobs = FsBlobStore::open_with_limit_and_timeout(
+        &std::path::absolute(&config.blob_path)?,
+        100 * 1024 * 1024,
+        Duration::from_secs(config.blob_operation_timeout_secs),
+    )
+    .await?;
     let store = PgCorpusStore::new(persistent.pool(), blobs.clone());
     let result: Result<u64, ServerError> = async {
         store.health().await?;
@@ -1247,9 +1250,10 @@ impl CorpusRuntime {
         } else {
             None
         };
-        let blobs = FsBlobStore::open_with_limit(
+        let blobs = FsBlobStore::open_with_limit_and_timeout(
             &std::path::absolute(&config.blob_path)?,
             100 * 1024 * 1024,
+            Duration::from_secs(config.blob_operation_timeout_secs),
         )
         .await?;
         let store = Arc::new(PgCorpusStore::new(persistent.pool(), blobs.clone()));
@@ -2825,6 +2829,7 @@ mod manual_pilot_tests {
         let config = DatabaseConfig {
             max_raw_bytes: Default::default(),
             auto_collection: true,
+            blob_operation_timeout_secs: 5,
             blob_path: "blobs".into(),
             index_path: "index".into(),
             mecab_dictionary_path: "dictionary".into(),
