@@ -80,6 +80,7 @@ impl Upstream for UpstreamMock {
 struct StorageState {
     values: Mutex<HashMap<PersistentKey, Arc<StoredPayload>>>,
     epoch: AtomicU64,
+    epoch_reads: AtomicUsize,
     recovery_epoch: AtomicU64,
     mode: AtomicUsize,
     lookups: AtomicUsize,
@@ -279,6 +280,7 @@ impl PersistentStore for Storage {
         Box::pin(async { Ok(()) })
     }
     fn epoch(&self) -> u64 {
+        self.0.epoch_reads.fetch_add(1, Ordering::SeqCst);
         self.0.epoch.load(Ordering::SeqCst)
     }
     fn recovery_epoch(&self) -> u64 {
@@ -775,23 +777,45 @@ async fn recovered_storage_rejects_a_pre_outage_publication_generation() {
     f.service.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn fast_recovery_during_upstream_work_is_fenced_without_observing_nonready_status() {
+    fast_recovery_during_upstream_work(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitored_fast_recovery_cancels_and_drains_upstream_work_without_publication() {
+    fast_recovery_during_upstream_work(true).await;
+}
+
+async fn fast_recovery_during_upstream_work(monitor_observes_recovery: bool) {
     let f = fixture();
+    // build reads the initial epoch once. Wait for the supervisor's immediate
+    // first tick before changing it; paused time keeps later periodic ticks out
+    // of the unobserved-recovery scenario even on a descheduled CI worker.
+    while f.storage.epoch_reads.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+    let started = Instant::now();
     f.storage.mode.store(13, Ordering::SeqCst);
     let service = f.service.clone();
     let request = tokio::spawn(async move { get(&service).await });
     f.storage.upstream_started.notified().await;
-    // Recovery completed while this flight was fetching; no request or periodic
-    // monitor saw the intermediate outage. Ordinary retention has a separate epoch.
+    // Recovery completed while this flight was fetching. Ordinary retention has
+    // a separate epoch. Exercise the publication fence with and without the
+    // supervisor observing the recovery generation before upstream completes.
     f.storage.recovery_epoch.fetch_add(1, Ordering::SeqCst);
     f.storage.epoch.fetch_add(2, Ordering::SeqCst);
     f.storage.mode.store(0, Ordering::SeqCst);
+    let expected = if monitor_observes_recovery {
+        let mut state = f.service.state.lock().unwrap();
+        f.service.sync_epoch(&mut state);
+        RetrievalError::Cancelled
+    } else {
+        RetrievalError::StorageUnavailable
+    };
     f.storage.upstream_release.notify_one();
-    assert_eq!(
-        request.await.unwrap(),
-        Err(RetrievalError::StorageUnavailable)
-    );
+    assert_eq!(request.await.unwrap(), Err(expected));
+    assert_eq!(Instant::now(), started, "periodic time must stay paused");
     assert_eq!(f.storage.writes.load(Ordering::SeqCst), 0);
     assert_eq!(f.service.metrics().cache_entries, 0);
     assert!(f.service.storage_ready());

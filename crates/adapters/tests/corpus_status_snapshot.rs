@@ -180,11 +180,13 @@ async fn status_reads_sixteen_thousand_toasted_bodies_without_copying_record_pay
     let mut first = 1;
     while first <= MATCHED + UNRELATED_HISTORY {
         // Keep setup itself under the unchanged 2s statement limit, including
-        // the larger required and unrelated permanent-history payloads.
+        // the larger required and unrelated permanent-history payloads. Small
+        // batches leave room for TOAST compression on constrained CI CPUs without
+        // reducing the corpus size or changing the status-read deadline.
         let batch = if first <= LARGE_MATCHED || first > MATCHED {
-            16
+            4
         } else {
-            128
+            32
         };
         let last = (first + batch - 1).min(if first <= LARGE_MATCHED {
             LARGE_MATCHED
