@@ -337,6 +337,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0026_clone_body_complete.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            27,
+            "current inventory conflict".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0027_current_inventory_conflict.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator
@@ -359,7 +366,7 @@ fn database_error(error: sqlx::Error) -> Error {
         _ => Error::StorageUnavailable,
     }
 }
-async fn pool(
+pub(crate) async fn pool(
     url: &str,
     options: PostgresOptions,
     acquire_timeout: Duration,
@@ -442,7 +449,7 @@ async fn verify_version(pool: &PgPool) -> Result<(), Error> {
     }
     Ok(())
 }
-async fn verify_schema(pool: &PgPool) -> Result<(), Error> {
+pub(crate) async fn verify_schema(pool: &PgPool) -> Result<(), Error> {
     verify_version(pool).await?;
     let rows = sqlx::query(
         "SELECT version, checksum, success FROM public._sqlx_migrations ORDER BY version",

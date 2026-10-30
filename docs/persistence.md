@@ -465,6 +465,57 @@ reads report unknown. Upgrade all restartable collectors before applying recover
 old binaries do not recognize the hold. Follow the coordinated restore procedure
 for rollback rather than removing new schema or retained audit records.
 
+## Offline current inventory administration
+
+Migration 27 adds an explicit `corpus_object.current_inventory_conflict` hold,
+bounded active-cycle candidate checkpoints and immutable
+`current_inventory_audit` decisions. Existing captures and blob identities are
+unchanged. Held checkpoint proof survives audited release and pruning of obsolete
+unconflicted cycles. Apply the migration and ordinary runtime table grants before
+using the matching binary; a schema-26 executable cannot open schema 27. Rollback
+requires a compatible executable or coordinated recovery, not deletion of the
+migration/audit rows.
+
+The native offline command uses only the configured runtime PostgreSQL credential
+and verified connection policy. It rejects database/application-object ownership,
+administrative role attributes and reachable server-file/program privileges.
+It opens no blob store, provider, dictionary,
+widget, worker or listener:
+
+```sh
+openlegal-server --current-inventory-admin inspect OBJECT.json CONFIG.toml
+openlegal-server --current-inventory-admin apply MANIFEST.json CONFIG.toml
+openlegal-server --current-inventory-admin readback OPERATION_ID CONFIG.toml
+```
+
+`OBJECT.json` is a typed object identifier. An apply manifest has
+`schema_version: 1`, a canonical UUID `operation_id`, `object`, exact
+`expected_version`, required nullable `expected_head_capture`, `action`
+(`quarantine` or `release_hold`), bounded `actor`, `reason`, `evidence_ref` and
+the evidence's hexadecimal SHA-256 `evidence_sha256`. These operator assertions
+must refer to reviewed evidence; the CLI does not prove legal applicability from
+the reference or digest. Keep operator inputs private and exclude credentials
+and raw legal text.
+
+Apply requires the explicit global provider recovery hold, drained writers and
+zero other database sessions or provider owners. Merely reaching a request quota
+is insufficient. Quarantine fences HEAD jobs and preserves attempts, charged
+usage, captures, historical jobs and prior validation time. Release refuses a
+still-ambiguous active-cycle candidate set. It clears only the conflict flag,
+increments the object version and leaves HEAD pending with no desired revision.
+It neither chooses a revision nor makes the previous HEAD fresh or searchable as
+current. A subsequent unambiguous current observation must schedule normal work.
+Historical and exact-capture access remains subject to the existing rights and
+withdrawal rules.
+
+The immutable audit binds the full canonical manifest, before/after state and
+operation UUID. Reusing a UUID with another manifest is rejected. Preserve the
+manifest and transmission marker before apply; an uncertain acknowledgment
+requires `readback` of that UUID rather than another apply attempt. Provider owner
+cleanup and global resumption remain separate audited operations described above.
+Inspect output is bounded and reports truncation; a display limit is not evidence
+that an undisplayed candidate does not exist.
+
 ## Deployment boundaries and validation
 
 The supported operating shape is one service process, PostgreSQL 18 and one dedicated

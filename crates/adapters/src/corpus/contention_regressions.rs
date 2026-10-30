@@ -304,6 +304,7 @@ async fn inventory_partial_checkpoint_and_completed_cycle_each_commit_once_after
     assert_eq!(store.clone_cursor(view).await.unwrap(), (1, 0));
     let page = InventoryPage {
         source_evidence: None,
+        source_observation: None,
         items: ["first", "second"]
             .map(|id| InventoryItem {
                 object: object(id),

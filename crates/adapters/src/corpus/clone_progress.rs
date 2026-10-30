@@ -290,7 +290,10 @@ impl PgCorpusStore {
         let gaps: i64 = row.try_get("gaps").map_err(db)?;
         let jobs: i64 = row.try_get("jobs").map_err(db)?;
         let index_ready: bool = row.try_get("index_ready").map_err(db)?;
-        complete &= gaps == 0 && jobs == 0 && index_ready;
+        let current_inventory_conflicts: i64 =
+            row.try_get("current_inventory_conflicts").map_err(db)?;
+        let current_inventory_ready: bool = row.try_get("current_inventory_ready").map_err(db)?;
+        complete &= gaps == 0 && jobs == 0 && index_ready && current_inventory_ready;
         let supplement_rows: Vec<SupplementProgressRow> =
             serde_json::from_value(row.try_get("supplementary").map_err(db)?).map_err(corrupt)?;
         let supplementary = supplement_progress_value(supplement_rows, required_keys.len())?;
@@ -305,7 +308,7 @@ impl PgCorpusStore {
             })
             .count();
         Ok(
-            serde_json::json!({"initial_canonical_clone_complete":complete,"full_available_clone_complete":complete && unresolved_guides==0 && supplementary["complete"]==true,"atomic_upstream_snapshot":false,"open_gaps":gaps,"active_jobs":jobs,"index_ready":index_ready,"views":views,"supplementary":supplementary,"unresolved_guides":unresolved_guides,"guide_coverage":guide_coverage}),
+            serde_json::json!({"initial_canonical_clone_complete":complete,"full_available_clone_complete":complete && unresolved_guides==0 && supplementary["complete"]==true,"atomic_upstream_snapshot":false,"open_gaps":gaps,"current_inventory_conflicts":current_inventory_conflicts,"active_jobs":jobs,"index_ready":index_ready,"views":views,"supplementary":supplementary,"unresolved_guides":unresolved_guides,"guide_coverage":guide_coverage}),
         )
     }
 
@@ -441,6 +444,9 @@ WITH members AS MATERIALIZED (
 )
 SELECT v.views, s.supplementary,
     (SELECT count(*) FROM openlegal.provider_collection_gap WHERE resolved_at IS NULL) AS gaps,
+    (SELECT count(*) FROM openlegal.corpus_object WHERE current_inventory_conflict AND NOT withdrawn) AS current_inventory_conflicts,
+    NOT EXISTS(SELECT 1 FROM openlegal.corpus_object WHERE NOT withdrawn AND
+        (current_inventory_conflict OR (pending AND desired_head_revision IS NULL))) AS current_inventory_ready,
     (SELECT count(*) FROM openlegal.corpus_job WHERE status IN ('pending', 'running')) AS jobs,
     c.index_ack = c.next_event - 1 AS index_ready
 FROM openlegal.corpus_control c CROSS JOIN view_progress v CROSS JOIN supplement_progress s

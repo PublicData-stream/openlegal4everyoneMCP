@@ -279,6 +279,12 @@ clone claim even when inventory traversal has completed.
 
 These are application choices, not claimed upstream service guarantees:
 
+- Current-list classification is distinct from effective-date ordering. The
+  [current-inventory conflict guard](../database.md#conflicting-current-inventory)
+  preserves ambiguous checkpoint assertions rather than selecting a revision by
+  dates or result order. Metadata-only families retain bounded normalized
+  identity/checkpoint manifests with observation provenance; this does not grant
+  permission to retain their original XML or legal bodies.
 - HEAD freshness and disclosed stale serving follow the
   [legal corpus freshness contract](../database.md#content-and-metadata). An
   observed replacement immediately makes HEAD processing-pending, including when

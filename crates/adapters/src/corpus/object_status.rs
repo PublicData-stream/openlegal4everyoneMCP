@@ -23,6 +23,13 @@ impl PgCorpusStore {
         if !state.observed {
             return Ok(status);
         }
+        if !state.withdrawn && self.head_inventory_conflicted(object).await? {
+            status.state = ObjectCollectionState::CollectionIncomplete;
+            status.eta = ObjectCompletionEta::Unknown {
+                reason: "current_inventory_conflict".into(),
+            };
+            return Ok(status);
+        }
         let object_key = key(object)?;
         if let Some(head) = &state.head_capture {
             let event: Option<i64> = sqlx::query_scalar(

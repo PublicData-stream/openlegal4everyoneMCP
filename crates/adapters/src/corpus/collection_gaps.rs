@@ -136,15 +136,42 @@ impl PgCorpusStore {
         let object_key = key(&job.object)?;
         let dataset = dataset_name(job.object.dataset)?;
         let gap = detail_key(&object_key, &job.revision_id);
-        self.ensure_gap_capacity(&gap).await?;
         let id = uuid::Uuid::parse_str(&job.id).map_err(|_| DatabaseError::InvalidInput)?;
+        let expected_version = i64::try_from(job.expected_version).map_err(|_| DatabaseError::InvalidInput)?;
         let mut tx = begin_storage(&self.pool, "skip_claim").await?;
         let rows = sqlx::query("UPDATE openlegal.corpus_job SET status='failed',lease_until=NULL,error_category=$2,completed_at=$5::text::numeric WHERE id=$1 AND expected_version=$3 AND attempts=$4 AND status='running'")
-            .bind(id).bind(reason).bind(job.expected_version as i64).bind(job.attempts as i32)
+            .bind(id).bind(reason).bind(expected_version).bind(job.attempts as i32)
             .bind(now.to_string())
             .execute(&mut *tx).await.map_err(db)?.rows_affected();
         if rows != 1 {
+            // Automatic quarantine fences HEAD claims without cancelling their
+            // physical provider work. Its late classified result is already
+            // terminal, even if history has since reused the same job row.
+            // Read the canonical object without adding an inverse object lock
+            // after the job lock; never mutate a replacement claim or its gap.
+            if job.install_head
+                && let Some(object) = sqlx::query("SELECT identity,version,current_inventory_conflict FROM openlegal.corpus_object WHERE object_key=$1")
+                    .bind(&object_key).fetch_optional(&mut *tx).await.map_err(db)?
+            {
+                let identity: ObjectId = serde_json::from_value(object.try_get("identity").map_err(db)?)
+                    .map_err(|_| DatabaseError::StorageCorrupt)?;
+                if identity != job.object {
+                    return Err(DatabaseError::StorageCorrupt);
+                }
+                if object.try_get::<bool, _>("current_inventory_conflict").map_err(db)?
+                    && object.try_get::<i64, _>("version").map_err(db)? > expected_version
+                {
+                    return commit_storage(tx, "skip_claim").await;
+                }
+            }
             return Err(DatabaseError::Conflict);
+        }
+        // Use the transaction's connection only after an owned transition:
+        // obsolete held HEADs need neither gap capacity nor another pool slot.
+        let allowed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.provider_collection_gap WHERE gap_key=$1) OR (SELECT count(*) FROM openlegal.provider_collection_gap WHERE resolved_at IS NULL)<100000")
+            .bind(&gap).fetch_one(&mut *tx).await.map_err(db)?;
+        if !allowed {
+            return Err(DatabaseError::Capacity);
         }
         sqlx::query("INSERT INTO openlegal.provider_collection_gap(gap_key,dataset,scope,object_key,revision_id,reason,first_seen_at,last_seen_at,retry_at) VALUES($1,$2,'detail',$3,$4,$5,$6,$6,$7) ON CONFLICT(gap_key) DO UPDATE SET reason=EXCLUDED.reason,last_seen_at=EXCLUDED.last_seen_at,retry_at=EXCLUDED.retry_at,resolved_at=NULL")
             .bind(gap).bind(dataset).bind(object_key).bind(&job.revision_id).bind(reason).bind(now as i64).bind(now.saturating_add(3600) as i64)

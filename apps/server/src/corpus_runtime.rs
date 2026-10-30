@@ -420,6 +420,9 @@ fn select_explicit_object(
     page: InventoryPage,
     object: &ObjectId,
 ) -> Result<InventoryItem, DatabaseError> {
+    if page.conflicting_current_objects().contains(object) {
+        return Err(DatabaseError::SourceInventoryIncomplete);
+    }
     let absent = if page.incomplete {
         DatabaseError::SourceInventoryIncomplete
     } else {
@@ -801,7 +804,16 @@ impl CorpusRuntime {
                             Err(error) => return Err(error),
                         };
                         summary.observe_page(&page);
-                        for item in page.items.into_iter().take(20) {
+                        let conflicts = page.conflicting_current_objects();
+                        if !conflicts.is_empty() {
+                            summary.observe_provider_failure(DatabaseError::SourceDataInvalid);
+                        }
+                        for item in page
+                            .items
+                            .into_iter()
+                            .filter(|item| !conflicts.contains(&item.object))
+                            .take(20)
+                        {
                             match self
                                 .collect_explicit_item(
                                     provider,
@@ -838,6 +850,9 @@ impl CorpusRuntime {
         list_started_at: u64,
         cancel: CancellationToken,
     ) -> Result<CollectionItemOutcome, DatabaseError> {
+        if self.store.head_inventory_conflicted(&item.object).await? {
+            return Err(DatabaseError::SourceDataInvalid);
+        }
         let observed = self.store.state(&item.object).await?;
         let budget_wait = observed.pending
             && self
@@ -921,7 +936,8 @@ impl CorpusRuntime {
             };
             job
         } else {
-            self.store
+            let result = self
+                .store
                 .enqueue_job_for_collection_request(
                     item.object.clone(),
                     item.revision_id.clone(),
@@ -933,7 +949,15 @@ impl CorpusRuntime {
                     Some(observed.version),
                     launch,
                 )
-                .await?
+                .await;
+            match result {
+                Err(DatabaseError::SourceInventoryIncomplete)
+                    if self.store.head_inventory_conflicted(&item.object).await? =>
+                {
+                    return Err(DatabaseError::SourceDataInvalid);
+                }
+                result => result?,
+            }
         };
         if queued
             .source_metadata
@@ -1114,6 +1138,9 @@ impl CorpusRuntime {
                     if let Some(total) = result.total {
                         metadata.insert("total".into(), total.to_string());
                     }
+                    if !historical {
+                        metadata.extend(result.current_revision_metadata()?);
+                    }
                     let rights = if family.metadata_only {
                         openlegal_domain::rights::SourceRights::default()
                     } else {
@@ -1122,16 +1149,22 @@ impl CorpusRuntime {
                     if family.metadata_only {
                         metadata.insert("status".into(), "rights_unverified_metadata_only".into());
                     }
-                    self.store
+                    let observation = self
+                        .store
                         .retain_source_observation(
                             SourceObservationInput {
                                 source_key: format!(
-                                    "law_go_kr:{}:{}:{}:{}:{}",
+                                    "law_go_kr:{}:{}:{}:{}:{}{}",
                                     family.list_guide,
                                     dataset.as_str(),
                                     historical,
                                     class.unwrap_or(0),
-                                    page
+                                    page,
+                                    if historical {
+                                        ""
+                                    } else {
+                                        ":current_revisions_v1"
+                                    },
                                 ),
                                 raw: (!family.metadata_only).then_some(evidence.raw),
                                 media_type: "application/xml".into(),
@@ -1142,6 +1175,34 @@ impl CorpusRuntime {
                             cancel.clone(),
                         )
                         .await?;
+                    result.source_observation = Some(observation);
+                }
+
+                if !historical {
+                    // Register the complete page before its first HEAD job can
+                    // start. Durable candidates also catch conflicts discovered
+                    // on later pages or after a scheduler restart.
+                    let conflicts = self
+                        .store
+                        .observe_current_inventory(
+                            CloneView {
+                                dataset,
+                                historical: false,
+                                treaty_class: class,
+                            },
+                            page,
+                            &result,
+                            now(),
+                        )
+                        .await?;
+                    if !conflicts.is_empty() {
+                        result.incomplete = true;
+                        result.rejected_rows += result
+                            .items
+                            .iter()
+                            .filter(|item| conflicts.contains(&item.object))
+                            .count();
+                    }
                 }
 
                 if result.incomplete {
@@ -1642,6 +1703,12 @@ impl CorpusRuntime {
         while offset < result.items.len() {
             let scheduled = async {
                 let item = &result.items[offset];
+                if !view.historical && self.store.head_inventory_conflicted(&item.object).await? {
+                    // The page gap records the ambiguity. Keep all inventory
+                    // members for provenance while allowing unrelated work to
+                    // advance; no HEAD candidate is selected for this object.
+                    return Ok(true);
+                }
                 if view.historical {
                     self.store
                         .record_revision_catalog(
@@ -1892,6 +1959,9 @@ impl CorpusRuntime {
             if cancel.is_cancelled() {
                 return Err(DatabaseError::Cancelled);
             }
+            if head && self.store.head_inventory_conflicted(&item.object).await? {
+                continue;
+            }
             if self
                 .store
                 .detail_gap_active(&item.object, &item.revision_id)
@@ -2125,6 +2195,9 @@ impl CorpusRuntime {
         install_head: bool,
         cancel: CancellationToken,
     ) -> Result<(), DatabaseError> {
+        if install_head && self.store.head_inventory_conflicted(&item.object).await? {
+            return Ok(());
+        }
         let replacement = if install_head {
             let old = self
                 .store
@@ -2181,7 +2254,9 @@ impl CorpusRuntime {
         if let Some(v) = &item.amendment_type {
             metadata.insert("amendment_type".into(), v.clone());
         }
-        self.store
+        let object = item.object.clone();
+        let queued = self
+            .store
             .enqueue_job_with_metadata(
                 item.object,
                 item.revision_id,
@@ -2191,8 +2266,15 @@ impl CorpusRuntime {
                 now(),
                 metadata,
             )
-            .await?;
-        Ok(())
+            .await;
+        match queued {
+            Err(DatabaseError::SourceInventoryIncomplete)
+                if install_head && self.store.head_inventory_conflicted(&object).await? =>
+            {
+                Ok(())
+            }
+            result => result.map(|_| ()),
+        }
     }
     async fn process_jobs(
         &self,
@@ -2512,6 +2594,7 @@ mod explicit_collection_tests {
     fn page(items: Vec<InventoryItem>, incomplete: bool) -> InventoryPage {
         InventoryPage {
             source_evidence: None,
+            source_observation: None,
             items,
             total: Some(200),
             done: false,
@@ -2536,6 +2619,30 @@ mod explicit_collection_tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn explicit_object_selection_refuses_conflicting_current_revisions_in_either_order() {
+        let original = item();
+        let mut conflicting = original.clone();
+        conflicting.revision_id = "199:20250101".into();
+        conflicting.effective_date = Some("20250101".into());
+        for items in [
+            vec![original.clone(), conflicting.clone()],
+            vec![conflicting, original.clone()],
+        ] {
+            assert_eq!(
+                select_explicit_object(page(items, false), &original.object).unwrap_err(),
+                DatabaseError::SourceInventoryIncomplete,
+            );
+        }
+        assert!(
+            select_explicit_object(
+                page(vec![original.clone(), original.clone()], false),
+                &original.object,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2703,6 +2810,7 @@ mod manual_pilot_tests {
     ) -> InventoryPage {
         InventoryPage {
             source_evidence: None,
+            source_observation: None,
             items: cases
                 .iter()
                 .map(|(id, case_number)| InventoryItem {

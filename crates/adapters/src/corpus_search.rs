@@ -279,6 +279,7 @@ impl CorpusSearch {
         } else {
             request.filters.datasets.clone()
         };
+        let current_only = !request.include_history;
         let (result, _lease) = tokio::task::spawn_blocking(move || {
             let result = scan(
                 &index,
@@ -292,12 +293,29 @@ impl CorpusSearch {
         })
         .await
         .map_err(|_| E::Capacity)?;
-        let result = result?;
+        let mut result = result?;
         if cancel.is_cancelled() {
             return Err(E::Cancelled);
         }
         // A source withdrawal invalidates the entire snapshot before returning any page.
         self.store.check_session(&id, now()).await?;
+        if current_only {
+            // Existing index generations may still contain the last selected
+            // HEAD. A durable ambiguity hold also applies to those readers.
+            // Preserve the scan cursor rather than refilling beyond its budget;
+            // explicit historical/capture retrieval remains unchanged.
+            let mut visible = Vec::with_capacity(result.0.len());
+            for hit in result.0 {
+                if !self
+                    .store
+                    .current_inventory_search_blocked(&hit.object)
+                    .await?
+                {
+                    visible.push(hit);
+                }
+            }
+            result.0 = visible;
+        }
         for hit in &result.0 {
             self.store
                 .resolve(
@@ -355,12 +373,17 @@ impl CorpusSearch {
             None
         };
         let terminal = next_cursor.is_none();
+        // A cursor pins search evidence, not a claim that current inventory
+        // stayed unambiguous after the session was created.
+        let corpus_complete = session.corpus_complete
+            && collection_notices.is_empty()
+            && self.store.current_coverage_ready(now()).await?;
         let page = SearchPage {
             schema_version: 1,
             hits: result.0,
             next_cursor,
             generation: session.snapshot.generation,
-            corpus_complete: session.corpus_complete && collection_notices.is_empty(),
+            corpus_complete,
             scanned_bytes: result.2 as u64,
             analyzer_version: session.snapshot.analyzer_version.clone(),
             index_lag,

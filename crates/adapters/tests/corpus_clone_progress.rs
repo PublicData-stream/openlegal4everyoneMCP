@@ -46,6 +46,7 @@ fn item(id: &str, revision: &str) -> InventoryItem {
 fn page(items: Vec<InventoryItem>, total: Option<u64>, done: bool) -> InventoryPage {
     InventoryPage {
         source_evidence: None,
+        source_observation: None,
         items,
         done,
         total,
@@ -73,6 +74,46 @@ async fn all_empty_views_stable(store: &PgCorpusStore) {
         checkpoint(store, current, vec![]).await;
         checkpoint(store, current, vec![]).await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn released_inventory_hold_keeps_otherwise_complete_progress_incomplete() {
+    let fixture = support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let blobs = FsBlobStore::open(&fixture.directory.path().join("released-current-hold"))
+        .await
+        .unwrap();
+    let store = PgCorpusStore::new(base.pool(), blobs);
+    all_empty_views_stable(&store).await;
+    assert_eq!(
+        store.clone_progress().await.unwrap()["initial_canonical_clone_complete"],
+        true
+    );
+    let object = ObjectId {
+        jurisdiction: "kr".into(),
+        provider: "law_go_kr".into(),
+        dataset: Dataset::SchoolRule,
+        id: "990001".into(),
+    };
+    // Synthetic metadata only: this test never downloads or publishes a school body.
+    store
+        .record_revision_catalog(&object, "990100", None, None, 100)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openlegal.corpus_object SET current_inventory_conflict=true,pending=true,desired_head_revision=NULL WHERE identity=$1")
+        .bind(serde_json::to_value(&object).unwrap()).execute(&base.pool()).await.unwrap();
+    assert_eq!(
+        store.clone_progress().await.unwrap()["current_inventory_conflicts"],
+        1
+    );
+    sqlx::query("UPDATE openlegal.corpus_object SET current_inventory_conflict=false,version=version+1 WHERE identity=$1")
+        .bind(serde_json::to_value(&object).unwrap()).execute(&base.pool()).await.unwrap();
+    let progress = store.clone_progress().await.unwrap();
+    assert_eq!(progress["current_inventory_conflicts"], 0);
+    assert_eq!(progress["initial_canonical_clone_complete"], false);
+    assert!(!store.current_coverage_ready(100).await.unwrap());
+    base.close().await.unwrap();
 }
 async fn progress_view(store: &PgCorpusStore, view: CloneView) -> Value {
     let key = view.key().unwrap();

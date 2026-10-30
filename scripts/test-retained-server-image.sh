@@ -28,6 +28,7 @@ client=$run_id-client
 initializer=$run_id-initialize
 migration=$run_id-migrate
 maintenance=$run_id-maintain
+inventory=$run_id-inventory
 interrupted=$run_id-interrupted
 rebuild=$run_id-rebuild
 seed=$run_id-seed
@@ -41,9 +42,9 @@ cleanup() {
     if (( status != 0 )); then
         # Never inspect Config.Env, SQL input, or print raw database/driver logs.
         docker inspect --format '{{.Name}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} running={{.State.Running}}' \
-            "$server" "$migration" "$maintenance" "$interrupted" "$rebuild" "$seed" "$postgres" >&2 2>/dev/null || true
+            "$server" "$migration" "$maintenance" "$inventory" "$interrupted" "$rebuild" "$seed" "$postgres" >&2 2>/dev/null || true
     fi
-    docker rm -fv "$server" "$client" "$initializer" "$migration" "$maintenance" "$interrupted" "$rebuild" "$seed" "$postgres" >/dev/null 2>&1 || true
+    docker rm -fv "$server" "$client" "$initializer" "$migration" "$maintenance" "$inventory" "$interrupted" "$rebuild" "$seed" "$postgres" >/dev/null 2>&1 || true
     docker network rm "$network" >/dev/null 2>&1 || true
     docker volume rm "${volumes[@]}" >/dev/null 2>&1 || true
     docker image rm "$helper_image" >/dev/null 2>&1 || true
@@ -461,4 +462,112 @@ docker run --rm --name "$initializer" --platform "$native_platform" --network no
 # A known-good startup and the same capture/query assertions after all negative
 # injections prevent an unrelated persistent failure from earning a passing gate.
 acceptance_cycle recovered
+# All serving processes are stopped. Enter maintenance only in this disposable
+# database; no application receives the protected control table's privileges.
+[[ $(fixture_sql "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()") == 0 ]]
+[[ $(fixture_sql 'SELECT count(*) FROM openlegal.provider_request_admission') == 0 ]]
+[[ $(fixture_sql 'SELECT admission_owner IS NULL AND NOT unresolved_response FROM openlegal.provider_request_budget WHERE singleton') == t ]]
+[[ $(fixture_sql 'SELECT count(*) FROM openlegal.corpus_object') == 1 ]]
+[[ $(fixture_sql 'SELECT count(*) FROM openlegal.current_inventory_audit') == 0 ]]
+fixture_sql 'UPDATE openlegal_admin.provider_control SET recovery_hold=true WHERE singleton; UPDATE openlegal.provider_request_budget SET daily_used=7,pilot_used=3 WHERE singleton' >/dev/null
+# Hash complete capture rows privately so this check covers their retained body,
+# metadata and storage identities without exporting or logging those contents.
+inventory_snapshot_sql=$(cat <<'SQL'
+SELECT jsonb_build_object(
+ 'object',o.identity,'state',to_jsonb(o)-'identity'-'object_key',
+ 'budget',(SELECT to_jsonb(b) FROM openlegal.provider_request_budget b WHERE singleton),
+ 'control',(SELECT to_jsonb(c) FROM openlegal_admin.provider_control c WHERE singleton),
+ 'corpus_control',(SELECT to_jsonb(c) FROM openlegal.corpus_control c WHERE singleton),
+ 'captures',(SELECT md5(jsonb_agg(to_jsonb(c) ORDER BY c.id)::text) FROM openlegal.corpus_capture c),
+ 'capture_blobs',(SELECT md5(COALESCE(jsonb_agg(to_jsonb(b) ORDER BY b.capture_id,b.ordinal),'[]'::jsonb)::text) FROM openlegal.corpus_capture_blob b),
+ 'revisions',(SELECT md5(jsonb_agg(to_jsonb(r) ORDER BY r.object_key,r.revision_id)::text) FROM openlegal.corpus_revision r),
+ 'jobs',(SELECT md5(COALESCE(jsonb_agg(to_jsonb(j) ORDER BY j.id),'[]'::jsonb)::text) FROM openlegal.corpus_job j)
+) FROM openlegal.corpus_object o
+SQL
+)
+fixture_sql "$inventory_snapshot_sql" > "$scratch/inventory-before.json"
+chmod 600 "$scratch/inventory-before.json"
+python3 - "$scratch" <<'PY'
+import hashlib, json, pathlib, sys, uuid
+root = pathlib.Path(sys.argv[1])
+before = json.loads((root / 'inventory-before.json').read_text())
+expected = json.loads((root / 'fixture/expected.json').read_text())
+assert before['object'] == expected['object']
+assert before['state']['head_capture'] == expected['head_capture_id']
+assert before['state']['validated_at'] is not None
+assert before['state']['current_inventory_conflict'] is False
+assert before['control']['recovery_hold'] is True
+assert before['budget']['daily_used'] == 7 and before['budget']['pilot_used'] == 3
+manifest = dict(schema_version=1, operation_id=str(uuid.uuid4()), object=before['object'],
+    expected_version=before['state']['version'], expected_head_capture=before['state']['head_capture'],
+    action='quarantine', actor='retained image fixture', reason='synthetic offline quarantine acceptance',
+    evidence_ref='fixture:retained-image/inventory-before',
+    evidence_sha256=hashlib.sha256((root / 'inventory-before.json').read_bytes()).hexdigest())
+inputs = root / 'fixture/inventory'
+inputs.mkdir(mode=0o700)
+for name, value in [('object.json', before['object']), ('manifest.json', manifest)]:
+    path = inputs / name
+    path.write_text(json.dumps(value) + '\n')
+    path.chmod(0o600)
+(root / 'inventory-operation-id').write_text(manifest['operation_id'] + '\n')
+(root / 'inventory-operation-id').chmod(0o600)
+PY
+# Stream inputs with runtime-only read access; the command has no writable mount,
+# blob store, dictionary, backend certificate, worker or provider credential.
+tar -c -C "$scratch/fixture" inventory | \
+    docker run --rm -i --name "$initializer" --platform "$native_platform" --network none --user 0:0 \
+        "${fixture_rw[@]}" --entrypoint tar "$node_image" -x -C /fixture
+docker run --rm --name "$initializer" --platform "$native_platform" --network none --user 0:0 \
+    "${fixture_rw[@]}" --entrypoint sh "$node_image" -ec '
+    chown -R 10004:10004 /fixture/inventory
+    chmod 500 /fixture/inventory
+    chmod 400 /fixture/inventory/object.json /fixture/inventory/manifest.json
+    '
+inventory_inputs=(--mount "type=volume,source=$fixture,target=/run/openlegal-current-inventory,volume-subpath=inventory,readonly")
+run_inventory_admin() {
+    local action=$1 input=$2 output=$3
+    if ! docker run --rm --name "$inventory" --platform "$platform" --network "$network" \
+        "${hardening[@]}" --memory 512m --cpus 1 "${config[@]}" "${ca[@]}" "${inventory_inputs[@]}" \
+        --env-file "$scratch/runtime.env" "$image" --current-inventory-admin "$action" "$input" \
+        /etc/openlegal/server.toml > "$output" 2> "$scratch/inventory.log"; then
+        # An ambiguous apply is never retried. Keep receipts and diagnostics private.
+        report_failure_category 'Current inventory administration' "$scratch/inventory.log"; exit 1
+    fi
+    chmod 600 "$output" "$scratch/inventory.log"
+}
+run_inventory_admin inspect /run/openlegal-current-inventory/object.json "$scratch/inventory-inspect-before.json"
+run_inventory_admin apply /run/openlegal-current-inventory/manifest.json "$scratch/inventory-apply.json"
+read -r inventory_operation_id < "$scratch/inventory-operation-id"
+run_inventory_admin readback "$inventory_operation_id" "$scratch/inventory-readback.json"
+run_inventory_admin inspect /run/openlegal-current-inventory/object.json "$scratch/inventory-inspect-after.json"
+fixture_sql "$inventory_snapshot_sql" > "$scratch/inventory-after.json"
+chmod 600 "$scratch/inventory-after.json"
+[[ $(fixture_sql 'SELECT count(*) FROM openlegal.current_inventory_audit') == 1 ]]
+python3 - "$scratch" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+def load(name):
+    return json.loads((root / f'inventory-{name}.json').read_text())
+before, after = load('before'), load('after')
+receipt, readback = load('apply'), load('readback')
+manifest = json.loads((root / 'fixture/inventory/manifest.json').read_text())
+assert receipt == readback
+assert receipt['operation_id'] == manifest['operation_id']
+assert receipt['schema_version'] == 1 and receipt['action'] == 'quarantine'
+assert receipt['object'] == before['object']
+expected_state = dict(before['state'], version=before['state']['version'] + 1,
+    current_inventory_conflict=True, pending=True, desired_head_revision=None)
+assert after == dict(before, state=expected_state)
+state_keys = ('version', 'head_capture', 'validated_at', 'pending', 'withdrawn',
+    'current_inventory_conflict', 'desired_head_revision')
+for phase, snapshot in [('before', before), ('after', after)]:
+    inspection = load(f'inspect-{phase}')
+    assert inspection['schema_version'] == 1 and inspection['object'] == before['object']
+    assert inspection['recovery_hold'] is True
+    assert inspection['candidates'] == [] and inspection['candidates_truncated'] is False
+    assert inspection['active_inventory_ambiguous'] is False
+    assert inspection['state'] == {key: snapshot['state'][key] for key in state_keys}
+    assert receipt[phase] == inspection['state']
+PY
+printf 'Native current inventory inspect/apply/readback passed for %s (runtime role, verified TLS).\n' "$platform"
 printf 'Retained image acceptance passed for %s (fictional data, Docker only).\n' "$platform"

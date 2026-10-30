@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 mod collection_scheduler_retry;
+mod current_inventory_admin;
 mod provider_admin;
 use collection_scheduler_retry::{create_and_mark_launch, dispatch_storage_result, retry_storage};
 
@@ -28,6 +29,9 @@ fn main() -> Result<(), ServerError> {
     )?;
     if first == "--provider-admin" {
         return provider_admin::run(args.collect());
+    }
+    if first == "--current-inventory-admin" {
+        return current_inventory_admin::run(args.collect());
     }
     if first == "--text-diff-worker" {
         if args.next().is_some() {

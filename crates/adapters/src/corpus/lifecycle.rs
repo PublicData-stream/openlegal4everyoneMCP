@@ -144,7 +144,7 @@ impl PgCorpusStore {
         self.gate().await?;
         let k = key(object)?;
         let version = i64::try_from(observed_version).map_err(|_| DatabaseError::InvalidInput)?;
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE j.object_key=$1 AND j.revision_id=$2 AND j.effective_date=$3 AND j.install_head AND j.status='running' AND j.error_category='budget_wait' AND j.expected_version=$4 AND o.version=$4 AND o.pending AND NOT o.withdrawn AND o.desired_head_revision=$2 AND j.explicit_request_id IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit' AND j.attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton))")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE j.object_key=$1 AND j.revision_id=$2 AND j.effective_date=$3 AND j.install_head AND j.status='running' AND j.error_category='budget_wait' AND j.expected_version=$4 AND o.version=$4 AND o.pending AND NOT o.withdrawn AND NOT o.current_inventory_conflict AND o.desired_head_revision=$2 AND j.explicit_request_id IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit' AND j.attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton))")
             .bind(k).bind(revision_id).bind(effective_date.unwrap_or(""))
             .bind(version).fetch_one(&self.pool).await.map_err(db)
     }
@@ -195,7 +195,7 @@ impl PgCorpusStore {
             .fetch_one(&mut *tx)
             .await
             .map_err(db)?;
-        let current: Option<i64> = sqlx::query_scalar("SELECT version FROM openlegal.corpus_object WHERE object_key=$1 AND pending AND NOT withdrawn AND desired_head_revision=$2 FOR UPDATE")
+        let current: Option<i64> = sqlx::query_scalar("SELECT version FROM openlegal.corpus_object WHERE object_key=$1 AND pending AND NOT withdrawn AND NOT current_inventory_conflict AND desired_head_revision=$2 FOR UPDATE")
             .bind(&k).bind(&revision_id).fetch_optional(&mut *tx).await.map_err(db)?;
         if current != Some(version) {
             return Ok(None);
@@ -292,7 +292,7 @@ impl PgCorpusStore {
             }
         }
         sqlx::query("INSERT INTO openlegal.corpus_object(object_key,identity) VALUES($1,$2) ON CONFLICT DO NOTHING").bind(&k).bind(serde_json::to_value(&object).map_err(corrupt)?).execute(&mut *tx).await.map_err(db)?;
-        let row=sqlx::query("SELECT identity,version,withdrawn,desired_head_revision,pending FROM openlegal.corpus_object WHERE object_key=$1 FOR UPDATE").bind(&k).fetch_one(&mut *tx).await.map_err(db)?;
+        let row=sqlx::query("SELECT identity,version,withdrawn,desired_head_revision,pending,current_inventory_conflict FROM openlegal.corpus_object WHERE object_key=$1 FOR UPDATE").bind(&k).fetch_one(&mut *tx).await.map_err(db)?;
         if serde_json::from_value::<ObjectId>(row.try_get("identity").map_err(db)?)
             .map_err(corrupt)?
             != object
@@ -301,6 +301,9 @@ impl PgCorpusStore {
         }
         if row.try_get::<bool, _>("withdrawn").map_err(db)? {
             return Err(DatabaseError::Withdrawn);
+        }
+        if install_head && row.try_get::<bool, _>("current_inventory_conflict").map_err(db)? {
+            return Err(DatabaseError::SourceInventoryIncomplete);
         }
         if observed_version.is_some_and(|expected| {
             row.try_get::<i64, _>("version")
@@ -491,7 +494,7 @@ impl PgCorpusStore {
                     .map(str::to_owned)
             })
             .transpose()?;
-        let row=sqlx::query("SELECT j.id,j.revision_id,j.expected_version,j.attempts,j.effective_date,j.install_head,j.source_metadata,o.identity,o.version AS object_version,j.object_key FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE NOT o.withdrawn AND (NOT j.install_head OR j.revision_id=o.desired_head_revision) AND (($2::uuid IS NULL AND j.explicit_request_id IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit') OR (j.id=$2 AND j.source_metadata->>'collection_origin'='explicit')) AND ($3::text IS NULL OR o.identity->>'dataset'=$3) AND (($4::uuid IS NULL AND j.explicit_request_id IS NULL) OR (j.explicit_request_id=$4 AND EXISTS(SELECT 1 FROM openlegal.collection_request owner WHERE owner.id=$4 AND owner.status IN ('launching','running') AND owner.lease_until>$1::bigint))) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>$1::text::numeric) AND j.attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) AND (j.status='pending' OR (j.status='running' AND j.lease_until<=$1::text::numeric)) ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED").bind(now.to_string()).bind(explicit_id).bind(dataset_name).bind(explicit_owner).fetch_optional(&mut *tx).await.map_err(db)?;
+        let row=sqlx::query("SELECT j.id,j.revision_id,j.expected_version,j.attempts,j.effective_date,j.install_head,j.source_metadata,o.identity,o.version AS object_version,j.object_key FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE NOT o.withdrawn AND (NOT j.install_head OR (NOT o.current_inventory_conflict AND j.revision_id=o.desired_head_revision)) AND (($2::uuid IS NULL AND j.explicit_request_id IS NULL AND COALESCE(j.source_metadata->>'collection_origin','')<>'explicit') OR (j.id=$2 AND j.source_metadata->>'collection_origin'='explicit')) AND ($3::text IS NULL OR o.identity->>'dataset'=$3) AND (($4::uuid IS NULL AND j.explicit_request_id IS NULL) OR (j.explicit_request_id=$4 AND EXISTS(SELECT 1 FROM openlegal.collection_request owner WHERE owner.id=$4 AND owner.status IN ('launching','running') AND owner.lease_until>$1::bigint))) AND NOT EXISTS(SELECT 1 FROM openlegal.corpus_job active WHERE active.object_key=j.object_key AND active.id<>j.id AND active.status='running' AND active.lease_until>$1::text::numeric) AND j.attempts<(SELECT max_job_attempts FROM openlegal.provider_request_budget WHERE singleton) AND (j.status='pending' OR (j.status='running' AND j.lease_until<=$1::text::numeric)) ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED").bind(now.to_string()).bind(explicit_id).bind(dataset_name).bind(explicit_owner).fetch_optional(&mut *tx).await.map_err(db)?;
         let Some(row) = row else {
             commit_storage(tx, "claim_job_inner").await?;
             return Ok(None);
@@ -635,7 +638,7 @@ impl PgCorpusStore {
     /// catalog-only objects and superseded jobs do not define current coverage.
     pub async fn current_coverage_ready(&self, now: u64) -> Result<bool, DatabaseError> {
         self.gate().await?;
-        sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM openlegal.corpus_object o LEFT JOIN openlegal.corpus_capture c ON c.id=o.head_capture WHERE o.identity->>'jurisdiction'='kr' AND o.identity->>'provider'='law_go_kr' AND NOT o.withdrawn AND o.desired_head_revision IS NOT NULL AND (o.head_capture IS NULL OR o.pending OR c.revision_id IS DISTINCT FROM o.desired_head_revision OR COALESCE(c.payload->'record'->'metadata'->>'attachment_status','complete') = 'incomplete' OR o.validated_at IS NULL OR o.validated_at>$1::text::numeric OR o.validated_at<=$1::text::numeric-86400 OR EXISTS(SELECT 1 FROM openlegal.corpus_job j WHERE j.object_key=o.object_key AND j.install_head AND j.revision_id=o.desired_head_revision AND j.status IN ('pending','running','failed'))))").bind(now.to_string()).fetch_one(&self.pool).await.map_err(db)
+        sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM openlegal.corpus_object o LEFT JOIN openlegal.corpus_capture c ON c.id=o.head_capture WHERE o.identity->>'jurisdiction'='kr' AND o.identity->>'provider'='law_go_kr' AND NOT o.withdrawn AND (o.current_inventory_conflict OR ((o.desired_head_revision IS NOT NULL OR o.pending) AND (o.head_capture IS NULL OR o.pending OR c.revision_id IS DISTINCT FROM o.desired_head_revision OR COALESCE(c.payload->'record'->'metadata'->>'attachment_status','complete') = 'incomplete' OR o.validated_at IS NULL OR o.validated_at>$1::text::numeric OR o.validated_at<=$1::text::numeric-86400 OR EXISTS(SELECT 1 FROM openlegal.corpus_job j WHERE j.object_key=o.object_key AND j.install_head AND j.revision_id=o.desired_head_revision AND j.status IN ('pending','running','failed'))))))").bind(now.to_string()).fetch_one(&self.pool).await.map_err(db)
     }
     pub async fn mark_dataset_inventory_complete(
         &self,
@@ -803,7 +806,7 @@ impl PgCorpusStore {
     ) -> Result<(), DatabaseError> {
         self.gate().await?;
         let k = key(object)?;
-        let count=sqlx::query("UPDATE openlegal.corpus_object SET validated_at=$4::text::numeric,pending=false,version=version+1 WHERE object_key=$1 AND head_capture=$2 AND version=$3 AND NOT withdrawn AND validated_at<=$4::text::numeric").bind(k).bind(capture_id).bind(i64::try_from(expected_version).map_err(|_|DatabaseError::InvalidInput)?).bind(now.to_string()).execute(&self.pool).await.map_err(db)?.rows_affected();
+        let count=sqlx::query("UPDATE openlegal.corpus_object SET validated_at=$4::text::numeric,pending=false,version=version+1 WHERE object_key=$1 AND head_capture=$2 AND version=$3 AND NOT withdrawn AND NOT current_inventory_conflict AND validated_at<=$4::text::numeric").bind(k).bind(capture_id).bind(i64::try_from(expected_version).map_err(|_|DatabaseError::InvalidInput)?).bind(now.to_string()).execute(&self.pool).await.map_err(db)?.rows_affected();
         if count == 0 {
             return Err(DatabaseError::Conflict);
         }
@@ -822,7 +825,7 @@ impl PgCorpusStore {
             .fetch_one(&mut *tx)
             .await
             .map_err(db)?;
-        let changed=sqlx::query("UPDATE openlegal.corpus_object SET withdrawn=true,pending=false,version=version+1 WHERE object_key=$1 AND version=$2 RETURNING version").bind(&k).bind(i64::try_from(expected_version).map_err(|_|DatabaseError::InvalidInput)?).fetch_optional(&mut *tx).await.map_err(db)?.ok_or(DatabaseError::Conflict)?;
+        let changed=sqlx::query("UPDATE openlegal.corpus_object SET withdrawn=true,pending=current_inventory_conflict,version=version+1 WHERE object_key=$1 AND version=$2 RETURNING version").bind(&k).bind(i64::try_from(expected_version).map_err(|_|DatabaseError::InvalidInput)?).fetch_optional(&mut *tx).await.map_err(db)?.ok_or(DatabaseError::Conflict)?;
         let version: i64 = changed.try_get("version").map_err(db)?;
         sqlx::query("INSERT INTO openlegal.corpus_outbox SELECT next_event,$1,$2,NULL,true,true,false FROM openlegal.corpus_control").bind(&k).bind(version).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.corpus_control SET next_event=next_event+1")

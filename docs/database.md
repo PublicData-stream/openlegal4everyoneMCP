@@ -429,6 +429,34 @@ metadata under content-derived IDs, without becoming legal captures or public
 citations. Corrections preserve earlier responses; unchanged responses only update
 validation timing. Temporary-stage cleanup never removes their referenced blobs.
 
+### Conflicting current inventory
+
+A current-list traversal must not choose a HEAD by row order, revision-number
+order or legal-date order. Before scheduling any current page, the collector
+registers its complete normalized identity/checkpoint manifest. Different
+`(revision_id, effective_date)` checkpoints for one typed object in the same
+active view cycle place that object in a durable current-inventory hold. This
+also covers a later page or a scheduler restart. Only observations registered
+after the upgrade participate; old clone-membership rows alone are not evidence
+of a newly observed conflict.
+
+The hold makes HEAD collection-incomplete, fences pending/running HEAD jobs and
+blocks HEAD enqueue, publication and successful revalidation. It leaves prior
+captures, revision selectors, permitted source evidence and validation timestamps
+intact. Unrelated objects and historical collection continue. The affected page
+has a visible `source_data_invalid` gap; `database.object_status` reports an unknown
+ETA with reason `current_inventory_conflict`, and corpus progress includes
+`current_inventory_conflicts`. Held objects cannot establish complete coverage.
+
+Offset traversal is not an atomic upstream snapshot. Two checkpoints within a
+long cycle may reflect an upstream change rather than an erroneous provider row;
+the hold records uncertainty, not a legal applicability finding. It never clears
+automatically from one later page, a new cycle or an explicit search. Release
+requires the separate [offline inventory administration](persistence.md#offline-current-inventory-administration)
+procedure; release itself selects no revision and does not freshen the old HEAD.
+Explicit collection also refuses conflicting checkpoints for its selected object
+or skips them in a bounded search instead of choosing the first match.
+
 ## Offline index rebuild
 
 For Kubernetes, follow the [administrative Job sequence](deployment-kubernetes.md#administrative-jobs)

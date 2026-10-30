@@ -76,12 +76,115 @@ pub struct ProviderDetail {
 #[derive(Clone, Debug)]
 pub struct InventoryPage {
     pub source_evidence: Option<InventoryEvidence>,
+    /// Exact retained list observation, attached only after durable storage.
+    pub source_observation: Option<crate::corpus::SourceObservation>,
     pub items: Vec<InventoryItem>,
     pub done: bool,
     pub total: Option<u64>,
     pub rejected_rows: usize,
     pub incomplete: bool,
 }
+
+// Fixed lexical field order makes these compact rows canonical without relying
+// on serde_json map feature flags. Descriptive/provider-supplied text is excluded.
+#[derive(Serialize)]
+struct CurrentRevisionRow<'a> {
+    effective_date: Option<&'a str>,
+    object: CurrentRevisionObject<'a>,
+    publication_date: Option<&'a str>,
+    revision_id: &'a str,
+}
+#[derive(Serialize)]
+struct CurrentRevisionObject<'a> {
+    dataset: &'a str,
+    id: &'a str,
+    jurisdiction: &'a str,
+    provider: &'a str,
+}
+impl InventoryPage {
+    /// Bounded identity evidence for a retained current-list observation. Every
+    /// listed row, including duplicates, retains its original ordinal. Callers
+    /// choose whether the observed view is current; this does not classify history.
+    pub fn current_revision_metadata(&self) -> Result<BTreeMap<String, String>, DatabaseError> {
+        if self.items.len() > 100 {
+            return Err(DatabaseError::InvalidInput);
+        }
+        let mut metadata =
+            BTreeMap::from([("current_revision_rows".into(), self.items.len().to_string())]);
+        for (index, item) in self.items.iter().enumerate() {
+            if item.object.jurisdiction != "kr" || item.object.provider != "law_go_kr" {
+                return Err(DatabaseError::InvalidInput);
+            }
+            // Only fields retained in this manifest define its admission. Large
+            // excluded descriptions keep the detail path's existing per-item policy.
+            item.object.validate()?;
+            revision_parts(item)?;
+            if item
+                .effective_date
+                .as_deref()
+                .is_some_and(|date| !valid_date(date))
+                || item
+                    .publication_date
+                    .as_deref()
+                    .is_some_and(|date| !valid_date(date))
+            {
+                return Err(DatabaseError::InvalidInput);
+            }
+            let row = CurrentRevisionRow {
+                effective_date: item.effective_date.as_deref(),
+                object: CurrentRevisionObject {
+                    dataset: item.object.dataset.as_str(),
+                    id: &item.object.id,
+                    jurisdiction: &item.object.jurisdiction,
+                    provider: &item.object.provider,
+                },
+                publication_date: item.publication_date.as_deref(),
+                revision_id: &item.revision_id,
+            };
+            let value = serde_json::to_string(&row).map_err(|_| DatabaseError::InvalidInput)?;
+            if value.len() > 4096 {
+                return Err(DatabaseError::InvalidInput);
+            }
+            metadata.insert(format!("current_revision_{index:03}"), value);
+        }
+        // Leave room for the observation's separate dataset/page/rights context
+        // under its 64 KiB metadata limit, including JSON string escaping.
+        if serde_json::to_vec(&metadata)
+            .map_err(|_| DatabaseError::InvalidInput)?
+            .len()
+            > 60 * 1024
+        {
+            return Err(DatabaseError::InvalidInput);
+        }
+        Ok(metadata)
+    }
+
+    /// Stable first-appearance order of objects with more than one distinct
+    /// (provider revision, effective date) checkpoint in this page. No row is
+    /// selected as newer/current, and publication dates never break a tie.
+    pub fn conflicting_current_objects(&self) -> Vec<ObjectId> {
+        let mut positions = std::collections::HashMap::<&ObjectId, usize>::new();
+        let mut groups: Vec<(&InventoryItem, bool)> = Vec::new();
+        for item in &self.items {
+            if let Some(index) = positions.get(&item.object).copied() {
+                let (first, conflicting) = &mut groups[index];
+                *conflicting |= first.revision_id != item.revision_id
+                    || first.effective_date != item.effective_date;
+            } else {
+                positions.insert(&item.object, groups.len());
+                groups.push((item, false));
+            }
+        }
+        groups
+            .into_iter()
+            .filter(|(_, conflicting)| *conflicting)
+            .map(|(item, _)| item.object.clone())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod current_inventory_tests;
 
 #[derive(Clone)]
 pub struct InventoryEvidence {
@@ -1766,6 +1869,7 @@ fn parse_inventory_tree(
     }
     Ok(InventoryPage {
         source_evidence: None,
+        source_observation: None,
         items,
         done: total.is_some_and(|total| (page as u64) * 100 >= total),
         total,

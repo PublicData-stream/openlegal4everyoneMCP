@@ -9,7 +9,10 @@ use openlegal_application::{
     blob::{BlobLocation, BlobMetrics, BlobPage, BlobPutResult},
     persistence::PersistentStore,
 };
-use openlegal_domain::{RetrievalError, legal::LegalRecord};
+use openlegal_domain::{
+    RetrievalError,
+    legal::{LegalRecord, ObjectCollectionState, ObjectCompletionEta},
+};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
@@ -114,6 +117,7 @@ fn item(id: &str) -> InventoryItem {
 fn page() -> InventoryPage {
     InventoryPage {
         source_evidence: None,
+        source_observation: None,
         items: ["first", "second", "third"].map(item).to_vec(),
         done: false,
         total: Some(6),
@@ -280,6 +284,65 @@ async fn typed_index_limits_settle_both_claim_origins_without_publication_or_htt
         runtime.store.clone_progress().await.unwrap()["full_available_clone_complete"],
         false
     );
+    runtime.close().await.unwrap();
+    persistent.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh and the pinned Korean dictionary"]
+async fn held_current_object_yields_inventory_capacity_and_preserves_history_admission() {
+    let (fixture, persistent, runtime) = setup().await;
+    let result = page();
+    let original_budget = budget(&fixture).await;
+    runtime.store.clone_cursor(view()).await.unwrap();
+    queue(&runtime, &result.items[0]).await;
+    fixture_sql(&fixture, "UPDATE openlegal.corpus_object SET current_inventory_conflict=true,pending=true,desired_head_revision=NULL,version=version+1 WHERE identity->>'id'='first'; UPDATE openlegal.corpus_job SET status='failed',error_category='source_data_invalid',lease_until=NULL WHERE object_key IN (SELECT object_key FROM openlegal.corpus_object WHERE identity->>'id'='first');").await;
+    let held = runtime.store.state(&result.items[0].object).await.unwrap();
+    runtime
+        .refresh(result.items[0].clone(), true, CancellationToken::new())
+        .await
+        .unwrap();
+    runtime
+        .schedule_inventory_page(view(), 1, &result, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(checkpoint(&fixture).await, json!([2, 0, 1, 0]));
+    assert_eq!(fixture_json(&fixture, "SELECT jsonb_agg(o.identity->>'id' ORDER BY o.identity->>'id') FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE j.status='pending' AND j.install_head;").await, json!(["second", "third"]));
+    let status = runtime
+        .store
+        .object_status(&result.items[0].object, now())
+        .await
+        .unwrap();
+    assert_eq!(status.state, ObjectCollectionState::CollectionIncomplete);
+    assert!(
+        matches!(status.eta, ObjectCompletionEta::Unknown { reason } if reason == "current_inventory_conflict")
+    );
+    runtime
+        .refresh(result.items[0].clone(), false, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .store
+            .state(&result.items[0].object)
+            .await
+            .unwrap()
+            .version,
+        held.version
+    );
+    assert!(
+        runtime
+            .store
+            .head_inventory_conflicted(&result.items[0].object)
+            .await
+            .unwrap()
+    );
+    assert_eq!(fixture_json(&fixture, "SELECT to_jsonb(install_head) FROM openlegal.corpus_job j JOIN openlegal.corpus_object o USING(object_key) WHERE o.identity->>'id'='first';").await, json!(false));
+    assert_eq!(
+        runtime.store.clone_progress().await.unwrap()["current_inventory_conflicts"],
+        1
+    );
+    assert_eq!(budget(&fixture).await, original_budget);
     runtime.close().await.unwrap();
     persistent.close().await.unwrap();
 }
@@ -559,7 +622,14 @@ impl BlobStore for PauseOneRead {
 }
 
 async fn publish_corrected(store: &PgCorpusStore, body: &str) -> Capture {
-    let candidate = item("head-race");
+    publish_corrected_item(store, body, item("head-race")).await
+}
+
+async fn publish_corrected_item(
+    store: &PgCorpusStore,
+    body: &str,
+    candidate: InventoryItem,
+) -> Capture {
     let version = store.state(&candidate.object).await.unwrap().version;
     let at = now();
     store
@@ -572,8 +642,8 @@ async fn publish_corrected(store: &PgCorpusStore, body: &str) -> Capture {
                     body: body.into(),
                     sections: vec![],
                     metadata: Default::default(),
-                    publication_date: None,
-                    effective_date: None,
+                    publication_date: candidate.publication_date,
+                    effective_date: candidate.effective_date,
                     source_url: "https://example.test/fictional-inventory".into(),
                     representation: "fictional_text".into(),
                 },
@@ -590,6 +660,98 @@ async fn publish_corrected(store: &PgCorpusStore, body: &str) -> Capture {
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh and the pinned Korean dictionary"]
+async fn current_search_hides_a_held_indexed_head_but_history_keeps_its_capture() {
+    use openlegal_application::search::SearchMode;
+    use openlegal_domain::legal_search::SearchRequest;
+    let (fixture, persistent, runtime) = setup().await;
+    let mut candidate = item("990001");
+    candidate.object.provider = "law_go_kr".into();
+    candidate.revision_id = "990100:20260101".into();
+    candidate.effective_date = Some("20260101".into());
+    let capture =
+        publish_corrected_item(&runtime.store, "Fictional retained text", candidate).await;
+    runtime
+        .index_events(&CancellationToken::new(), &mut PendingIndexAck(None))
+        .await
+        .unwrap();
+    let query = |history: bool| {
+        serde_json::from_value::<SearchRequest>(json!({
+                "query":"Fictional", "literal":true, "sections":["title"], "include_history":history,"limit":1,
+        }))
+        .unwrap()
+    };
+    let search = |history| {
+        runtime.search.search(
+            SearchMode::Query,
+            query(history),
+            std::time::Instant::now() + Duration::from_secs(10),
+            CancellationToken::new(),
+        )
+    };
+    runtime.inventory_verified.store(true, Ordering::Release);
+    let first = search(false).await.unwrap();
+    assert!(!first.hits.is_empty());
+    assert!(first.corpus_complete);
+    let mut continuation = query(false);
+    continuation.cursor = Some(
+        first
+            .next_cursor
+            .expect("bounded first page has a continuation"),
+    );
+    fixture_sql(&fixture, "UPDATE openlegal.corpus_object SET current_inventory_conflict=true,pending=true,desired_head_revision=NULL,version=version+1 WHERE identity->>'id'='990001';").await;
+    let next = runtime
+        .search
+        .search(
+            SearchMode::Query,
+            continuation,
+            std::time::Instant::now() + Duration::from_secs(10),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !next.corpus_complete,
+        "a held object invalidates a previously complete current session"
+    );
+    assert!(search(false).await.unwrap().hits.is_empty());
+    let historical = search(true).await.unwrap();
+    assert!(
+        historical
+            .hits
+            .iter()
+            .any(|hit| hit.capture_id == capture.capture_id)
+    );
+    // Release does not validate the retained HEAD or make an old index entry
+    // current. Only a subsequent unambiguous observation may schedule it again.
+    fixture_sql(&fixture, "UPDATE openlegal.corpus_object SET current_inventory_conflict=false,version=version+1 WHERE identity->>'id'='990001';").await;
+    assert!(search(false).await.unwrap().hits.is_empty());
+    assert!(
+        search(true)
+            .await
+            .unwrap()
+            .hits
+            .iter()
+            .any(|hit| hit.capture_id == capture.capture_id)
+    );
+    let retained = runtime
+        .store
+        .resolve(
+            capture.record.object.clone(),
+            RevisionSelector::Capture {
+                id: capture.capture_id.clone(),
+            },
+            now(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retained.raw_sha256, capture.raw_sha256);
+    runtime.close().await.unwrap();
+    persistent.close().await.unwrap();
 }
 
 #[tokio::test]

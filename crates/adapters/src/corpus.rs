@@ -24,6 +24,8 @@ mod contention_regressions;
 mod citation;
 mod clone_progress;
 pub use clone_progress::CloneView;
+mod current_inventory;
+pub mod current_inventory_admin;
 mod supplement_jobs;
 pub use supplement_jobs::{SupplementJob, SupplementJobStatus};
 mod source_observations;
@@ -881,7 +883,7 @@ impl PgCorpusStore {
         .await
         .map_err(db)?;
         sqlx::query("INSERT INTO openlegal.corpus_object(object_key,identity) VALUES($1,$2) ON CONFLICT DO NOTHING").bind(&k).bind(&prepared_identity).execute(&mut *tx).await.map_err(db)?;
-        let object=sqlx::query("SELECT identity,version,next_capture,withdrawn,head_capture,validated_at::text FROM openlegal.corpus_object WHERE object_key=$1 FOR UPDATE").bind(&k).fetch_one(&mut *tx).await.map_err(db)?;
+        let object=sqlx::query("SELECT identity,version,next_capture,withdrawn,head_capture,validated_at::text,current_inventory_conflict FROM openlegal.corpus_object WHERE object_key=$1 FOR UPDATE").bind(&k).fetch_one(&mut *tx).await.map_err(db)?;
         if serde_json::from_value::<ObjectId>(object.try_get("identity").map_err(db)?)
             .map_err(corrupt)?
             != p.record.object
@@ -890,6 +892,11 @@ impl PgCorpusStore {
         }
         if object.try_get::<bool, _>("withdrawn").map_err(db)? {
             return Err(DatabaseError::Withdrawn);
+        }
+        // A retained historical capture remains readable, but an ambiguous
+        // current inventory never authorizes HEAD publication or revalidation.
+        if p.install_head && object.try_get::<bool, _>("current_inventory_conflict").map_err(db)? {
+            return Err(DatabaseError::Conflict);
         }
         // Stamp the publication transaction after durable blob staging and lock
         // admission. Returned captures are visible only after this transaction commits.
