@@ -8,12 +8,20 @@ use tracing::{Subscriber, instrument::WithSubscriber};
 struct Rejections {
     attempts: tokio::sync::watch::Sender<usize>,
     span_id: Arc<AtomicU64>,
+    count_unlabelled: bool,
 }
 impl Rejections {
     fn new() -> Self {
         Self {
             attempts: tokio::sync::watch::channel(0).0,
             span_id: Arc::new(AtomicU64::new(1)),
+            count_unlabelled: false,
+        }
+    }
+    fn heartbeat() -> Self {
+        Self {
+            count_unlabelled: true,
+            ..Self::new()
         }
     }
     fn count(&self) -> usize {
@@ -62,16 +70,34 @@ impl Subscriber for Rejections {
                     self.lock_rejected = true;
                 }
             }
-            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "sqlstate" && format!("{value:?}") == "55P03" {
+                    self.lock_rejected = true;
+                }
+            }
         }
         let mut fields = Fields::default();
         event.record(&mut fields);
         if fields.lock_rejected
-            && let Some(attempt) = fields.attempt
+            && let Some(attempt) = fields
+                .attempt
+                .or_else(|| self.count_unlabelled.then(|| self.count() + 1))
         {
             self.attempts.send_replace(attempt);
         }
     }
+}
+
+#[test]
+fn heartbeat_rejection_capture_requires_the_actual_lock_sqlstate() {
+    let rejections = Rejections::heartbeat();
+    tracing::subscriber::with_default(rejections.clone(), || {
+        tracing::warn!(sqlstate = %"57014", "different rejection");
+        tracing::warn!(error_kind = "pool_timeout", "no server rejection");
+        assert_eq!(rejections.count(), 0);
+        tracing::warn!(sqlstate = %"55P03", "heartbeat lock rejection");
+        assert_eq!(rejections.count(), 1);
+    });
 }
 
 async fn retry_pool(pool: &PgPool) -> PgPool {
@@ -123,6 +149,205 @@ async fn usage(pool: &PgPool) -> (i64, i64) {
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+/// A composed SQL/lifecycle fault fixture, not a production scheduler or HTTP
+/// end-to-end test. The admission helpers below reserve real charged owners
+/// without constructing an HTTP client. Server lifecycle tests separately cover
+/// the production supervisor; this fixture compares JoinSet drop with drainage.
+async fn heartbeat_failure_during_settlement(drain: bool) {
+    let fixture = crate::test_support::TestDatabase::new().await;
+    let base = fixture.open(100).await;
+    let pool = base.pool();
+    unrestricted(&pool).await;
+    let admissions = retry_pool(&pool).await;
+    let mut response = start(&admissions).await;
+    let mut sibling = start(&admissions).await;
+    let owner = response.owner();
+    let slot = response.slot;
+    let before: (i64, i64, i64) = sqlx::query_as(
+        "SELECT daily_used,on_demand_used,pilot_used FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before, (2, 0, 0));
+    let settings: (String, String, String) = sqlx::query_as(
+        "SELECT current_setting('lock_timeout'),current_setting('statement_timeout'),current_setting('transaction_timeout')",
+    )
+    .fetch_one(response.connection.as_mut().unwrap())
+    .await
+    .unwrap();
+    assert_eq!(settings, ("1s".into(), "2s".into(), "5s".into()));
+
+    // Both rows are locked before either subject starts. Only this existing
+    // barrier session has its transaction/idle deadlines disabled; subjects keep
+    // the actual one/two/five-second SQL limits.
+    let mut blocker = block_budget(&pool).await;
+    sqlx::query("SELECT singleton FROM openlegal.corpus_control WHERE singleton FOR UPDATE")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let blobs = crate::blob::FsBlobStore::open(&fixture.directory.path().join("heartbeat-drain"))
+        .await
+        .unwrap();
+    let heartbeat_store = crate::corpus::PgCorpusStore::new(pool.clone(), blobs);
+    let heartbeat_rejections = Rejections::heartbeat();
+    let heartbeat_seen = heartbeat_rejections.clone();
+    let settlement_rejections = Rejections::new();
+    let settlement_seen = settlement_rejections.clone();
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        start_rx.await.unwrap();
+        let completing = response.complete().with_subscriber(settlement_seen.clone());
+        tokio::pin!(completing);
+        // Confirm a real rejected budget lock and acknowledged ROLLBACK AND
+        // CHAIN before holding the future. Keeping it unpolled at this explicit
+        // barrier prevents settlement retry exhaustion racing the fatal model.
+        tokio::select! {
+            biased;
+            _ = settlement_seen.wait(1) => {},
+            result = &mut completing => panic!("blocked settlement completed: {result:?}"),
+        }
+        blocked_tx.send(()).unwrap();
+        resume_rx.await.unwrap();
+        assert!(worker_cancel.is_cancelled());
+        completing.await
+    });
+    let heartbeat = tokio::spawn(
+        async move {
+            let mut start_tx = Some(start_tx);
+            let mut blocked_rx = Some(blocked_rx);
+            // Model only the existing four-attempt fatal policy. Each operation is
+            // the real heartbeat API and must report an actual server 55P03, rather
+            // than a pool timeout or a synthetic error. No main-module dependency.
+            for attempt in 0..4 {
+                assert_eq!(
+                    heartbeat_store.heartbeat_collection_scheduler().await,
+                    Err(DatabaseError::StorageContended)
+                );
+                assert_eq!(heartbeat_seen.count(), attempt + 1);
+                if attempt == 2 {
+                    start_tx.take().unwrap().send(()).unwrap();
+                    tokio::time::timeout(Duration::from_secs(10), blocked_rx.take().unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                if let Some(delay) = [100, 200, 400].get(attempt) {
+                    tokio::time::sleep(Duration::from_millis(*delay)).await;
+                }
+            }
+            DatabaseError::StorageContended
+        }
+        .with_subscriber(heartbeat_rejections),
+    );
+    let fatal = tokio::time::timeout(Duration::from_secs(15), heartbeat)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fatal, DatabaseError::StorageContended);
+    assert_eq!(settlement_rejections.count(), 1);
+    assert!(!tasks.is_empty());
+    let still_owned: bool = sqlx::query_scalar("SELECT NOT pg_try_advisory_xact_lock($1,$2)")
+        .bind(PROVIDER_LOCK.0)
+        .bind(PROVIDER_LOCK.1 + slot)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        still_owned,
+        "response must still own its session at fatality"
+    );
+    cancel.cancel();
+    if drain {
+        // Cancellation alone must not discard this post-response settlement.
+        assert!(tasks.try_join_next().is_none());
+        blocker.rollback().await.unwrap();
+        resume_tx.send(()).unwrap();
+        let settled = tokio::time::timeout(Duration::from_secs(5), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled, Ok(()));
+        assert!(tasks.join_next().await.is_none());
+    } else {
+        // Dropping the old owner's JoinSet aborts its held future and closes the
+        // detached session. Do not resume/retry it or erase its uncertain row.
+        drop(tasks);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let unlocked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1,$2)")
+                    .bind(PROVIDER_LOCK.0)
+                    .bind(PROVIDER_LOCK.1 + slot)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                if unlocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted response connection must actually release its lock");
+        drop(resume_tx);
+        blocker.rollback().await.unwrap();
+    }
+    let after: (i64, i64, i64) = sqlx::query_as(
+        "SELECT daily_used,on_demand_used,pilot_used FROM openlegal.provider_request_budget WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after, before,
+        "neither path may refund or replay an attempt"
+    );
+    let mut owners: Vec<Uuid> =
+        sqlx::query_scalar("SELECT owner FROM openlegal.provider_request_admission ORDER BY owner")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let mut expected = vec![sibling.owner()];
+    if !drain {
+        expected.push(owner);
+    }
+    expected.sort();
+    assert_eq!(owners, expected);
+    let sibling_owned: bool = sqlx::query_scalar("SELECT NOT pg_try_advisory_xact_lock($1,$2)")
+        .bind(PROVIDER_LOCK.0)
+        .bind(PROVIDER_LOCK.1 + sibling.slot)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(sibling_owned);
+    sibling.complete().await.unwrap();
+    owners = sqlx::query_scalar("SELECT owner FROM openlegal.provider_request_admission")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owners, if drain { vec![] } else { vec![owner] });
+    admissions.close().await;
+    base.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn heartbeat_fatal_model_dropping_settlement_leaves_charged_abandoned_owner() {
+    heartbeat_failure_during_settlement(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn heartbeat_fatal_model_draining_settlement_preserves_charges_and_other_owner() {
+    heartbeat_failure_during_settlement(true).await;
 }
 
 #[tokio::test]

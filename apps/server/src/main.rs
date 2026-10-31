@@ -7,9 +7,11 @@ use openlegal_server::{
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
+mod collection_scheduler_lifecycle;
 mod collection_scheduler_retry;
 mod current_inventory_admin;
 mod provider_admin;
+use collection_scheduler_lifecycle::run_and_drain;
 use collection_scheduler_retry::{create_and_mark_launch, dispatch_storage_result, retry_storage};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,16 +220,12 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
             Command::CollectionScheduler => {
                 let background = runtime.clone();
                 let collector = cancel.child_token();
-                tokio::select! {
-                    result = run_collection_scheduler(runtime.store.clone(), ingestion, collector.clone()) => {
-                        collector.cancel();
-                        result
-                    },
-                    result = background.run(collector.clone()) => {
-                        collector.cancel();
-                        result
-                    },
-                }
+                run_and_drain(
+                    run_collection_scheduler(runtime.store.clone(), ingestion, collector.clone()),
+                    background.run(collector.clone()),
+                    collector,
+                )
+                .await
             }
             Command::CollectionJob(id, epoch) => {
                 let id = id.clone();
