@@ -1,10 +1,75 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     sync::{Condvar, Mutex},
 };
+
+#[derive(Clone, Default)]
+struct FailureEvents(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+impl tracing::Subscriber for FailureEvents {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "openlegal_adapters::blob"
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_owned(), value.to_owned());
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+        }
+        let mut fields = Fields(BTreeMap::new());
+        event.record(&mut fields);
+        self.0.lock().unwrap().push(fields.0);
+    }
+}
+
+impl FailureEvents {
+    fn assert_failure(&self, probe: bool, category: &str) {
+        let events = self.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            event.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "elapsed_ms",
+                "error_category",
+                "message",
+                "operation",
+                "operation_timeout_ms",
+                "probe"
+            ]
+        );
+        assert_eq!(
+            event["operation"],
+            if probe { "blob_health" } else { "blob_job" }
+        );
+        assert_eq!(event["error_category"], category);
+        assert_eq!(event["probe"], probe.to_string());
+        assert_eq!(event["operation_timeout_ms"], "5000");
+        assert!(event["elapsed_ms"].parse::<u64>().unwrap() <= 999_999_999_999);
+        assert!(!format!("{event:?}").contains("private panic sentinel"));
+    }
+}
 
 // Independent test runtimes share the production startup semaphore. Bound only
 // fixture construction so a high-core test runner does not exhaust its 16 slots;
@@ -850,6 +915,66 @@ async fn configured_jobs_drain(blobs: &FsBlobStore) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn owned_job_deadline_reports_static_metadata_and_keeps_physical_ownership() {
+    for probe in [false, true] {
+        let root = root();
+        let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
+        let events = FailureEvents::default();
+        let _subscriber = tracing::subscriber::set_default(events.clone());
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = ReleaseOnDrop(released.clone());
+        let (entered, mut entry) = tokio::sync::mpsc::unbounded_channel();
+        let pending = tokio::spawn(blobs.job(token(), probe, move |_, _, _| {
+            entered.send(()).unwrap();
+            let (lock, ready) = &*released;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+            Ok(())
+        }));
+        entry.recv().await.unwrap();
+        let clock = FrozenClock::new().await;
+        tokio::time::advance(DEADLINE + Duration::from_millis(1)).await;
+        settle(|| pending.is_finished()).await;
+        assert_eq!(pending.await.unwrap(), Err(Error::StorageUnavailable));
+        events.assert_failure(probe, "local_deadline");
+        assert_eq!(blobs.metrics().active_jobs, 1);
+        assert_eq!(blobs.metrics().failures, 1);
+        assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+        drop(clock);
+        drop(release);
+        configured_jobs_drain(&blobs).await;
+        assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+        assert_eq!(blobs.metrics().failures, 1);
+        blobs.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn owned_worker_join_failure_reports_static_metadata_and_preserves_error() {
+    for probe in [false, true] {
+        let root = root();
+        let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
+        let events = FailureEvents::default();
+        let _subscriber = tracing::subscriber::set_default(events.clone());
+        assert_eq!(
+            blobs
+                .job(token(), probe, |_, _, _| -> Result<(), Error> {
+                    panic!("private panic sentinel");
+                })
+                .await,
+            Err(Error::StorageUnavailable)
+        );
+        events.assert_failure(probe, "worker_join");
+        assert_eq!(blobs.metrics().active_jobs, 0);
+        assert_eq!(blobs.metrics().failures, 1);
+        assert!(!blobs.shared.healthy.load(Ordering::Acquire));
+        blobs.close().await.unwrap();
+    }
 }
 
 #[tokio::test]

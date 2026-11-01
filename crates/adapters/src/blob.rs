@@ -213,11 +213,33 @@ impl FsBlobStore {
             // The deadline supervisor is owned independently of the requesting
             // future, so dropping a waiter cannot disable its health watchdog.
             tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
                 let result = match tokio::time::timeout(shared.operation_timeout, task).await {
                     Ok(Ok(result)) => result,
-                    Ok(Err(_)) | Err(_) => {
+                    Ok(Err(_)) => {
                         token.cancel();
                         failed(&shared, Error::StorageUnavailable);
+                        tracing::warn!(
+                            operation = if probe { "blob_health" } else { "blob_job" },
+                            error_category = "worker_join",
+                            elapsed_ms = started.elapsed().as_millis().min(999_999_999_999) as u64,
+                            operation_timeout_ms = shared.operation_timeout.as_millis() as u64,
+                            probe,
+                            "blob owned job failed"
+                        );
+                        Err(Error::StorageUnavailable)
+                    }
+                    Err(_) => {
+                        token.cancel();
+                        failed(&shared, Error::StorageUnavailable);
+                        tracing::warn!(
+                            operation = if probe { "blob_health" } else { "blob_job" },
+                            error_category = "local_deadline",
+                            elapsed_ms = started.elapsed().as_millis().min(999_999_999_999) as u64,
+                            operation_timeout_ms = shared.operation_timeout.as_millis() as u64,
+                            probe,
+                            "blob owned job failed"
+                        );
                         Err(Error::StorageUnavailable)
                     }
                 };

@@ -1402,6 +1402,15 @@ acceptance claims.
 
 ### Collector quarantine and recovery completion
 
+Storage health diagnostics distinguish `operation=corpus_health` failures with
+`health_phase=sql` or `blob`. The blob watchdog distinguishes `local_deadline`
+from `worker_join` for `blob_health` and ordinary `blob_job` operations, with
+elapsed time, the configured allowance and the probe flag. Check the running
+source revision: earlier builds lack these dependency and watchdog fields. These
+are bounded classifications, not raw errors or measured fsync durations. The
+[November 1 review](reviews-storage-health-2026-11-01.md) describes their scope;
+the diagnostics preserve existing errors, limits and durability.
+
 Quarantine collection when a collector fails: stop the scheduler, suspend unfinished
 request Jobs and verify termination of request/detail Pods, external initiators and
 late callbacks. Preserve uncertain owners and charged usage. A protected

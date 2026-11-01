@@ -345,16 +345,65 @@ impl PgCorpusStore {
         if !self.healthy() {
             return Err(DatabaseError::StorageCorrupt);
         }
+        let sql_started = tokio::time::Instant::now();
         retry_storage(&CancellationToken::new(), "corpus_health", || async {
             sqlx::query("SELECT singleton FROM openlegal.corpus_control")
                 .fetch_one(&self.pool)
                 .await
                 .map_err(db)
         })
-        .await?;
+        .await
+        .inspect_err(|error| {
+            let error = match error {
+                DatabaseError::StorageContended => "StorageContended",
+                DatabaseError::StorageUnavailable => "StorageUnavailable",
+                DatabaseError::Cancelled => "Cancelled",
+                _ => "Other",
+            };
+            tracing::warn!(
+                operation = "corpus_health",
+                health_phase = "sql",
+                elapsed_ms = sql_started.elapsed().as_millis().min(999_999_999_999) as u64,
+                error,
+                "corpus health dependency failed"
+            );
+        })?;
+        let blob_started = tokio::time::Instant::now();
         self.blobs
             .health(CancellationToken::new())
             .await
+            .inspect_err(|error| {
+                // Omit even the optional numeric throttle payload: only a
+                // closed variant name crosses the diagnostic boundary.
+                use openlegal_domain::RetrievalError as E;
+                let error = match error {
+                    E::StorageUnavailable => "StorageUnavailable",
+                    E::StorageCorrupt => "StorageCorrupt",
+                    E::StorageCapacity => "StorageCapacity",
+                    E::SnapshotUnavailable => "SnapshotUnavailable",
+                    E::InvalidInput => "InvalidInput",
+                    E::UnknownSource => "UnknownSource",
+                    E::NotFound => "NotFound",
+                    E::Ambiguous => "Ambiguous",
+                    E::Busy => "Busy",
+                    E::Unavailable => "Unavailable",
+                    E::FreshnessUnavailable => "FreshnessUnavailable",
+                    E::NormalizationFailed => "NormalizationFailed",
+                    E::InvalidPayload => "InvalidPayload",
+                    E::ResourceLimit => "ResourceLimit",
+                    E::Cancelled => "Cancelled",
+                    E::Shutdown => "Shutdown",
+                    E::Internal => "Internal",
+                    E::Throttled { .. } => "Throttled",
+                };
+                tracing::warn!(
+                    operation = "corpus_health",
+                    health_phase = "blob",
+                    elapsed_ms = blob_started.elapsed().as_millis().min(999_999_999_999) as u64,
+                    error,
+                    "corpus health dependency failed"
+                );
+            })
             .map_err(blob_error)?;
         Ok(())
     }
@@ -1206,6 +1255,105 @@ mod contention_tests {
     use openlegal_application::{blob::*, persistence::PersistentStore};
     use openlegal_domain::{RetrievalError, rights::SourceRights};
     use std::sync::atomic::AtomicUsize;
+
+    #[derive(Clone, Default)]
+    struct HealthFailures(Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>);
+    impl tracing::Subscriber for HealthFailures {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "openlegal_adapters::corpus"
+                && metadata.fields().field("health_phase").is_some()
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(std::collections::BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().to_owned(), value.to_owned());
+                }
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    self.0.insert(field.name().to_owned(), value.to_string());
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.insert(field.name().to_owned(), format!("{value:?}"));
+                }
+            }
+            let mut fields = Fields(std::collections::BTreeMap::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn health_failure_telemetry_distinguishes_sql_and_blob_without_changing_errors() {
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let base = fixture.open(100).await;
+        let blobs =
+            crate::blob::FsBlobStore::open(&fixture.directory.path().join("health-telemetry"))
+                .await
+                .unwrap();
+        let store = PgCorpusStore::new(base.pool(), blobs.clone());
+        let failures = HealthFailures::default();
+        let _subscriber = tracing::subscriber::set_default(failures.clone());
+        store.health().await.unwrap();
+        assert!(failures.0.lock().unwrap().is_empty());
+        blobs.close().await.unwrap();
+        assert_eq!(store.health().await, Err(DatabaseError::StorageUnavailable));
+        let mut lock = base.pool().begin().await.unwrap();
+        // Only this fixture's blocker needs to outlive the four rejected
+        // health reads. Restart PG18's transaction timer before lengthening it;
+        // rollback restores the pool's unchanged production defaults.
+        sqlx::query("SET LOCAL transaction_timeout = '0'")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        sqlx::query("SET LOCAL transaction_timeout = '20s'")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '20s'")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        sqlx::query("LOCK TABLE openlegal.corpus_control IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        assert_eq!(store.health().await, Err(DatabaseError::StorageContended));
+        lock.rollback().await.unwrap();
+        let events = failures.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for (event, (phase, error)) in events
+            .iter()
+            .zip([("blob", "Shutdown"), ("sql", "StorageContended")])
+        {
+            assert_eq!(
+                event.keys().map(String::as_str).collect::<Vec<_>>(),
+                [
+                    "elapsed_ms",
+                    "error",
+                    "health_phase",
+                    "message",
+                    "operation"
+                ]
+            );
+            assert_eq!(event["operation"], "corpus_health");
+            assert_eq!(event["health_phase"], phase);
+            assert_eq!(event["error"], error);
+            assert!(event["elapsed_ms"].parse::<u64>().unwrap() <= 999_999_999_999);
+        }
+        assert!(store.healthy());
+    }
 
     struct FixedClock;
     impl openlegal_application::Clock for FixedClock {
