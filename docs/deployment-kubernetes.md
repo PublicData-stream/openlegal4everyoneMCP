@@ -1173,6 +1173,7 @@ The [command dispatcher](../apps/server/src/main.rs) implements these modes;
 | `openlegal-server --migrate CONFIG.toml` | Parses the full configuration and uses only the migration database credential. Does not open blobs, dictionary, widgets, workers or listeners. Required source/HTTP/WebTransport/health sections must still parse; referenced serving files need not be mounted. |
 | `openlegal-server --maintain CONFIG.toml` | Uses the runtime credential and cache blob store for bounded cache pruning, then exits without serving or upstream fetching. This is not a general corpus-maintenance command; follow the offline procedure in the persistence contract. |
 | `openlegal-server --rebuild-corpus-index CONFIG.toml` | Uses runtime storage, retained corpus evidence, the provisioned dictionary and a fresh index destination under the corpus lease. No provider credential or listeners are needed. Follow the corpus contract's stop/rebuild/restart procedure and rollback constraints. |
+| `openlegal-server --current-inventory-admin inspect OBJECT.json CONFIG.toml` / `apply MANIFEST.json CONFIG.toml` / `readback OPERATION_ID CONFIG.toml` | Offline, runtime-credential-only inspection and audited quarantine/release of current-inventory ambiguity. Apply requires global provider hold and zero other writers/sessions; release selects no HEAD. Follow [inventory administration](persistence.md#offline-current-inventory-administration). |
 | `openlegal-server --text-diff-worker` | Internal pipe-based comparison worker; takes no further arguments and bypasses configuration and listener startup. This is distinct from the document-worker image. |
 
 The [configuration implementation](../apps/server/src/config.rs) makes listener
@@ -1398,6 +1399,63 @@ new schema; rollback requires the coordinated database/retained-storage recovery
 procedure rather than deleting the new migration or audit rows. Code, disposable
 fixture verification, production deployment and actual recovery are separate
 acceptance claims.
+
+### Collector quarantine and recovery completion
+
+Quarantine collection when a collector fails: stop the scheduler, suspend unfinished
+request Jobs and verify termination of request/detail Pods, external initiators and
+late callbacks. Preserve uncertain owners and charged usage. A protected
+`provider_diagnostic()` result distinguishes active slots from abandoned slots;
+two abandoned slots after shutdown are uncertainty for audited recovery, not two
+live collectors and not permission to delete their ledger entries.
+
+The pure [collection guard](../scripts/collection_guard.py) exposes
+`assess(observation, now)` for an operator observer. It performs no network calls,
+scaling, cleanup, resumption or rollback. The site adapter supplies the reviewed
+operation ID/revision/baseline and fresh, correlated collector, storage and serving
+evidence; see the module contract and the
+[synthetic adapter fixture](../scripts/tests/test_collection_guard.py).
+Every observed migration row must be represented; failed rows use `None`, never a
+successful checksum. Expected identities come from the reviewed baseline rather
+than being copied from the new observations.
+
+Preserve serving only after the guard returns `preserve_serving`: collectors are
+quarantined, no live provider owner remains, schema/checksums, storage identity,
+complete compatible index/analyzer/watermark and retained capture match, and private
+health plus both public transports pass for the selected hosts/revisions. Evidence
+expires after 120 seconds. Missing/stale evidence, active ownership or integrity
+failure returns `stop_serving`; explicit maintenance returns `maintenance`.
+Keep exact reason codes such as `provider_owner_still_active`,
+`index_integrity_unverified` and `public_transport_failed_or_missing` in the private
+operation report. `provider_uncertainty_preserved` and
+`provider_recovery_hold_preserved` remain visible even when lookup can continue.
+Private success with public failure still requires the separate edge diagnosis;
+it does not establish public recovery.
+
+Maintain a private completion journal with operation/previous/target identities,
+maintenance intent, completed phase, coherent snapshot reference and each gate's
+evidence. Record migration termination, rebuild destination/completion, actual
+replicas/endpoints, private/public results, recovery operation IDs and readback.
+Do not mark an interrupted operation accepted or restore replicas from an exit
+handler after a failed compatibility gate. Cleanup and explicit global resume are
+separate [audited operations](persistence.md#offline-provider-recovery); reconcile
+lost apply acknowledgments with readback before further action. Record the selected
+post-resumption observation separately from initial serving recovery; the
+[October 2026 recovery](recovery-2026-10-29.md) requires two hours.
+
+For migration 26's table rewrite, prepare an operator Job override of
+`activeDeadlineSeconds: 2700` and retain zero automatic retries. This exceeds its
+30-minute statement and 35-minute transaction limits; the committed generic
+migration Job's 600-second default remains unchanged. Check rewrite/WAL space and
+coherent recovery material first. Format-2 indexes need a fresh format-3 rebuild,
+not inline conversion; preserve the old generation and follow the
+[index compatibility contract](database.md#offline-index-rebuild).
+
+Run the offline guard regression checks without provider or cluster access:
+
+```sh
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p 'test_collection_guard.py'
+```
 
 ### Offline acceptance
 
