@@ -1,5 +1,8 @@
 # Diagnostic lookup deployment, 2026-11-01
 
+Later change: [corpus Blob SSD lookup cutover and two-hour observation](deployment-ssd-lookup-2026-11-01.md).
+The earlier checkpoint below is preserved.
+
 This record captures the lookup acceptance completed at **07:51:14 UTC** against
 signed source [`eef8c514d065d062ad6aaedebbfd1596f135597f`](https://github.com/PublicData-stream/openlegal4everyoneMCP/commit/eef8c514d065d062ad6aaedebbfd1596f135597f),
 version `0.1.0-build.eef8c514`. Current procedures belong to the
