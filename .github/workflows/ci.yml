@@ -63,6 +63,13 @@ jobs:
       - name: Check x86-64-v3 support
         if: runner.arch == 'X64'
         run: /lib64/ld-linux-x86-64.so.2 --help | grep -F 'x86-64-v3 (supported, searched)'
+      - name: Reserve space for PostgreSQL test builds
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+          df -h /
+          available_kib=$(df -Pk / | awk 'NR == 2 {print $4}')
+          test "$available_kib" -ge 20971520
       - name: Isolate pinned Rust toolchain
         run: echo "RUSTUP_HOME=$RUNNER_TEMP/openlegal-rustup" >> "$GITHUB_ENV"
       - run: rustup toolchain install 1.98.1 --profile minimal

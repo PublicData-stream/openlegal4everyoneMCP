@@ -217,9 +217,11 @@ the scheduled advisory checks. It does not establish Kubernetes, sandbox-runtime
 AppArmor acceptance; see the [document sandbox status](docs/document-sandbox.md#current-status).
 The separately configured real-cluster gate and its deployment prerequisites are
 documented in [document processing](docs/document-sandbox.md).
-The dedicated hosted worker job removes unused preinstalled Android/.NET SDKs and
-requires at least 20 GiB free build space; local runs must provision that space
-without deleting unrelated host data.
+The hosted PostgreSQL and document-worker jobs remove unused preinstalled
+Android/.NET SDKs and require at least 20 GiB free build space. The PostgreSQL job
+reports available disk space and checks this minimum before toolchain installation
+and compilation. This cleanup belongs to hosted workflow steps; local runs must
+provision that space without deleting unrelated host data.
 
 Changes to Alpine package installation also require
 `scripts/test-alpine-packages.sh`. Its isolated signed HTTPS repository tests
