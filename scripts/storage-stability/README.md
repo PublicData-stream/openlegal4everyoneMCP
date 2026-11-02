@@ -505,6 +505,10 @@ writer descriptors and original deadline throughout this order:
 5. `initial_pg_pair.run`: qualify the new SSD PostgreSQL target, copy and verify
    the whole cluster, start the named TLS peer and perform the first protected
    binding with `expected_old=NULL`.
+6. `initial_epoch_certificate.run`: consume that same live pair and its raw
+   first-bind/final-ACK evidence, observe the prepared strict configuration and
+   four Blob roots, and install an initial generation-1 certificate on both
+   held control roots. This callable component has no orchestration CLI.
 
 These components do not start serving, release collection or establish Ready.
 The original initial-enrollment deadline is at most 2400 seconds; an additional
@@ -538,10 +542,11 @@ The emergency wrapper still requires its immutable pre-fault authority and
 compares the fresh shared projection with the expected configuration hash.
 Common readers do not mint authority or certificates. M33 position and snapshot
 queries are standby-only; selecting a primary is refused before dispatch. Fresh
-primary prefix/flush evidence, the actual observation and installer child exits,
-current-head installation, restart renewal and admission on every Ready path
-remain separate integration requirements. Passing the standalone source tests
-or returning an initial pair result does not satisfy those requirements.
+primary prefix/flush evidence and the actual observation and installer child
+exits are consumed by the initial certificate producer. Restart renewal and
+admission on every Ready path remain separate integration requirements. Passing
+the standalone source tests or returning an initial pair result does not satisfy
+those requirements.
 
 `epoch_current.py` reads the actual current HEAD before opening its selected
 immutable certificate. A stale expected pin, split heads, changed bytes/inodes
@@ -555,3 +560,39 @@ and archives actual command results afterward under the original operation end.
 Its approved authority, complete source graph and critical source pins must
 agree. Archived windows remain historical data, with explicit SQL closure and
 no public ACK or Ready. Neither reader replaces the pending lifecycle hooks.
+
+## Initial certificate producer
+
+`initial_epoch_certificate.py` is callable only from the original dedicated ROOT
+with its exact live initial backend, shared lock, pair, journal and retained
+native descriptors. Its separate closed source graph includes the full initial
+chain; it does not enlarge the legacy checkpoint dispatcher. Approved raw input
+and authority hashes bind that whole graph. The initial-bind-only path requires
+generation1, no predecessor and two absent current heads. It validates actual
+immutable images, strict TOML, ConfigMap/PVC/PV mappings and all four Blob roots.
+Additional mounts cannot shadow the verified configuration or CA file.
+
+One fixed observation child produces source/native/configuration evidence; ROOT
+waits for its actual exit0 and all descendant closure before constructing the
+certificate. A distinct fixed install child consumes the dual-durable intent and
+installs the same certificate and current head on both retained roots. ROOT then
+observes its actual exit0, independently reads both heads and certificates,
+refreshes roots/configuration/native and primary-fence evidence, and pins final
+SQL closure for both database copies in a detached completion record.
+
+Wait ownership is allocated before fork and receives the raw child PID before
+fallible socket cleanup, pidfd registration or identity capture. Child prologue
+errors terminate in the child. Parent failure teardown bypasses capped discovery,
+retains subreaper ownership, and waits for actual descendant drainage and reaping
+before releasing its local serialization. A logical timeout cannot release
+ownership of kernel-uninterruptible work. ROOT's backend, shared lock, descriptors
+and partial journals remain held on failure; no retry, adoption or cleanup is
+provided.
+
+The producer reserves384 records/128MiB inside the original4096 records/512MiB
+journal budget and original initial-enrollment deadline. Command receipts retain
+their existing output limits and headroom; no phase renews a budget. Its detached
+result explicitly has `ready=false`, `public_ack=false` and an unobservable outer
+ROOT exit. Physical dual-media qualification, full-copy fit, actual enrollment,
+outer process exit, recovery renewal and application admission remain separate
+requirements. The failed HDD calibration does not authorize running this producer.
