@@ -176,6 +176,22 @@ wait, seed binding, least-privilege grants and the physical-delete barrier.
 Use only disposable storage; synthetic pair success is not a production seed or
 failover result. CI runs this gate in its PostgreSQL job.
 
+Storage operator changes require
+`sudo -n env TMPDIR=/tmp python3 -I -B -m unittest discover -s scripts/storage-stability/tests -p 'test_*.py'`,
+syntax checks and `systemd-analyze verify` for changed units. Distinguish ordinary
+temporary-file tests and explicitly synthetic command backends from actual
+process/SQL closure, dual-media durability and isolated restoration. Those
+operator gates require separate exact-operation evidence before deployment;
+passing a JSON schema or a mocked phase does not establish them. CI runs the
+operator tests without production access. Root is required for the ownership and
+permission cases; a non-root run that skips those cases is an incomplete gate.
+The libpq environment regression also requires a local PostgreSQL client library
+(`libpq5`, or `OPENLEGAL_TEST_LIBPQ` pointing to a reviewed native library); CI
+installs it explicitly. A run that skips this regression is incomplete.
+The fixtures use disposable `/tmp` storage, controlled local processes and
+synthetic service backends.
+Changes in these authority,
+path/parser, process and retention boundaries require independent Security Review.
 The separate `scripts/test-oxibelt.sh` Docker gate verifies both transports through
 the pinned edge and runs in CI. Edge, NodePort handoff, and OxiBelt harness changes
 require both `scripts/test-oxibelt.sh --profile fixture` and

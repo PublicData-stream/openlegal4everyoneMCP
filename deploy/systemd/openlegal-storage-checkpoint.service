@@ -1,0 +1,28 @@
+[Unit]
+Description=Verified stopped OpenLegal storage recovery checkpoint
+Documentation=file:/usr/local/lib/openlegal-storage-stability/README.md
+After=docker.service k3s.service
+ConditionPathExists=/etc/openlegal-storage-stability/inventory.json
+ConditionPathExists=/etc/openlegal-storage-stability/daily-authority.json
+ConditionPathExists=/etc/openlegal-storage-stability/checkpoint.env
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+EnvironmentFile=/etc/openlegal-storage-stability/checkpoint.env
+ExecStart=/usr/bin/python3 -I -B /usr/local/lib/openlegal-storage-stability/checkpoint.py checkpoint --inventory /etc/openlegal-storage-stability/inventory.json --inventory-sha256 ${INVENTORY_SHA256} --authority /etc/openlegal-storage-stability/daily-authority.json --authority-sha256 ${AUTHORITY_SHA256}
+TimeoutStartSec=8h
+TimeoutStopSec=30s
+KillMode=mixed
+Restart=no
+NoNewPrivileges=yes
+PrivateTmp=no
+PrivateDevices=no
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal

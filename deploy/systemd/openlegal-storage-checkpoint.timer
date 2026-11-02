@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily OpenLegal checkpoint at 19:00 UTC (04:00 Korea)
+
+[Timer]
+OnCalendar=*-*-* 19:00:00 UTC
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=true
+Unit=openlegal-storage-checkpoint.service
+
+[Install]
+WantedBy=timers.target
