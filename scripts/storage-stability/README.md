@@ -596,3 +596,38 @@ result explicitly has `ready=false`, `public_ack=false` and an unobservable oute
 ROOT exit. Physical dual-media qualification, full-copy fit, actual enrollment,
 outer process exit, recovery renewal and application admission remain separate
 requirements. The failed HDD calibration does not authorize running this producer.
+
+## Historical completion read port
+
+`epoch_completion.read_completed_install` reads an initial generation-1 install
+through the original SSD archive FD plus separate held source and control root
+FDs. It checks actual descriptors, kernel FD path associations and a single
+filesystem/mount profile. Different mounts, replaced source bytes and rebinding
+of the original archive root are unsupported. A source-owned caller must still
+qualify physical SSD devices and hold serialization; no caller-supplied
+qualification boolean grants that trust.
+
+The reader opens only relative no-follow components below those held roots,
+retains its file/directory FDs for final raw-byte and inode rechecks, and validates
+private ownership, modes, link counts, canonical records and expected hashes.
+Its separate closed historical producer graph leaves the fifteen-file checkpoint
+registry unchanged. Source bytes are read and hashed without executing archived
+code. Unique records/bytes share the caller's unchanged limits, at most4096
+records/512MiB. It does not instantiate a journal, open unavailable HDD paths,
+rewrite references, copy escrow material or retry an alternative certificate.
+
+Fixed evidence branches link the original inventory/authority, first bind and
+seed, observation and actual child exits, dual-install intent/results and
+independent readback inodes, native command receipts and final SQL closure.
+The older detached shape without `final_sql_closure` refuses. One legacy pair
+intent is located by a bounded listing of its original fixed phase and the raw
+SHA pinned by the first-bind command output; ambiguous candidates refuse.
+Historical authority scope is checked as archived data, without treating it as
+current execution approval or renewing its expiry/deadline.
+
+The returned raw bundle is historical data. It supplies no outer ROOT exit,
+current HEAD, fresh health, admission, Ready or public ACK. The current-head reader,
+immutable pre-fault authority, fresh native qualification, renewal and one-use
+pre-start/pre-release gates remain separate controller requirements. Private-FD
+and source-generated synthetic receipt tests are not native SQL, independent
+physical-media or production acceptance.
