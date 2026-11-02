@@ -905,7 +905,7 @@ class LinuxBackend:
              and type(binding['primary_system_identifier']) is str
              and re.fullmatch('[1-9][0-9]{0,19}',binding['primary_system_identifier'])
              and type(binding['standby_client_serial']) is str
-             and re.fullmatch('[1-9][0-9]{0,49}',binding['standby_client_serial']), 'postgres_replication_identity')
+             and re.fullmatch('[1-9][0-9]{0,59}',binding['standby_client_serial']), 'postgres_replication_identity')
         for key in ('standby_name','standby_role'):
             identifier(binding[key])
         for key in ('standby_client_dn','standby_issuer_dn'):

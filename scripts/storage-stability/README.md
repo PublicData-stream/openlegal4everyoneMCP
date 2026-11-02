@@ -542,3 +542,16 @@ primary prefix/flush evidence, the actual observation and installer child exits,
 current-head installation, restart renewal and admission on every Ready path
 remain separate integration requirements. Passing the standalone source tests
 or returning an initial pair result does not satisfy those requirements.
+
+`epoch_current.py` reads the actual current HEAD before opening its selected
+immutable certificate. A stale expected pin, split heads, changed bytes/inodes
+or a missing selected file refuses; there is no historical fallback. The caller
+retains its root descriptors and serialization locks and separately qualifies
+hardware, provenance and completed installation evidence.
+
+`epoch_primary_fence.py` prepares the fixed read-only primary observer outside
+the two-second native window, captures prefix/flush through the held executable,
+and archives actual command results afterward under the original operation end.
+Its approved authority, complete source graph and critical source pins must
+agree. Archived windows remain historical data, with explicit SQL closure and
+no public ACK or Ready. Neither reader replaces the pending lifecycle hooks.

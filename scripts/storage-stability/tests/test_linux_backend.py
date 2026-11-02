@@ -382,6 +382,73 @@ def observation(op):
         sender_started_at='2026-11-02 00:00:01+00', prefix_lsn='1/100', flush_lsn='1/100')
 
 
+class StaticReplicationSerialDomain(unittest.TestCase):
+    """Structural inventory checks only; every path and identity is synthetic."""
+
+    def config(self, serial):
+        binding = copy.deepcopy(operation().inventory['linux']['postgres']['binding'])
+        binding['standby_client_serial'] = serial
+        image = 'sha256:' + 'c' * 64
+        uid = '00000000-0000-4000-8000-000000000001'
+        return {
+            'binaries': {name: {'path': '/unopened/' + name, 'sha256': 'a' * 64}
+                         for name in ('kubectl', 'docker', 'crictl', 'zfs', 'zpool')},
+            'kubeconfig': {'path': '/unopened/kubeconfig', 'sha256': 'a' * 64},
+            'context': 'fixture', 'namespace': 'fixture',
+            'serving_workload': 'fixture-serving', 'serving_selector': 'app=fixture',
+            'health_port': 8080, 'blob_binding_sha256': binding['blob_binding_sha256'],
+            'serving_image': image, 'serving_runtime_image_id': image,
+            'serving_service': {'name': 'fixture', 'uid': uid, 'spec_sha256': 'a' * 64},
+            'cri_endpoint': 'unix:///unopened/cri.sock',
+            'postgres': {'database': 'fixture', 'admin_user': 'fixture_admin', 'uid': 70,
+                'binding': binding, **{side: {'container_id': digit * 64, 'image_id': image,
+                    'mounts': [{'source': '/unopened/' + side, 'destination': '/pgdata',
+                                'rw': True, 'type': 'bind'}]}
+                    for side, digit in (('primary', '1'), ('standby', '2'))}},
+            'workloads': [{'kind': 'deployment', 'name': name, 'uid': uid,
+                           'pod_spec_sha256': 'a' * 64}
+                          for name in ('fixture-serving', 'fixture-scheduler')],
+            'jobs': [], 'writer_cgroups': [],
+            'config_maps': [{'name': 'fixture', 'uid': uid, 'data_sha256': 'a' * 64}],
+            'bound_roots': [{'role': role, 'path': '/unopened/' + role,
+                             'uid': 0, 'dev': 1, 'ino': number}
+                            for number, role in enumerate(('cache_primary', 'cache_replica',
+                                                           'corpus_primary', 'corpus_replica'), 1)],
+            'persistent_volumes': [], 'index_tree': 'fixture-index',
+            'original_tree_policies': {}, 'restore': {}, 'manual_recovery': {},
+            'failure_domains': {'hdd': ['/dev/fixture-hdd'], 'ssd': ['/dev/fixture-ssd'],
+                'leaf_devices': [{'path': '/dev/fixture-' + medium, 'major': 8,
+                    'minor': number, 'sysfs_path': '/sys/devices/fixture/' + medium,
+                    'identity_file': 'wwid', 'identity_sha256': 'a' * 64}
+                    for number, medium in enumerate(('hdd', 'ssd'), 1)]},
+        }
+
+    def validate(self, config):
+        with mock.patch('linux_backend.os.open', side_effect=AssertionError('unexpected open')), \
+                mock.patch.object(LinuxBackend, '_run', side_effect=AssertionError('unexpected command')):
+            LinuxBackend._validate_linux(config)
+
+    def test_positive_decimal_serials_preserve_all_digits(self):
+        for length in (1, 50, 51, 60):
+            with self.subTest(length=length):
+                serial = ('1234567890' * 6)[:length]
+                config = self.config(serial)
+                before = canonical(config)
+                self.validate(config)
+                self.assertEqual(config['postgres']['binding']['standby_client_serial'], serial)
+                self.assertEqual(canonical(config), before)
+
+    def test_out_of_domain_serials_refuse_without_coercion(self):
+        for serial in ('9' * 61, '0', '00', '-1', '+1', True, False, 1,
+                       int('9' * 60), 1.0, None, '', '1.0', '1e59', ' 1', '1 ', '1\n', '\u0661'):
+            with self.subTest(serial=serial):
+                config = self.config(serial)
+                before = canonical(config)
+                with self.assertRaisesRegex(Refused, 'postgres_replication_identity'):
+                    self.validate(config)
+                self.assertEqual(canonical(config), before)
+
+
 class MutationOrdering(unittest.TestCase):
     def setUp(self):
         self.op = operation()
