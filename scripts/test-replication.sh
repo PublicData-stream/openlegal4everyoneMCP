@@ -6,7 +6,6 @@ for command in docker python3 openssl cargo timeout; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
 export TMPDIR=/tmp
-export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/buildcache/rust/target}
 cd "$repo"
 cargo test --locked --lib -p openlegal-adapters replication_pair -- --ignored --test-threads=1
 cargo test --locked -p openlegal-adapters --test replication_binding -- --ignored --test-threads=1
