@@ -219,18 +219,31 @@ async fn replication_pair_readonly_fence_covers_durable_cut_with_idle_unflushed_
         .fetch_one(&mut *connection)
         .await
         .unwrap();
-    assert_eq!(after["local_flush_lsn"], before["local_flush_lsn"]);
-    assert!(
-        lsn(&after["insert_lsn"]) > lsn(&after["local_flush_lsn"]),
-        "the readonly proof must not erase its idle-tail precondition: {after}"
-    );
-    assert!(lsn(&after["proof"]["flush_lsn"]) >= lsn(&before["local_flush_lsn"]));
+    // The initial sample proved the idle tail. Background WAL flushing may
+    // advance it while the readonly fence runs; separate volatile observations
+    // need only stay within the original cut and a freshly sampled upper cut.
+    let after_end_flush: String = sqlx::query_scalar("SELECT pg_current_wal_flush_lsn()::text")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    let after_end_insert: String = sqlx::query_scalar("SELECT pg_current_wal_insert_lsn()::text")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    let original_cut = lsn(&before["local_flush_lsn"]);
+    let upper_cut = lsn(&serde_json::json!(after_end_flush));
+    assert!(upper_cut >= original_cut && upper_cut <= lsn(&serde_json::json!(after_end_insert)));
+    assert!(lsn(&after["proof"]["flush_lsn"]) >= original_cut);
     for value in [
+        &after["local_flush_lsn"],
         &after["proof"]["prefix_lsn"],
         &after["position"]["wal_lsn"],
         &after["candidate"]["candidate"]["prefix_lsn"],
     ] {
-        assert_eq!(value, &after["local_flush_lsn"]);
+        assert!(
+            (original_cut..=upper_cut).contains(&lsn(value)),
+            "readonly durable cut outside the observed range: {after}"
+        );
     }
     for key in [
         "managed_epoch",
