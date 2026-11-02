@@ -1,3 +1,4 @@
+use super::availability::CorpusExecuteExt;
 use super::{PgCorpusStore, db, key};
 use openlegal_application::database::Job;
 use openlegal_domain::legal::{CollectionNotice, DatabaseError, Dataset, ObjectId};
@@ -91,6 +92,7 @@ impl PgCorpusStore {
         page: u32,
         observation: PageGapObservation<'_>,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         let dataset = dataset_name(dataset)?;
         let rows = i32::try_from(observation.rows.clamp(1, 100))
             .map_err(|_| DatabaseError::InvalidInput)?;
@@ -99,7 +101,7 @@ impl PgCorpusStore {
         self.ensure_gap_capacity(&gap).await?;
         sqlx::query("INSERT INTO openlegal.provider_collection_gap(gap_key,dataset,scope,historical,treaty_class,page,reason,affected_rows,first_seen_at,last_seen_at,retry_at) VALUES($1,$2,'page',$3,$4,$5,$6,$7,$8,$8,$9) ON CONFLICT(gap_key) DO UPDATE SET reason=EXCLUDED.reason,affected_rows=EXCLUDED.affected_rows,last_seen_at=EXCLUDED.last_seen_at,retry_at=EXCLUDED.retry_at,resolved_at=NULL")
             .bind(gap).bind(dataset).bind(historical).bind(class.map(i16::from)).bind(page).bind(observation.reason).bind(rows).bind(observation.now as i64).bind(observation.now.saturating_add(3600) as i64)
-            .execute(&self.pool).await.map_err(db)?;
+            .corpus_execute(self).await?;
         Ok(())
     }
     pub async fn resolve_page_gap(
@@ -110,9 +112,10 @@ impl PgCorpusStore {
         page: u32,
         now: u64,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         let dataset = dataset_name(dataset)?;
         sqlx::query("UPDATE openlegal.provider_collection_gap SET resolved_at=$2 WHERE gap_key=$1 AND resolved_at IS NULL")
-            .bind(page_key(&dataset,historical,class,page)).bind(now as i64).execute(&self.pool).await.map_err(db)?;
+            .bind(page_key(&dataset,historical,class,page)).bind(now as i64).corpus_execute(self).await?;
         Ok(())
     }
     pub async fn due_gap_page(
@@ -122,6 +125,7 @@ impl PgCorpusStore {
         class: Option<u8>,
         now: u64,
     ) -> Result<Option<u32>, DatabaseError> {
+        self.gate().await?;
         let dataset = dataset_name(dataset)?;
         let page: Option<i32> = sqlx::query_scalar("SELECT page FROM openlegal.provider_collection_gap WHERE dataset=$1 AND scope='page' AND historical=$2 AND treaty_class IS NOT DISTINCT FROM $3 AND resolved_at IS NULL AND retry_at<=$4 ORDER BY retry_at,page LIMIT 1")
             .bind(dataset).bind(historical).bind(class.map(i16::from)).bind(now as i64).fetch_optional(&self.pool).await.map_err(db)?;
@@ -129,6 +133,7 @@ impl PgCorpusStore {
             .transpose()
     }
     pub async fn skip_claim(&self, job: &Job, reason: &str, now: u64) -> Result<(), DatabaseError> {
+        self.gate().await?;
         let retry_cancel = CancellationToken::new();
         retry_storage(&retry_cancel, "skip_claim", || {
             async {
@@ -161,7 +166,7 @@ impl PgCorpusStore {
                 if object.try_get::<bool, _>("current_inventory_conflict").map_err(db)?
                     && object.try_get::<i64, _>("version").map_err(db)? > expected_version
                 {
-                    return commit_storage(tx, "skip_claim").await;
+                    return self.commit_storage(tx, "skip_claim").await;
                 }
             }
             return Err(DatabaseError::Conflict);
@@ -176,7 +181,7 @@ impl PgCorpusStore {
         sqlx::query("INSERT INTO openlegal.provider_collection_gap(gap_key,dataset,scope,object_key,revision_id,reason,first_seen_at,last_seen_at,retry_at) VALUES($1,$2,'detail',$3,$4,$5,$6,$6,$7) ON CONFLICT(gap_key) DO UPDATE SET reason=EXCLUDED.reason,last_seen_at=EXCLUDED.last_seen_at,retry_at=EXCLUDED.retry_at,resolved_at=NULL")
             .bind(gap).bind(dataset).bind(object_key).bind(&job.revision_id).bind(reason).bind(now as i64).bind(now.saturating_add(3600) as i64)
             .execute(&mut *tx).await.map_err(db)?;
-        commit_storage(tx, "skip_claim").await?;
+        self.commit_storage(tx, "skip_claim").await?;
         Ok(())
 
             }
@@ -188,9 +193,10 @@ impl PgCorpusStore {
         revision: &str,
         now: u64,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         let object_key = key(object)?;
         sqlx::query("UPDATE openlegal.provider_collection_gap SET resolved_at=$2 WHERE gap_key=$1 AND resolved_at IS NULL")
-            .bind(detail_key(&object_key,revision)).bind(now as i64).execute(&self.pool).await.map_err(db)?;
+            .bind(detail_key(&object_key,revision)).bind(now as i64).corpus_execute(self).await?;
         Ok(())
     }
     pub async fn detail_gap_active(
@@ -198,11 +204,13 @@ impl PgCorpusStore {
         object: &ObjectId,
         revision: &str,
     ) -> Result<bool, DatabaseError> {
+        self.gate().await?;
         let object_key = key(object)?;
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.provider_collection_gap WHERE gap_key=$1 AND resolved_at IS NULL)")
             .bind(detail_key(&object_key, revision)).fetch_one(&self.pool).await.map_err(db)
     }
     pub async fn requeue_due_details(&self, now: u64) -> Result<u64, DatabaseError> {
+        self.gate().await?;
         let retry_cancel = CancellationToken::new();
         retry_storage(&retry_cancel, "requeue_due_details", || {
             async {
@@ -245,7 +253,7 @@ impl PgCorpusStore {
             .await
             .map_err(db)?;
         }
-        commit_storage(tx, "requeue_due_details").await?;
+        self.commit_storage(tx, "requeue_due_details").await?;
         Ok(rows.len() as u64)
 
             }
@@ -256,6 +264,7 @@ impl PgCorpusStore {
         datasets: &[Dataset],
         object: Option<&ObjectId>,
     ) -> Result<Vec<CollectionNotice>, DatabaseError> {
+        self.gate().await?;
         let names = datasets
             .iter()
             .copied()
@@ -290,6 +299,6 @@ impl PgCorpusStore {
             .collect()
     }
 }
+use super::storage_retry::begin_storage;
 use super::storage_retry::retry_storage;
-use super::storage_retry::{begin_storage, commit_storage};
 use tokio_util::sync::CancellationToken;

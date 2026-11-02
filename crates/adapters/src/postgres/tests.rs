@@ -7,6 +7,122 @@ use openlegal_application::{
 use openlegal_domain::{Provenance, Query, Record, RetrievalData};
 use sha2::{Digest, Sha256, Sha384};
 
+struct SwitchFence(Arc<std::sync::atomic::AtomicBool>);
+impl openlegal_application::durability::DurabilityFence for SwitchFence {
+    fn check(
+        &self,
+        _: tokio::time::Instant,
+        _: CancellationToken,
+    ) -> BoxFuture<'static, Result<(), Error>> {
+        let ready = self.0.clone();
+        Box::pin(async move {
+            if ready.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(Error::StorageUnavailable)
+            }
+        })
+    }
+}
+fn attach_test_fence(store: &mut Arc<PostgresStore>) -> Arc<std::sync::atomic::AtomicBool> {
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let inner = Arc::get_mut(&mut Arc::get_mut(store).unwrap().inner).unwrap();
+    inner.durability = Some(Arc::new(GuardedFence {
+        fence: Arc::new(SwitchFence(ready.clone())),
+        uncertain: inner.strict_uncertain.clone(),
+    }));
+    ready
+}
+#[test]
+fn strict_commit_scope_drop_is_sticky_and_another_success_cannot_clear_it() {
+    let uncertain = Arc::new(AtomicBool::new(false));
+    let transaction = |started, confirmed| DbTransaction {
+        connection: None,
+        committed: true,
+        commit_started: started,
+        barrier_confirmed: confirmed,
+        durability: None,
+        uncertain: Some(uncertain.clone()),
+    };
+    drop(transaction(false, false));
+    assert!(!uncertain.load(Ordering::Acquire));
+    // Models cancellation/drop after COMMIT submission, before barrier success.
+    drop(transaction(true, false));
+    assert!(uncertain.load(Ordering::Acquire));
+    drop(transaction(true, true));
+    assert!(uncertain.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh PostgreSQL 18"]
+async fn local_commit_is_not_publication_success_without_replica_fence() {
+    let db = fixture::TestDatabase::new().await;
+    let mut store = db.open(100).await;
+    let ready = attach_test_fence(&mut store);
+    let pending = request(&store, 100).await;
+    let commit = gate(&store, TestPoint::BeforeCommit, None);
+    let task = tokio::spawn(store.publish(pending));
+    reached(&commit).await;
+    ready.store(false, Ordering::Release);
+    commit.resume.add_permits(1);
+    assert_eq!(task.await.unwrap().err(), Some(Error::StorageUnavailable));
+    let local_count: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.cache_snapshot")
+        .fetch_one(&store.inner.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        local_count, 1,
+        "a visible local commit is not a replicated ACK"
+    );
+    assert!(!store.healthy());
+    assert_eq!(
+        store.health(100).await.err(),
+        Some(Error::StorageUnavailable)
+    );
+    ready.store(true, Ordering::Release);
+    assert_eq!(
+        store.health(100).await.err(),
+        Some(Error::StorageUnavailable)
+    );
+    assert_eq!(store.status(), StorageStatus::CommitUncertain);
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh PostgreSQL 18"]
+async fn unfenced_tombstone_never_unlinks_blob_and_queue_is_preserved() {
+    let db = fixture::TestDatabase::new().await;
+    let mut store = db.open(100).await;
+    let ready = attach_test_fence(&mut store);
+    store.publish(request(&store, 100).await).await.unwrap();
+    let row =
+        sqlx::query("SELECT sha256,generation,size_bytes,storage_key FROM openlegal.blob_object")
+            .fetch_one(&store.inner.pool)
+            .await
+            .unwrap();
+    let location = data::location(&row).unwrap();
+    let deadline = 100 + RetentionPolicy::default().retention_days * 86_400;
+    let deletion = gate(&store, TestPoint::BeforeDelete, None);
+    let task = tokio::spawn(store.maintain(deadline));
+    reached(&deletion).await;
+    ready.store(false, Ordering::Release);
+    deletion.resume.add_permits(1);
+    assert_eq!(task.await.unwrap().err(), Some(Error::StorageUnavailable));
+    assert!(
+        store
+            .inner
+            .blobs
+            .get(location, CancellationToken::new())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM openlegal.blob_deletion")
+        .fetch_one(&store.inner.pool)
+        .await
+        .unwrap();
+    assert_eq!(queued, 1);
+}
+
 #[test]
 fn compiled_migration_catalog_matches_checked_in_sql() {
     // Detect an SQL file omitted from the explicit runtime catalog: both
@@ -78,7 +194,7 @@ fn payload(now: u64) -> Arc<StoredPayload> {
         snapshot: None,
     })
 }
-async fn request(store: &PostgresStore, now: u64) -> PublicationRequest {
+pub(super) async fn request(store: &PostgresStore, now: u64) -> PublicationRequest {
     let expected = store
         .lookup(key(), now, CancellationToken::new())
         .await
@@ -93,7 +209,7 @@ async fn request(store: &PostgresStore, now: u64) -> PublicationRequest {
         cancellation: CancellationToken::new(),
     }
 }
-fn gate(store: &PostgresStore, point: TestPoint, error: Option<Error>) -> Arc<TestGate> {
+pub(super) fn gate(store: &PostgresStore, point: TestPoint, error: Option<Error>) -> Arc<TestGate> {
     let gate = Arc::new(TestGate {
         reached: Semaphore::new(0),
         resume: Semaphore::new(0),
@@ -107,7 +223,7 @@ fn gate(store: &PostgresStore, point: TestPoint, error: Option<Error>) -> Arc<Te
         .insert(point, gate.clone());
     gate
 }
-async fn reached(gate: &TestGate) {
+pub(super) async fn reached(gate: &TestGate) {
     tokio::time::timeout(Duration::from_secs(5), gate.reached.acquire())
         .await
         .unwrap()

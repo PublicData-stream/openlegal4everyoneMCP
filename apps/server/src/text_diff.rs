@@ -107,7 +107,20 @@ impl ToolModule for TextDiffTools {
                 })
             } },
         )?;
-        register_canonical(registry, self.service)
+        register_canonical(registry, self.service)?;
+        for name in [
+            "text.diff",
+            "text.diff.page",
+            "text.diff.show",
+            "text.diff.delete",
+            "text.apply_patch",
+            "text.attachment.upload",
+            "text.attachment.read",
+            "text.attachment.delete",
+        ] {
+            registry.mark_storage_independent(name)?;
+        }
+        Ok(())
     }
 }
 

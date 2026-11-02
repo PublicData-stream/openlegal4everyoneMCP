@@ -110,7 +110,7 @@ impl PgCorpusStore {
                 .map_err(db)?;
         }
         check(&cancel)?;
-        tx.commit().await.map_err(db)
+        self.commit_storage(tx, "retain_citations").await
     }
 
     pub(crate) async fn renew_search_citation_leases(
@@ -120,6 +120,7 @@ impl PgCorpusStore {
         now: u64,
         cancel: CancellationToken,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         self.renew_citation_leases(objects, Some(origin_session), now, cancel)
             .await
     }

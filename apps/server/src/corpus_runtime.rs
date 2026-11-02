@@ -1,13 +1,12 @@
 //! Operator-selected corpus composition and bounded demand collection.
 use crate::{
     ServerError,
-    config::{DatabaseConfig, IngestionMode},
+    config::{CorpusStorageFailurePolicy, DatabaseConfig, IngestionMode},
 };
 use openlegal_adapters::{
-    blob::FsBlobStore,
     corpus::{
-        CloneView, CollectionLaunch, CorpusRuntimeLease, PageGapObservation, PgCorpusStore,
-        SourceObservationInput, SupplementJobStatus,
+        CloneView, CollectionLaunch, CorpusHealthFailure, CorpusRuntimeLease, PageGapObservation,
+        PgCorpusStore, SourceObservationInput, SupplementJobStatus,
     },
     corpus_search::CorpusSearch,
     korean_analysis::KoreanAnalyzer,
@@ -31,7 +30,8 @@ pub struct CorpusRuntime {
     pub search: Arc<SearchService>,
     index: Arc<CorpusIndex>,
     lease: Option<CorpusRuntimeLease>,
-    blobs: Arc<FsBlobStore>,
+    blobs: Arc<dyn BlobStore>,
+    storage_failure_policy: CorpusStorageFailurePolicy,
     provider: Option<LawClient>,
     retain_history_bodies: bool,
     detail_timeout_secs: u64,
@@ -142,6 +142,24 @@ fn storage_stage_completed(
             Err(error)
         }
     }
+}
+
+fn recoverable_health_failure(
+    policy: CorpusStorageFailurePolicy,
+    failure: CorpusHealthFailure,
+) -> bool {
+    policy == CorpusStorageFailurePolicy::Recover
+        && matches!(failure, CorpusHealthFailure::Availability(_))
+}
+
+async fn drain_for_dependency_recovery(
+    child: &CancellationToken,
+    tasks: &mut tokio::task::JoinSet<Result<(), DatabaseError>>,
+) -> Result<(), ServerError> {
+    child.cancel();
+    // Cancellation is expected; any independently returned uncertainty or
+    // integrity failure keeps its original fatal meaning.
+    drain_runtime_tasks(tasks, Ok(())).await
 }
 
 /// Dropping work that can write storage at its outer deadline cannot establish
@@ -518,24 +536,28 @@ pub async fn rebuild_corpus_index(
     cancel: CancellationToken,
 ) -> Result<u64, ServerError> {
     config.validate()?;
-    let blobs = FsBlobStore::open_with_limit_and_timeout(
-        &std::path::absolute(&config.blob_path)?,
-        100 * 1024 * 1024,
-        Duration::from_secs(config.blob_operation_timeout_secs),
-    )
-    .await?;
-    let store = PgCorpusStore::new(persistent.pool(), blobs.clone());
+    let verifier = persistent.root_verifier();
+    if persistent.durability_fence().is_some() && verifier.is_none() {
+        return Err(DatabaseError::StorageCorrupt.into());
+    }
+    let blobs = crate::config::open_corpus_blobs_checked(config, verifier).await?;
+    let store = PgCorpusStore::new_with_persistence(persistent, blobs.clone());
     let result: Result<u64, ServerError> = async {
         store.health().await?;
         let lease = store.acquire_runtime_lease().await?;
         let result = rebuild_with_lease(config, &store, &lease, &cancel).await;
+        let storage = store.drain_storage_work().await;
         let closed = lease.close().await;
+        storage?;
         let generation = result?;
         closed?;
         Ok(generation)
     }
     .await;
+    let storage = store.drain_storage_work().await;
+    store.close_collection_events().await;
     let closed = blobs.close().await;
+    storage?;
     let generation = result?;
     closed?;
     Ok(generation)
@@ -1302,44 +1324,66 @@ impl CorpusRuntime {
                 Some(proxy) => client.with_socks5_proxy(proxy.load()?),
                 None => client,
             };
-            LawClient::configure_provider_request_limits(
+            LawClient::configure_provider_request_limits_with_durability(
                 &persistent.pool(),
                 &c.provider_requests.limits()?,
+                persistent.durability_fence(),
             )
             .await?;
-            Some(client.with_request_budget(persistent.pool(), mode))
+            Some(
+                client
+                    .with_request_budget(persistent.pool(), mode)
+                    .with_persistence_durability(persistent.durability_fence(), c.canary_operation),
+            )
         } else {
             None
         };
-        let blobs = FsBlobStore::open_with_limit_and_timeout(
-            &std::path::absolute(&config.blob_path)?,
-            100 * 1024 * 1024,
-            Duration::from_secs(config.blob_operation_timeout_secs),
-        )
-        .await?;
-        let store = Arc::new(PgCorpusStore::new(persistent.pool(), blobs.clone()));
-        if let Err(e) = store.health().await {
-            let _ = blobs.close().await;
-            return Err(e.into());
+        let verifier = persistent.root_verifier();
+        if persistent.durability_fence().is_some() && verifier.is_none() {
+            return Err(DatabaseError::StorageCorrupt.into());
         }
-        if serving {
-            store
-                .configure_archive_capacity(config.max_raw_bytes.as_option())
-                .await?;
+        let blobs = crate::config::open_corpus_blobs_checked(config, verifier).await?;
+        let store = Arc::new(PgCorpusStore::new_with_persistence(
+            persistent,
+            blobs.clone(),
+        ));
+        let prepared: Result<_, DatabaseError> = async {
+            store.health().await?;
+            if serving {
+                store
+                    .configure_archive_capacity(config.max_raw_bytes.as_option())
+                    .await?;
+            }
+            match provider {
+                Some(client) => Ok(Some(
+                    client
+                        .with_source_archive(store.clone())
+                        .with_collection_events(store.collection_events().await?),
+                )),
+                None => Ok(None),
+            }
         }
-        let provider = match provider {
-            Some(client) => Some(
-                client
-                    .with_source_archive(store.clone())
-                    .with_collection_events(store.collection_events().await?),
-            ),
-            None => None,
+        .await;
+        let provider = match prepared {
+            Ok(provider) => provider,
+            Err(error) => {
+                let storage = store.drain_storage_work().await;
+                store.close_collection_events().await;
+                let closed = blobs.close().await;
+                storage?;
+                closed?;
+                return Err(error.into());
+            }
         };
         let lease = if serving {
             match store.acquire_runtime_lease().await {
                 Ok(lease) => Some(lease),
                 Err(error) => {
-                    let _ = blobs.close().await;
+                    let storage = store.drain_storage_work().await;
+                    store.close_collection_events().await;
+                    let closed = blobs.close().await;
+                    storage?;
+                    closed?;
                     return Err(error.into());
                 }
             }
@@ -1356,16 +1400,23 @@ impl CorpusRuntime {
             if serving
                 && let Err(error) = store.mark_dataset_inventory_complete(dataset, false).await
             {
-                if let Some(lease) = &lease {
-                    let _ = lease.close().await;
-                }
-                let _ = blobs.close().await;
+                let storage = store.drain_storage_work().await;
+                store.close_collection_events().await;
+                let lease_closed = if let Some(lease) = &lease {
+                    lease.close().await
+                } else {
+                    Ok(())
+                };
+                let blobs_closed = blobs.close().await;
+                storage?;
+                lease_closed?;
+                blobs_closed?;
                 return Err(error.into());
             }
         }
-        let index_path = std::path::absolute(&config.index_path)?;
-        let dictionary_path = std::path::absolute(&config.mecab_dictionary_path)?;
         let opened: Result<_, ServerError> = async {
+            let index_path = std::path::absolute(&config.index_path)?;
+            let dictionary_path = std::path::absolute(&config.mecab_dictionary_path)?;
             let index = tokio::task::spawn_blocking(move || {
                 CorpusIndex::open(&index_path, KoreanAnalyzer::open(&dictionary_path)?)
             })
@@ -1382,10 +1433,17 @@ impl CorpusRuntime {
         let index = match opened {
             Ok(index) => index,
             Err(error) => {
-                if let Some(lease) = &lease {
-                    let _ = lease.close().await;
-                }
-                let _ = blobs.close().await;
+                let storage = store.drain_storage_work().await;
+                store.close_collection_events().await;
+                let lease_closed = if let Some(lease) = &lease {
+                    lease.close().await
+                } else {
+                    Ok(())
+                };
+                let blobs_closed = blobs.close().await;
+                storage?;
+                lease_closed?;
+                blobs_closed?;
                 return Err(error);
             }
         };
@@ -1413,6 +1471,7 @@ impl CorpusRuntime {
             index,
             lease,
             blobs,
+            storage_failure_policy: config.storage_failure_policy,
             provider,
             ingestion_mode: config
                 .ingestion
@@ -1441,6 +1500,7 @@ impl CorpusRuntime {
         }))
     }
     pub async fn close(&self) -> Result<(), ServerError> {
+        let storage = self.store.drain_storage_work().await;
         self.store.close_collection_events().await;
         let blobs = self.blobs.close().await;
         let lease = if let Some(lease) = &self.lease {
@@ -1448,20 +1508,16 @@ impl CorpusRuntime {
         } else {
             Ok(())
         };
+        storage?;
         blobs?;
         lease?;
         Ok(())
     }
-    pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<(), ServerError> {
-        // A prior process may have committed its index generation but failed
-        // to acknowledge it. Reconcile that durable prefix even with no new event.
-        let mut pending_index_ack = PendingIndexAck(if self.lease.is_some() {
-            Some(self.index.snapshot()?.generation)
-        } else {
-            None
-        });
-        let child = cancel.child_token();
-        let mut tasks = tokio::task::JoinSet::new();
+    async fn spawn_collection_tasks(
+        self: &Arc<Self>,
+        child: &CancellationToken,
+        tasks: &mut tokio::task::JoinSet<Result<(), DatabaseError>>,
+    ) -> Result<(), DatabaseError> {
         if self.provider.is_some() {
             let ingestion = child.child_token();
             if self.ingestion_mode == Some(IngestionMode::Pilot) {
@@ -1480,7 +1536,7 @@ impl CorpusRuntime {
             }
             let runtime = self.clone();
             let token = ingestion.clone();
-            spawn_runtime_task(&mut tasks, "ingestion", token.clone(), async move {
+            spawn_runtime_task(tasks, "ingestion", token.clone(), async move {
                 let provider = runtime
                     .provider
                     .as_ref()
@@ -1506,7 +1562,7 @@ impl CorpusRuntime {
             if self.ingestion_mode == Some(IngestionMode::Continuous) {
                 let runtime = self.clone();
                 let token = ingestion.clone();
-                spawn_runtime_task(&mut tasks, "supplements", token.clone(), async move {
+                spawn_runtime_task(tasks, "supplements", token.clone(), async move {
                     run_storage_isolated("supplements", &token, || {
                         runtime.process_supplements(token.clone())
                     })
@@ -1516,7 +1572,7 @@ impl CorpusRuntime {
             for slot in 0..self.detail_job_workers {
                 let runtime = self.clone();
                 let token = ingestion.clone();
-                spawn_runtime_task(&mut tasks, "detail", token.clone(), async move {
+                spawn_runtime_task(tasks, "detail", token.clone(), async move {
                     run_storage_isolated("detail", &token, || {
                         runtime.process_jobs(slot, token.clone())
                     })
@@ -1524,6 +1580,21 @@ impl CorpusRuntime {
                 });
             }
         }
+        Ok(())
+    }
+    pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<(), ServerError> {
+        // A prior process may have committed its index generation but failed
+        // to acknowledge it. Reconcile that durable prefix even with no new event.
+        let mut pending_index_ack = PendingIndexAck(if self.lease.is_some() {
+            Some(self.index.snapshot()?.generation)
+        } else {
+            None
+        });
+        let mut child = cancel.child_token();
+        let mut tasks = tokio::task::JoinSet::new();
+        self.spawn_collection_tasks(&child, &mut tasks).await?;
+        let mut collection_paused = false;
+        let mut collection_resume_blocked = false;
         let mut maintenance = tokio::time::Instant::now();
         let result = loop {
             tokio::select! {
@@ -1539,21 +1610,85 @@ impl CorpusRuntime {
                     },
                 },
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if let Some(lease) = &self.lease {
-                        if let Err(e) = lease.check().await {
-                            log_runtime_failure("lease", e);
-                            break Err(e);
+                    if let Some(lease) = &self.lease
+                        && let Err(e) = lease.check().await {
+                        log_runtime_failure("lease", e);
+                        break Err(e);
+                    }
+                    if self.storage_failure_policy == CorpusStorageFailurePolicy::Recover {
+                        let generation = match self.index.snapshot() {
+                            Ok(snapshot) => snapshot.generation,
+                            Err(error) => break Err(error),
+                        };
+                        let health = self.store.probe_health(
+                            self.lease.as_ref().map(|_| generation), cancel.clone(),
+                        ).await;
+                        let health = match health {
+                            Ok(proof) => {
+                                // A reconnect cannot stand in for this still-owned lease.
+                                if let Some(lease) = &self.lease
+                                    && let Err(error) = lease.check().await {
+                                    log_runtime_failure("lease", error);
+                                    break Err(error);
+                                }
+                                self.store.complete_health(proof)
+                            }
+                            Err(error) => Err(error),
+                        };
+                        match health {
+                            Ok(()) => {
+                                if collection_paused && !collection_resume_blocked {
+                                    // Cancellation can leave a charged uncertain provider
+                                    // owner. Never repair or release that owner here.
+                                    let clear = self.provider.is_none() || (self.ingestion_mode != Some(IngestionMode::Pilot)
+                                        && self.store.provider_admission_snapshot().await.is_ok_and(|state| {
+                                            !state.recovery_hold && !state.operator_suspended
+                                                && !state.legacy_uncertain && state.abandoned_slots == 0
+                                                && state.active_slots == 0
+                                                && !state.continuous.requires_operator_review
+                                        }));
+                                    if clear {
+                                        child = cancel.child_token();
+                                        if let Err(error) = self.spawn_collection_tasks(&child, &mut tasks).await {
+                                            break Err(error);
+                                        }
+                                        collection_paused = false;
+                                    } else {
+                                        collection_resume_blocked = true;
+                                        tracing::warn!(stage = "health_recovery", collection = "held",
+                                            "lookup recovered; collection requires operator review");
+                                    }
+                                }
+                            }
+                            Err(CorpusHealthFailure::Contended) => continue,
+                            Err(failure) if recoverable_health_failure(self.storage_failure_policy, failure) => {
+                                if !collection_paused {
+                                    // Genuine concurrent worker/COMMIT uncertainty
+                                    // remains fatal despite the probe outage.
+                                    drain_for_dependency_recovery(&child, &mut tasks).await?;
+                                    collection_paused = true;
+                                    tracing::warn!(stage = "health_recovery", collection = "paused",
+                                        "corpus dependency unavailable; admission closed");
+                                }
+                                continue;
+                            }
+                            Err(error) if cancel.is_cancelled() && error.error() == DatabaseError::Cancelled => break Ok(()),
+                            Err(error) => break Err(error.error()),
                         }
+                    }
+                    if self.lease.is_some() {
                         match storage_stage_completed("index", self.index_events(&child, &mut pending_index_ack).await) {
                             Ok(true) => {},
                             Ok(false) => continue,
                             Err(error) => break Err(error),
                         }
                     }
-                    match storage_stage_completed("health", self.store.health().await) {
-                        Ok(true) => {},
-                        Ok(false) => continue,
-                        Err(error) => break Err(error),
+                    if self.storage_failure_policy == CorpusStorageFailurePolicy::Shutdown {
+                        match storage_stage_completed("health", self.store.health().await) {
+                            Ok(true) => {},
+                            Ok(false) => continue,
+                            Err(error) => break Err(error),
+                        }
                     }
                     if self.lease.is_some() && maintenance.elapsed() >= Duration::from_secs(60) {
                         match storage_stage_completed("maintenance", self.store.maintain(now(), 0).await.map(|_| ())) {
@@ -2937,12 +3072,15 @@ mod manual_pilot_tests {
         let config = DatabaseConfig {
             max_raw_bytes: Default::default(),
             auto_collection: true,
+            storage_failure_policy: Default::default(),
+            blob_replica_path: None,
             blob_operation_timeout_secs: 5,
             blob_path: "blobs".into(),
             index_path: "index".into(),
             mecab_dictionary_path: "dictionary".into(),
             widget_html: "widget".into(),
             ingestion: Some(IngestionConfig {
+                canary_operation: None,
                 adaptive_polling: true,
                 credential_env: "PROVIDER_CREDENTIAL".into(),
                 proxy: None,
@@ -3012,6 +3150,77 @@ mod runtime_shutdown_tests {
             drained.fetch_add(1, Ordering::SeqCst);
             result
         });
+    }
+
+    #[test]
+    fn recovery_is_opt_in_and_requires_probe_provenance() {
+        let probe = CorpusHealthFailure::Availability(DatabaseError::StorageUnavailable);
+        assert!(!recoverable_health_failure(
+            CorpusStorageFailurePolicy::Shutdown,
+            probe
+        ));
+        assert!(recoverable_health_failure(
+            CorpusStorageFailurePolicy::Recover,
+            probe
+        ));
+        for failure in [
+            CorpusHealthFailure::Fatal(DatabaseError::StorageUnavailable),
+            CorpusHealthFailure::Fatal(DatabaseError::StorageCorrupt),
+            CorpusHealthFailure::Contended,
+        ] {
+            assert!(!recoverable_health_failure(
+                CorpusStorageFailurePolicy::Recover,
+                failure
+            ));
+        }
+        assert_eq!(
+            storage_stage_completed(
+                "fixture_publication",
+                Err(DatabaseError::StorageUnavailable)
+            ),
+            Err(DatabaseError::StorageUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_pause_drains_cancellation_without_cancelling_the_process() {
+        let process = CancellationToken::new();
+        let child_cancel = process.child_token();
+        let drained = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        child(
+            &mut tasks,
+            &child_cancel,
+            &drained,
+            Err(DatabaseError::Cancelled),
+        );
+        drain_for_dependency_recovery(&child_cancel, &mut tasks)
+            .await
+            .unwrap();
+        assert!(tasks.is_empty());
+        assert_eq!(drained.load(Ordering::SeqCst), 1);
+        assert!(!process.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn concurrent_uncertain_child_stays_fatal_during_confirmed_probe_outage() {
+        let cancel = CancellationToken::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        child(
+            &mut tasks,
+            &cancel,
+            &drained,
+            Err(DatabaseError::StorageUnavailable),
+        );
+        let error = drain_for_dependency_recovery(&cancel, &mut tasks)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<DatabaseError>(),
+            Some(&DatabaseError::StorageUnavailable)
+        );
+        assert_eq!(drained.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]

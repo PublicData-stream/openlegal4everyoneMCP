@@ -67,6 +67,7 @@ impl CloneView {
 }
 impl PgCorpusStore {
     pub async fn clone_cursor(&self, view: CloneView) -> Result<(u32, usize), DatabaseError> {
+        self.gate().await?;
         let retry_cancel = CancellationToken::new();
         retry_storage(&retry_cancel, "clone_cursor", || {
             async {
@@ -74,7 +75,7 @@ impl PgCorpusStore {
         self.gate().await?;
         let k = view.key()?;
         sqlx::query("INSERT INTO openlegal.provider_clone_view(view_key,dataset,historical,treaty_class) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
-            .bind(&k).bind(view.dataset.as_str()).bind(view.historical).bind(view.treaty_class.map(i16::from)).execute(&self.pool).await.map_err(db)?;
+            .bind(&k).bind(view.dataset.as_str()).bind(view.historical).bind(view.treaty_class.map(i16::from)).corpus_execute(self).await?;
         let (page, offset): (i32, i32) = sqlx::query_as(
             "SELECT next_page,item_offset FROM openlegal.provider_clone_view WHERE view_key=$1",
         )
@@ -98,6 +99,7 @@ impl PgCorpusStore {
         page: u32,
         result: &InventoryPage,
     ) -> Result<usize, DatabaseError> {
+        self.gate().await?;
         let retry_cancel = CancellationToken::new();
         retry_storage(&retry_cancel, "clone_page_offset", || {
             async {
@@ -117,7 +119,7 @@ impl PgCorpusStore {
             0
         };
         sqlx::query("UPDATE openlegal.provider_clone_view SET item_offset=$2,page_digest=$3 WHERE view_key=$1").bind(k).bind(offset as i32).bind(digest).execute(&mut *tx).await.map_err(db)?;
-        commit_storage(tx, "clone_page_offset").await?;
+        self.commit_storage(tx, "clone_page_offset").await?;
         Ok(offset)
 
             }
@@ -132,6 +134,7 @@ impl PgCorpusStore {
         now: u64,
         cancel: &CancellationToken,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         let retry_cancel = cancel.clone();
         retry_storage(&retry_cancel, "clone_page_scheduled", || {
             async {
@@ -217,7 +220,7 @@ impl PgCorpusStore {
                 .bind(&k).bind(i32::try_from(next).map_err(corrupt)?).bind(if complete_page {0} else {i32::try_from(offset).map_err(corrupt)?}).bind(if page==1 {total} else {expected}).bind(invalid).bind(i64::try_from(now).map_err(corrupt)?).execute(&mut *tx).await.map_err(db)?;
         }
         check(cancel)?;
-        commit_storage(tx, "clone_page_scheduled").await?;
+        self.commit_storage(tx, "clone_page_scheduled").await?;
         Ok(())
 
             }
@@ -225,6 +228,7 @@ impl PgCorpusStore {
     }
     /// Read all durable progress components from one statement snapshot.
     pub async fn clone_progress(&self) -> Result<serde_json::Value, DatabaseError> {
+        self.gate().await?;
         self.clone_progress_cancellable(&CancellationToken::new())
             .await
     }

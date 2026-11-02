@@ -21,6 +21,7 @@ impl PgCorpusStore {
     }
 
     pub async fn acquire_runtime_lease(&self) -> Result<CorpusRuntimeLease, DatabaseError> {
+        self.gate().await?;
         let mut connection = self.pool.acquire().await.map_err(db)?.detach();
         // Two fixed int keys identify this application's corpus runtime within
         // the current database. Cache-only administration uses a separate scope.

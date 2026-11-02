@@ -144,7 +144,7 @@ impl PgCorpusStore {
             for object_key in &held {
                 quarantine_current_inventory_object(&mut tx, object_key, now).await?;
             }
-            commit_storage(tx, "current_inventory.observe").await?;
+            self.commit_storage(tx, "current_inventory.observe").await?;
             let mut returned = BTreeSet::new();
             let mut held_objects = Vec::new();
             for item in &result.items {

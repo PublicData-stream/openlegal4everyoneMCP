@@ -268,7 +268,7 @@ impl PgCorpusStore {
             check(&cancel)?;
             retry_storage(&cancel, "observation_revalidate", || async {
                 sqlx::query("UPDATE openlegal.corpus_source_observation SET validated_at=GREATEST(validated_at,$2::text::numeric) WHERE id=$1")
-                    .bind(&prior.observation_id).bind(input.observed_at.to_string()).execute(&self.pool).await.map_err(db)
+                    .bind(&prior.observation_id).bind(input.observed_at.to_string()).corpus_execute(self).await
             }).await?;
             prior.validated_at = prior.validated_at.max(input.observed_at);
             check(&cancel)?;
@@ -320,7 +320,7 @@ impl PgCorpusStore {
                 .await
                 .map_err(db)?;
             check(&cancel)?;
-            commit_storage(tx, "retain_source_observation").await?;
+            self.commit_storage(tx, "retain_source_observation").await?;
             Ok(())
             }).await?;
             self.blobs
@@ -338,7 +338,7 @@ impl PgCorpusStore {
                     cancel.clone(),
                 )
                 .await
-                .map_err(blob_error)?;
+                .map_err(|error| self.record_blob_error(error))?;
         }
         check(&cancel)?;
         retry_storage(&cancel, "observation_commit", || async {
@@ -394,7 +394,7 @@ impl PgCorpusStore {
                 .bind(observation.raw_size as i64).execute(&mut *tx).await.map_err(db)?;
         }
         check(&cancel)?;
-        commit_storage(tx, "retain_source_observation").await?;
+        self.commit_storage(tx, "retain_source_observation").await?;
         Ok(())
         }).await?;
         // A committed observation is never re-inserted to retry its readback.

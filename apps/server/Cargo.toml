@@ -16,6 +16,7 @@ openlegal-application = { version = "0.0.0", path = "../../crates/application" }
 openlegal-adapters = { version = "0.0.0", path = "../../crates/adapters" }
 axum = "0.8"
 futures = "0.3"
+uuid = { version = "1", default-features = false, features = ["std", "serde"] }
 http = "1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }

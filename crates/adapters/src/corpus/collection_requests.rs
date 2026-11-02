@@ -103,7 +103,7 @@ impl PgCorpusStore {
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
         let epoch = i64::try_from(epoch).map_err(|_| DatabaseError::InvalidInput)?;
         sqlx::query("UPDATE openlegal.collection_request SET status='failed',payload='{}'::jsonb,lease_until=NULL,reason='worker_failed' WHERE id=$1 AND launched_at=$3 AND ((status='running' AND job_name=$2) OR (status='launching' AND job_name IS NULL))")
-            .bind(id).bind(job_name).bind(epoch).execute(&self.pool).await.map_err(db)?;
+            .bind(id).bind(job_name).bind(epoch).corpus_execute(self).await?;
         Ok(())
     }
 
@@ -113,15 +113,16 @@ impl PgCorpusStore {
         id: &str,
         job_name: &str,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
         sqlx::query("UPDATE openlegal.collection_request SET status='failed',payload='{}'::jsonb,lease_until=NULL,reason='worker_failed' WHERE id=$1 AND ((status='running' AND job_name=$2) OR (status='launching' AND job_name IS NULL))")
-            .bind(id).bind(job_name).execute(&self.pool).await.map_err(db)?;
+            .bind(id).bind(job_name).corpus_execute(self).await?;
         Ok(())
     }
     pub async fn heartbeat_collection_scheduler(&self) -> Result<(), DatabaseError> {
         self.gate().await?;
         sqlx::query("UPDATE openlegal.corpus_control SET collection_scheduler_seen_at=floor(extract(epoch from clock_timestamp()))::bigint WHERE singleton")
-            .execute(&self.pool).await.map_err(db)?;
+            .corpus_execute(self).await?;
         Ok(())
     }
     /// Claim one request only when fewer than sixteen claims have been launched.
@@ -129,6 +130,7 @@ impl PgCorpusStore {
     pub async fn claim_collection_request(
         &self,
     ) -> Result<Option<(String, CollectionRequest)>, DatabaseError> {
+        self.gate().await?;
         Ok(self
             .claim_collection_request_with_policy(7200, RequestLimit::Limited(32))
             .await?
@@ -140,6 +142,7 @@ impl PgCorpusStore {
         timeout_secs: u64,
         attempt_limit: RequestLimit,
     ) -> Result<Option<CollectionLaunch>, DatabaseError> {
+        self.gate().await?;
         if !(60..=86400).contains(&timeout_secs) {
             return Err(DatabaseError::InvalidInput);
         }
@@ -180,7 +183,7 @@ impl PgCorpusStore {
         let launch = launch_from_row(&row)?;
         // Claim COMMIT acknowledgements cannot be retried as pre-admission
         // contention: the new launch epoch may already be durable.
-        tx.commit()
+        self.commit_storage(tx, "claim_collection_request")
             .await
             .map_err(|_| DatabaseError::StorageUnavailable)?;
         Ok(Some(launch))
@@ -191,6 +194,7 @@ impl PgCorpusStore {
         id: &str,
         job_name: &str,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
         if job_name.len() > 63
             || !job_name
@@ -200,7 +204,7 @@ impl PgCorpusStore {
             return Err(DatabaseError::InvalidInput);
         }
         let changed = sqlx::query("UPDATE openlegal.collection_request SET status='running',job_name=$2 WHERE id=$1 AND status='launching'")
-            .bind(id).bind(job_name).execute(&self.pool).await.map_err(db)?.rows_affected();
+            .bind(id).bind(job_name).corpus_execute(self).await?.rows_affected();
         if changed != 1 {
             let status: Option<String> =
                 sqlx::query_scalar("SELECT status FROM openlegal.collection_request WHERE id=$1")
@@ -235,7 +239,7 @@ impl PgCorpusStore {
         let id = Uuid::parse_str(&launch.id).map_err(|_| DatabaseError::InvalidInput)?;
         let epoch = i64::try_from(launch.launched_at).map_err(|_| DatabaseError::InvalidInput)?;
         let changed = sqlx::query("UPDATE openlegal.collection_request SET status='running',job_name=$2 WHERE id=$1 AND status='launching' AND launched_at=$3 AND lease_until>floor(extract(epoch from clock_timestamp()))::bigint")
-            .bind(id).bind(job_name).bind(epoch).execute(&self.pool).await.map_err(db)?.rows_affected();
+            .bind(id).bind(job_name).bind(epoch).corpus_execute(self).await?.rows_affected();
         if changed != 1 {
             let row = sqlx::query("SELECT status,job_name FROM openlegal.collection_request WHERE id=$1 AND launched_at=$2")
                 .bind(id).bind(epoch).fetch_optional(&self.pool).await.map_err(db)?;
@@ -297,6 +301,7 @@ impl PgCorpusStore {
         id: &str,
         status: &str,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         self.settle_collection_request_with_reason(id, status, None)
             .await
     }
@@ -307,13 +312,14 @@ impl PgCorpusStore {
         status: &str,
         reason: Option<&str>,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         if !matches!(status, "done" | "skipped" | "deferred" | "failed") {
             return Err(DatabaseError::InvalidInput);
         }
         validate_settlement_reason(reason)?;
         let id = Uuid::parse_str(id).map_err(|_| DatabaseError::InvalidInput)?;
         let changed = sqlx::query("UPDATE openlegal.collection_request SET status=$2,payload=CASE WHEN $2='deferred' THEN payload ELSE '{}'::jsonb END,lease_until=CASE WHEN $2='deferred' THEN floor(extract(epoch from clock_timestamp()))::bigint+3600 ELSE NULL END,reason=$3,provider_deferral_fingerprint=NULL WHERE id=$1 AND status IN ('launching','running')")
-            .bind(id).bind(status).bind(reason).execute(&self.pool).await.map_err(db)?.rows_affected();
+            .bind(id).bind(status).bind(reason).corpus_execute(self).await?.rows_affected();
         if changed != 1 {
             return Err(DatabaseError::Conflict);
         }
@@ -329,6 +335,7 @@ impl PgCorpusStore {
         reason: Option<&str>,
         deferred_until: Option<u64>,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         self.settle_collection_launch_with_fingerprint(launch, status, reason, deferred_until, None)
             .await
     }
@@ -340,6 +347,7 @@ impl PgCorpusStore {
         deferred_until: Option<u64>,
         fingerprint: Option<&openlegal_domain::provider_admin::ProviderBlockerFingerprint>,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         if !matches!(status, "done" | "skipped" | "deferred" | "failed")
             || (status == "deferred") != deferred_until.is_some()
         {
@@ -354,7 +362,7 @@ impl PgCorpusStore {
             .bind(id).bind(status).bind(deferred_until.map(|value| value.to_string()))
             .bind(reason).bind(launch.launched_at.to_string())
             .bind(fingerprint.map(serde_json::to_value).transpose().map_err(corrupt)?)
-            .execute(&self.pool).await.map_err(db)?.rows_affected();
+            .corpus_execute(self).await?.rows_affected();
         if changed != 1 {
             return Err(DatabaseError::Conflict);
         }
@@ -365,6 +373,7 @@ impl PgCorpusStore {
         &self,
         request: CollectionRequest,
     ) -> Result<CollectionReceipt, DatabaseError> {
+        self.gate().await?;
         self.request_collection_shared(request, false, &CancellationToken::new())
             .await?
             .receipt
@@ -423,7 +432,7 @@ impl PgCorpusStore {
                     .execute(&mut *tx).await.map_err(db)?;
             }
             check(cancel)?;
-            commit_storage(tx, "request_collection_shared").await?;
+            self.commit_storage(tx, "request_collection_shared").await?;
             return Ok(DemandCollectionStatus {
                 status: DemandState::Pending,
                 receipt: Some(receipt),
@@ -470,7 +479,7 @@ impl PgCorpusStore {
                     DemandState::Unavailable
                 };
                 check(cancel)?;
-                commit_storage(tx, "request_collection_shared").await?;
+                self.commit_storage(tx, "request_collection_shared").await?;
                 return Ok(DemandCollectionStatus {
                     status,
                     reason: receipt.reason.clone(),
@@ -515,7 +524,7 @@ impl PgCorpusStore {
             .bind(&canonical).bind(payload).bind(now).bind(now+86400)
             .bind((!demand).then_some(now+86400)).fetch_one(&mut *tx).await.map_err(db)?;
         check(cancel)?;
-        commit_storage(tx, "request_collection_shared").await?;
+        self.commit_storage(tx, "request_collection_shared").await?;
         Ok(DemandCollectionStatus {
             status: DemandState::Pending,
             receipt: Some(CollectionReceipt {
@@ -541,14 +550,15 @@ impl PgCorpusStore {
     }
 
     pub async fn prune_collection_requests(&self) -> Result<(), DatabaseError> {
+        self.gate().await?;
         sqlx::query("DELETE FROM openlegal.collection_request WHERE expires_at < floor(extract(epoch from clock_timestamp()))::bigint AND status NOT IN ('launching','running')")
-            .execute(&self.pool).await.map_err(db)?;
+            .corpus_execute(self).await?;
         Ok(())
     }
     pub async fn reap_stale_collection_requests(&self) -> Result<(), DatabaseError> {
         self.gate().await?;
         sqlx::query("UPDATE openlegal.collection_request SET status='failed',payload='{}'::jsonb,lease_until=NULL,reason='worker_lost' WHERE status IN ('launching','running') AND lease_until < floor(extract(epoch from clock_timestamp()))::bigint")
-            .execute(&self.pool).await.map_err(db)?;
+            .corpus_execute(self).await?;
         Ok(())
     }
 }

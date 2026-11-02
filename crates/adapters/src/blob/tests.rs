@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     sync::{Condvar, Mutex},
 };
 
@@ -115,6 +115,7 @@ impl Drop for ReleaseOnDrop {
 
 #[tokio::test]
 async fn immutable_generations_deduplicate_and_survive_restart() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let bytes = b"fictional evidence";
     let first = location(bytes, 1);
@@ -166,6 +167,7 @@ async fn immutable_generations_deduplicate_and_survive_restart() {
 
 #[tokio::test]
 async fn corrupt_reads_and_existing_puts_never_repair_evidence() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let object = location(b"ABC", 1);
@@ -196,6 +198,7 @@ async fn corrupt_reads_and_existing_puts_never_repair_evidence() {
 
 #[tokio::test]
 async fn size_identity_and_path_validation_are_independent() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let object = location(b"ABC", 1);
@@ -232,6 +235,7 @@ async fn size_identity_and_path_validation_are_independent() {
 
 #[tokio::test]
 async fn symlinks_hardlinks_and_permissive_files_fail_closed() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let object = location(b"ABC", 1);
@@ -265,6 +269,7 @@ async fn symlinks_hardlinks_and_permissive_files_fail_closed() {
 
 #[tokio::test]
 async fn root_and_shard_symlinks_are_rejected() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     symlink(root.path(), root.path().join("linked")).unwrap();
     assert!(
@@ -286,6 +291,7 @@ async fn root_and_shard_symlinks_are_rejected() {
 
 #[tokio::test]
 async fn bounded_enumeration_ignores_foreign_files_and_lists_all_generations() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let mut expected = Vec::new();
@@ -319,6 +325,7 @@ async fn bounded_enumeration_ignores_foreign_files_and_lists_all_generations() {
 
 #[tokio::test]
 async fn staged_garbage_is_cleaned_without_removing_final_or_foreign_objects() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let object = location(b"ABC", 1);
@@ -351,6 +358,7 @@ async fn staged_garbage_is_cleaned_without_removing_final_or_foreign_objects() {
 
 #[tokio::test]
 async fn canceled_and_dropped_waiters_keep_actual_job_admission_owned() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -399,6 +407,7 @@ async fn canceled_and_dropped_waiters_keep_actual_job_admission_owned() {
 
 #[tokio::test]
 async fn concurrent_immutable_puts_publish_one_complete_object() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let bytes = vec![42; 64 * 1024];
@@ -410,15 +419,20 @@ async fn concurrent_immutable_puts_publish_one_complete_object() {
             .iter()
             .filter(|v| **v == Ok(BlobPutResult::Created))
             .count(),
-        1
+        1,
+        "publication ACK results: {results:?}"
     );
-    assert!(results.iter().all(Result::is_ok));
+    assert!(
+        results.iter().all(Result::is_ok),
+        "publication ACK results: {results:?}"
+    );
     assert_eq!(blobs.get(object, token()).await.unwrap(), Some(bytes));
     blobs.close().await.unwrap();
 }
 
 #[test]
 fn interrupted_publication_leaves_absence_or_a_complete_immutable_object() {
+    let _io = crate::blob::test_io_admission_blocking();
     for failure in 0..3 {
         let root = root();
         let object = location(b"source evidence", 1);
@@ -448,6 +462,7 @@ fn interrupted_publication_leaves_absence_or_a_complete_immutable_object() {
 
 #[tokio::test]
 async fn cancellation_before_admission_writes_nothing() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let object = location(b"source", 1);
@@ -466,6 +481,7 @@ async fn cancellation_before_admission_writes_nothing() {
 
 #[tokio::test]
 async fn dropped_waiter_cannot_disable_deadline_health_failure() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -500,6 +516,7 @@ async fn dropped_waiter_cannot_disable_deadline_health_failure() {
 
 #[test]
 fn existing_root_and_shard_still_require_parent_directory_durability() {
+    let _io = crate::blob::test_io_admission_blocking();
     let root = root();
     // Simulate the directory already existing after an interrupted creator.
     filesystem::PARENT_SYNC_FAIL.set(true);
@@ -538,6 +555,7 @@ fn pause_health(blobs: &FsBlobStore) -> (ReleaseOnDrop, tokio::sync::mpsc::Unbou
 
 #[tokio::test]
 async fn overlapping_health_checks_do_not_report_storage_failure() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let (release, mut entered) = pause_health(&blobs);
@@ -564,6 +582,7 @@ async fn overlapping_health_checks_do_not_report_storage_failure() {
 
 #[tokio::test]
 async fn successful_probe_cannot_clear_a_newer_failure() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let (release, mut entered) = pause_health(&blobs);
@@ -592,6 +611,7 @@ async fn successful_probe_cannot_clear_a_newer_failure() {
 
 #[tokio::test]
 async fn recovery_probe_requires_older_jobs_to_drain() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -627,6 +647,7 @@ async fn recovery_probe_requires_older_jobs_to_drain() {
 
 #[tokio::test]
 async fn late_probe_completion_cannot_clear_its_deadline_failure() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let (release, mut entered) = pause_health(&blobs);
@@ -657,6 +678,7 @@ async fn late_probe_completion_cannot_clear_its_deadline_failure() {
 
 #[tokio::test]
 async fn initiating_health_waiter_cancellation_and_drop_leave_other_waiter_live() {
+    let _io = crate::blob::test_io_admission().await;
     for cancel in [true, false] {
         let root = root();
         let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
@@ -684,6 +706,7 @@ async fn initiating_health_waiter_cancellation_and_drop_leave_other_waiter_live(
 
 #[tokio::test]
 async fn abandoned_shared_recovery_cannot_restore_health() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     failed(&blobs.shared, Error::StorageUnavailable);
@@ -717,6 +740,7 @@ async fn abandoned_shared_recovery_cannot_restore_health() {
 
 #[tokio::test]
 async fn shared_health_waiters_are_bounded_and_release_admission() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     let (release, mut entered) = pause_health(&blobs);
@@ -747,6 +771,7 @@ async fn shared_health_waiters_are_bounded_and_release_admission() {
 
 #[tokio::test]
 async fn close_prevents_shared_recovery() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     failed(&blobs.shared, Error::StorageUnavailable);
@@ -766,6 +791,7 @@ async fn close_prevents_shared_recovery() {
 
 #[tokio::test]
 async fn second_recovery_waiter_accepts_already_recovered_epoch_with_ordinary_work() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     failed(&blobs.shared, Error::StorageUnavailable);
@@ -798,6 +824,7 @@ async fn second_recovery_waiter_accepts_already_recovered_epoch_with_ordinary_wo
 
 #[tokio::test]
 async fn newer_probe_does_not_block_completed_recovery_acknowledgement() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
     failed(&blobs.shared, Error::StorageUnavailable);
@@ -831,6 +858,7 @@ async fn newer_probe_does_not_block_completed_recovery_acknowledgement() {
 
 #[tokio::test]
 async fn configured_timeout_bounds_are_checked_before_creating_a_root() {
+    let _io = crate::blob::test_io_admission().await;
     let parent = root();
     let path = parent.path().join("not-created");
     for operation_timeout in [
@@ -919,6 +947,7 @@ async fn configured_jobs_drain(blobs: &FsBlobStore) {
 
 #[tokio::test]
 async fn owned_job_deadline_reports_static_metadata_and_keeps_physical_ownership() {
+    let _io = crate::blob::test_io_admission().await;
     for probe in [false, true] {
         let root = root();
         let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
@@ -956,6 +985,7 @@ async fn owned_job_deadline_reports_static_metadata_and_keeps_physical_ownership
 
 #[tokio::test]
 async fn owned_worker_join_failure_reports_static_metadata_and_preserves_error() {
+    let _io = crate::blob::test_io_admission().await;
     for probe in [false, true] {
         let root = root();
         let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
@@ -979,6 +1009,7 @@ async fn owned_worker_join_failure_reports_static_metadata_and_preserves_error()
 
 #[tokio::test]
 async fn configured_health_budgets_are_independent_and_late_success_stays_unhealthy() {
+    let _io = crate::blob::test_io_admission().await;
     let short_root = root();
     let long_root = root();
     let short = start_blob(FsBlobStore::open_with_limit_and_timeout(
@@ -1027,6 +1058,7 @@ async fn configured_health_budgets_are_independent_and_late_success_stays_unheal
 
 #[tokio::test]
 async fn configured_watchdog_survives_ordinary_waiter_cancellation_and_drop() {
+    let _io = crate::blob::test_io_admission().await;
     for cancel in [true, false] {
         let root = root();
         let blobs = start_blob(FsBlobStore::open_with_limit_and_timeout(
@@ -1073,6 +1105,7 @@ async fn configured_watchdog_survives_ordinary_waiter_cancellation_and_drop() {
 
 #[tokio::test]
 async fn configured_close_budget_does_not_release_a_blocked_jobs_admission() {
+    let _io = crate::blob::test_io_admission().await;
     let root = root();
     let blobs = start_blob(FsBlobStore::open_with_limit_and_timeout(
         root.path(),
@@ -1119,6 +1152,7 @@ async fn configured_close_budget_does_not_release_a_blocked_jobs_admission() {
 
 #[tokio::test]
 async fn configured_health_watchdog_survives_every_waiter_leaving() {
+    let _io = crate::blob::test_io_admission().await;
     for cancel in [true, false] {
         let root = root();
         let blobs = start_blob(FsBlobStore::open_with_limit_and_timeout(
@@ -1166,4 +1200,80 @@ async fn configured_health_watchdog_survives_every_waiter_leaving() {
         blobs.health(token()).await.unwrap();
         blobs.close().await.unwrap();
     }
+}
+
+#[test]
+fn queue_and_filesystem_timing_preserve_physical_job_ownership() {
+    let _io = crate::blob::test_io_admission_blocking();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = root();
+        let blobs = start_blob(FsBlobStore::open(root.path())).await.unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = gate.clone();
+        let release = ReleaseOnDrop(gate);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = entered.send(());
+            let (lock, ready) = &*worker;
+            let mut done = lock.lock().unwrap();
+            while !*done {
+                done = ready.wait(done).unwrap();
+            }
+        });
+        started.await.unwrap();
+        let pending = tokio::spawn(blobs.get(location(b"missing", 1), token()));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while blobs.metrics().queued_jobs != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(blobs.metrics().active_jobs, 1);
+        assert_eq!(blobs.metrics().started_jobs, 0);
+        pending.abort();
+        let _ = pending.await;
+        // Caller drop cannot erase a queued physical job or its permit.
+        assert_eq!(blobs.metrics().active_jobs, 1);
+        assert_eq!(blobs.metrics().queued_jobs, 1);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        drop(release);
+        blocker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), blobs.physical_drain())
+            .await
+            .unwrap();
+        let metrics = blobs.metrics();
+        assert_eq!(metrics.queued_jobs, 0);
+        assert_eq!(metrics.started_jobs, 1);
+        assert!(metrics.queue_wait_us > 0 && metrics.queue_wait_us <= 999_999_999_999);
+        assert!(metrics.filesystem_work_us <= 999_999_999_999);
+    });
+}
+
+#[tokio::test]
+async fn root_identity_describes_retained_fd_after_path_is_replaced_and_restored() {
+    let _io = crate::blob::test_io_admission().await;
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = root.path().join("blob-root");
+    let a = start_blob(FsBlobStore::open(&path)).await.unwrap();
+    let identity_a = a.root_identities().unwrap();
+    fs::rename(&path, root.path().join("retained-a")).unwrap();
+    let b = start_blob(FsBlobStore::open(&path)).await.unwrap();
+    let identity_b = b.root_identities().unwrap();
+    assert_ne!(identity_a, identity_b);
+    fs::rename(&path, root.path().join("retained-b")).unwrap();
+    fs::rename(root.path().join("retained-a"), &path).unwrap();
+    // The configured pathname is A again, but the second factory retained B.
+    // A seed verifier can now reject B using the cached actual identity.
+    assert_eq!(a.root_identities(), Some(identity_a.clone()));
+    assert_eq!(b.root_identities(), Some(identity_b));
+    assert_eq!(fs::metadata(&path).unwrap().ino(), identity_a[0].inode);
+    a.close().await.unwrap();
+    b.close().await.unwrap();
 }

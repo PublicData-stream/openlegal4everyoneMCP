@@ -437,6 +437,11 @@ GRANT SELECT ON ALL TABLES IN SCHEMA openlegal_admin TO openlegal_provider_funct
 GRANT UPDATE ON openlegal_admin.provider_control TO openlegal_provider_function_owner;
 GRANT INSERT, UPDATE ON openlegal_admin.uncertainty_observation TO openlegal_provider_function_owner;
 GRANT INSERT ON openlegal_admin.provider_recovery_audit TO openlegal_provider_function_owner;
+-- Schema 28: these SECURITY DEFINER functions share this existing owner.
+-- FOR UPDATE of the singleton requires UPDATE privilege even without changing it.
+GRANT INSERT, UPDATE ON openlegal_admin.provider_canary,
+  openlegal_admin.provider_canary_control TO openlegal_provider_function_owner;
+GRANT INSERT ON openlegal_admin.provider_canary_audit TO openlegal_provider_function_owner;
 -- Temporarily permit function ownership transfer, then remove CREATE.
 GRANT CREATE ON SCHEMA openlegal_admin TO openlegal_provider_function_owner;
 DO $$ DECLARE f record; BEGIN
@@ -451,9 +456,12 @@ GRANT EXECUTE ON FUNCTION openlegal_admin.provider_inspect(),
   openlegal_admin.provider_inspect_selected(jsonb),
   openlegal_admin.provider_apply(jsonb), openlegal_admin.provider_readback(uuid)
   TO openlegal_provider_operator;
+GRANT EXECUTE ON FUNCTION openlegal_admin.canary_init(uuid,uuid),
+  openlegal_admin.canary_close(uuid,uuid) TO openlegal_provider_operator;
 GRANT EXECUTE ON FUNCTION openlegal_admin.provider_diagnostic(),
   openlegal_admin.provider_held(), openlegal_admin.observe_uncertainty(),
-  openlegal_admin.provider_blocker_fingerprint() TO runtime;
+  openlegal_admin.provider_blocker_fingerprint(),
+  openlegal_admin.canary_consume(uuid) TO runtime;
 ```
 
 Replace `runtime` with the deployment's actual runtime role. Verify that PUBLIC
@@ -516,13 +524,339 @@ cleanup and global resumption remain separate audited operations described above
 Inspect output is bounded and reports truncation; a display limit is not evidence
 that an undisplayed candidate does not exist.
 
+## Strict two-copy durability
+
+Replication is optional. Existing configurations keep local durability and the
+existing cache recovery lifecycle. Schema 28 introduces the strict policy;
+install the complete migration set matching the executable (including schema
+29 for checked daily holds). A complete configuration includes these additions:
+
+```toml
+[cache.postgres]
+replication_mode = "required"
+replication_epoch = "a1f71db8-bd59-4d33-a3bb-fb77154b571e" # operator-issued example
+tls_mode = "verify-full"
+
+[cache.blob]
+kind = "filesystem_mirror"
+path = "/var/lib/openlegal/cache-blobs"
+replica_path = "/var/lib/openlegal/cache-blobs-replica"
+
+[database]
+blob_path = "/var/lib/openlegal/corpus-blobs"
+blob_replica_path = "/var/lib/openlegal/corpus-blobs-replica"
+storage_failure_policy = "recover"
+```
+
+These are additions to a complete configuration, not a standalone configuration.
+Required mode rejects plaintext PostgreSQL, a missing or nil epoch, single-copy
+cache/corpus storage and overlapping roots. A DBA seeds all retained references
+and physical generations before binding the protected database control to that
+epoch and the exact authenticated Blob seed/root proof. Startup refuses a
+missing, replaced or mismatched seed; merely creating an empty directory is not
+seeding. Operator qualification separately proves independent HDD/SSD backing
+devices, PV/PVC identities and matching configuration in serving, scheduler and
+every collection template. Distinct paths alone prove no hardware independence.
+
+Both Blob writes use the same immutable physical key and generation. Success
+requires file and parent-directory durability on both media. Ready-object
+deduplication verifies and synchronizes the existing object on both copies; it
+does not repair a missing copy. Reads and enumeration use the selected primary
+only. There is no automatic fallback, asynchronous mirror or single-copy ACK.
+One logical timeout covers both legs; timeout/cancellation does not interrupt
+kernel I/O. Aggregate admission remains held until both physical jobs drain.
+
+PostgreSQL 18 requires `fsync=on`, `full_page_writes=on`,
+`synchronous_commit=on` for every authoritative writer, and the exact named
+synchronous peer. After the operation, the observer samples the primary's local
+durable WAL flush position; the authenticated peer must durably flush through
+that fixed position. Completed synchronous commits are covered by this cut.
+Unflushed background WAL in a partial page does not advance it. The private
+`prefix_lsn` and checkpoint `wal_lsn` fields both identify this primary durable
+position; physical restore diagnostics retain their separate raw insertion
+positions. The fresh proof binds the managed epoch, primary system identifier/current
+timeline, postmaster start, sender session, dedicated replication role/address
+and TLS client certificate DN, issuer and serial. A COMMIT command tag alone is
+insufficient: cancelling synchronous wait may leave a transaction committed
+locally before standby confirmation. The observer checks its binding again after
+the flush observation and does not reuse a readiness bit or cached receipt.
+Each proof uses at most two seconds or the caller's remaining deadline.
+
+The fence covers cache/corpus publication, ready-object deduplication, provider
+admission before DNS/HTTP, persistent public results and retained-source bytes,
+and reference absence/generation authorization before physical garbage collection.
+Uncertain COMMIT or post-COMMIT proof failure is sticky in that process and stops
+supervised work. A later health success cannot authorize replay. Confirmed
+health-probe availability recovery remains a separate, narrower lifecycle.
+
+The guarantee is RPO 0 for acknowledged database state and its referenced Blob
+bytes on the two configured media, including resumed collection. It does not
+cover an external response not yet durably retained, host loss, loss of both
+media, operator deletion, logical corruption or unresolved reuse rights. Peer
+loss blocks new write/provider admission; already admitted work receives bounded
+best-effort cancellation and keeps charged usage and uncertain ownership. Manual
+recovery physically fences all old writers, verifies the latest standby WAL and
+index, and durably seeds a second copy before strict service resumes. An advisory
+lock on the former primary cannot fence a promoted database.
+
+The observer schema and control are private. Runtime roles receive only the
+named fixed observer functions; a separate NOLOGIN function owner holds catalog
+privileges. The sole PUBLIC exception is the inputless nonsecret boolean
+`openlegal.replication_required()`: a legacy local client uses it to refuse
+opening a database already configured as strict, before accounting or GC.
+PUBLIC receives no observer, control-table or catalog access through it.
+
+Schemas 28 through 31 are additive; previous migration bytes remain unchanged. After a strict
+ACK, rollback must retain the latest database and both Blob generations with an
+executable compatible with the complete installed migration set, or fix forward. Restoring an older checkpoint
+over acknowledged writes is not a rollback method for this policy.
+
+### Checkpoint operator privileges
+
+Schema 29 provides fixed, private operator functions. Provision their separate
+NOLOGIN owner and the named LOGIN operator before qualifying the workflow.
+The migration creates neither role nor a password. The LOGIN operator must not
+inherit the function owner, receive direct table privileges, or use a superuser
+fallback. Its authentication and certificate/peer identity are a separate,
+reviewed deployment input.
+
+The following grant block is a template for a DBA, not an executed provisioning
+step. Create the two roles with `NOSUPERUSER NOCREATEDB NOCREATEROLE
+NOREPLICATION NOBYPASSRLS NOINHERIT`; the owner also has `NOLOGIN`. Do not grant
+either role to the application runtime. Replace the names consistently after
+reviewing the exact deployment authority.
+
+```sql
+GRANT USAGE ON SCHEMA public,openlegal,openlegal_admin,
+  openlegal_replication,openlegal_checkpoint TO openlegal_checkpoint_function_owner;
+GRANT SELECT ON ALL TABLES IN SCHEMA openlegal,openlegal_admin,
+  openlegal_replication,openlegal_checkpoint TO openlegal_checkpoint_function_owner;
+GRANT SELECT ON public._sqlx_migrations TO openlegal_checkpoint_function_owner;
+GRANT UPDATE(singleton) ON openlegal.corpus_control,
+  openlegal.provider_request_budget TO openlegal_checkpoint_function_owner;
+GRANT UPDATE(recovery_hold,generation,hold_started_at)
+  ON openlegal_admin.provider_control TO openlegal_checkpoint_function_owner;
+GRANT SELECT,INSERT,UPDATE ON openlegal_checkpoint.operation
+  TO openlegal_checkpoint_function_owner;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system(),
+  pg_catalog.pg_control_checkpoint(),openlegal_admin.slot_locked(integer)
+  TO openlegal_checkpoint_function_owner;
+GRANT pg_read_all_settings TO openlegal_checkpoint_function_owner
+  WITH INHERIT TRUE, SET FALSE;
+GRANT CREATE ON SCHEMA openlegal_checkpoint TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.state() OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.hold(uuid,text) OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.release(uuid,text) OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.readback(uuid) OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.observe(uuid) OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.retained_tables() OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.retained_references() OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.database_position() OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.database_layout() OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.client_sessions() OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.storage_metadata() OWNER TO openlegal_checkpoint_function_owner;
+ALTER FUNCTION openlegal_checkpoint.canary_observation(uuid) OWNER TO openlegal_checkpoint_function_owner;
+REVOKE CREATE ON SCHEMA openlegal_checkpoint FROM openlegal_checkpoint_function_owner;
+GRANT USAGE ON SCHEMA openlegal_checkpoint TO openlegal_storage_operator;
+GRANT EXECUTE ON FUNCTION openlegal_checkpoint.state(),
+  openlegal_checkpoint.hold(uuid,text),openlegal_checkpoint.release(uuid,text),
+  openlegal_checkpoint.readback(uuid),openlegal_checkpoint.observe(uuid),
+  openlegal_checkpoint.retained_tables(),openlegal_checkpoint.retained_references(),
+  openlegal_checkpoint.database_position(),openlegal_checkpoint.database_layout(),
+  openlegal_checkpoint.client_sessions(),
+  openlegal_checkpoint.storage_metadata(),openlegal_checkpoint.canary_observation(uuid)
+  TO openlegal_storage_operator;
+```
+
+The LOGIN also needs the fixed replication observers under their separate
+NOLOGIN owner. Those return only authenticated peer/epoch/WAL metadata.
+`observe(uuid)` takes budget then provider-control SHARE locks and returns one
+fresh state, slot-lock provenance and protected checkpoint-owner/readback
+observation. `state()` omits the three mutable hold bookkeeping fields so a
+checked hold change cannot mask a usage or policy change. The other functions
+return row counts/hashes, exact Blob references, database/index positions and
+bounded storage/session metadata; they return no legal bodies, query text,
+credentials or connection strings. Hash/reference limits and timeout/physical
+closure checks remain the caller's responsibility.
+`database_layout()` exposes only the effective server data-directory path. The
+operator maps it through the exact inspected container's bind mounts, checks the
+actual `pg_wal` directory or reviewed symlink, and requires correspondence with
+each side's selected backup source. Environment variables are not evidence of
+the effective directory. The LOGIN does not inherit `pg_read_all_settings`.
+The session observer counts every PID in the database, including background
+sessions, and excludes only its own PID. It does not filter on PostgreSQL's
+privilege-masked `backend_type`, which could hide another role's client. An
+unrelated database background session can therefore conservatively block drain;
+the function owner does not receive `pg_read_all_stats`.
+
+`hold` and `release` expose a generic named operator surface; SQL grants do not
+restrict them to one approved operation UUID. Source/inventory/intent pins,
+immutable authority, a shared operation lock and dual-media journals enforce the
+workflow's narrower scope. A foreign or uncertain hold is preserved; only a clean
+hold created by the current verified operation may be released. There is no
+owner cleanup, usage refund, credential creation or automatic resume on a failed
+or unknown result. The real PostgreSQL checkpoint fixture tests this function-only
+effective role privileges and actual advisory-lock provenance using `SET ROLE`;
+it does not establish end-to-end production LOGIN/TLS authentication. Offline JSON tests do not
+establish that production roles have these privileges.
+
+### Explicit replica binding
+
+Schema 30 adds a separate recovery-only `bind_replica(uuid,text,jsonb,jsonb)`
+function. Ordinary checkpoint operators do not receive it. Provision its
+NOLOGIN owner with the provider-control locks used above, SELECT/INSERT/UPDATE
+on `openlegal_replication.control`, and named EXECUTE on `capture_prefix()`;
+grant the separately approved recovery LOGIN only schema USAGE and named
+EXECUTE. Never grant the owner role to that LOGIN. The migration creates no
+credentials or grants to an existing runtime account.
+
+The caller records an exact two-media seed intent before invoking it once. An
+initial binding requires an empty control row. A manual replacement compares
+all previous typed fields and requires a new epoch, the same system identifier
+and a strictly newer promoted timeline. A held, drained provider, all admission
+locks and the actual authenticated synchronous peer are required. A failed peer
+check rolls back the proposed binding. The caller must separately fence old
+physical writers, prove both Blob copies, and verify a fresh post-COMMIT WAL
+prefix and peer flush within the original acknowledgement deadline. An unknown
+result is preserved for investigation; it does not authorize replay.
+
+`observe_candidate(jsonb)` is a read-only startup observer under the existing
+NOLOGIN replication owner. Give the recovery LOGIN only named EXECUTE. Its
+response separates the proposed epoch/Blob intent from actual primary/peer/WAL
+facts; it does not claim the proposed control is already installed. Proposed
+binding inputs and fixed peer observers encode certificate serials as decimal
+strings. `bind_replica` returns typed control-row JSON; the operator parses its
+numeric serial without floating-point conversion and normalizes it to decimal
+text before comparison. The isolated TLS pair gate uses
+an actual non-superuser LOGIN to test owner-membership denial and initial bind
+rollback/success. It is not a production seed or promoted-pair acceptance test.
+
+### Bounded collection canary
+
+An operator can bind `[database.ingestion].canary_operation` to a protected
+six-hour operation. Schema 28 consumes at most **100 additional provider HTTP
+attempts total**, in the same locked reservation transaction as ordinary budgets,
+across modes, origins, restarts and UTC days. Attempts include attachments and
+failed DNS/TLS; usage is never refunded or reset by a retry or phase change.
+Existing stricter quotas, rights and uncertainty fences still apply. The original
+deadline bounds request connection, send and body work; it is not renewed per
+request. Automatic redirects and transport retries remain disabled.
+
+Initialization/closure require the separately audited held and drained provider
+operation. A closed canary remains required and cannot enable an unlimited
+fallback. This mechanism bounds traffic; it does not establish successful
+publication. Acceptance requires actual 21,600-second observation and at least
+one eligible acknowledged publication, with fresh transport and preservation
+checks. Exhausting the cap without sufficient evidence is incomplete acceptance.
+
+Schema 31 adds recovery-only `activate_canary(uuid,uuid,text,uuid)`,
+`finish_canary(uuid,text,uuid)` and `canary_readback(uuid)`. They are separate
+from daily checkpoint privileges. Before serving starts, the operator must
+already have a legitimate audited provider hold from the existing reviewed
+provider-recovery procedure. Activation compares that exact held generation,
+requires a clean ledger and actual strict replica, and atomically initializes
+the original six-hour canary and releases that hold. It changes no request
+charges, suspension, retry state, waits or policy. The serving process need not
+restart between the watch's before/after observations.
+
+After the full observation, the operator physically stops and drains every
+known writer and creates its own clean schema-29 checkpoint hold. Finish
+requires that exact current hold/intent, unchanged epoch/Blob binding and
+original elapsed database deadline. It closes the canary while preserving both
+the final hold and required canary ID. It records the original recovery audit
+and final checkpoint operation together. Replays are refused; use the readback
+function to investigate a lost acknowledgement. These database functions do not
+prove physical closure, preservation, publication or public transport success.
+
+Provision a separate NOLOGIN canary function owner and an explicitly approved
+operator LOGIN with no owner membership. Neither receives superuser, role
+creation, database creation, replication or RLS-bypass privileges. The LOGIN
+receives only the needed named functions, including separately reviewed
+checkpoint/replica observations. A DBA grant template for the function owner is:
+
+```sql
+GRANT USAGE ON SCHEMA openlegal,openlegal_admin,openlegal_replication,
+  openlegal_checkpoint TO openlegal_canary_function_owner;
+GRANT SELECT ON openlegal.corpus_control,openlegal.provider_request_budget,
+  openlegal.provider_request_admission,openlegal_admin.provider_control,
+  openlegal_admin.provider_recovery_audit,openlegal_admin.provider_canary,
+  openlegal_admin.provider_canary_control,openlegal_replication.control,
+  openlegal_checkpoint.operation,openlegal_checkpoint.canary_lifecycle
+  TO openlegal_canary_function_owner;
+GRANT UPDATE(singleton) ON openlegal.corpus_control,
+  openlegal.provider_request_budget,openlegal_replication.control
+  TO openlegal_canary_function_owner;
+GRANT UPDATE(recovery_hold,generation,hold_started_at)
+  ON openlegal_admin.provider_control TO openlegal_canary_function_owner;
+GRANT UPDATE(ended_at) ON openlegal_admin.provider_canary
+  TO openlegal_canary_function_owner;
+GRANT UPDATE(required_id) ON openlegal_admin.provider_canary_control
+  TO openlegal_canary_function_owner;
+GRANT UPDATE(operation_id) ON openlegal_checkpoint.operation
+  TO openlegal_canary_function_owner;
+GRANT INSERT ON openlegal_admin.provider_canary_audit
+  TO openlegal_canary_function_owner;
+GRANT INSERT,UPDATE ON openlegal_checkpoint.canary_lifecycle
+  TO openlegal_canary_function_owner;
+GRANT EXECUTE ON FUNCTION openlegal_admin.canary_init(uuid,uuid),
+  openlegal_replication.capture_prefix(),openlegal_checkpoint.state()
+  TO openlegal_canary_function_owner;
+GRANT CREATE ON SCHEMA openlegal_checkpoint TO openlegal_canary_function_owner;
+ALTER FUNCTION openlegal_checkpoint.activate_canary(uuid,uuid,text,uuid)
+  OWNER TO openlegal_canary_function_owner;
+ALTER FUNCTION openlegal_checkpoint.finish_canary(uuid,text,uuid)
+  OWNER TO openlegal_canary_function_owner;
+ALTER FUNCTION openlegal_checkpoint.canary_readback(uuid)
+  OWNER TO openlegal_canary_function_owner;
+REVOKE CREATE ON SCHEMA openlegal_checkpoint FROM openlegal_canary_function_owner;
+GRANT USAGE ON SCHEMA openlegal_checkpoint TO openlegal_canary_operator;
+GRANT EXECUTE ON FUNCTION openlegal_checkpoint.activate_canary(uuid,uuid,text,uuid),
+  openlegal_checkpoint.finish_canary(uuid,text,uuid),
+  openlegal_checkpoint.canary_readback(uuid) TO openlegal_canary_operator;
+```
+
+The existing `canary_init` owner retains its separately provisioned table
+privileges; the new owner calls that function without inheriting its role.
+The isolated TLS/LOGIN lifecycle test shifts timestamps only to exercise SQL
+finish conditions. It cannot establish actual six-hour production observation.
+
+### Preservation and standby observations
+
+Schema 32 adds recovery-only `preservation_page(text,jsonb,integer)` and
+`publication_page(bigint,text,integer)` functions. Both use fixed projections,
+at most 128 rows per page and a 256 KiB response bound. They return metadata and
+digests, without legal bodies or arbitrary SQL. PUBLIC receives no execution
+privilege. Provision named observation functions separately from lifecycle
+mutation privileges.
+
+The operator captures all fifteen preservation relations and every permanent
+generation in the four BlobStore roots while writers are physically drained.
+Final comparison runs under its owned checkpoint hold before finishing the
+canary. Every baseline key and immutable digest must remain; permitted counters
+may only advance. This includes ready cache blobs that are currently unreferenced:
+ordinary cache GC that removes a baseline generation fails this acceptance gate.
+Additions do not excuse missing history. Both journals and the original absolute
+deadline are checked through final acknowledgement. These proofs alone do not
+establish a publicly acknowledged publication, producer OS exit or restoration.
+
+Schema 33 adds standby-only `survivor_position()`,
+`provider_survivor_state()` and `survivor_snapshot()` in the replication and
+checkpoint schemas. The snapshot requires a repeatable-read, read-only
+transaction. A recovery observer seals one receive position only after the old
+WAL receiver has disconnected, then requires replay through that fixed position
+and no reconnect. Primary advisory locks are not replicated, so a standby's
+lock-free observation cannot justify clearing ownership or uncertainty.
+Provision function owners as separate NOLOGIN roles and grant named callers
+only the required execution privileges. These observers neither promote a standby nor
+authorize serving before a second durable copy is established.
+
 ## Deployment boundaries and validation
 
-The supported operating shape is one service process, PostgreSQL 18 and one dedicated
-blob store. Native SQL constraints, per-query sequences, explicit provenance and
+The supported operating shape is one service process and PostgreSQL 18, with
+local storage by default or the opt-in two-copy policy above. Native SQL constraints, per-query sequences, explicit provenance and
 stable snapshot UUIDs permit later compute replicas without a history-format
 migration. Multi-instance upstream rate coordination, distributed refresh leases,
-regional L1 invalidation, edge routing, replication orchestration, NFS deployment
+regional L1 invalidation, automatic failover, NFS deployment
 and S3 SDKs are deferred. The separate [legal corpus](database.md) tables and
 search index do not make cache observations authoritative legal revisions.
 
@@ -542,3 +876,8 @@ revisions, exact history and comparison origins. Widget unit/browser tests prese
 client contract validation. See [contributor checks](../CONTRIBUTING.md#testing-and-ci)
 and [review evidence](persistence-review.md). No legal provider or live ChatGPT
 acceptance is implied by these synthetic checks.
+
+`scripts/test-replication.sh` separately provisions a disposable TLS-authenticated
+PostgreSQL primary/physical standby pair. It exercises real flush confirmation,
+identity/epoch/ACL rejection, cancelled synchronous wait and the physical-delete
+barrier. This synthetic pair is not a production seed or failover receipt.

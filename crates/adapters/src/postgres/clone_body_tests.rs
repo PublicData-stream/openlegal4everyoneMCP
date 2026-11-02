@@ -13,7 +13,7 @@ async fn schema_25() -> (fixture::TestDatabase, PgPool) {
     // TestDatabase normally installs the current schema. Reinstall the actual
     // preceding catalog in this disposable database rather than fabricating an
     // applied migration or changing any checked-in SQL/checksum.
-    sqlx::raw_sql("DROP SCHEMA openlegal_admin CASCADE; DROP SCHEMA openlegal CASCADE; DROP TABLE public._sqlx_migrations")
+    sqlx::raw_sql("DROP SCHEMA IF EXISTS openlegal_checkpoint CASCADE; DROP SCHEMA openlegal_replication CASCADE; DROP SCHEMA openlegal_admin CASCADE; DROP SCHEMA openlegal CASCADE; DROP TABLE public._sqlx_migrations")
         .execute(&pool)
         .await
         .unwrap();

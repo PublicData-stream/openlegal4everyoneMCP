@@ -131,6 +131,9 @@ pub enum PublicationOutcome {
 pub enum StorageStatus {
     Ready,
     Recovering,
+    /// A strict commit/barrier was not acknowledged. Dependency health alone
+    /// cannot authorize recovery of this process's publication authority.
+    CommitUncertain,
     IntegrityBlocked,
     Maintaining,
     Closed,
@@ -142,7 +145,9 @@ impl StorageStatus {
             Self::Ready => None,
             Self::Maintaining => Some(RetrievalError::Busy),
             Self::IntegrityBlocked => Some(RetrievalError::StorageCorrupt),
-            Self::Recovering | Self::Closed => Some(RetrievalError::StorageUnavailable),
+            Self::Recovering | Self::CommitUncertain | Self::Closed => {
+                Some(RetrievalError::StorageUnavailable)
+            }
         }
     }
 }

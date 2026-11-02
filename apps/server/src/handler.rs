@@ -37,6 +37,7 @@ pub struct McpHandler {
     source: SourceOffer,
     resources: Arc<ResourceRegistry>,
     citations: Option<Arc<CitationService>>,
+    durability: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
     limits: Arc<Limits>,
     calls: Arc<Semaphore>,
     rate: Arc<RateLimiter>,
@@ -97,6 +98,7 @@ impl McpHandler {
             source,
             resources: Arc::new(resources),
             citations: None,
+            durability: None,
             calls: Arc::new(Semaphore::new(limits.max_in_flight)),
             rate: Arc::new(RateLimiter::new(
                 limits.rate_limit.enabled,
@@ -150,6 +152,43 @@ impl McpHandler {
         self.citations.clone()
     }
 
+    pub fn with_durability_fence(
+        mut self,
+        fence: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
+    ) -> Self {
+        self.durability = fence;
+        self
+    }
+
+    async fn authorize_persistent_output(
+        &self,
+        deadline: tokio::time::Instant,
+        cancellation: CancellationToken,
+    ) -> Result<(), DatabaseError> {
+        if let Some(fence) = &self.durability {
+            let fence_cancellation = cancellation.child_token();
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(openlegal_domain::RetrievalError::Cancelled),
+                result = tokio::time::timeout_at(deadline, fence.check(deadline, fence_cancellation.clone())) => {
+                    match result {
+                        Ok(result) => result,
+                        Err(_) => {
+                            fence_cancellation.cancel();
+                            Err(openlegal_domain::RetrievalError::StorageUnavailable)
+                        }
+                    }
+                }
+            };
+            result.map_err(|error| match error {
+                openlegal_domain::RetrievalError::Cancelled => DatabaseError::Cancelled,
+                openlegal_domain::RetrievalError::StorageCorrupt => DatabaseError::StorageCorrupt,
+                _ => DatabaseError::StorageUnavailable,
+            })?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn message_limit(&self) -> usize {
         self.limits.max_message_bytes
     }
@@ -197,11 +236,20 @@ impl McpHandler {
         }
         let cancel = cancel.child_token();
         let _guard = cancel.clone().drop_guard();
-        let lookup = service.original_evidence(capture_id, ordinal, cancel.clone());
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.limits.call_timeout_secs);
+        let lookup = async {
+            let value = service
+                .original_evidence(capture_id, ordinal, cancel.clone())
+                .await?;
+            self.authorize_persistent_output(deadline, cancel.clone())
+                .await?;
+            Ok(value)
+        };
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(DatabaseError::Cancelled),
-            result = tokio::time::timeout(Duration::from_secs(self.limits.call_timeout_secs), lookup) => {
+            result = tokio::time::timeout_at(deadline, lookup) => {
                 result.unwrap_or(Err(DatabaseError::Capacity))
             }
         };
@@ -236,17 +284,22 @@ impl McpHandler {
         }
         let cancel = cancel.child_token();
         let _guard = cancel.clone().drop_guard();
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.limits.call_timeout_secs);
         let lookup = async {
-            if page {
+            let value = if page {
                 service.page(id, cancel.clone()).await
             } else {
                 service.source(id, cancel.clone()).await
-            }
+            }?;
+            self.authorize_persistent_output(deadline, cancel.clone())
+                .await?;
+            Ok(value)
         };
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(DatabaseError::Cancelled),
-            result = tokio::time::timeout(Duration::from_secs(self.limits.call_timeout_secs), lookup) => {
+            result = tokio::time::timeout_at(deadline, lookup) => {
                 result.unwrap_or(Err(DatabaseError::Capacity))
             }
         };
@@ -458,6 +511,17 @@ impl ServerHandler for McpHandler {
         };
         match result {
             Ok(mut value) => {
+                if tool.requires_durability
+                    && self
+                        .authorize_persistent_output(deadline, context.ct.clone())
+                        .await
+                        .is_err()
+                {
+                    self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                    // Unconfirmed persistent output, including error sidecars,
+                    // never crosses either transport. Do not retain its metadata.
+                    return Ok(map_tool_error(ToolError::StorageUnavailable)?.into());
+                }
                 if let Some(error) = value.error {
                     self.counters.failures.fetch_add(1, Ordering::Relaxed);
                     // This is the same tool failure as the ordinary Err path.
@@ -527,6 +591,9 @@ impl ServerHandler for McpHandler {
     }
 }
 
+/// Unknown extension tools conservatively require authorization in strict mode.
+/// Supplied-text outputs and existing bearer handles are independent; a handle
+/// created from corpus data is exposed only by its already-fenced creating tool.
 fn qualify_tool_error(
     error: ToolError,
     meta: Option<rmcp::model::MetaObject>,

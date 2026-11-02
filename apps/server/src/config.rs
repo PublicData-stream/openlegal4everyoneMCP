@@ -404,7 +404,7 @@ pub enum CacheConfig {
         max_snapshots: usize,
         #[serde(default = "default_query_count")]
         max_queries: usize,
-        postgres: PostgresConfig,
+        postgres: Box<PostgresConfig>,
         blob: BlobConfig,
     },
 }
@@ -423,6 +423,17 @@ pub struct PostgresConfig {
     #[serde(default)]
     pub tls_mode: PostgresTlsConfig,
     pub ca_file: Option<PathBuf>,
+    #[serde(default)]
+    pub replication_mode: ReplicationMode,
+    pub replication_epoch: Option<uuid::Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationMode {
+    #[default]
+    Local,
+    Required,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -437,7 +448,40 @@ pub enum PostgresTlsConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BlobConfig {
-    Filesystem { path: PathBuf },
+    Filesystem {
+        path: PathBuf,
+    },
+    FilesystemMirror {
+        path: PathBuf,
+        replica_path: PathBuf,
+    },
+}
+
+impl BlobConfig {
+    fn paths(&self) -> Vec<&PathBuf> {
+        match self {
+            Self::Filesystem { path } => vec![path],
+            Self::FilesystemMirror { path, replica_path } => vec![path, replica_path],
+        }
+    }
+
+    pub async fn open(
+        &self,
+    ) -> Result<std::sync::Arc<dyn openlegal_application::blob::BlobStore>, ServerError> {
+        match self {
+            Self::Filesystem { path } => Ok(openlegal_adapters::blob::FsBlobStore::open(
+                &std::path::absolute(path)?,
+            )
+            .await?),
+            Self::FilesystemMirror { path, replica_path } => {
+                Ok(openlegal_adapters::blob::MirroredBlobStore::open(
+                    &std::path::absolute(path)?,
+                    &std::path::absolute(replica_path)?,
+                )
+                .await?)
+            }
+        }
+    }
 }
 
 fn default_retention_days() -> u64 {
@@ -498,11 +542,23 @@ impl CacheConfig {
         if let Self::Persistent { postgres, blob, .. } = self {
             self.policy()?;
             postgres.options()?;
-            match blob {
-                BlobConfig::Filesystem { path } if path.as_os_str().is_empty() => {
-                    return Err("blob store requires a dedicated path".into());
-                }
-                _ => {}
+            if blob.paths().iter().any(|path| path.as_os_str().is_empty()) {
+                return Err("blob store requires dedicated paths".into());
+            }
+            let paths = blob
+                .paths()
+                .into_iter()
+                .map(std::path::absolute)
+                .collect::<Result<Vec<_>, _>>()?;
+            if paths.len() == 2
+                && (paths[0].starts_with(&paths[1]) || paths[1].starts_with(&paths[0]))
+            {
+                return Err("mirrored blob roots must be separate non-nested directories".into());
+            }
+            if postgres.replication_mode == ReplicationMode::Required
+                && !matches!(blob, BlobConfig::FilesystemMirror { .. })
+            {
+                return Err("required replication needs mirrored cache blobs".into());
             }
         }
         Ok(())
@@ -511,6 +567,20 @@ impl CacheConfig {
 
 impl PostgresConfig {
     pub fn options(&self) -> Result<openlegal_adapters::postgres::PostgresOptions, ServerError> {
+        match (self.replication_mode, self.replication_epoch) {
+            (ReplicationMode::Local, None) => {}
+            (ReplicationMode::Required, Some(epoch)) if !epoch.is_nil() => {}
+            _ => {
+                return Err(
+                    "required replication needs a non-nil epoch; local mode cannot set one".into(),
+                );
+            }
+        }
+        if self.replication_mode == ReplicationMode::Required
+            && matches!(self.tls_mode, PostgresTlsConfig::Plaintext)
+        {
+            return Err("required replication needs verify_full PostgreSQL TLS".into());
+        }
         fn valid_env(value: &str) -> bool {
             let mut bytes = value.bytes();
             value.len() <= 128
@@ -587,6 +657,43 @@ impl PostgresConfig {
 }
 
 impl Config {
+    /// Strict startup attests existing seeded directories before a Blob factory
+    /// can create anything. Local/default mode performs no seed-marker I/O.
+    pub fn open_seed_binding(
+        &self,
+    ) -> Result<Option<openlegal_adapters::storage_binding::SeedBinding>, ServerError> {
+        let Some(CacheConfig::Persistent { postgres, blob, .. }) = &self.cache else {
+            return Ok(None);
+        };
+        if postgres.replication_mode == ReplicationMode::Local {
+            return Ok(None);
+        }
+        let BlobConfig::FilesystemMirror { path, replica_path } = blob else {
+            return Err("strict cache requires a seeded mirror".into());
+        };
+        let mut roots = vec![
+            ("cache_primary", path.as_path()),
+            ("cache_replica", replica_path.as_path()),
+        ];
+        if let Some(database) = &self.database {
+            roots.push(("corpus_primary", database.blob_path.as_path()));
+            roots.push((
+                "corpus_replica",
+                database
+                    .blob_replica_path
+                    .as_ref()
+                    .ok_or("strict corpus requires a seeded mirror")?
+                    .as_path(),
+            ));
+        }
+        Ok(Some(openlegal_adapters::storage_binding::open(
+            postgres
+                .replication_epoch
+                .ok_or("strict replication epoch is missing")?,
+            &roots,
+        )?))
+    }
+
     pub fn validate_transport_security(&self) -> Result<(), ServerError> {
         if let Some(edge_mtls) = &self.edge_mtls {
             edge_mtls.validate()?;
@@ -623,24 +730,41 @@ impl Config {
             if self.text_diff.is_none() {
                 return Err("database requires text_diff for checkpoint comparisons".into());
             }
-            let Some(CacheConfig::Persistent {
-                blob: BlobConfig::Filesystem { path },
-                ..
-            }) = &self.cache
-            else {
+            let Some(CacheConfig::Persistent { postgres, blob, .. }) = &self.cache else {
                 return Err("database requires persistent PostgreSQL storage".into());
             };
-            let a = std::path::absolute(path)?;
-            let b = std::path::absolute(&database.blob_path)?;
-            let c = std::path::absolute(&database.index_path)?;
-            if a.starts_with(&b)
-                || b.starts_with(&a)
-                || a.starts_with(&c)
-                || c.starts_with(&a)
-                || b.starts_with(&c)
-                || c.starts_with(&b)
+            if postgres.replication_mode == ReplicationMode::Required
+                && database.blob_replica_path.is_none()
             {
-                return Err("cache blobs, corpus blobs, and corpus index require separate non-nested directories".into());
+                return Err("required replication needs mirrored corpus blobs".into());
+            }
+            let mut paths = blob.paths();
+            paths.extend([&database.blob_path, &database.index_path]);
+            paths.extend(database.blob_replica_path.iter());
+            let paths = paths
+                .into_iter()
+                .map(std::path::absolute)
+                .collect::<Result<Vec<_>, _>>()?;
+            for (i, a) in paths.iter().enumerate() {
+                if paths[i + 1..]
+                    .iter()
+                    .any(|b| a.starts_with(b) || b.starts_with(a))
+                {
+                    return Err("cache, corpus, index and replica roots require separate non-nested directories".into());
+                }
+            }
+            // Preserve existing dictionary layouts; new replica roots must not
+            // cover immutable assets or let asset paths alias writable replicas.
+            let dictionary = std::path::absolute(&database.mecab_dictionary_path)?;
+            let mut replicas: Vec<&PathBuf> = database.blob_replica_path.iter().collect();
+            if let BlobConfig::FilesystemMirror { replica_path, .. } = blob {
+                replicas.push(replica_path);
+            }
+            for replica in replicas {
+                let replica = std::path::absolute(replica)?;
+                if replica.starts_with(&dictionary) || dictionary.starts_with(&replica) {
+                    return Err("replica roots must be separate from dictionary assets".into());
+                }
             }
         }
         if let Some(cache) = &self.cache {
@@ -1107,6 +1231,9 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub max_raw_bytes: ArchiveByteLimit,
     pub blob_path: PathBuf,
+    pub blob_replica_path: Option<PathBuf>,
+    #[serde(default)]
+    pub storage_failure_policy: CorpusStorageFailurePolicy,
     /// Per-operation caller deadline for corpus blobs, including durability probes.
     #[serde(default = "default_blob_operation_timeout_secs")]
     pub blob_operation_timeout_secs: u64,
@@ -1117,6 +1244,76 @@ pub struct DatabaseConfig {
     pub ingestion: Option<IngestionConfig>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CorpusStorageFailurePolicy {
+    #[default]
+    Shutdown,
+    Recover,
+}
+
+/// Compare the actual opened backend descriptors with the authenticated seed.
+/// Both accessors are cached; this performs no pathname or filesystem I/O.
+pub fn verify_blob_mirror(
+    blobs: &dyn openlegal_application::blob::BlobStore,
+    verifier: &dyn openlegal_application::blob::BlobRootVerifier,
+    roles: [&str; 2],
+) -> Result<(), ServerError> {
+    let roots = blobs
+        .root_identities()
+        .ok_or("backend does not expose seeded root identities")?;
+    let [primary, replica] = roots.as_slice() else {
+        return Err("strict storage requires exactly two opened roots".into());
+    };
+    verifier.verify(roles[0], *primary)?;
+    verifier.verify(roles[1], *replica)?;
+    Ok(())
+}
+
+pub async fn open_corpus_blobs_checked(
+    config: &DatabaseConfig,
+    verifier: Option<std::sync::Arc<dyn openlegal_application::blob::BlobRootVerifier>>,
+) -> Result<std::sync::Arc<dyn openlegal_application::blob::BlobStore>, ServerError> {
+    let blobs = open_corpus_blobs(config).await?;
+    if let Some(verifier) = verifier
+        && let Err(error) = verify_blob_mirror(
+            blobs.as_ref(),
+            verifier.as_ref(),
+            ["corpus_primary", "corpus_replica"],
+        )
+    {
+        let _ = blobs.close().await;
+        return Err(error);
+    }
+    Ok(blobs)
+}
+
+pub async fn open_corpus_blobs(
+    config: &DatabaseConfig,
+) -> Result<std::sync::Arc<dyn openlegal_application::blob::BlobStore>, ServerError> {
+    let path = std::path::absolute(&config.blob_path)?;
+    let timeout = std::time::Duration::from_secs(config.blob_operation_timeout_secs);
+    match &config.blob_replica_path {
+        Some(replica) => Ok(
+            openlegal_adapters::blob::MirroredBlobStore::open_with_limit_and_timeout(
+                &path,
+                &std::path::absolute(replica)?,
+                100 * 1024 * 1024,
+                timeout,
+            )
+            .await?,
+        ),
+        None => Ok(
+            openlegal_adapters::blob::FsBlobStore::open_with_limit_and_timeout(
+                &path,
+                100 * 1024 * 1024,
+                timeout,
+            )
+            .await?,
+        ),
+    }
+}
+
 fn default_blob_operation_timeout_secs() -> u64 {
     5
 }
@@ -1124,6 +1321,8 @@ fn default_blob_operation_timeout_secs() -> u64 {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestionConfig {
+    /// A held-operator-created durable canary budget; never a process-local counter.
+    pub canary_operation: Option<uuid::Uuid>,
     /// Idle scans continue immediately; busy scans wait for shared wakeups.
     #[serde(default = "enabled_by_default")]
     pub adaptive_polling: bool,
@@ -1293,6 +1492,13 @@ impl DatabaseConfig {
     pub fn validate(&self) -> Result<(), ServerError> {
         if !(1..=60).contains(&self.blob_operation_timeout_secs) {
             return Err("blob_operation_timeout_secs must be between 1 and 60".into());
+        }
+        if self
+            .blob_replica_path
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            return Err("database blob_replica_path cannot be empty".into());
         }
         if [
             &self.blob_path,

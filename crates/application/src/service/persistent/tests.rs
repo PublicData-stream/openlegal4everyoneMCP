@@ -287,13 +287,14 @@ impl PersistentStore for Storage {
         self.0.recovery_epoch.load(Ordering::SeqCst)
     }
     fn healthy(&self) -> bool {
-        !matches!(self.0.mode.load(Ordering::SeqCst), 6 | 11 | 12 | 14)
+        !matches!(self.0.mode.load(Ordering::SeqCst), 6 | 11 | 12 | 14 | 16)
     }
     fn status(&self) -> StorageStatus {
         match self.0.mode.load(Ordering::SeqCst) {
             6 | 14 => StorageStatus::Recovering,
             11 => StorageStatus::IntegrityBlocked,
             12 => StorageStatus::Maintaining,
+            16 => StorageStatus::CommitUncertain,
             _ => StorageStatus::Ready,
         }
     }
@@ -844,6 +845,29 @@ async fn owned_health_probe_recovers_before_retention_maintenance_is_due() {
     get(&f.service).await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     f.service.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn uncertain_commit_stops_supervised_service_despite_successful_dependency_probe() {
+    let f = fixture();
+    get(&f.service).await.unwrap();
+    f.storage.mode.store(16, Ordering::SeqCst);
+    assert!(!f.service.storage_ready());
+    assert_eq!(
+        get(&f.service).await,
+        Err(RetrievalError::StorageUnavailable)
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    // This fixture's dependency probe returns Ok. It cannot resolve an
+    // uncertain COMMIT or grant permission to replay the publication.
+    assert_eq!(f.storage.health_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.service.run(CancellationToken::new()).await,
+        Err(RetrievalError::Internal)
+    );
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.storage.writes.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

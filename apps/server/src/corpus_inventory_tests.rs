@@ -66,6 +66,8 @@ async fn setup() -> (
     let config = DatabaseConfig {
         max_raw_bytes: Default::default(),
         auto_collection: true,
+        storage_failure_policy: Default::default(),
+        blob_replica_path: None,
         blob_operation_timeout_secs: 5,
         blob_path: fixture.directory.path().join("inventory-blobs"),
         index_path: fixture.directory.path().join("inventory-index"),
@@ -85,6 +87,165 @@ async fn setup() -> (
     )
     .await;
     (fixture, persistent, runtime)
+}
+
+struct ProbeAvailabilityBlob {
+    inner: Arc<dyn BlobStore>,
+    fail: Arc<AtomicBool>,
+}
+impl BlobStore for ProbeAvailabilityBlob {
+    fn put_if_absent(
+        &self,
+        location: BlobLocation,
+        bytes: Vec<u8>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<BlobPutResult, RetrievalError>> {
+        self.inner.put_if_absent(location, bytes, cancel)
+    }
+    fn get(
+        &self,
+        location: BlobLocation,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<Option<Vec<u8>>, RetrievalError>> {
+        self.inner.get(location, cancel)
+    }
+    fn confirm_durable(
+        &self,
+        location: BlobLocation,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<(), RetrievalError>> {
+        self.inner.confirm_durable(location, cancel)
+    }
+    fn delete_if_present(
+        &self,
+        location: BlobLocation,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<(), RetrievalError>> {
+        self.inner.delete_if_present(location, cancel)
+    }
+    fn enumerate(
+        &self,
+        cursor: Option<String>,
+        limit: usize,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<BlobPage, RetrievalError>> {
+        self.inner.enumerate(cursor, limit, cancel)
+    }
+    fn cleanup_staging(
+        &self,
+        now: u64,
+        limit: usize,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<usize, RetrievalError>> {
+        self.inner.cleanup_staging(now, limit, cancel)
+    }
+    fn health(&self, cancel: CancellationToken) -> BoxFuture<'static, Result<(), RetrievalError>> {
+        if self.fail.load(Ordering::Acquire) {
+            Box::pin(async { Err(RetrievalError::StorageUnavailable) })
+        } else {
+            self.inner.health(cancel)
+        }
+    }
+    fn close(&self) -> BoxFuture<'static, Result<(), RetrievalError>> {
+        self.inner.close()
+    }
+    fn metrics(&self) -> BlobMetrics {
+        self.inner.metrics()
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh and pinned MeCab-Ko dictionary"]
+async fn recover_policy_keeps_live_while_corpus_readiness_closes_and_recovers() {
+    let (_fixture, persistent, mut runtime) = setup().await;
+    let fail = Arc::new(AtomicBool::new(false));
+    let inner = runtime.blobs.clone();
+    let rt = Arc::get_mut(&mut runtime).unwrap();
+    rt.storage_failure_policy = CorpusStorageFailurePolicy::Recover;
+    rt.blobs = Arc::new(ProbeAvailabilityBlob {
+        inner,
+        fail: fail.clone(),
+    });
+    rt.store = Arc::new(PgCorpusStore::new_with_persistence(
+        &persistent,
+        rt.blobs.clone(),
+    ));
+    rt.database = Arc::new(DatabaseService::new(
+        rt.store.clone(),
+        Arc::new(SystemClock::default()),
+    ));
+    rt.reader = Arc::new(openlegal_application::database_read::DatabaseReader::new(
+        rt.database.clone(),
+        Arc::new(openlegal_adapters::corpus_read::CorpusReadRetention(
+            rt.store.clone(),
+        )),
+        Arc::new(SystemClock::default()),
+    ));
+    rt.search = Arc::new(SearchService::new(Arc::new(
+        CorpusSearch::new(rt.index.clone(), rt.store.clone())
+            .with_coverage(rt.inventory_verified.clone()),
+    )));
+    let readiness = runtime.store.clone();
+    let mut builder = crate::ServerBuilder::new(
+        crate::registry::ToolRegistry::new(),
+        crate::config::Limits::default(),
+        crate::config::SourceOffer::new("https://example.test/fixture-source").unwrap(),
+    );
+    builder
+        .register_endpoint(
+            crate::http::HealthEndpoint {
+                bind: "127.0.0.1:0".parse().unwrap(),
+            }
+            .with_metrics(String::new)
+            .with_readiness(move || readiness.healthy()),
+        )
+        .unwrap();
+    let worker = runtime.clone();
+    builder
+        .register_worker("fixture_corpus", move |cancel| async move {
+            worker.run(cancel).await
+        })
+        .unwrap();
+    let server = builder.bind().await.unwrap();
+    let address = server.addresses()[0].1[0];
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(server.run(shutdown.clone()));
+    let client = reqwest::Client::new();
+    for expected in [true, false, true] {
+        fail.store(!expected, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let status = client
+                    .get(format!("http://{address}/ready"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16();
+                if status == if expected { 200 } else { 503 } {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("corpus readiness transition");
+        assert_eq!(
+            client
+                .get(format!("http://{address}/live"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            200
+        );
+        assert!(!task.is_finished());
+    }
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    runtime.close().await.unwrap();
+    persistent.close().await.unwrap();
 }
 
 fn view() -> CloneView {

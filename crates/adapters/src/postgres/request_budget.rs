@@ -20,14 +20,15 @@ impl DailyBudgetStore for PostgresStore {
         self.own(move |store| Box::pin(async move {
             validate_identity(&namespace, &provider)?;
             limit.validate()?;
-            let mut tx = DbTransaction::begin(&store.inner.pool).await?;
+            let mut tx = store.begin_transaction().await?;
             sqlx::query("INSERT INTO openlegal.upstream_daily_budget(namespace,provider,daily_limit) VALUES($1,$2,$3) ON CONFLICT(namespace,provider) DO UPDATE SET daily_limit=EXCLUDED.daily_limit")
                 .bind(namespace).bind(provider).bind(limit.as_option().map(i64::from))
                 .execute(tx.conn()?).await.map_err(database_error)?;
             if store.inner.closing.is_cancelled() || store.status().error().is_some() {
                 return Err(Error::StorageUnavailable);
             }
-            tx.commit().await
+            tx.commit().await?;
+            store.check_durability(store.inner.closing.child_token()).await
         }))
     }
 
@@ -40,7 +41,7 @@ impl DailyBudgetStore for PostgresStore {
         self.own(move |store| Box::pin(async move {
             validate_identity(&namespace, &provider)?;
             if cancellation.is_cancelled() { return Err(Error::Cancelled); }
-            let mut tx = DbTransaction::begin(&store.inner.pool).await?;
+            let mut tx = store.begin_transaction().await?;
             let row = sqlx::query("SELECT utc_day,used,daily_limit,floor(extract(epoch from clock_timestamp())/86400)::bigint AS current_day FROM openlegal.upstream_daily_budget WHERE namespace=$1 AND provider=$2 FOR UPDATE")
                 .bind(&namespace).bind(&provider).fetch_optional(tx.conn()?).await
                 .map_err(database_error)?.ok_or(Error::StorageCorrupt)?;
@@ -62,7 +63,8 @@ impl DailyBudgetStore for PostgresStore {
             }
             // The store owns this commit even if its caller disappears. An
             // uncertain outcome never refunds a possibly committed reservation.
-            tx.commit().await
+            tx.commit().await?;
+            store.check_durability(cancellation).await
         }))
     }
 }

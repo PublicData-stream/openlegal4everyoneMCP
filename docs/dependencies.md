@@ -331,8 +331,12 @@ operator CA files remain supported. Exact transitive versions are in Cargo.lock;
 are not compiled into the admitted PostgreSQL feature graph. No MySQL or SQLite
 persistent backend is implemented.
 
-`uuid` 1 is used for typed database UUID decoding/encoding only (std, no generator
-features). PostgreSQL 18 generates relational IDs through native `uuidv7()`;
+`uuid` 1 is used for typed database UUID decoding/encoding and operator replication
+epochs, seed operation IDs and bounded collection canaries. The server directly
+uses the already locked crates.io dependency with default features disabled and
+`std`/`serde`; this adds no package, generator, build script or runtime download.
+Typed deserialization rejects malformed IDs before storage admission, instead of
+duplicating UUID parsing as configuration strings. PostgreSQL 18 generates relational IDs through native `uuidv7()`;
 cryptographic public aliases/comparison handles continue to use `getrandom`.
 The UUID crate is MIT OR Apache-2.0, from crates.io.
 

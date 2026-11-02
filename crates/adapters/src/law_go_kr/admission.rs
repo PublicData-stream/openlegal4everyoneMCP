@@ -15,6 +15,37 @@ use uuid::Uuid;
 // Distinct from the corpus runtime and cache maintenance advisory-lock keys.
 const PROVIDER_LOCK: (i32, i32) = (1869376611, 1818326864);
 
+struct CommitProof {
+    fence: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
+    submitted: Arc<AtomicBool>,
+    confirmed: bool,
+}
+impl CommitProof {
+    fn new(fence: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>) -> Self {
+        Self {
+            fence,
+            submitted: Arc::new(AtomicBool::new(false)),
+            confirmed: false,
+        }
+    }
+    fn submit(&self) {
+        self.submitted.store(true, Ordering::Release);
+    }
+    fn confirm(&mut self) {
+        self.confirmed = true;
+    }
+}
+impl Drop for CommitProof {
+    fn drop(&mut self) {
+        if self.submitted.load(Ordering::Acquire)
+            && !self.confirmed
+            && let Some(fence) = &self.fence
+        {
+            fence.mark_uncertain();
+        }
+    }
+}
+
 fn storage(error: sqlx::Error) -> DatabaseError {
     let sqlstate = error.as_database_error().and_then(|error| error.code());
     let error_kind = if sqlstate.is_some() {
@@ -30,6 +61,18 @@ fn storage(error: sqlx::Error) -> DatabaseError {
         "LAW storage operation failed; outcome is not replayable"
     );
     DatabaseError::StorageUnavailable
+}
+fn canary_error(error: sqlx::Error) -> DatabaseError {
+    if error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .as_deref()
+        == Some("54000")
+    {
+        DatabaseError::BudgetExhausted
+    } else {
+        storage(error)
+    }
 }
 
 /// No statement or provider request has been submitted on this acquisition.
@@ -68,6 +111,38 @@ async fn commit_budget(
         );
         storage(error)
     })
+}
+pub(super) async fn commit_with_durability(
+    tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    operation: &'static str,
+    durability: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
+) -> Result<(), DatabaseError> {
+    let mut proof = CommitProof::new(durability.clone());
+    proof.submit();
+    if let Some(fence) = durability {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        tokio::time::timeout_at(deadline, commit_budget(tx, operation))
+            .await
+            .map_err(|_| DatabaseError::StorageUnavailable)??;
+        fence
+            .check(deadline, CancellationToken::new())
+            .await
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+    } else {
+        commit_budget(tx, operation).await?;
+    }
+    proof.confirm();
+    Ok(())
+}
+pub(super) async fn require_fence(pool: &PgPool, provided: bool) -> Result<(), DatabaseError> {
+    let required: bool = sqlx::query_scalar("SELECT openlegal.replication_required()")
+        .fetch_one(pool)
+        .await
+        .map_err(storage)?;
+    if required && !provided {
+        return Err(DatabaseError::StorageUnavailable);
+    }
+    Ok(())
 }
 
 /// Retry only the first budget-row lock, before any admission mutation.
@@ -160,6 +235,8 @@ pub struct ProviderRequestGuard {
     connection: Option<PgConnection>,
     owner: Uuid,
     slot: i32,
+    dispatch_deadline: Option<tokio::time::Instant>,
+    durability: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
 }
 impl std::fmt::Debug for ProviderRequestGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -175,6 +252,18 @@ impl PartialEq for ProviderRequestGuard {
 impl Eq for ProviderRequestGuard {}
 
 impl ProviderRequestGuard {
+    pub(super) fn dispatch_deadline(&self) -> Option<tokio::time::Instant> {
+        self.dispatch_deadline
+    }
+    pub(super) fn check_dispatch(&self) -> Result<(), DatabaseError> {
+        if self
+            .dispatch_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(DatabaseError::BudgetExhausted);
+        }
+        Ok(())
+    }
     /// Settle only this response; other concurrent owners retain their evidence.
     pub async fn complete(&mut self) -> Result<(), DatabaseError> {
         self.settle(None).await?;
@@ -207,12 +296,30 @@ impl ProviderRequestGuard {
             sqlx::query("UPDATE openlegal.provider_request_budget SET next_allowed_at=GREATEST(next_allowed_at,floor(extract(epoch from clock_timestamp()))::bigint+$1),operator_suspended=operator_suspended OR $2 WHERE singleton")
                 .bind(delay).bind(delay > 7 * 86400).execute(&mut *tx).await.map_err(storage)?;
         }
-        commit_budget(tx, "settle_response").await
+        if let Some(fence) = &self.durability {
+            let mut proof = CommitProof::new(Some(fence.clone()));
+            proof.submit();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            tokio::time::timeout_at(deadline, commit_budget(tx, "settle_response"))
+                .await
+                .map_err(|_| DatabaseError::StorageUnavailable)??;
+            let result = fence
+                .check(deadline, CancellationToken::new())
+                .await
+                .map_err(|_| DatabaseError::StorageUnavailable);
+            if result.is_ok() {
+                proof.confirm();
+            }
+            result
+        } else {
+            commit_budget(tx, "settle_response").await
+        }
     }
     /// Rejection can be discovered after HTTP settlement, during parsing. Its
     /// original owner token cannot clear another concurrent request's evidence.
     pub async fn suspend(&mut self) -> Result<(), DatabaseError> {
-        suspend_owned_response(&self.pool, self.owner).await?;
+        suspend_owned_response_with_durability(&self.pool, self.owner, self.durability.clone())
+            .await?;
         self.release().await
     }
     async fn release(&mut self) -> Result<(), DatabaseError> {
@@ -242,9 +349,17 @@ impl ProviderRequestGuard {
 }
 
 #[tracing::instrument(skip_all, fields(operation = "suspend_response"))]
+#[cfg(test)]
 pub(super) async fn suspend_owned_response(
     pool: &PgPool,
     owner: Uuid,
+) -> Result<(), DatabaseError> {
+    suspend_owned_response_with_durability(pool, owner, None).await
+}
+pub(super) async fn suspend_owned_response_with_durability(
+    pool: &PgPool,
+    owner: Uuid,
+    durability: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
 ) -> Result<(), DatabaseError> {
     let mut tx = pool.begin().await.map_err(storage)?;
     lock_budget(&mut tx, "suspend_response", None, false).await?;
@@ -263,7 +378,22 @@ pub(super) async fn suspend_owned_response(
         .execute(&mut *tx)
         .await
         .map_err(storage)?;
-    commit_budget(tx, "suspend_response").await
+    let mut proof = CommitProof::new(durability.clone());
+    proof.submit();
+    if let Some(fence) = durability {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        tokio::time::timeout_at(deadline, commit_budget(tx, "suspend_response"))
+            .await
+            .map_err(|_| DatabaseError::StorageUnavailable)??;
+        fence
+            .check(deadline, CancellationToken::new())
+            .await
+            .map_err(|_| DatabaseError::StorageUnavailable)?;
+    } else {
+        commit_budget(tx, "suspend_response").await?;
+    }
+    proof.confirm();
+    Ok(())
 }
 
 /// Detect every abandoned slot, including slots above a newly lowered limit.
@@ -599,8 +729,42 @@ pub(super) async fn reserve(
     explicit_owner: Option<&(Uuid, u64)>,
     cancel: &CancellationToken,
 ) -> Result<ProviderRequestGuard, DatabaseError> {
+    reserve_with_durability(
+        pool,
+        mode,
+        local_cap,
+        ticket,
+        shared_events,
+        reservation_observer,
+        explicit_owner,
+        None,
+        None,
+        cancel,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn reserve_with_durability(
+    pool: &PgPool,
+    mode: RequestBudgetMode,
+    local_cap: Option<&Arc<AtomicU32>>,
+    ticket: Option<&ForegroundTicket>,
+    shared_events: &tokio::sync::OnceCell<CollectionEvents>,
+    reservation_observer: Option<&Arc<AtomicBool>>,
+    explicit_owner: Option<&(Uuid, u64)>,
+    durability: Option<&Arc<dyn openlegal_application::durability::DurabilityFence>>,
+    canary_operation: Option<Uuid>,
+    cancel: &CancellationToken,
+) -> Result<ProviderRequestGuard, DatabaseError> {
     if cancel.is_cancelled() {
         return Err(DatabaseError::Cancelled);
+    }
+    let required: bool = sqlx::query_scalar("SELECT openlegal.replication_required()")
+        .fetch_one(pool)
+        .await
+        .map_err(storage)?;
+    if required && durability.is_none() {
+        return Err(DatabaseError::StorageUnavailable);
     }
     let own_ticket = if ticket.is_none() {
         Some(
@@ -633,24 +797,43 @@ pub(super) async fn reserve(
         // Detach before acquiring any session lock: a cancelled query may have
         // acquired its lock, so this connection must never return to the pool.
         let mut connection = connection.detach();
-        let decision = reserve_locked(
+        let mut proof = CommitProof::new(durability.cloned());
+        let decision = reserve_locked_with_canary(
             &mut connection,
             mode,
             local_cap,
             ticket,
             reservation_observer,
             explicit_owner,
+            canary_operation,
+            durability.is_some(),
+            Some(&proof.submitted),
             cancel,
         )
         .await;
         match decision {
-            Ok(Decision::Reserved(owner, slot)) => {
-                return Ok(ProviderRequestGuard {
+            Ok(Decision::Reserved(owner, slot, dispatch_deadline, commit_deadline)) => {
+                let guard = ProviderRequestGuard {
                     pool: pool.clone(),
                     connection: Some(connection),
                     owner,
                     slot,
-                });
+                    dispatch_deadline,
+                    durability: durability.cloned(),
+                };
+                if let Some(fence) = durability {
+                    let deadline = commit_deadline
+                        .unwrap_or(tokio::time::Instant::now() + Duration::from_secs(2));
+                    let deadline =
+                        dispatch_deadline.map_or(deadline, |canary| canary.min(deadline));
+                    fence
+                        .check(deadline, cancel.clone())
+                        .await
+                        .map_err(|_| DatabaseError::StorageUnavailable)?;
+                }
+                proof.confirm();
+                guard.check_dispatch()?;
+                return Ok(guard);
             }
             Ok(Decision::Wait(duration)) => {
                 connection.close().await.map_err(storage)?;
@@ -664,7 +847,12 @@ pub(super) async fn reserve(
     }
 }
 enum Decision {
-    Reserved(Uuid, i32),
+    Reserved(
+        Uuid,
+        i32,
+        Option<tokio::time::Instant>,
+        Option<tokio::time::Instant>,
+    ),
     Wait(Duration),
 }
 async fn wait_change(
@@ -697,6 +885,7 @@ async fn wait_change(
 }
 
 #[tracing::instrument(skip_all, fields(operation = "reserve_request"))]
+#[cfg(test)]
 async fn reserve_locked(
     connection: &mut PgConnection,
     mode: RequestBudgetMode,
@@ -704,6 +893,33 @@ async fn reserve_locked(
     ticket: Option<&ForegroundTicket>,
     reservation_observer: Option<&Arc<AtomicBool>>,
     explicit_owner: Option<&(Uuid, u64)>,
+    cancel: &CancellationToken,
+) -> Result<Decision, DatabaseError> {
+    reserve_locked_with_canary(
+        connection,
+        mode,
+        local_cap,
+        ticket,
+        reservation_observer,
+        explicit_owner,
+        None,
+        false,
+        None,
+        cancel,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn reserve_locked_with_canary(
+    connection: &mut PgConnection,
+    mode: RequestBudgetMode,
+    local_cap: Option<&Arc<AtomicU32>>,
+    ticket: Option<&ForegroundTicket>,
+    reservation_observer: Option<&Arc<AtomicBool>>,
+    explicit_owner: Option<&(Uuid, u64)>,
+    canary_operation: Option<Uuid>,
+    strict_commit: bool,
+    commit_submission: Option<&Arc<AtomicBool>>,
     cancel: &CancellationToken,
 ) -> Result<Decision, DatabaseError> {
     let mut tx = connection.begin().await.map_err(storage)?;
@@ -869,7 +1085,18 @@ async fn reserve_locked(
         })
         .map_err(|_| DatabaseError::BudgetExhausted)?;
     }
+    let mut dispatch_deadline = None;
+    let mut commit_deadline = None;
     let reservation = async {
+        let started = tokio::time::Instant::now();
+        let seconds: Option<f64> = sqlx::query_scalar("WITH c AS MATERIALIZED (SELECT openlegal_admin.canary_consume($1) AS deadline) SELECT extract(epoch FROM (deadline-clock_timestamp()))::double precision FROM c")
+            .bind(canary_operation).fetch_one(&mut *tx).await.map_err(canary_error)?;
+        if let Some(seconds) = seconds {
+            if !seconds.is_finite() || !(0.0..=21600.0).contains(&seconds) {
+                return Err(DatabaseError::BudgetExhausted);
+            }
+            dispatch_deadline = Some(started + Duration::from_secs_f64(seconds));
+        }
         let policy_mode = if mode == RequestBudgetMode::OnDemand { "on_demand" } else { "continuous" };
         let request_mode = if mode == RequestBudgetMode::Pilot { "pilot" } else { policy_mode };
         sqlx::query("UPDATE openlegal.provider_request_budget SET utc_day=$1,daily_used=$2,on_demand_used=$3,next_request_at_ms=$4,last_admission_mode=$5,pilot_started_at=CASE WHEN $6 THEN COALESCE(pilot_started_at,$7) ELSE pilot_started_at END,pilot_duration_secs=CASE WHEN $6 THEN COALESCE(pilot_duration_secs,pilot_timeout_secs) ELSE pilot_duration_secs END,pilot_used=$8 WHERE singleton")
@@ -891,12 +1118,23 @@ async fn reserve_locked(
         if let Some(observer) = reservation_observer {
             observer.store(true, Ordering::Release);
         }
-        commit_budget(tx, "reserve_request").await
+        if let Some(submitted)=commit_submission { submitted.store(true,Ordering::Release); }
+        if strict_commit {
+            let deadline = tokio::time::Instant::now()+Duration::from_secs(2);
+            commit_deadline = Some(deadline);
+            tokio::time::timeout_at(deadline,commit_budget(tx,"reserve_request"))
+                .await.map_err(|_| DatabaseError::StorageUnavailable)?
+        } else { commit_budget(tx,"reserve_request").await }
     }.await;
     // A failed acknowledgement is uncertain, so do not refund an attempt
     // that may have committed. Fail-closed durable evidence remains the fence.
     reservation?;
-    Ok(Decision::Reserved(owner, slot))
+    Ok(Decision::Reserved(
+        owner,
+        slot,
+        dispatch_deadline,
+        commit_deadline,
+    ))
 }
 
 #[cfg(test)]
@@ -905,6 +1143,7 @@ mod tests {
     use crate::law_go_kr::{LawClient, ProviderRequestLimits};
     use openlegal_application::{persistence::PersistentStore, upstream_policy::RequestLimit};
 
+    mod canary;
     mod lock_retry;
 
     async fn unrestricted(pool: &PgPool) {

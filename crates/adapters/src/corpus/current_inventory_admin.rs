@@ -830,6 +830,26 @@ mod tests {
         let store = CurrentInventoryAdminStore::open(&url, crate::test_support::options())
             .await
             .unwrap();
+        // Closing the setup pool does not acknowledge server-side backend
+        // teardown. Establish the quiet fixture before the guarded transaction;
+        // never retry the guard or filter a still-visible setup session away.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let others: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity
+                     WHERE datname=current_database() AND pid<>pg_backend_pid()",
+                )
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+                if others == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("closed setup SQL session remains visible");
         let mut tx = store.pool.begin().await.unwrap();
         maintenance_guard(&mut tx).await.unwrap();
         // Keep the same transaction (and its statistics snapshot) open while

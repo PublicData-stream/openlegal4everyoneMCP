@@ -168,6 +168,14 @@ the CPU flag when adding flags. See [Cargo configuration precedence](https://doc
 Install `cargo-audit` 0.22.2 and `cargo-deny` 0.20.2 using the locked commands in
 [dependency admission](docs/dependencies.md). Both require current advisory-data
 access; unavailable/stale advisory data is not a successful current check.
+Strict persistence, replica admission, Blob mirror, process guard and canary
+changes also require `scripts/test-replication.sh`, in addition to the ordinary
+PostgreSQL gate. This provisions a disposable real PostgreSQL 18 primary and
+physical standby with TLS and verifies flush identity, cancelled synchronous
+wait, seed binding, least-privilege grants and the physical-delete barrier.
+Use only disposable storage; synthetic pair success is not a production seed or
+failover result. CI runs this gate in its PostgreSQL job.
+
 The separate `scripts/test-oxibelt.sh` Docker gate verifies both transports through
 the pinned edge and runs in CI. Edge, NodePort handoff, and OxiBelt harness changes
 require both `scripts/test-oxibelt.sh --profile fixture` and

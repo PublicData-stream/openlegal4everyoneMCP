@@ -36,6 +36,7 @@ impl PgCorpusStore {
         ordinal: u32,
         cancel: CancellationToken,
     ) -> Result<OriginalEvidence, DatabaseError> {
+        self.gate().await?;
         if !openlegal_domain::history::valid_snapshot_id(capture_id) {
             return Err(DatabaseError::InvalidInput);
         }

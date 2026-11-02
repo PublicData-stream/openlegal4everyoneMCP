@@ -5,12 +5,15 @@ mod data;
 mod maintenance;
 pub mod provider_admin;
 mod publication;
+#[cfg(test)]
+mod replication_tests;
 mod request_budget;
 #[cfg(test)]
 mod tests;
 
 use futures::future::BoxFuture;
 use openlegal_application::blob::BlobStore;
+use openlegal_application::durability::DurabilityFence;
 use openlegal_application::persistence::{
     HistoryKey, LookupResult, PersistentKey, PersistentStore, PublicationOutcome,
     PublicationRequest, RetentionPolicy, StorageMetrics, StorageStatus,
@@ -30,7 +33,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -93,6 +96,9 @@ pub struct PostgresStore {
 struct Inner {
     pool: PgPool,
     probe_pool: PgPool,
+    durability: Option<Arc<dyn DurabilityFence>>,
+    strict_uncertain: Arc<AtomicBool>,
+    root_verifier: Option<Arc<dyn openlegal_application::blob::BlobRootVerifier>>,
     transition: Mutex<()>,
     blobs: Arc<dyn BlobStore>,
     policy: RetentionPolicy,
@@ -106,6 +112,34 @@ struct Inner {
     closing: CancellationToken,
     #[cfg(test)]
     hooks: Mutex<std::collections::HashMap<TestPoint, Arc<TestGate>>>,
+}
+struct GuardedFence {
+    fence: Arc<dyn DurabilityFence>,
+    uncertain: Arc<AtomicBool>,
+}
+impl DurabilityFence for GuardedFence {
+    fn mark_uncertain(&self) {
+        self.uncertain.store(true, Ordering::Release);
+        self.fence.mark_uncertain();
+    }
+    fn check(
+        &self,
+        deadline: tokio::time::Instant,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'static, Result<(), Error>> {
+        let fence = self.fence.clone();
+        let uncertain = self.uncertain.clone();
+        Box::pin(async move {
+            if uncertain.load(Ordering::Acquire) {
+                return Err(Error::StorageUnavailable);
+            }
+            fence.check(deadline, cancellation).await?;
+            if uncertain.load(Ordering::Acquire) {
+                return Err(Error::StorageUnavailable);
+            }
+            Ok(())
+        })
+    }
 }
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -344,6 +378,48 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0027_current_inventory_conflict.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            28,
+            "storage replication and canary".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0028_storage_replication.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            29,
+            "owned checkpoint holds".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0029_checkpoint_hold.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            30,
+            "checked replication binding".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0030_replication_binding.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            31,
+            "audited bounded canary lifecycle".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0031_canary_lifecycle.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            32,
+            "bounded preservation and publication observers".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0032_preservation_observers.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            33,
+            "readonly surviving replica observations".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0033_survivor_observers.sql").into_sql_str(),
+            false,
+        ),
     ]);
     migrator.dangerous_set_table_name("public._sqlx_migrations");
     migrator
@@ -480,6 +556,34 @@ impl PostgresStore {
     pub fn pool(&self) -> PgPool {
         self.inner.pool.clone()
     }
+    pub(crate) fn probe_pool(&self) -> PgPool {
+        self.inner.probe_pool.clone()
+    }
+    pub fn durability_fence(&self) -> Option<Arc<dyn DurabilityFence>> {
+        self.inner.durability.clone()
+    }
+    pub fn root_verifier(&self) -> Option<Arc<dyn openlegal_application::blob::BlobRootVerifier>> {
+        self.inner.root_verifier.clone()
+    }
+    async fn check_durability(&self, cancellation: CancellationToken) -> Result<(), Error> {
+        if let Some(fence) = &self.inner.durability {
+            fence
+                .check(
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                    cancellation,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+    async fn begin_transaction(&self) -> Result<DbTransaction, Error> {
+        let mut tx = DbTransaction::begin(&self.inner.pool).await?;
+        if let Some(fence) = &self.inner.durability {
+            tx.durability = Some(fence.clone());
+            tx.uncertain = Some(self.inner.strict_uncertain.clone());
+        }
+        Ok(tx)
+    }
     pub async fn migrate(url: &str, options: PostgresOptions) -> Result<(), StartupError> {
         // A fresh administrative Pod must establish a new TLS connection after
         // PostgreSQL restarts. Keep this startup budget separate from serving.
@@ -503,9 +607,35 @@ impl PostgresStore {
         now: u64,
         mode: StartupMode,
     ) -> Result<Arc<Self>, StartupError> {
+        Self::open_with_replication(url, options, blobs, policy, now, mode, None).await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_with_replication(
+        url: &str,
+        options: PostgresOptions,
+        blobs: Arc<dyn BlobStore>,
+        policy: RetentionPolicy,
+        now: u64,
+        mode: StartupMode,
+        replication: Option<crate::replication::ReplicationOptions>,
+    ) -> Result<Arc<Self>, StartupError> {
         policy.validate()?;
+        if replication.is_some() && matches!(options.tls, PostgresTls::Plaintext) {
+            return Err(Error::InvalidInput.into());
+        }
         if options.max_connections < 2 {
             return Err(Error::InvalidInput.into());
+        }
+        let root_verifier = replication
+            .as_ref()
+            .and_then(|options| options.root_verifier.clone());
+        if let Some(verifier) = &root_verifier {
+            let roots = blobs.root_identities().ok_or(Error::StorageUnavailable)?;
+            if roots.len() != 2 {
+                return Err(Error::StorageUnavailable.into());
+            }
+            verifier.verify("cache_primary", roots[0])?;
+            verifier.verify("cache_replica", roots[1])?;
         }
         let mut probe_options = options.clone();
         probe_options.max_connections = 1;
@@ -519,10 +649,33 @@ impl PostgresStore {
                 return Err(error.into());
             }
         };
+        let strict_uncertain = Arc::new(AtomicBool::new(false));
+        let durability: Option<Arc<dyn DurabilityFence>> = match replication {
+            Some(options) => {
+                match crate::replication::PostgresDurabilityFence::open(probe_pool.clone(), options)
+                    .await
+                {
+                    Ok(fence) => Some(Arc::new(GuardedFence {
+                        fence,
+                        uncertain: strict_uncertain.clone(),
+                    })),
+                    Err(error) => {
+                        pool.close().await;
+                        probe_pool.close().await;
+                        let _ = blobs.close().await;
+                        return Err(error.into());
+                    }
+                }
+            }
+            None => None,
+        };
         let store = Arc::new(Self {
             inner: Arc::new(Inner {
                 pool,
                 probe_pool,
+                durability,
+                strict_uncertain,
+                root_verifier,
                 transition: Mutex::new(()),
                 blobs,
                 policy,
@@ -543,6 +696,13 @@ impl PostgresStore {
             verify_schema(&store.inner.pool)
                 .await
                 .map_err(|_| StartupError::SchemaMismatch)?;
+            let required: bool = sqlx::query_scalar("SELECT openlegal.replication_required()")
+                .fetch_one(&store.inner.probe_pool)
+                .await
+                .map_err(database_error)?;
+            if required != store.inner.durability.is_some() {
+                return Err(Error::StorageUnavailable.into());
+            }
             store.inner.blobs.health(CancellationToken::new()).await?;
             store.check_accounting(mode == StartupMode::Serve).await?;
             // Probe database-selected evidence, in addition to object-store capability checks.
@@ -625,6 +785,9 @@ impl PostgresStore {
         })
     }
     async fn recover(&self) -> Result<(), Error> {
+        if self.inner.strict_uncertain.load(Ordering::Acquire) {
+            return Err(Error::StorageUnavailable);
+        }
         if self.inner.state.load(Ordering::Acquire) == CORRUPT {
             return Err(Error::StorageCorrupt);
         }
@@ -634,8 +797,16 @@ impl PostgresStore {
         let failure_generation = self.inner.recovery_epoch.load(Ordering::Acquire);
         // All commits held this row. Acquiring it on another connection fences an uncertain commit.
         let transaction = DbTransaction::begin(&self.inner.probe_pool).await?;
-        transaction.commit().await?;
+        if self.inner.durability.is_some() {
+            tokio::time::timeout(Duration::from_secs(2), transaction.commit())
+                .await
+                .map_err(|_| Error::StorageUnavailable)??;
+        } else {
+            transaction.commit().await?;
+        }
         verify_schema(&self.inner.probe_pool).await?;
+        self.check_durability(self.inner.closing.child_token())
+            .await?;
         self.check_accounting(true).await?;
         self.inner.blobs.health(CancellationToken::new()).await?;
         #[cfg(test)]
@@ -658,6 +829,10 @@ impl PostgresStore {
 struct DbTransaction {
     connection: Option<PoolConnection<Postgres>>,
     committed: bool,
+    commit_started: bool,
+    barrier_confirmed: bool,
+    durability: Option<Arc<dyn DurabilityFence>>,
+    uncertain: Option<Arc<AtomicBool>>,
 }
 impl DbTransaction {
     async fn begin(pool: &PgPool) -> Result<Self, Error> {
@@ -665,6 +840,10 @@ impl DbTransaction {
         let mut transaction = Self {
             connection: Some(connection),
             committed: false,
+            commit_started: false,
+            barrier_confirmed: false,
+            durability: None,
+            uncertain: None,
         };
         sqlx::query("BEGIN")
             .execute(transaction.conn()?)
@@ -680,16 +859,38 @@ impl DbTransaction {
         self.connection.as_deref_mut().ok_or(Error::Internal)
     }
     async fn commit(mut self) -> Result<(), Error> {
-        sqlx::query("COMMIT")
-            .execute(self.conn()?)
-            .await
-            .map_err(database_error)?;
+        self.commit_started = true;
+        let strict = self.durability.is_some();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let command = sqlx::query("COMMIT");
+        let commit = command.execute(self.conn()?);
+        if strict {
+            tokio::time::timeout_at(deadline, commit)
+                .await
+                .map_err(|_| Error::StorageUnavailable)?
+                .map_err(database_error)?;
+        } else {
+            commit.await.map_err(database_error)?;
+        }
         self.committed = true;
+        if let Some(fence) = &self.durability {
+            fence.check(deadline, CancellationToken::new()).await?;
+        }
+        self.barrier_confirmed = true;
         Ok(())
     }
 }
 impl Drop for DbTransaction {
     fn drop(&mut self) {
+        if self.commit_started
+            && !self.barrier_confirmed
+            && let Some(uncertain) = &self.uncertain
+        {
+            uncertain.store(true, Ordering::Release);
+            if let Some(fence) = &self.durability {
+                fence.mark_uncertain();
+            }
+        }
         if !self.committed
             && let Some(connection) = self.connection.take()
         {
@@ -769,6 +970,9 @@ impl PersistentStore for PostgresStore {
                     RECOVERING => store.recover().await,
                     READY => {
                         verify_schema(&store.inner.probe_pool).await?;
+                        store
+                            .check_durability(store.inner.closing.child_token())
+                            .await?;
                         store.refresh_gauges().await?;
                         store
                             .inner
@@ -784,7 +988,7 @@ impl PersistentStore for PostgresStore {
             let result = tokio::time::timeout(Duration::from_secs(5), work)
                 .await
                 .unwrap_or(Err(Error::StorageUnavailable));
-            let result = if matches!(result, Err(Error::Busy)) {
+            let result = if matches!(result, Err(Error::Busy)) && store.inner.durability.is_none() {
                 Err(Error::StorageUnavailable)
             } else {
                 result
@@ -850,8 +1054,12 @@ impl PersistentStore for PostgresStore {
     }
     fn healthy(&self) -> bool {
         self.inner.state.load(Ordering::Acquire) == READY
+            && !self.inner.strict_uncertain.load(Ordering::Acquire)
     }
     fn status(&self) -> StorageStatus {
+        if self.inner.strict_uncertain.load(Ordering::Acquire) {
+            return StorageStatus::CommitUncertain;
+        }
         match self.inner.state.load(Ordering::Acquire) {
             READY => StorageStatus::Ready,
             CORRUPT => StorageStatus::IntegrityBlocked,

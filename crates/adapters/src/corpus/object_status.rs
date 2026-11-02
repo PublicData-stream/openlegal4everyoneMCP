@@ -7,6 +7,7 @@ impl PgCorpusStore {
         object: &ObjectId,
         now: u64,
     ) -> Result<ObjectStatus, DatabaseError> {
+        self.gate().await?;
         let state = self.state(object).await?;
         let mut status = ObjectStatus {
             schema_version: 1,

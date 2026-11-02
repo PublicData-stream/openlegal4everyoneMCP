@@ -60,6 +60,7 @@ async fn relay_connection(
     armed: Arc<AtomicBool>,
     forwarded_commits: Arc<AtomicUsize>,
     committed: CommitSignal,
+    cancel_after_commit: bool,
 ) -> io::Result<()> {
     // Plaintext PgConnectOptions never sends SSLRequest; the untagged initial
     // packet must be protocol 3 StartupMessage, before tagged authentication.
@@ -111,6 +112,17 @@ async fn relay_connection(
                 {
                     let _ = signal.send(());
                 }
+                if cancel_after_commit {
+                    // Model PostgreSQL cancelling synchronous replication wait
+                    // after a locally durable COMMIT. 57014 is not rollback proof.
+                    write_packet(
+                        &mut client_write,
+                        Some(b'E'),
+                        b"SERROR\0C57014\0Mfictional synchronous wait cancelled\0\0",
+                    )
+                    .await?;
+                    write_packet(&mut client_write, Some(b'Z'), b"I").await?;
+                }
                 return Ok(());
             }
             write_packet(&mut client_write, Some(kind), &body).await?;
@@ -129,6 +141,9 @@ struct CommitAckProxy {
 }
 impl CommitAckProxy {
     async fn open(url: &str) -> Self {
+        Self::open_with_fault(url, false).await
+    }
+    async fn open_with_fault(url: &str, cancel_after_commit: bool) -> Self {
         let mut parsed = url::Url::parse(url).expect("fixture database URL syntax");
         assert!(
             !parsed
@@ -166,7 +181,7 @@ impl CommitAckProxy {
                         relays.spawn(async move {
                             let _ = tokio::time::timeout(Duration::from_secs(30), async {
                                 let backend = TcpStream::connect((host.as_str(), upstream_port)).await?;
-                                relay_connection(client, backend, arm, commits, signal).await
+                                relay_connection(client, backend, arm, commits, signal, cancel_after_commit).await
                             }).await;
                         });
                     }
@@ -244,8 +259,18 @@ fn publication(object: ObjectId, version: u64, job: Option<String>, now: u64) ->
 #[tokio::test]
 #[ignore = "requires scripts/test-postgres.sh"]
 async fn lost_observation_commit_ack_is_not_retried_and_direct_readback_proves_one_commit() {
+    prove_unknown_observation_commit(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-postgres.sh"]
+async fn server_cancelled_sync_wait_after_commit_is_never_retried_as_statement_contention() {
+    prove_unknown_observation_commit(true).await;
+}
+
+async fn prove_unknown_observation_commit(cancel_after_commit: bool) {
     let (fixture, base, _store) = setup().await;
-    let mut proxy = CommitAckProxy::open(&fixture.url).await;
+    let mut proxy = CommitAckProxy::open_with_fault(&fixture.url, cancel_after_commit).await;
     let options = sqlx::postgres::PgConnectOptions::from_str(&proxy.url)
         .unwrap()
         .ssl_mode(sqlx::postgres::PgSslMode::Disable);

@@ -498,7 +498,7 @@ async fn reservation_lock_retry_charges_once_and_exhaustion_has_no_effects() {
     assert!(!reserved.load(Ordering::Acquire));
     blocker.rollback().await.unwrap();
     let (connection, decision) = reserving.await.unwrap();
-    let Ok(Decision::Reserved(owner, slot)) = decision else {
+    let Ok(Decision::Reserved(owner, slot, dispatch_deadline, _)) = decision else {
         panic!("reservation must succeed after the known blocker releases");
     };
     assert_eq!(rejections.count(), 2);
@@ -510,6 +510,8 @@ async fn reservation_lock_retry_charges_once_and_exhaustion_has_no_effects() {
         connection: Some(connection),
         owner,
         slot,
+        dispatch_deadline,
+        durability: None,
     };
     guard.complete().await.unwrap();
     retry_pool.close().await;

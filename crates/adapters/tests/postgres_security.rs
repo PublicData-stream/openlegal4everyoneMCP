@@ -110,6 +110,14 @@ async fn restricted_migration_and_runtime_roles_keep_ddl_out_of_serving() {
     let mut admin = PgConnection::connect(&fixture.url)
         .await
         .expect("isolated admin connection");
+    sqlx::query("DROP SCHEMA IF EXISTS openlegal_checkpoint CASCADE")
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    sqlx::query("DROP SCHEMA openlegal_replication CASCADE")
+        .execute(&mut admin)
+        .await
+        .unwrap();
     sqlx::query("DROP SCHEMA openlegal_admin CASCADE")
         .execute(&mut admin)
         .await

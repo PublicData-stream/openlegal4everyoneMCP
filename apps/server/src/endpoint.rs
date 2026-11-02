@@ -74,6 +74,7 @@ pub struct ServerBuilder {
     source: SourceOffer,
     resources: ResourceRegistry,
     citations: Option<Arc<openlegal_application::citation::CitationService>>,
+    durability: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
     workers: Vec<WorkerFactory>,
     limits: Limits,
     ids: HashSet<String>,
@@ -88,6 +89,7 @@ impl ServerBuilder {
             source,
             resources: ResourceRegistry::new(),
             citations: None,
+            durability: None,
             workers: Vec::new(),
             limits,
             ids: HashSet::new(),
@@ -99,6 +101,15 @@ impl ServerBuilder {
     /// Add immutable resources before listener binding. An empty registry is the default.
     pub fn with_resources(mut self, resources: ResourceRegistry) -> Self {
         self.resources = resources;
+        self
+    }
+
+    /// Require a shared application durability authorization for persistent output.
+    pub fn with_durability_fence(
+        mut self,
+        fence: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
+    ) -> Self {
+        self.durability = fence;
         self
     }
 
@@ -161,7 +172,8 @@ impl ServerBuilder {
                 limits.clone(),
                 self.source,
             )?
-            .with_citations(self.citations)?,
+            .with_citations(self.citations)?
+            .with_durability_fence(self.durability),
             buffers: Arc::new(Semaphore::new(limits.max_buffer_bytes)),
             original_buffers: Arc::new(Semaphore::new(limits.max_original_buffer_bytes)),
             requests: Arc::new(Semaphore::new(limits.max_in_flight)),

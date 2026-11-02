@@ -1,5 +1,5 @@
 use super::{Error, MAX_BATCH, check_cancel};
-use openlegal_application::blob::{BlobLocation, BlobPage, BlobPutResult};
+use openlegal_application::blob::{BlobLocation, BlobPage, BlobPutResult, BlobRootIdentity};
 use rustix::fs::{self, AtFlags, Mode, OFlags, RenameFlags};
 use sha2::{Digest, Sha256};
 use std::{
@@ -41,11 +41,25 @@ fn checkpoint() -> Result<(), Error> {
 
 pub(super) struct Filesystem {
     root: File,
+    root_identity: BlobRootIdentity,
     max_object_bytes: usize,
     staging_cursor: Mutex<(u16, i64)>,
 }
 
-fn unavailable(_: impl std::fmt::Debug) -> Error {
+fn unavailable(error: impl std::fmt::Debug + 'static) -> Error {
+    // Do not format errors: an io::Error can contain a pathname or private data.
+    let typed = &error as &dyn std::any::Any;
+    let errno = typed
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .or_else(|| {
+            typed
+                .downcast_ref::<rustix::io::Errno>()
+                .map(|value| value.raw_os_error())
+        });
+    tracing::warn!(target: "openlegal_adapters::blob", operation = "blob_filesystem",
+        error_category = "filesystem_unavailable", errno = errno.unwrap_or(0),
+        "blob filesystem operation failed");
     Error::StorageUnavailable
 }
 fn hex(bytes: &[u8]) -> String {
@@ -157,6 +171,12 @@ fn staging_name(name: &str) -> bool {
 }
 
 impl Filesystem {
+    pub(super) fn root_identity(&self) -> (u64, u64) {
+        (self.root_identity.device, self.root_identity.inode)
+    }
+    pub(super) fn cached_root_identity(&self) -> BlobRootIdentity {
+        self.root_identity
+    }
     #[cfg(test)]
     pub(super) fn open(path: &Path) -> Result<Self, Error> {
         Self::open_with_limit(path, openlegal_application::MAX_RAW_BYTES)
@@ -200,8 +220,16 @@ impl Filesystem {
                 _ => return Err(Error::InvalidInput),
             }
         }
+        let root = private_directory(directory)?;
+        let metadata = root.metadata().map_err(unavailable)?;
+        let root_identity = BlobRootIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            filesystem: fs::fstatvfs(&root).map_err(unavailable)?.f_fsid,
+        };
         Ok(Self {
-            root: private_directory(directory)?,
+            root,
+            root_identity,
             max_object_bytes,
             staging_cursor: Mutex::new((0, 0)),
         })
@@ -260,6 +288,15 @@ impl Filesystem {
             return Ok(None);
         };
         self.verified(&dir, name, location, false)
+    }
+    pub(super) fn confirm_durable(&self, location: &BlobLocation) -> Result<(), Error> {
+        let (prefix, name) = location_parts(location, self.max_object_bytes)?;
+        let dir = self.shard(prefix, false)?.ok_or(Error::StorageCorrupt)?;
+        self.verified(&dir, name, location, true)?
+            .ok_or(Error::StorageCorrupt)?;
+        // The existing shard must also be reachable after a crash. No mkdir,
+        // staging write or rename is permitted on this confirmation path.
+        self.root.sync_all().map_err(unavailable)
     }
     pub(super) fn put(
         &self,

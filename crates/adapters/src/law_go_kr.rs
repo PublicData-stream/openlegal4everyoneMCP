@@ -237,6 +237,8 @@ pub struct LawClient {
     collection_events: Arc<tokio::sync::OnceCell<crate::collection_events::CollectionEvents>>,
     proxy: Option<crate::upstream_proxy::Socks5Proxy>,
     source_archive: Option<Arc<crate::corpus::PgCorpusStore>>,
+    durability: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
+    canary_operation: Option<uuid::Uuid>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestBudgetMode {
@@ -324,6 +326,14 @@ impl LawClient {
         pool: &PgPool,
         limits: &ProviderRequestLimits,
     ) -> Result<u64, DatabaseError> {
+        Self::configure_provider_request_limits_with_durability(pool, limits, None).await
+    }
+    pub async fn configure_provider_request_limits_with_durability(
+        pool: &PgPool,
+        limits: &ProviderRequestLimits,
+        durability: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
+    ) -> Result<u64, DatabaseError> {
+        admission::require_fence(pool, durability.is_some()).await?;
         let mut tx = pool
             .begin()
             .await
@@ -411,9 +421,8 @@ impl LawClient {
                 .bind(resume_at.to_string()).bind(wake_on_demand).bind(wake_continuous)
                 .execute(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?.rows_affected();
         }
-        tx.commit()
-            .await
-            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        admission::commit_with_durability(tx, "configure_provider_request_limits", durability)
+            .await?;
         Ok(woken)
     }
     pub fn new(
@@ -452,6 +461,8 @@ impl LawClient {
             collection_events: Arc::new(tokio::sync::OnceCell::new()),
             proxy: None,
             source_archive: None,
+            durability: None,
+            canary_operation: None,
         })
     }
     /// Covers inventory, details, NTS HTML and linked attachments, including clones
@@ -464,6 +475,18 @@ impl LawClient {
     /// identity projection. This never publishes an unverified legal record.
     pub fn with_source_archive(mut self, archive: Arc<crate::corpus::PgCorpusStore>) -> Self {
         self.source_archive = Some(archive);
+        self
+    }
+    /// Share the persistence fence and protected global canary identity across
+    /// inventory, details, retry and attachment clients. Missing identities are
+    /// rejected by the database when an operator has armed a canary.
+    pub fn with_persistence_durability(
+        mut self,
+        fence: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
+        canary_operation: Option<uuid::Uuid>,
+    ) -> Self {
+        self.durability = fence;
+        self.canary_operation = canary_operation;
         self
     }
     /// The database migration must be applied before an enabled client starts.
@@ -517,6 +540,7 @@ impl LawClient {
         if *mode != RequestBudgetMode::Pilot {
             return Err(DatabaseError::InvalidInput);
         }
+        admission::require_fence(pool, self.durability.is_some()).await?;
         let mut tx = pool
             .begin()
             .await
@@ -539,9 +563,7 @@ impl LawClient {
         let duration = duration.unwrap_or(configured);
         sqlx::query("UPDATE openlegal.provider_request_budget SET pilot_started_at=$1,pilot_duration_secs=$2 WHERE singleton")
             .bind(started).bind(duration).execute(&mut *tx).await.map_err(|_| DatabaseError::StorageUnavailable)?;
-        tx.commit()
-            .await
-            .map_err(|_| DatabaseError::StorageUnavailable)?;
+        admission::commit_with_durability(tx, "begin_pilot", self.durability.clone()).await?;
         let remaining = started.saturating_add(duration).saturating_sub(now).max(0);
         Ok(Duration::from_secs(remaining as u64))
     }
@@ -576,7 +598,7 @@ impl LawClient {
             return Err(DatabaseError::BudgetExhausted);
         }
         if let Some((pool, mode)) = &self.budget {
-            let guard = admission::reserve(
+            let guard = admission::reserve_with_durability(
                 pool,
                 *mode,
                 self.local_cap.as_ref(),
@@ -584,6 +606,8 @@ impl LawClient {
                 &self.collection_events,
                 self.reservation_observer.as_ref(),
                 self.explicit_owner.as_ref(),
+                self.durability.as_ref(),
+                self.canary_operation,
                 cancel,
             )
             .await?;
@@ -591,6 +615,9 @@ impl LawClient {
                 observer.store(true, Ordering::Release);
             }
             return Ok(Some(guard));
+        }
+        if self.durability.is_some() || self.canary_operation.is_some() {
+            return Err(DatabaseError::StorageUnavailable);
         }
         if let Some(cap) = &self.local_cap {
             cap.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
@@ -626,7 +653,12 @@ impl LawClient {
     async fn suspend_owned_response(&self, owner: Option<uuid::Uuid>) -> Result<(), DatabaseError> {
         self.operator_suspended.store(true, Ordering::Release);
         if let Some((pool, _)) = &self.budget {
-            admission::suspend_owned_response(pool, owner.ok_or(DatabaseError::Conflict)?).await?;
+            admission::suspend_owned_response_with_durability(
+                pool,
+                owner.ok_or(DatabaseError::Conflict)?,
+                self.durability.clone(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -650,6 +682,11 @@ impl LawClient {
                 Err(error)
             }
             Err(error @ (DatabaseError::Cancelled | DatabaseError::StorageUnavailable)) => {
+                if guard.as_ref().is_some_and(|guard| guard.is_active())
+                    && let Some(fence) = &self.durability
+                {
+                    fence.mark_uncertain();
+                }
                 Err(error)
             }
             Err(error) => {
@@ -1536,114 +1573,119 @@ impl LawClient {
             .reserve_request_with_ticket(&cancel, ticket.as_ref())
             .await?;
         let response_owner = guard.as_ref().map(|guard| guard.owner());
+        let dispatch_deadline = guard.as_ref().and_then(|guard| guard.dispatch_deadline());
         drop(ticket);
         let fetched = async {
-        let host = url.host_str().ok_or(DatabaseError::InvalidInput)?;
-        let ips = tokio::select! {_=cancel.cancelled()=>return Err(DatabaseError::Cancelled),r=self.resolver.lookup_ip(format!("{host}."))=>r.map_err(|_|download_failed("dns"))?};
-        let mut addresses = Vec::new();
-        for ip in ips.iter() {
-            if !public_address(ip) || addresses.len() >= 16 {
-                return Err(DatabaseError::InvalidInput);
+            if let Some(guard) = &guard {
+                guard.check_dispatch()?;
             }
-            addresses.push(SocketAddr::new(ip, 443));
-        }
-        if addresses.is_empty() {
-            return Err(download_failed("dns_empty"));
-        }
-        let builder = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30))
-            .resolve_to_addrs(host, &addresses);
-        let builder = match &self.proxy {
-            Some(proxy) => proxy.apply(builder),
-            None => builder,
-        };
-        let client = builder
-            .build()
-            .map_err(|_| DatabaseError::StorageUnavailable)?;
-        let fetch = async {
-            let mut response = client
-                .get(url)
-                .header("accept-encoding", "identity")
-                .send()
-                .await
-                .map_err(|error| {
-                    download_failed(if error.is_timeout() {
-                        "request_timeout"
-                    } else if error.is_connect() {
-                        "connect_tls"
-                    } else {
-                        "response"
-                    })
-                })?;
-            if matches!(
-                response.status(),
-                reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
-            ) {
-                let delay = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(crate::retry_after)
-                    .unwrap_or(60)
-                    .max(1);
-                self.pause_provider_requests(delay, guard.as_mut()).await?;
-                return Err(if self.budget.is_some() {
-                    DatabaseError::BudgetExhausted
-                } else {
-                    DatabaseError::Capacity
-                });
+            let host = url.host_str().ok_or(DatabaseError::InvalidInput)?;
+            let ips = tokio::select! {_=cancel.cancelled()=>return Err(DatabaseError::Cancelled),r=self.resolver.lookup_ip(format!("{host}."))=>r.map_err(|_|download_failed("dns"))?};
+            let mut addresses = Vec::new();
+            for ip in ips.iter() {
+                if !public_address(ip) || addresses.len() >= 16 {
+                    return Err(DatabaseError::InvalidInput);
+                }
+                addresses.push(SocketAddr::new(ip, 443));
             }
-            if let Some(error) = http_status_error(response.status()) {
-                return Err(error);
+            if addresses.is_empty() {
+                return Err(download_failed("dns_empty"));
             }
-            if response
-                .headers()
-                .get("content-encoding")
-                .is_some_and(|v| v != "identity")
-            {
-                return Err(DatabaseError::SourceDataInvalid);
-            }
-            let html_content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/html"));
-            let max = if matches!(format, DocumentFormat::Xml | DocumentFormat::Html)
-                || (attachment_remaining_bytes.is_some() && html_content_type)
-            {
-                16 * 1024 * 1024
-            } else {
-                100 * 1024 * 1024
+            let builder = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
+                .resolve_to_addrs(host, &addresses);
+            let builder = match &self.proxy {
+                Some(proxy) => proxy.apply(builder),
+                None => builder,
             };
-            let max = max.min(attachment_remaining_bytes.unwrap_or(usize::MAX));
-            if response.content_length().is_some_and(|n| n > max as u64) {
-                return Err(DatabaseError::SourceDataInvalid);
-            }
-            let mut raw = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|error| {
+            let client = builder
+                .build()
+                .map_err(|_| DatabaseError::StorageUnavailable)?;
+            let fetch = async {
+                if let Some(guard) = &guard {
+                    guard.check_dispatch()?;
+                }
+                let mut response = client
+                    .get(url)
+                    .header("accept-encoding", "identity")
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        download_failed(if error.is_timeout() {
+                            "request_timeout"
+                        } else if error.is_connect() {
+                            "connect_tls"
+                        } else {
+                            "response"
+                        })
+                    })?;
+                if matches!(
+                    response.status(),
+                    reqwest::StatusCode::TOO_MANY_REQUESTS
+                        | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                ) {
+                    let delay = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(crate::retry_after)
+                        .unwrap_or(60)
+                        .max(1);
+                    self.pause_provider_requests(delay, guard.as_mut()).await?;
+                    return Err(if self.budget.is_some() {
+                        DatabaseError::BudgetExhausted
+                    } else {
+                        DatabaseError::Capacity
+                    });
+                }
+                if let Some(error) = http_status_error(response.status()) {
+                    return Err(error);
+                }
+                if response
+                    .headers()
+                    .get("content-encoding")
+                    .is_some_and(|v| v != "identity")
+                {
+                    return Err(DatabaseError::SourceDataInvalid);
+                }
+                let html_content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/html"));
+                let max = if matches!(format, DocumentFormat::Xml | DocumentFormat::Html)
+                    || (attachment_remaining_bytes.is_some() && html_content_type)
+                {
+                    16 * 1024 * 1024
+                } else {
+                    100 * 1024 * 1024
+                };
+                let max = max.min(attachment_remaining_bytes.unwrap_or(usize::MAX));
+                if response.content_length().is_some_and(|n| n > max as u64) {
+                    return Err(DatabaseError::SourceDataInvalid);
+                }
+                let mut raw = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(|error| {
                     download_failed(if error.is_timeout() {
                         "body_timeout"
                     } else {
                         "body"
                     })
-                })?
-            {
-                if raw.len().saturating_add(chunk.len()) > max {
-                    return Err(DatabaseError::SourceDataInvalid);
+                })? {
+                    if raw.len().saturating_add(chunk.len()) > max {
+                        return Err(DatabaseError::SourceDataInvalid);
+                    }
+                    raw.extend_from_slice(&chunk);
                 }
-                raw.extend_from_slice(&chunk);
-            }
-            Ok((raw, html_content_type))
+                Ok((raw, html_content_type))
+            };
+            tokio::select! {_ = cancel.cancelled()=>Err(DatabaseError::Cancelled),result=fetch=>result}
         };
-        tokio::select! {_ = cancel.cancelled()=>Err(DatabaseError::Cancelled),result=fetch=>result}
-        }.await;
+        let fetched = within_dispatch_deadline(dispatch_deadline, fetched).await;
         let settled = self.settle_fetch(fetched, guard.as_mut()).await;
         drop(guard);
         drop(permit);
@@ -1757,6 +1799,22 @@ impl LawClient {
             _ => {}
         }
         output
+    }
+}
+/// The original canary deadline covers DNS, proxy/TLS negotiation, request send
+/// and response-body work. Expiry is uncertain, so settle_fetch retains its owner
+/// and spent allowance rather than refunding or authorizing another attempt.
+async fn within_dispatch_deadline<T>(
+    deadline: Option<Instant>,
+    future: impl std::future::Future<Output = Result<T, DatabaseError>>,
+) -> Result<T, DatabaseError> {
+    match deadline {
+        Some(deadline) => tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => Err(DatabaseError::StorageUnavailable),
+            result = future => result,
+        },
+        None => future.await,
     }
 }
 fn parse_inventory_tree(
@@ -3543,6 +3601,38 @@ fn project_additional(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn canary_deadline_cancels_stalled_tls_send_without_a_new_timeout_window() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted, observed) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            let _ = accepted.send(());
+            std::future::pending::<()>().await;
+        });
+        let request = tokio::spawn(async move {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            within_dispatch_deadline(Some(Instant::now() + Duration::from_secs(1)), async {
+                client
+                    .get(format!("https://{address}/"))
+                    .send()
+                    .await
+                    .map_err(|_| DatabaseError::SourceDownloadFailed)
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(DatabaseError::StorageUnavailable)
+        ));
+        server.abort();
+        let _ = server.await;
+    }
     use openlegal_application::persistence::PersistentStore;
 
     struct UnusedProcessor;

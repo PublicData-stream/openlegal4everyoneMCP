@@ -48,7 +48,7 @@ pub(super) async fn commit_storage(
         commit_started = true,
         "corpus COMMIT started"
     );
-    tx.commit().await.map_err(|error| {
+    tx.commit().await.map_err(|_| {
         tracing::warn!(
             operation,
             subphase = "commit",
@@ -56,7 +56,10 @@ pub(super) async fn commit_storage(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "corpus COMMIT was not acknowledged"
         );
-        super::db(error)
+        // A server-reported cancellation can interrupt synchronous replication
+        // wait after the local COMMIT. Statement rejection rules do not prove
+        // rollback at this boundary, so never replay the transaction here.
+        DatabaseError::StorageUnavailable
     })
 }
 

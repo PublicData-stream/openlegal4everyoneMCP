@@ -1,4 +1,7 @@
 //! Isolated PostgreSQL 18 test databases; invoked only by the explicit Docker gate.
+#[path = "replication.rs"]
+#[allow(dead_code)] // Shared support is also compiled by suites without paired tests.
+pub mod replication;
 use openlegal_adapters::{
     blob::FsBlobStore,
     postgres::{PostgresOptions, PostgresStore, PostgresTls, StartupMode},

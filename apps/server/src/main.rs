@@ -1,6 +1,6 @@
 use openlegal_server::{
     ServerBuilder, ServerError,
-    config::{AccessPolicy, BlobConfig, CacheConfig, Config},
+    config::{AccessPolicy, CacheConfig, Config},
     http::{HealthEndpoint, HttpEndpoint},
     webtransport::WebTransportEndpoint,
 };
@@ -20,6 +20,7 @@ enum Command {
     Migrate,
     Maintain,
     RebuildCorpusIndex,
+    StorageBinding,
     CollectionScheduler,
     CollectionJob(String, Option<u64>),
 }
@@ -27,7 +28,7 @@ enum Command {
 fn main() -> Result<(), ServerError> {
     let mut args = std::env::args_os().skip(1);
     let first = args.next().ok_or(
-        "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index|--collection-scheduler|--collection-job ID] CONFIG.toml",
+        "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index|--storage-binding|--collection-scheduler|--collection-job ID] CONFIG.toml",
     )?;
     if first == "--provider-admin" {
         return provider_admin::run(args.collect());
@@ -56,6 +57,7 @@ fn main() -> Result<(), ServerError> {
         || first == "--maintain"
         || first == "--rebuild-corpus-index"
         || first == "--collection-scheduler"
+        || first == "--storage-binding"
     {
         let command = if first == "--migrate" {
             Command::Migrate
@@ -63,6 +65,8 @@ fn main() -> Result<(), ServerError> {
             Command::Maintain
         } else if first == "--collection-scheduler" {
             Command::CollectionScheduler
+        } else if first == "--storage-binding" {
+            Command::StorageBinding
         } else {
             Command::RebuildCorpusIndex
         };
@@ -79,7 +83,7 @@ fn main() -> Result<(), ServerError> {
     };
     if args.next().is_some() {
         return Err(
-            "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index|--collection-scheduler|--collection-job ID] CONFIG.toml"
+            "usage: openlegal-server [--migrate|--maintain|--rebuild-corpus-index|--storage-binding|--collection-scheduler|--collection-job ID] CONFIG.toml"
                 .into(),
         );
     }
@@ -122,30 +126,118 @@ fn collection_job_name(id: &str, epoch: u64) -> Result<String, ServerError> {
     Ok(name)
 }
 
+async fn open_seed_binding_owned(
+    config: &Config,
+) -> Result<Option<std::sync::Arc<openlegal_adapters::storage_binding::SeedBinding>>, ServerError> {
+    let strict = matches!(config.cache.as_ref(), Some(CacheConfig::Persistent { postgres, .. })
+        if postgres.replication_mode == openlegal_server::config::ReplicationMode::Required);
+    if !strict {
+        return Ok(None);
+    }
+    let config = config.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        config
+            .open_seed_binding()
+            .map(|binding| binding.map(std::sync::Arc::new))
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker).await {
+        Ok(result) => result?,
+        Err(_) => {
+            // A logical deadline does not interrupt kernel metadata/read I/O.
+            // Own and drain the job, then refuse its late proof before startup.
+            let _ = worker.await;
+            Err(openlegal_domain::RetrievalError::StorageUnavailable.into())
+        }
+    }
+}
+
+async fn revalidate_seed_owned(
+    binding: &std::sync::Arc<openlegal_adapters::storage_binding::SeedBinding>,
+) -> Result<(), ServerError> {
+    let binding = binding.clone();
+    let mut worker = tokio::task::spawn_blocking(move || binding.revalidate());
+    match tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker).await {
+        Ok(result) => result?.map_err(ServerError::from),
+        Err(_) => {
+            let _ = worker.await;
+            Err(openlegal_domain::RetrievalError::StorageUnavailable.into())
+        }
+    }
+}
+
 async fn open_storage(
-    cache: &CacheConfig,
+    config: &Config,
     mode: openlegal_adapters::postgres::StartupMode,
+    admission_guard: Option<std::sync::Arc<dyn openlegal_application::durability::DurabilityFence>>,
 ) -> Result<std::sync::Arc<openlegal_adapters::postgres::PostgresStore>, ServerError> {
-    use openlegal_application::blob::BlobStore;
+    let cache = config
+        .cache
+        .as_ref()
+        .ok_or("storage administration requires persistent cache")?;
     let CacheConfig::Persistent { postgres, blob, .. } = cache else {
         return Err("storage administration requires cache mode persistent".into());
     };
     let options = postgres.options()?;
     let url = postgres.connection_url(false)?;
     let policy = cache.policy()?;
-    let BlobConfig::Filesystem { path } = blob;
-    let blobs = openlegal_adapters::blob::FsBlobStore::open(&std::path::absolute(path)?).await?;
-    match openlegal_adapters::postgres::PostgresStore::open(
+    let seed_binding = open_seed_binding_owned(config).await?;
+    let blobs = blob.open().await?;
+    if let Some(binding) = &seed_binding
+        && let Err(error) = openlegal_server::config::verify_blob_mirror(
+            blobs.as_ref(),
+            binding.as_ref(),
+            ["cache_primary", "cache_replica"],
+        )
+    {
+        let _ = blobs.close().await;
+        return Err(error);
+    }
+    if let Some(binding) = &seed_binding
+        && let Err(error) = revalidate_seed_owned(binding).await
+    {
+        let _ = blobs.close().await;
+        return Err(error);
+    }
+    let replication = match postgres.replication_mode {
+        openlegal_server::config::ReplicationMode::Local => None,
+        openlegal_server::config::ReplicationMode::Required => {
+            Some(openlegal_adapters::replication::ReplicationOptions {
+                managed_epoch: postgres
+                    .replication_epoch
+                    .ok_or("replication epoch is missing")?,
+                expected_blob_binding_sha256: seed_binding
+                    .as_ref()
+                    .ok_or("strict seed binding is missing")?
+                    .sha256(),
+                admission_guard: Some(admission_guard.ok_or("strict runtime guard is missing")?),
+                root_verifier: seed_binding.as_ref().map(|binding| {
+                    binding.clone()
+                        as std::sync::Arc<dyn openlegal_application::blob::BlobRootVerifier>
+                }),
+            })
+        }
+    };
+    match openlegal_adapters::postgres::PostgresStore::open_with_replication(
         &url,
         options,
         blobs.clone(),
         policy,
         now(),
         mode,
+        replication,
     )
     .await
     {
-        Ok(store) => Ok(store),
+        Ok(store) => {
+            if let Some(binding) = &seed_binding
+                && let Err(error) = revalidate_seed_owned(binding).await
+            {
+                use openlegal_application::persistence::PersistentStore;
+                let _ = store.close().await;
+                return Err(error);
+            }
+            Ok(store)
+        }
         Err(error) => {
             let _ = blobs.close().await;
             Err(error.into())
@@ -156,13 +248,14 @@ async fn open_storage(
 /// Collection Pods may overlap briefly with other storage users during startup.
 /// Retry only admission contention, before a provider client can make a request.
 async fn open_collection_storage(
-    cache: &CacheConfig,
+    config: &Config,
+    admission_guard: Option<std::sync::Arc<dyn openlegal_application::durability::DurabilityFence>>,
 ) -> Result<std::sync::Arc<openlegal_adapters::postgres::PostgresStore>, ServerError> {
     use openlegal_adapters::postgres::{StartupError, StartupMode};
     use openlegal_domain::RetrievalError;
 
     for attempt in 0..5 {
-        match open_storage(cache, StartupMode::Serve).await {
+        match open_storage(config, StartupMode::Serve, admission_guard.clone()).await {
             Ok(store) => return Ok(store),
             Err(error) => {
                 let busy = matches!(
@@ -179,7 +272,7 @@ async fn open_collection_storage(
             }
         }
     }
-    open_storage(cache, StartupMode::Serve).await
+    open_storage(config, StartupMode::Serve, admission_guard).await
 }
 
 #[tokio::main]
@@ -188,6 +281,81 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     logging_subscriber(filter, std::io::stdout).init();
     let config: Config = toml::from_str(&tokio::fs::read_to_string(path).await?)?;
+    if command == Command::StorageBinding {
+        config.validate_storage()?;
+        let binding = open_seed_binding_owned(&config)
+            .await?
+            .ok_or("storage binding requires strict replication")?;
+        revalidate_seed_owned(&binding).await?;
+        println!(
+            "{}",
+            serde_json::json!({"kind":"openlegal_blob_seed_binding","schema_version":1,"sha256":binding.sha256()})
+        );
+        return Ok(());
+    }
+    // Keep all seeded root descriptors alive through corpus construction and
+    // listener admission. Migration remains independent of Blob configuration.
+    let startup_seed = if command == Command::Migrate {
+        None
+    } else {
+        open_seed_binding_owned(&config).await?
+    };
+    let runtime_guard = if let Some(binding) = &startup_seed {
+        config.validate_storage()?;
+        let Some(CacheConfig::Persistent {
+            postgres,
+            blob: openlegal_server::config::BlobConfig::FilesystemMirror { replica_path, .. },
+            ..
+        }) = &config.cache
+        else {
+            return Err("strict startup requires the seeded replica".into());
+        };
+        let key = match &command {
+            Command::Serve => "serve".to_owned(),
+            Command::CollectionScheduler => "scheduler".to_owned(),
+            Command::CollectionJob(id, epoch) => format!("collection.{id}.{}", epoch.unwrap_or(0)),
+            Command::Maintain => "admin.maintain".to_owned(),
+            Command::RebuildCorpusIndex => "admin.rebuild".to_owned(),
+            _ => return Err("unsupported strict runtime command".into()),
+        };
+        Some(
+            openlegal_adapters::runtime_guard::RuntimeGuard::acquire(
+                &replica_path.join(".openlegal-runtime-guards"),
+                postgres
+                    .replication_epoch
+                    .ok_or("strict epoch is missing")?,
+                &key,
+                &binding.sha256(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let admission_guard = runtime_guard.as_ref().map(|guard| {
+        guard.clone() as std::sync::Arc<dyn openlegal_application::durability::DurabilityFence>
+    });
+    let result =
+        run_configured_server(config, command, admission_guard, startup_seed.clone()).await;
+    if let Some(guard) = runtime_guard {
+        match result {
+            Ok(()) => guard.release_clean().await?,
+            Err(error) => {
+                guard.mark_uncertain();
+                return Err(error);
+            }
+        }
+        return Ok(());
+    }
+    result
+}
+
+async fn run_configured_server(
+    config: Config,
+    command: Command,
+    admission_guard: Option<std::sync::Arc<dyn openlegal_application::durability::DurabilityFence>>,
+    startup_seed: Option<std::sync::Arc<openlegal_adapters::storage_binding::SeedBinding>>,
+) -> Result<(), ServerError> {
     if matches!(
         command,
         Command::CollectionScheduler | Command::CollectionJob(_, _)
@@ -202,65 +370,86 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
             .as_ref()
             .filter(|ingestion| ingestion.enabled)
             .ok_or("collection requires enabled [database.ingestion]")?;
-        let cache = config
-            .cache
-            .as_ref()
-            .ok_or("collection requires persistent storage")?;
-        let persistent = open_collection_storage(cache).await?;
-        let runtime =
-            openlegal_server::corpus_runtime::CorpusRuntime::open_background(database, &persistent)
-                .await?;
+        let persistent = open_collection_storage(&config, admission_guard.clone()).await?;
+        let runtime = match openlegal_server::corpus_runtime::CorpusRuntime::open_background(
+            database,
+            &persistent,
+        )
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                use openlegal_application::persistence::PersistentStore;
+                let _ = persistent.close().await;
+                return Err(error);
+            }
+        };
+        if let Some(binding) = &startup_seed
+            && let Err(error) = revalidate_seed_owned(binding).await
+        {
+            use openlegal_application::persistence::PersistentStore;
+            let _ = runtime.close().await;
+            let _ = persistent.close().await;
+            return Err(error);
+        }
         let cancel = CancellationToken::new();
         let signal_cancel = cancel.clone();
         let signal = tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             signal_cancel.cancel();
         });
-        let result = match &command {
-            Command::CollectionScheduler => {
-                let background = runtime.clone();
-                let collector = cancel.child_token();
-                run_and_drain(
-                    run_collection_scheduler(runtime.store.clone(), ingestion, collector.clone()),
-                    background.run(collector.clone()),
-                    collector,
-                )
-                .await
-            }
-            Command::CollectionJob(id, epoch) => {
-                let id = id.clone();
-                let launch = if let Some(epoch) = epoch {
-                    runtime
-                        .store
-                        .load_collection_launch_for_epoch(&id, *epoch)
-                        .await?
-                } else {
-                    runtime.store.load_collection_launch(&id).await?
-                };
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(launch.remaining_secs(launch.observed_at)),
-                    runtime.execute_collection_request(&launch, cancel.clone()),
-                )
-                .await
-                {
-                    Ok(result) => result.map_err(ServerError::from),
-                    Err(_) => {
-                        cancel.cancel();
+        let result: Result<(), ServerError> = async {
+            match &command {
+                Command::CollectionScheduler => {
+                    let background = runtime.clone();
+                    let collector = cancel.child_token();
+                    run_and_drain(
+                        run_collection_scheduler(
+                            runtime.store.clone(),
+                            ingestion,
+                            collector.clone(),
+                        ),
+                        background.run(collector.clone()),
+                        collector,
+                    )
+                    .await
+                }
+                Command::CollectionJob(id, epoch) => {
+                    let id = id.clone();
+                    let launch = if let Some(epoch) = epoch {
                         runtime
                             .store
-                            .settle_collection_launch(
-                                &launch,
-                                "failed",
-                                Some("worker_failed"),
-                                None,
-                            )
-                            .await?;
-                        Err("collection request exceeded its operation deadline".into())
+                            .load_collection_launch_for_epoch(&id, *epoch)
+                            .await?
+                    } else {
+                        runtime.store.load_collection_launch(&id).await?
+                    };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(launch.remaining_secs(launch.observed_at)),
+                        runtime.execute_collection_request(&launch, cancel.clone()),
+                    )
+                    .await
+                    {
+                        Ok(result) => result.map_err(ServerError::from),
+                        Err(_) => {
+                            cancel.cancel();
+                            runtime
+                                .store
+                                .settle_collection_launch(
+                                    &launch,
+                                    "failed",
+                                    Some("worker_failed"),
+                                    None,
+                                )
+                                .await?;
+                            Err("collection request exceeded its operation deadline".into())
+                        }
                     }
                 }
+                _ => unreachable!(),
             }
-            _ => unreachable!(),
-        };
+        }
+        .await;
         signal.abort();
         let closed = runtime.close().await;
         let storage_closed = {
@@ -294,8 +483,12 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                 .database
                 .as_ref()
                 .ok_or("index rebuild requires [database]")?;
-            let store =
-                open_storage(cache, openlegal_adapters::postgres::StartupMode::Maintain).await?;
+            let store = open_storage(
+                &config,
+                openlegal_adapters::postgres::StartupMode::Maintain,
+                admission_guard.clone(),
+            )
+            .await?;
             let cancel = CancellationToken::new();
             let signal_cancel = cancel.clone();
             let signal = tokio::spawn(async move {
@@ -312,8 +505,12 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
             tracing::info!(generation, "corpus index rebuild complete");
         } else {
             use openlegal_application::persistence::PersistentStore;
-            let store =
-                open_storage(cache, openlegal_adapters::postgres::StartupMode::Maintain).await?;
+            let store = open_storage(
+                &config,
+                openlegal_adapters::postgres::StartupMode::Maintain,
+                admission_guard.clone(),
+            )
+            .await?;
             let result = store.prune(now()).await;
             let closed = store.close().await;
             result?;
@@ -338,9 +535,14 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         })?;
     }
     let persistent = match &config.cache {
-        Some(cache @ CacheConfig::Persistent { .. }) => {
-            Some(open_storage(cache, openlegal_adapters::postgres::StartupMode::Serve).await?)
-        }
+        Some(CacheConfig::Persistent { .. }) => Some(
+            open_storage(
+                &config,
+                openlegal_adapters::postgres::StartupMode::Serve,
+                admission_guard.clone(),
+            )
+            .await?,
+        ),
         _ => None,
     };
     let mut corpus_runtime = None;
@@ -352,6 +554,8 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                 persistent.as_ref().ok_or("database storage unavailable")?,
             )
             .await?;
+            // Own cleanup before any later fallible registry/citation setup.
+            corpus_runtime = Some(runtime.clone());
             let demand = std::sync::Arc::new(openlegal_application::demand_collection::DemandCollectionCoordinator::new(runtime.store.clone(), database.auto_collection));
             registry.register_module(openlegal_server::database::DatabaseTools {
                 demand: Some(demand.clone()),
@@ -389,7 +593,6 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                 })?;
                 citations = Some(service);
             }
-            corpus_runtime = Some(runtime);
         }
         let demo_options = config
             .demo
@@ -432,7 +635,8 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
             )?;
         }
         let mut builder = ServerBuilder::new(registry, config.limits, config.source.url.clone())
-            .with_resources(resources);
+            .with_resources(resources)
+            .with_durability_fence(persistent.as_ref().and_then(|store| store.durability_fence()));
         if let Some(service) = citations {
             builder = builder.with_citations(service);
         }
@@ -481,6 +685,7 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
         if demo_service.is_some() || diff_service.is_some() || corpus_runtime.is_some() {
             let readiness_service = demo_service.clone();
             let corpus_readiness = corpus_runtime.clone();
+            let corpus_metrics = corpus_runtime.clone();
             builder.register_endpoint(
                 health
                     .with_metrics(move || {
@@ -490,6 +695,9 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
                         }
                         if let Some(service) = &diff_service {
                             metrics.push_str(&service.metrics_prometheus());
+                        }
+                        if let Some(runtime) = &corpus_metrics {
+                            metrics.push_str(&runtime.store.metrics_prometheus());
                         }
                         metrics
                     })
@@ -504,6 +712,9 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
             )?;
         } else {
             builder.register_endpoint(health)?;
+        }
+        if let Some(binding) = &startup_seed {
+            revalidate_seed_owned(binding).await?;
         }
         let server = builder.bind().await?;
         for (id, addresses) in server.addresses() {
@@ -530,20 +741,21 @@ async fn run_server(path: std::ffi::OsString, command: Command) -> Result<(), Se
     }
     .await;
     // Every startup and serving exit owns persistence cleanup, including bind/widget errors.
-    if let Some(runtime) = corpus_runtime {
-        let closed = runtime.close().await;
-        if result.is_ok() {
-            closed?;
-        }
-    }
-    if let Some(store) = persistent {
+    let corpus_closed = if let Some(runtime) = corpus_runtime {
+        runtime.close().await
+    } else {
+        Ok(())
+    };
+    let cache_closed = if let Some(store) = persistent {
         use openlegal_application::persistence::PersistentStore;
-        let closed = store.close().await;
-        if result.is_ok() {
-            closed?;
-        }
-    }
-    result
+        store.close().await.map_err(ServerError::from)
+    } else {
+        Ok(())
+    };
+    result?;
+    corpus_closed?;
+    cache_closed?;
+    Ok(())
 }
 
 async fn run_collection_scheduler(

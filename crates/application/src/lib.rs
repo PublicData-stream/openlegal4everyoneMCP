@@ -8,6 +8,7 @@ pub mod citation;
 pub mod database;
 pub mod demand_collection;
 pub mod document;
+pub mod durability;
 pub mod legal_reference;
 pub mod persistence;
 mod service;

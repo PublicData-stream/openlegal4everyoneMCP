@@ -264,8 +264,14 @@ async fn guard(
             .get("mcp-protocol-version")
             .and_then(|v| v.to_str().ok())
             == Some("2026-07-28");
-    let response = match tokio::time::timeout(
-        Duration::from_secs(context.limits.call_timeout_secs),
+    // Handler work retains its own call deadline; terminal errors also need
+    // bounded I/O time to become response headers/data (including stateless
+    // protocol requests). Share one outer deadline across headers and body so
+    // neither SSE probing nor serialization starts another timeout window.
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(context.limits.call_timeout_secs + context.limits.io_timeout_secs);
+    let response = match tokio::time::timeout_at(
+        deadline,
         next.run(Request::from_parts(parts, Body::from(bytes))),
     )
     .await
@@ -273,8 +279,6 @@ async fn guard(
         Ok(response) => response,
         Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
     };
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(context.limits.call_timeout_secs);
     let response = crate::http_status::preserve_invalid_params_status(
         response,
         modern,

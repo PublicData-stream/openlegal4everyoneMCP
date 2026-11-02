@@ -4,7 +4,9 @@
 //! completes, including after an awaiting caller disappears. A deadline cannot
 //! interrupt kernel I/O; it closes healthy admission until a successful probe.
 use futures::future::BoxFuture;
-use openlegal_application::blob::{BlobLocation, BlobMetrics, BlobPage, BlobPutResult, BlobStore};
+use openlegal_application::blob::{
+    BlobLocation, BlobMetrics, BlobPage, BlobPutResult, BlobRootIdentity, BlobStore,
+};
 use openlegal_domain::RetrievalError as Error;
 use std::{
     path::Path,
@@ -19,12 +21,32 @@ use tokio_util::sync::CancellationToken;
 
 mod filesystem;
 use filesystem::Filesystem;
+mod mirrored;
+pub use mirrored::MirroredBlobStore;
 
 const JOBS: usize = 16;
 const HEALTH_WAITERS: usize = 16;
 const DEADLINE: Duration = Duration::from_secs(5);
 const MAX_BATCH: usize = 128;
 static STARTUPS: Semaphore = Semaphore::const_new(JOBS);
+
+// Unrelated libtest runtimes can otherwise make real fsync fixtures exhaust
+// their 2s/5s production deadlines. Hold this TEST-ONLY permit for a full test,
+// including recovery/close, rather than relaxing any runtime operation budget.
+// Within-test parallel jobs, both mirror legs, and 64-peer guards remain real.
+#[cfg(test)]
+static TEST_IO_ADMISSION: Semaphore = Semaphore::const_new(1);
+#[cfg(test)]
+pub(crate) async fn test_io_admission() -> tokio::sync::SemaphorePermit<'static> {
+    TEST_IO_ADMISSION
+        .acquire()
+        .await
+        .expect("test admission is never closed")
+}
+#[cfg(test)]
+pub(crate) fn test_io_admission_blocking() -> tokio::sync::SemaphorePermit<'static> {
+    futures::executor::block_on(test_io_admission())
+}
 
 #[derive(Default)]
 struct Counters {
@@ -36,6 +58,63 @@ struct Counters {
     corruptions: AtomicU64,
     saturation: AtomicU64,
     active_jobs: AtomicU64,
+    queued_jobs: AtomicU64,
+    started_jobs: AtomicU64,
+    queue_wait_us: AtomicU64,
+    filesystem_work_us: AtomicU64,
+}
+
+#[derive(Default)]
+struct BootstrapProgress {
+    phase: AtomicU64,
+    queued_us: AtomicU64,
+    open_us: AtomicU64,
+    health_us: AtomicU64,
+    expired: AtomicBool,
+}
+impl BootstrapProgress {
+    fn phase_name(&self) -> &'static str {
+        match self.phase.load(Ordering::Acquire) {
+            0 => "queued",
+            1 => "open",
+            2 => "health",
+            _ => "complete",
+        }
+    }
+    fn failure(&self, kind: &'static str, started: std::time::Instant, budget: Duration) {
+        #[cfg(test)]
+        eprintln!(
+            "blob_bootstrap failure_kind={} phase={} elapsed_us={} budget_ms={} queued_us={} open_us={} health_us={}",
+            kind,
+            self.phase_name(),
+            elapsed_us(started),
+            budget.as_millis(),
+            self.queued_us.load(Ordering::Acquire),
+            self.open_us.load(Ordering::Acquire),
+            self.health_us.load(Ordering::Acquire)
+        );
+        tracing::warn!(
+            target: "openlegal_adapters::blob",
+            operation = "blob_bootstrap",
+            failure_kind = kind,
+            phase = self.phase_name(),
+            elapsed_us = elapsed_us(started),
+            bootstrap_timeout_ms = budget.as_millis() as u64,
+            queued_us = self.queued_us.load(Ordering::Acquire),
+            open_us = self.open_us.load(Ordering::Acquire),
+            health_us = self.health_us.load(Ordering::Acquire),
+            "blob bootstrap failed"
+        );
+    }
+}
+
+fn elapsed_us(start: std::time::Instant) -> u64 {
+    start.elapsed().as_micros().min(999_999_999_999) as u64
+}
+fn add_timing(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(old.saturating_add(value).min(999_999_999_999))
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -114,18 +193,56 @@ impl FsBlobStore {
         let path = path.to_owned();
         let startup = STARTUPS.try_acquire().map_err(|_| Error::Busy)?;
         // Bootstrap is one owned job, independent of the application runtime locks.
-        let files = tokio::time::timeout(
-            operation_timeout,
-            tokio::task::spawn_blocking(move || {
-                let _startup = startup;
-                let files = Filesystem::open_with_limit(&path, max_object_bytes)?;
-                files.health()?;
-                Ok::<_, Error>(files)
-            }),
-        )
-        .await
-        .map_err(|_| Error::StorageUnavailable)?
-        .map_err(|_| Error::StorageUnavailable)??;
+        let started = std::time::Instant::now();
+        let progress = Arc::new(BootstrapProgress::default());
+        let worker_progress = progress.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _startup = startup;
+            worker_progress
+                .queued_us
+                .store(elapsed_us(started), Ordering::Release);
+            worker_progress.phase.store(1, Ordering::Release);
+            let open_started = std::time::Instant::now();
+            let opened = Filesystem::open_with_limit(&path, max_object_bytes);
+            worker_progress
+                .open_us
+                .store(elapsed_us(open_started), Ordering::Release);
+            let result = opened.and_then(|files| {
+                worker_progress.phase.store(2, Ordering::Release);
+                let health_started = std::time::Instant::now();
+                let health = files.health();
+                worker_progress
+                    .health_us
+                    .store(elapsed_us(health_started), Ordering::Release);
+                health?;
+                worker_progress.phase.store(3, Ordering::Release);
+                Ok(files)
+            });
+            if worker_progress.expired.load(Ordering::Acquire) {
+                worker_progress.failure(
+                    "physical_completion_after_deadline",
+                    started,
+                    operation_timeout,
+                );
+            }
+            result
+        });
+        let files = match tokio::time::timeout(operation_timeout, task).await {
+            Err(_) => {
+                progress.expired.store(true, Ordering::Release);
+                progress.failure("logical_deadline", started, operation_timeout);
+                return Err(Error::StorageUnavailable);
+            }
+            Ok(Err(_)) => {
+                progress.failure("worker_join", started, operation_timeout);
+                return Err(Error::StorageUnavailable);
+            }
+            Ok(Ok(Err(error))) => {
+                progress.failure("physical_error", started, operation_timeout);
+                return Err(error);
+            }
+            Ok(Ok(Ok(files))) => files,
+        };
         Ok(Arc::new(Self {
             shared: Arc::new(Shared {
                 files,
@@ -184,7 +301,12 @@ impl FsBlobStore {
             let _cancel_on_drop = token.clone().drop_guard();
             let worker = shared.clone();
             let worker_token = token.clone();
+            let queued = std::time::Instant::now();
+            worker.counters.queued_jobs.fetch_add(1, Ordering::Relaxed);
             let task = tokio::task::spawn_blocking(move || {
+                worker.counters.queued_jobs.fetch_sub(1, Ordering::Relaxed);
+                worker.counters.started_jobs.fetch_add(1, Ordering::Relaxed);
+                add_timing(&worker.counters.queue_wait_us, elapsed_us(queued));
                 struct Finished(Arc<Shared>);
                 impl Drop for Finished {
                     fn drop(&mut self) {
@@ -194,6 +316,13 @@ impl FsBlobStore {
                 }
                 let _finished = Finished(worker.clone());
                 let _permit = permit;
+                struct FilesystemTiming(Arc<Shared>, std::time::Instant);
+                impl Drop for FilesystemTiming {
+                    fn drop(&mut self) {
+                        add_timing(&self.0.counters.filesystem_work_us, elapsed_us(self.1));
+                    }
+                }
+                let _timing = FilesystemTiming(worker.clone(), std::time::Instant::now());
                 let result = if worker_token.is_cancelled() {
                     Err(Error::Cancelled)
                 } else {
@@ -205,6 +334,12 @@ impl FsBlobStore {
                         Error::Cancelled | Error::InvalidInput | Error::Busy | Error::Shutdown
                     )
                 {
+                    #[cfg(test)]
+                    eprintln!(
+                        "blob_owned failure_kind=physical_error error_category={error:?} queue_us={} active_jobs={}",
+                        worker.counters.queue_wait_us.load(Ordering::Acquire),
+                        worker.counters.active_jobs.load(Ordering::Acquire)
+                    );
                     failed(&worker, *error);
                 }
                 result
@@ -219,6 +354,13 @@ impl FsBlobStore {
                     Ok(Err(_)) => {
                         token.cancel();
                         failed(&shared, Error::StorageUnavailable);
+                        #[cfg(test)]
+                        eprintln!(
+                            "blob_owned failure_kind=worker_join probe={} elapsed_ms={} budget_ms={}",
+                            probe,
+                            started.elapsed().as_millis(),
+                            shared.operation_timeout.as_millis()
+                        );
                         tracing::warn!(
                             operation = if probe { "blob_health" } else { "blob_job" },
                             error_category = "worker_join",
@@ -232,6 +374,15 @@ impl FsBlobStore {
                     Err(_) => {
                         token.cancel();
                         failed(&shared, Error::StorageUnavailable);
+                        #[cfg(test)]
+                        eprintln!(
+                            "blob_owned failure_kind=logical_deadline probe={} elapsed_ms={} budget_ms={} queued_jobs={} active_jobs={}",
+                            probe,
+                            started.elapsed().as_millis(),
+                            shared.operation_timeout.as_millis(),
+                            shared.counters.queued_jobs.load(Ordering::Acquire),
+                            shared.counters.active_jobs.load(Ordering::Acquire)
+                        );
                         tracing::warn!(
                             operation = if probe { "blob_health" } else { "blob_job" },
                             error_category = "local_deadline",
@@ -251,9 +402,29 @@ impl FsBlobStore {
             }
         })
     }
+
+    // Internal owned supervisors retain their aggregate permits until physical
+    // completion. This deliberately has no new watchdog or caller-facing budget.
+    fn physical_drain(&self) -> BoxFuture<'static, ()> {
+        let shared = self.shared.clone();
+        Box::pin(async move {
+            loop {
+                let notified = shared.completed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if shared.counters.active_jobs.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+    }
 }
 
 impl BlobStore for FsBlobStore {
+    fn root_identities(&self) -> Option<Vec<BlobRootIdentity>> {
+        Some(vec![self.shared.files.cached_root_identity()])
+    }
     fn put_if_absent(
         &self,
         location: BlobLocation,
@@ -286,6 +457,17 @@ impl BlobStore for FsBlobStore {
             let value = files.get(&location)?;
             counters.reads.fetch_add(1, Ordering::Relaxed);
             Ok(value)
+        })
+    }
+    fn confirm_durable(
+        &self,
+        location: BlobLocation,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'static, Result<(), Error>> {
+        self.job(cancellation, false, move |files, token, _| {
+            check_cancel(token)?;
+            files.confirm_durable(&location)?;
+            check_cancel(token)
         })
     }
     fn delete_if_present(
@@ -484,6 +666,10 @@ impl BlobStore for FsBlobStore {
             corruptions: c.corruptions.load(Ordering::Relaxed),
             saturation: c.saturation.load(Ordering::Relaxed),
             active_jobs: c.active_jobs.load(Ordering::Relaxed),
+            queued_jobs: c.queued_jobs.load(Ordering::Relaxed),
+            started_jobs: c.started_jobs.load(Ordering::Relaxed),
+            queue_wait_us: c.queue_wait_us.load(Ordering::Relaxed),
+            filesystem_work_us: c.filesystem_work_us.load(Ordering::Relaxed),
         }
     }
 }

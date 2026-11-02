@@ -313,6 +313,8 @@ async fn automatic_collection_contracts_hold_through_http_and_webtransport() {
         let persistent = fixture.open(SystemClock::default().now()).await;
         let runtime = CorpusRuntime::open(
             &DatabaseConfig {
+                blob_replica_path: None,
+                storage_failure_policy: Default::default(),
                 max_raw_bytes: Default::default(),
                 auto_collection: enabled,
                 blob_operation_timeout_secs: 5,

@@ -77,7 +77,7 @@ impl PostgresStore {
     }
     pub(super) async fn check_accounting(&self, enforce: bool) -> Result<(), Error> {
         // Consistent view under the same short mutation lock; no repair hidden in startup.
-        let mut tx = DbTransaction::begin(&self.inner.pool).await?;
+        let mut tx = self.begin_transaction().await?;
         let totals = Self::totals(tx.conn()?).await?;
         let recorded=sqlx::query("SELECT snapshots,queries,referenced_bytes FROM openlegal.cache_storage WHERE singleton").fetch_one(tx.conn()?).await.map_err(database_error)?;
         if recorded
@@ -210,7 +210,7 @@ impl PostgresStore {
             .health(self.inner.closing.child_token())
             .await?;
         self.cleanup_queue().await?;
-        let mut tx = DbTransaction::begin(&self.inner.pool).await?;
+        let mut tx = self.begin_transaction().await?;
         let mut barrier = None;
         let evicted = self.trim(&mut tx, None, now, &mut barrier).await?;
         let pending=sqlx::query("SELECT sha256,generation,size_bytes,storage_key FROM openlegal.blob_object WHERE NOT ready AND created_at<=$1::text::numeric-60 ORDER BY created_at LIMIT 128").bind(now.to_string()).fetch_all(tx.conn()?).await.map_err(database_error)?;
@@ -246,11 +246,13 @@ impl PostgresStore {
             }
             #[cfg(test)]
             self.checkpoint(TestPoint::BeforeDelete).await?;
+            self.check_durability(self.inner.closing.child_token())
+                .await?;
             self.inner
                 .blobs
                 .delete_if_present(location.clone(), self.inner.closing.child_token())
                 .await?;
-            let mut tx = DbTransaction::begin(&self.inner.pool).await?;
+            let mut tx = self.begin_transaction().await?;
             sqlx::query("DELETE FROM openlegal.blob_deletion WHERE storage_key=$1")
                 .bind(location.storage_key)
                 .execute(tx.conn()?)
@@ -279,7 +281,7 @@ impl PostgresStore {
                 .get(68..)
                 .and_then(|s| Uuid::parse_str(s).ok())
                 .ok_or(Error::StorageCorrupt)?;
-            let mut tx = DbTransaction::begin(&self.inner.pool).await?;
+            let mut tx = self.begin_transaction().await?;
             let live:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM openlegal.blob_object WHERE storage_key=$1) OR EXISTS(SELECT 1 FROM openlegal.blob_deletion WHERE storage_key=$1)").bind(&blob.storage_key).fetch_one(tx.conn()?).await.map_err(database_error)?;
             if !live {
                 Self::queue_available(&mut tx, blob.size_bytes as i64).await?;

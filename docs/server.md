@@ -376,6 +376,24 @@ Actual endpoint/worker failure still triggers shared shutdown and drain. Databas
 and blob errors are translated to sanitized `storage_unavailable`, `storage_corrupt`,
 `storage_capacity`, and `snapshot_unavailable` outcomes.
 
+Corpus runtime failure handling is separately opt-in:
+`[database].storage_failure_policy = "recover"` keeps the process and `/live`
+available after a confirmed dependency-health availability failure while `/ready`
+returns 503. Omission retains `"shutdown"`. Recovery drains owned collection
+work, revalidates the still-owned lease, schema, index acknowledgement, Blob
+generation and physical jobs, and any required replica fence. Fresh collection
+cycles additionally require an already safe provider state. Recovery never
+clears a provider hold or an uncertain response. Lease loss, corruption,
+uncertain COMMIT, failed worker and arbitrary maintenance/index storage errors
+remain fatal; this setting does not make every `storage_unavailable` retryable.
+
+The optional [strict two-copy policy](persistence.md#strict-two-copy-durability)
+also gates data-bearing MCP responses, retained-source citation pages and source
+bytes on a fresh replica proof. A failed proof removes the original result,
+metadata and diagnostic sidecars. Static widgets, `server_info` and supplied-text
+comparison remain independent. The same boundary applies to HTTP and native
+WebTransport in both supported protocol revisions.
+
 Persistent mode enables `demo_list_snapshots` and `demo_get_snapshot`; adding `[text_diff]` also
 enables `demo_compare_record_snapshots`. Current result envelopes optionally include
 `snapshot`; historical responses use a separate envelope. Demo render results

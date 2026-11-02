@@ -16,7 +16,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub(super) mod storage_retry;
-use storage_retry::{begin_storage, commit_storage, retry_storage};
+use storage_retry::{begin_storage, commit_storage as commit_sql, retry_storage};
+
+mod availability;
+use availability::CorpusExecuteExt;
+pub use availability::{CorpusHealthFailure, CorpusHealthProof};
 
 #[cfg(test)]
 mod contention_regressions;
@@ -44,8 +48,13 @@ pub use runtime_lease::CorpusRuntimeLease;
 #[derive(Clone)]
 pub struct PgCorpusStore {
     pool: PgPool,
+    probe_pool: PgPool,
     blobs: Arc<dyn BlobStore>,
     blocked: Arc<AtomicBool>,
+    availability: Arc<availability::Availability>,
+    health_probe: Arc<tokio::sync::Mutex<()>>,
+    durability_fence: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
+    track_uncertainty: bool,
     publication_clock: Arc<dyn openlegal_application::Clock>,
     collection_events: Arc<tokio::sync::OnceCell<crate::collection_events::CollectionEvents>>,
 }
@@ -222,7 +231,7 @@ impl PgCorpusStore {
             serde_json::to_string(&dataset).map_err(corrupt)?
         );
         sqlx::query("INSERT INTO openlegal.provider_inventory_cursor(dataset) VALUES($1) ON CONFLICT DO NOTHING")
-            .bind(&name).execute(&self.pool).await.map_err(db)?;
+            .bind(&name).corpus_execute(self).await?;
         let page: i32 = sqlx::query_scalar(
             "SELECT next_page FROM openlegal.provider_inventory_cursor WHERE dataset=$1",
         )
@@ -255,7 +264,7 @@ impl PgCorpusStore {
             .bind(i32::try_from(next).map_err(corrupt)?)
             .bind(&name)
             .bind(i32::try_from(observed_page).map_err(corrupt)?)
-            .execute(&self.pool).await.map_err(db)?.rows_affected();
+            .corpus_execute(self).await?.rows_affected();
         if rows != 1 {
             return Err(DatabaseError::Conflict);
         }
@@ -292,7 +301,7 @@ impl PgCorpusStore {
         let rows = sqlx::query("UPDATE openlegal.provider_inventory_cursor SET item_offset=$1 WHERE dataset=$2 AND next_page=$3")
             .bind(i32::try_from(offset).map_err(corrupt)?)
             .bind(name).bind(i32::try_from(page).map_err(corrupt)?)
-            .execute(&self.pool).await.map_err(db)?.rows_affected();
+            .corpus_execute(self).await?.rows_affected();
         if rows != 1 {
             return Err(DatabaseError::Conflict);
         }
@@ -305,6 +314,18 @@ impl PgCorpusStore {
             Arc::new(openlegal_application::SystemClock::default()),
         )
     }
+    /// Shares the already reserved probe connection and replication authority;
+    /// this never creates another PostgreSQL pool or connection allowance.
+    pub fn new_with_persistence(
+        persistent: &crate::postgres::PostgresStore,
+        blobs: Arc<dyn BlobStore>,
+    ) -> Self {
+        let mut store = Self::new(persistent.pool(), blobs);
+        store.probe_pool = persistent.probe_pool();
+        store.durability_fence = persistent.durability_fence();
+        store.track_uncertainty = true;
+        store
+    }
     pub fn with_publication_clock(
         pool: PgPool,
         blobs: Arc<dyn BlobStore>,
@@ -313,9 +334,14 @@ impl PgCorpusStore {
         Self {
             collection_events: Arc::new(tokio::sync::OnceCell::new()),
             publication_clock,
+            probe_pool: pool.clone(),
             pool,
             blobs,
             blocked: Arc::new(AtomicBool::new(false)),
+            availability: Arc::new(availability::Availability::default()),
+            health_probe: Arc::new(tokio::sync::Mutex::new(())),
+            durability_fence: None,
+            track_uncertainty: false,
         }
     }
     /// Shared archive capacity. `None` admits storage without a configured total
@@ -325,6 +351,7 @@ impl PgCorpusStore {
         &self,
         max_raw_bytes: Option<u64>,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         if max_raw_bytes == Some(0) {
             return Err(DatabaseError::InvalidInput);
         }
@@ -333,85 +360,31 @@ impl PgCorpusStore {
             "UPDATE openlegal.corpus_control SET max_raw_bytes=$1::text::numeric WHERE singleton",
         )
         .bind(max_raw_bytes.map(|n| n.to_string()))
-        .execute(&self.pool)
-        .await
-        .map_err(db)?;
+        .corpus_execute(self)
+        .await?;
         Ok(())
     }
     pub fn healthy(&self) -> bool {
-        !self.blocked.load(Ordering::Acquire) && !self.pool.is_closed()
+        !self.blocked.load(Ordering::Acquire)
+            && !self.pool.is_closed()
+            && self.availability.healthy()
     }
     pub async fn health(&self) -> Result<(), DatabaseError> {
-        if !self.healthy() {
-            return Err(DatabaseError::StorageCorrupt);
-        }
-        let sql_started = tokio::time::Instant::now();
-        retry_storage(&CancellationToken::new(), "corpus_health", || async {
-            sqlx::query("SELECT singleton FROM openlegal.corpus_control")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(db)
-        })
-        .await
-        .inspect_err(|error| {
-            let error = match error {
-                DatabaseError::StorageContended => "StorageContended",
-                DatabaseError::StorageUnavailable => "StorageUnavailable",
-                DatabaseError::Cancelled => "Cancelled",
-                _ => "Other",
-            };
-            tracing::warn!(
-                operation = "corpus_health",
-                health_phase = "sql",
-                elapsed_ms = sql_started.elapsed().as_millis().min(999_999_999_999) as u64,
-                error,
-                "corpus health dependency failed"
-            );
-        })?;
-        let blob_started = tokio::time::Instant::now();
-        self.blobs
-            .health(CancellationToken::new())
+        let proof = self
+            .probe_health(None, CancellationToken::new())
             .await
-            .inspect_err(|error| {
-                // Omit even the optional numeric throttle payload: only a
-                // closed variant name crosses the diagnostic boundary.
-                use openlegal_domain::RetrievalError as E;
-                let error = match error {
-                    E::StorageUnavailable => "StorageUnavailable",
-                    E::StorageCorrupt => "StorageCorrupt",
-                    E::StorageCapacity => "StorageCapacity",
-                    E::SnapshotUnavailable => "SnapshotUnavailable",
-                    E::InvalidInput => "InvalidInput",
-                    E::UnknownSource => "UnknownSource",
-                    E::NotFound => "NotFound",
-                    E::Ambiguous => "Ambiguous",
-                    E::Busy => "Busy",
-                    E::Unavailable => "Unavailable",
-                    E::FreshnessUnavailable => "FreshnessUnavailable",
-                    E::NormalizationFailed => "NormalizationFailed",
-                    E::InvalidPayload => "InvalidPayload",
-                    E::ResourceLimit => "ResourceLimit",
-                    E::Cancelled => "Cancelled",
-                    E::Shutdown => "Shutdown",
-                    E::Internal => "Internal",
-                    E::Throttled { .. } => "Throttled",
-                };
-                tracing::warn!(
-                    operation = "corpus_health",
-                    health_phase = "blob",
-                    elapsed_ms = blob_started.elapsed().as_millis().min(999_999_999_999) as u64,
-                    error,
-                    "corpus health dependency failed"
-                );
-            })
-            .map_err(blob_error)?;
-        Ok(())
+            .map_err(CorpusHealthFailure::error)?;
+        self.complete_health(proof)
+            .map_err(CorpusHealthFailure::error)
     }
     async fn gate(&self) -> Result<(), DatabaseError> {
-        if !self.healthy() {
+        if self.blocked.load(Ordering::Acquire) || self.pool.is_closed() {
             return Err(DatabaseError::StorageCorrupt);
         }
-        Ok(())
+        if !self.availability.healthy() {
+            return Err(DatabaseError::StorageUnavailable);
+        }
+        self.durable(CancellationToken::new()).await
     }
     pub async fn state(&self, object: &ObjectId) -> Result<ObjectState, DatabaseError> {
         self.gate().await?;
@@ -503,7 +476,7 @@ impl PgCorpusStore {
             .blobs
             .get(location, cancel.clone())
             .await
-            .map_err(blob_error)?;
+            .map_err(|error| self.record_blob_error(error))?;
         let raw = match raw {
             Some(raw) => raw,
             None => return Err(self.missing_evidence(id).await?),
@@ -539,7 +512,7 @@ impl PgCorpusStore {
                     cancel.clone(),
                 )
                 .await
-                .map_err(blob_error)?;
+                .map_err(|error| self.record_blob_error(error))?;
             let data = match data {
                 Some(data) => data,
                 None => return Err(self.missing_evidence(id).await?),
@@ -879,7 +852,7 @@ impl PgCorpusStore {
             .await
             .map_err(db)?;
         check(&cancel)?;
-        commit_storage(reserve, "publish").await?;
+        self.commit_storage(reserve, "publish").await?;
         Ok(())
         }).await?;
         for ((location, d, n), raw) in staged_blobs.iter().zip(inputs) {
@@ -894,7 +867,7 @@ impl PgCorpusStore {
                     cancel.clone(),
                 )
                 .await
-                .map_err(blob_error)?;
+                .map_err(|error| self.record_blob_error(error))?;
         }
         check(&cancel)?;
         // Build immutable source and catalog payloads before taking the shared
@@ -1077,7 +1050,7 @@ impl PgCorpusStore {
                 .await?;
             }
             check(&cancel)?;
-            commit_storage(tx, "publish").await?;
+            self.commit_storage(tx, "publish").await?;
             if !attachment_incomplete {
                 old.validated_at = now;
             }
@@ -1153,7 +1126,7 @@ impl PgCorpusStore {
             .await?;
         }
         check(&cancel)?;
-        commit_storage(tx, "publish").await?;
+        self.commit_storage(tx, "publish").await?;
         Ok(Capture {
             capture_id: capture_id.clone(), sequence: sequence_number, record: p.record.clone(),
             retrieved_at: p.retrieved_at, captured_at: now, validated_at: now,

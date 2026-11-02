@@ -113,6 +113,7 @@ impl PgCorpusStore {
         request: &SupplementRequest,
         now: u64,
     ) -> Result<bool, DatabaseError> {
+        self.gate().await?;
         let retry_cancel = CancellationToken::new();
         retry_storage(&retry_cancel, "enqueue_supplement", || {
             async {
@@ -124,7 +125,7 @@ impl PgCorpusStore {
         sqlx::query("SELECT singleton FROM openlegal.provider_supplement_control WHERE singleton FOR UPDATE")
             .execute(&mut *tx).await.map_err(db)?;
         let changed = enqueue(&mut tx, request, now).await?;
-        commit_storage(tx, "enqueue_supplement").await?;
+        self.commit_storage(tx, "enqueue_supplement").await?;
         Ok(changed)
 
             }
@@ -133,6 +134,7 @@ impl PgCorpusStore {
     /// One execution lease; global work and identified seeds alternate, then
     /// source names rotate. Expired workers are fenced by a fresh UUID owner.
     pub async fn claim_supplement(&self, now: u64) -> Result<Option<SupplementJob>, DatabaseError> {
+        self.gate().await?;
         let retry_cancel = CancellationToken::new();
         let retry_started = tokio::time::Instant::now();
         retry_storage(&retry_cancel, "claim_supplement", || {
@@ -191,7 +193,7 @@ impl PgCorpusStore {
             .bind(&key).bind(owner).bind(until.to_string()).bind(observed_before.to_string()).bind(&observation_id).bind(refresh_incomplete).bind(now.to_string()).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE openlegal.provider_supplement_control SET last_global_source=CASE WHEN $2 THEN $1 ELSE last_global_source END,last_seed_source=CASE WHEN $2 THEN last_seed_source ELSE $1 END,last_global=$2 WHERE singleton")
             .bind(row.try_get::<String,_>("source").map_err(db)?).bind(row.try_get::<bool,_>("is_global").map_err(db)?).execute(&mut *tx).await.map_err(db)?;
-        commit_storage(tx, "claim_supplement").await?;
+        self.commit_storage(tx, "claim_supplement").await?;
         Ok(Some(SupplementJob {
             key,
             request,
@@ -212,6 +214,7 @@ impl PgCorpusStore {
         observed_rows: u64,
         now: u64,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         self.settle_supplement_with_successor(job, status, observation_id, observed_rows, now, None)
             .await
     }
@@ -227,6 +230,7 @@ impl PgCorpusStore {
         now: u64,
         successor: Option<&SupplementRequest>,
     ) -> Result<(), DatabaseError> {
+        self.gate().await?;
         let retry_cancel = CancellationToken::new();
         let retry_started = tokio::time::Instant::now();
         retry_storage(&retry_cancel, "settle_supplement_with_successor", || {
@@ -284,7 +288,7 @@ impl PgCorpusStore {
         if let Some(next) = successor {
             enqueue(&mut tx, next, now).await?;
         }
-        tx.commit().await.map_err(db)
+        self.commit_storage(tx, "settle_supplement").await
 
             }
         }).await

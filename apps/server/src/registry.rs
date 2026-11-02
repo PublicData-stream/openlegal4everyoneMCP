@@ -152,6 +152,9 @@ pub(crate) struct RegisteredTool {
     pub validator: jsonschema::Validator,
     pub output_validator: Option<jsonschema::Validator>,
     pub invoke: Arc<Invoke>,
+    /// Trusted built-ins may explicitly opt out; an extension's name grants
+    /// no authority to bypass a configured persistent-output barrier.
+    pub requires_durability: bool,
 }
 
 #[derive(Default)]
@@ -294,8 +297,31 @@ impl ToolRegistry {
                 validator,
                 output_validator: None,
                 invoke,
+                requires_durability: true,
             },
         );
+        Ok(())
+    }
+
+    pub(crate) fn mark_storage_independent(&mut self, name: &str) -> Result<(), ServerError> {
+        if !matches!(
+            name,
+            "server_info"
+                | "text.diff"
+                | "text.diff.page"
+                | "text.diff.show"
+                | "text.diff.delete"
+                | "text.apply_patch"
+                | "text.attachment.upload"
+                | "text.attachment.read"
+                | "text.attachment.delete"
+        ) {
+            return Err("only independent built-ins may omit the storage barrier".into());
+        }
+        self.tools
+            .get_mut(name)
+            .ok_or("independent built-in is missing")?
+            .requires_durability = false;
         Ok(())
     }
 
@@ -739,6 +765,7 @@ pub fn server_info_registry(
             Ok(server_info(&source))
         }
     })?;
+    registry.mark_storage_independent("server_info")?;
     Ok(registry)
 }
 

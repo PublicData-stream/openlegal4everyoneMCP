@@ -19,7 +19,7 @@ impl PostgresStore {
         size: usize,
         now: u64,
     ) -> Result<(BlobLocation, Uuid, bool), Error> {
-        let mut tx = DbTransaction::begin(&self.inner.pool).await?;
+        let mut tx = self.begin_transaction().await?;
         let row=sqlx::query("SELECT sha256,generation,size_bytes,storage_key,ready FROM openlegal.blob_object WHERE sha256=$1").bind(digest.as_slice()).fetch_optional(tx.conn()?).await.map_err(database_error)?;
         let row = if let Some(row) = row {
             row
@@ -111,6 +111,12 @@ impl PostgresStore {
             if bytes != value.raw {
                 return Err(Error::StorageCorrupt);
             };
+            if self.inner.durability.is_some() {
+                self.inner
+                    .blobs
+                    .confirm_durable(blob.clone(), cancellation.clone())
+                    .await?;
+            }
         } else {
             self.inner
                 .blobs
@@ -125,7 +131,7 @@ impl PostgresStore {
         if self.epoch() != start_epoch || !self.healthy() {
             return Err(Error::Busy);
         };
-        let mut tx = DbTransaction::begin(&self.inner.pool).await?;
+        let mut tx = self.begin_transaction().await?;
         let hash = identity_digest(&key.history)?;
         let row=sqlx::query("SELECT id,namespace,provider,dataset,query_hash,canonical_identity,query,mutation_revision FROM openlegal.cache_query WHERE query_hash=$1 FOR UPDATE")
             .bind(hash.as_slice()).fetch_optional(tx.conn()?).await.map_err(database_error)?;

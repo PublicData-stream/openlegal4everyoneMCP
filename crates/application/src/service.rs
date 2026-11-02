@@ -390,6 +390,10 @@ impl RetrievalService {
                                     // Drain it on cancellation instead of dropping a
                                     // possible database reconciliation operation.
                                     let _result = store.health(service.clock.now()).await;
+                                    if store.status() == crate::persistence::StorageStatus::CommitUncertain {
+                                        service.failed.store(true, Ordering::Relaxed);
+                                        service.shutdown.cancel();
+                                    }
                                 }
                                 if let Ok(mut state) = service.state.lock() {
                                     service.sync_epoch(&mut state);

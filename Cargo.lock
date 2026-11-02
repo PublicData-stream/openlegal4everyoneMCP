@@ -2667,6 +2667,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "wtransport",
  "x509-parser",
 ]
