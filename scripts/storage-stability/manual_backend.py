@@ -145,7 +145,7 @@ def validate(config, inventory):
          and type(peer['port']) is int and 1 <= peer['port'] <= 65535,
          'manual_peer_endpoint')
     need(all(type(peer[k]) is str and IDENTIFIER.fullmatch(peer[k]) for k in ('role', 'application_name'))
-         and type(peer['client_serial']) is str and re.fullmatch('[1-9][0-9]{0,49}', peer['client_serial']),
+         and type(peer['client_serial']) is str and re.fullmatch('[1-9][0-9]{0,59}', peer['client_serial']),
          'manual_peer_identity')
     need(all(type(peer[k]) is str and 0 < len(peer[k].encode('utf-8')) <= 1024
              for k in ('client_dn', 'issuer_dn')), 'manual_peer_certificate_identity')

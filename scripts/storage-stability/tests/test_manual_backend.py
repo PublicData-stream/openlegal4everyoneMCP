@@ -98,6 +98,21 @@ class PolicyTests(unittest.TestCase):
                         {'port': True}, {'role': 'x;SELECT'}, {'client_serial': '0'}, {'issuer_dn': ''}):
             changed = copy.deepcopy(self.config); changed['replication_peer'].update(changes)
             with self.subTest(changes=changes), self.assertRaises(Refused): m.validate(changed, self.inventory)
+    def test_replication_serial_accepts_canonical_one_to_sixty_digits_without_coercion(self):
+        for digits in (1, 50, 51, 60):
+            serial = '1' + '0' * (digits - 1)
+            changed = copy.deepcopy(self.config); changed['replication_peer']['client_serial'] = serial
+            with self.subTest(digits=digits):
+                self.assertIs(m.validate(changed, self.inventory), changed)
+                self.assertIs(changed['replication_peer']['client_serial'], serial)
+
+    def test_replication_serial_rejects_out_of_bound_or_noncanonical_values(self):
+        for serial in ('1' * 61, '0', '01', '', 123, None, True, False,
+                       '+1', '-1', ' 1', '1 ', '1\n', '1.0', '1e2', '1E+2'):
+            changed = copy.deepcopy(self.config); changed['replication_peer']['client_serial'] = serial
+            with self.subTest(serial=serial), self.assertRaisesRegex(Refused, 'manual_peer_identity'):
+                m.validate(changed, self.inventory)
+
     def test_credential_paths_cannot_be_commands_or_parent_paths(self):
         for path in ('../../secret', '/tmp/../etc/key', '/', '/tmp/key\x00'):
             changed = copy.deepcopy(self.config); changed['replication_peer']['private_key']['path'] = path
