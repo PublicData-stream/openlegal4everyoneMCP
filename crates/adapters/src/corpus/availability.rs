@@ -6,6 +6,9 @@ use std::future::Future;
 use std::sync::{Mutex, atomic::AtomicU64};
 use std::time::Duration;
 
+pub(super) const PUBLIC_HEALTH_WAITERS: usize = 16;
+const PUBLIC_HEALTH_WAIT: Duration = Duration::from_secs(2);
+
 struct CommitGuard {
     store: PgCorpusStore,
     armed: bool,
@@ -378,13 +381,7 @@ impl PgCorpusStore {
             .unwrap_or(Err(DatabaseError::StorageUnavailable))
     }
 
-    /// One active coordinator uses the already reserved probe pool. Contending
-    /// callers do not queue more probes or open additional connections.
-    pub async fn probe_health(
-        &self,
-        index_generation: Option<u64>,
-        cancel: CancellationToken,
-    ) -> Result<CorpusHealthProof, CorpusHealthFailure> {
+    fn health_probe_allowed(&self) -> Result<(), CorpusHealthFailure> {
         if self.blocked.load(Ordering::Acquire) || self.pool.is_closed() {
             return Err(CorpusHealthFailure::Fatal(DatabaseError::StorageCorrupt));
         }
@@ -393,10 +390,64 @@ impl PgCorpusStore {
                 DatabaseError::StorageUnavailable,
             ));
         }
+        Ok(())
+    }
+
+    /// One active background coordinator uses the reserved probe pool. A second
+    /// background caller yields without queueing or opening another connection.
+    pub async fn probe_health(
+        &self,
+        index_generation: Option<u64>,
+        cancel: CancellationToken,
+    ) -> Result<CorpusHealthProof, CorpusHealthFailure> {
+        self.health_probe_allowed()?;
         let _probe = self
             .health_probe
             .try_lock()
             .map_err(|_| CorpusHealthFailure::Contended)?;
+        self.probe_health_locked(index_generation, cancel, _probe)
+            .await
+    }
+
+    /// Public reads may wait for the coordinator, then perform their own fresh
+    /// proof. Waiting never reuses the background result or renews a caller's
+    /// outer request deadline. Cancellation/drop releases admission and the
+    /// mutex queue; local contention is not an observed dependency failure.
+    pub(super) async fn wait_for_health_probe(
+        &self,
+        index_generation: Option<u64>,
+        cancel: CancellationToken,
+    ) -> Result<CorpusHealthProof, CorpusHealthFailure> {
+        self.health_probe_allowed()?;
+        check(&cancel).map_err(CorpusHealthFailure::Fatal)?;
+        let _waiter = self
+            .health_waiters
+            .try_acquire()
+            .map_err(|_| CorpusHealthFailure::Contended)?;
+        let deadline = tokio::time::Instant::now() + PUBLIC_HEALTH_WAIT;
+        let probe = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(CorpusHealthFailure::Fatal(DatabaseError::Cancelled)),
+            result = tokio::time::timeout_at(deadline, self.health_probe.lock()) => result,
+        };
+        self.health_probe_allowed()?;
+        check(&cancel).map_err(CorpusHealthFailure::Fatal)?;
+        let probe = probe.map_err(|_| CorpusHealthFailure::Contended)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CorpusHealthFailure::Contended);
+        }
+        self.probe_health_locked(index_generation, cancel, probe)
+            .await
+    }
+
+    async fn probe_health_locked(
+        &self,
+        index_generation: Option<u64>,
+        cancel: CancellationToken,
+        _probe: tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<CorpusHealthProof, CorpusHealthFailure> {
+        // A sticky stop may have arrived while a public caller was waiting.
+        self.health_probe_allowed()?;
         check(&cancel).map_err(CorpusHealthFailure::Fatal)?;
         let generation = self.availability.generation.load(Ordering::Acquire);
         let recovering = !self.availability.healthy();
@@ -542,6 +593,11 @@ mod tests {
         calls: AtomicUsize,
         deletions: AtomicUsize,
         error: Mutex<Option<RetrievalError>>,
+        pause: Mutex<Option<Arc<ProbePause>>>,
+    }
+    struct ProbePause {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
     }
     fn unused<T: Send + 'static>() -> BoxFuture<'static, Result<T, RetrievalError>> {
         Box::pin(async { Err(RetrievalError::Internal) })
@@ -586,10 +642,24 @@ mod tests {
         ) -> BoxFuture<'static, Result<usize, RetrievalError>> {
             unused()
         }
-        fn health(&self, _: CancellationToken) -> BoxFuture<'static, Result<(), RetrievalError>> {
+        fn health(
+            &self,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'static, Result<(), RetrievalError>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let error = *self.error.lock().unwrap();
-            Box::pin(async move { error.map_or(Ok(()), Err) })
+            let pause = self.pause.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(pause) = pause {
+                    pause.entered.notify_one();
+                    let permit = tokio::select! {
+                        _ = cancel.cancelled() => return Err(RetrievalError::Cancelled),
+                        permit = pause.release.acquire() => permit.map_err(|_| RetrievalError::Shutdown)?,
+                    };
+                    permit.forget();
+                }
+                error.map_or(Ok(()), Err)
+            })
         }
         fn close(&self) -> BoxFuture<'static, Result<(), RetrievalError>> {
             Box::pin(async { Ok(()) })
@@ -663,6 +733,111 @@ mod tests {
             Err(CorpusHealthFailure::Contended)
         ));
         assert!(!store.healthy());
+    }
+
+    #[tokio::test]
+    async fn public_health_waits_for_active_probe_without_false_dependency_failure() {
+        let store = disconnected_store();
+        let _active = store.health_probe.lock().await;
+        let generation = store.availability.generation.load(Ordering::Acquire);
+        let mut public = Box::pin(store.health());
+        assert!(
+            futures::poll!(public.as_mut()).is_pending(),
+            "a public read must wait for its fresh probe instead of treating another coordinator as unavailable"
+        );
+        assert!(matches!(
+            store.probe_health(None, CancellationToken::new()).await,
+            Err(CorpusHealthFailure::Contended)
+        ));
+        drop(public);
+        assert!(store.healthy());
+        assert_eq!(
+            store.availability.generation.load(Ordering::Acquire),
+            generation
+        );
+        assert!(!store.availability.uncertain.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_health_wait_budget_is_contention_without_poisoning_availability() {
+        let store = disconnected_store();
+        let _active = store.health_probe.lock().await;
+        let generation = store.availability.generation.load(Ordering::Acquire);
+        let mut public = Box::pin(store.health());
+        assert!(futures::poll!(public.as_mut()).is_pending());
+        tokio::time::advance(PUBLIC_HEALTH_WAIT).await;
+        assert_eq!(public.await, Err(DatabaseError::StorageContended));
+        assert!(store.healthy());
+        assert_eq!(
+            store.availability.generation.load(Ordering::Acquire),
+            generation
+        );
+        assert_eq!(
+            store.health_waiters.available_permits(),
+            PUBLIC_HEALTH_WAITERS
+        );
+        assert_eq!(store.probe_pool.size(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_available_coordinator_does_not_renew_the_public_wait_deadline() {
+        let store = disconnected_store();
+        let active = store.health_probe.lock().await;
+        let mut public = Box::pin(store.health());
+        assert!(futures::poll!(public.as_mut()).is_pending());
+        tokio::time::advance(PUBLIC_HEALTH_WAIT).await;
+        drop(active);
+        assert_eq!(public.await, Err(DatabaseError::StorageContended));
+        assert_eq!(store.probe_pool.size(), 0);
+        assert!(store.healthy());
+        assert_eq!(store.availability.generation.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn public_health_waiters_are_bounded_and_cancel_or_drop_releases_admission() {
+        let store = disconnected_store();
+        let _active = store.health_probe.lock().await;
+        let mut waiting = Vec::new();
+        for _ in 0..PUBLIC_HEALTH_WAITERS {
+            let mut request = Box::pin(store.health());
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            waiting.push(request);
+        }
+        assert_eq!(store.health().await, Err(DatabaseError::StorageContended));
+        assert_eq!(store.health_waiters.available_permits(), 0);
+        drop(waiting.pop());
+        assert_eq!(store.health_waiters.available_permits(), 1);
+        let cancel = CancellationToken::new();
+        let mut cancelled = Box::pin(store.wait_for_health_probe(None, cancel.clone()));
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        cancel.cancel();
+        assert!(matches!(
+            cancelled.await,
+            Err(CorpusHealthFailure::Fatal(DatabaseError::Cancelled))
+        ));
+        drop(waiting);
+        assert_eq!(
+            store.health_waiters.available_permits(),
+            PUBLIC_HEALTH_WAITERS
+        );
+        assert_eq!(store.probe_pool.size(), 0);
+        assert!(store.healthy());
+        assert_eq!(store.availability.generation.load(Ordering::Acquire), 0);
+        assert!(!store.availability.uncertain.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn public_wait_cannot_cross_a_new_uncertain_commit_or_issue_sql_after_it() {
+        let store = disconnected_store();
+        let active = store.health_probe.lock().await;
+        let mut public = Box::pin(store.health());
+        assert!(futures::poll!(public.as_mut()).is_pending());
+        store.record_commit_uncertain();
+        drop(active);
+        assert_eq!(public.await, Err(DatabaseError::StorageUnavailable));
+        assert_eq!(store.probe_pool.size(), 0);
+        assert!(!store.healthy());
+        assert!(store.availability.uncertain.load(Ordering::Acquire));
     }
 
     struct FailedFence(Arc<AtomicUsize>);
@@ -1055,6 +1230,89 @@ mod tests {
         ));
         assert!(!store.healthy());
         assert_eq!(store.gate().await, Err(DatabaseError::StorageCorrupt));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-postgres.sh"]
+    async fn public_health_queues_behind_background_then_checks_its_own_sql_and_blob() {
+        let fixture = crate::test_support::TestDatabase::new().await;
+        let base = fixture.open(100).await;
+        let blobs = Arc::new(ProbeBlob::default());
+        let store = PgCorpusStore::new_with_persistence(&base, blobs.clone());
+        let pause = Arc::new(ProbePause {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *blobs.pause.lock().unwrap() = Some(pause.clone());
+        let background_store = store.clone();
+        let background = tokio::spawn(async move {
+            background_store
+                .probe_health(None, CancellationToken::new())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+            .await
+            .expect("background reaches its blocking Blob health proof");
+        assert_eq!(blobs.calls.load(Ordering::SeqCst), 1);
+        let mut public = Box::pin(store.health());
+        assert!(futures::poll!(public.as_mut()).is_pending());
+        assert!(matches!(
+            store.probe_health(None, CancellationToken::new()).await,
+            Err(CorpusHealthFailure::Contended)
+        ));
+        assert!(store.healthy());
+        assert_eq!(blobs.calls.load(Ordering::SeqCst), 1);
+
+        // Once the background finishes, a cached success would bypass this
+        // newly acquired SQL blocker. The public caller must perform its own
+        // SELECT on the same single reserved probe connection before Blob IO.
+        let mut blocker = base.pool().begin().await.unwrap();
+        sqlx::query("LOCK TABLE openlegal.corpus_control IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        *blobs.pause.lock().unwrap() = None;
+        pause.release.add_permits(1);
+        store
+            .complete_health(background.await.unwrap().unwrap())
+            .unwrap();
+        let blocked_query = async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() \
+                     AND pid<>pg_backend_pid() AND wait_event_type='Lock' \
+                     AND query='SELECT singleton FROM openlegal.corpus_control'",
+                )
+                .fetch_one(&base.pool())
+                .await
+                .unwrap();
+                if waiting == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            result = public.as_mut() => panic!("public probe skipped its own locked SQL: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(3), blocked_query) =>
+                result.expect("one public SQL health probe waits on the fixture lock"),
+        }
+        assert_eq!(store.probe_pool.options().get_max_connections(), 1);
+        assert_eq!(store.probe_pool.size(), 1);
+        assert_eq!(blobs.calls.load(Ordering::SeqCst), 1);
+        blocker.rollback().await.unwrap();
+        public.await.unwrap();
+        assert_eq!(blobs.calls.load(Ordering::SeqCst), 2);
+        assert!(store.healthy());
+
+        // A fresh failure after a successful background/public proof must not
+        // be hidden by caching, and genuine dependency failure still degrades.
+        *blobs.error.lock().unwrap() = Some(RetrievalError::StorageUnavailable);
+        assert_eq!(store.health().await, Err(DatabaseError::StorageUnavailable));
+        assert_eq!(blobs.calls.load(Ordering::SeqCst), 3);
+        assert!(!store.healthy());
+        assert_eq!(store.gate().await, Err(DatabaseError::StorageUnavailable));
+        assert!(!store.availability.uncertain.load(Ordering::Acquire));
     }
 
     #[tokio::test]

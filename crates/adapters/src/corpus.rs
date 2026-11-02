@@ -53,6 +53,7 @@ pub struct PgCorpusStore {
     blocked: Arc<AtomicBool>,
     availability: Arc<availability::Availability>,
     health_probe: Arc<tokio::sync::Mutex<()>>,
+    health_waiters: Arc<tokio::sync::Semaphore>,
     durability_fence: Option<Arc<dyn openlegal_application::durability::DurabilityFence>>,
     track_uncertainty: bool,
     publication_clock: Arc<dyn openlegal_application::Clock>,
@@ -340,6 +341,9 @@ impl PgCorpusStore {
             blocked: Arc::new(AtomicBool::new(false)),
             availability: Arc::new(availability::Availability::default()),
             health_probe: Arc::new(tokio::sync::Mutex::new(())),
+            health_waiters: Arc::new(tokio::sync::Semaphore::new(
+                availability::PUBLIC_HEALTH_WAITERS,
+            )),
             durability_fence: None,
             track_uncertainty: false,
         }
@@ -371,7 +375,7 @@ impl PgCorpusStore {
     }
     pub async fn health(&self) -> Result<(), DatabaseError> {
         let proof = self
-            .probe_health(None, CancellationToken::new())
+            .wait_for_health_probe(None, CancellationToken::new())
             .await
             .map_err(CorpusHealthFailure::error)?;
         self.complete_health(proof)
