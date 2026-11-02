@@ -33,8 +33,8 @@ glibc compatibility loader. The Rust parser updates and vendored rhwp source are
 recorded in [document processing](document-sandbox.md#image-and-dependency-admission);
 OCR model and font assets retain their pinned versions and licenses.
 
-The isolated document-worker lockfile selects `pulldown-cmark` 0.13.5 through
-Xberg 1.3.10, replacing 0.13.4 to address
+The isolated document-worker lockfile selects `pulldown-cmark` 0.13.6 through
+Xberg 1.3.10. The earlier 0.13.5 update replaced 0.13.4 to address
 [RUSTSEC-2026-0414](https://rustsec.org/advisories/RUSTSEC-2026-0414/).
 The [upstream patch release](https://github.com/pulldown-cmark/pulldown-cmark/releases/tag/v0.13.5)
 fixes exponential event growth when parsing empty-display wikilinks. This retains
@@ -439,6 +439,14 @@ blocking-work cancellation and admission require focused independent review.
 Passing synthetic fixtures does not establish improved legal-search accuracy.
 Analyzer/dictionary changes invalidate index compatibility and require the
 [offline rebuild](database.md#offline-index-rebuild).
+
+The standalone document worker pins the transitive `pulldown-cmark` resolution to
+0.13.6 for [RUSTSEC-2026-0433](https://rustsec.org/advisories/RUSTSEC-2026-0433/).
+The upstream patch bounds nested image-wikilink parsing when `ENABLE_WIKILINKS`
+is enabled. This targeted crates.io lockfile update retains existing first-party
+features, parser confinement and license admission; it adds no advisory exception.
+The serving workspace does not resolve this package. Fresh worker admission and
+the native document-worker image gate remain required for the updated artifact.
 
 ### Narrow dependency exceptions
 
