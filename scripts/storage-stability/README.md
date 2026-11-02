@@ -483,3 +483,62 @@ closure is supplied as raw typed rows and bound to the after-observation hash.
 The core validates all candidate facts independently before accepting a phase.
 These offline helper tests mock SQL/commands and do not prove an actual database
 role grant, WAL flush, command exit, physical closure, or deployment acceptance.
+
+## Initial enrollment components
+
+The initial enrollment modules are separate, callable preparation components;
+they are not added to the fifteen-file checkpoint dispatch registry. Their
+inventories separately pin the producer source and every preceding raw capability.
+A source-owned caller must retain the same live ROOT backend, shared lock,
+writer descriptors and original deadline throughout this order:
+
+1. `initial_driver.run`: fence writers, preserve the original data and apply the
+   compiled initial migration manifest through its two fixed child phases.
+2. `initial_blob_seed.run`: verify the complete retained subset and seed the four
+   explicit mixed-media Blob roles, including physical permanent generations
+   without current SQL references.
+3. `initial_role_prepare.run`: use one fixed role transaction to create nine new
+   named roles and assign source-fixed grants and the 28 new function owners.
+4. `initial_provider_maintenance.run`: execute the official pinned server's fixed
+   plan/apply/readback sequence once, preserving accounting and retained history,
+   and reconcile its audit and the actual owned child exit.
+5. `initial_pg_pair.run`: qualify the new SSD PostgreSQL target, copy and verify
+   the whole cluster, start the named TLS peer and perform the first protected
+   binding with `expected_old=NULL`.
+
+These components do not start serving, release collection or establish Ready.
+The original initial-enrollment deadline is at most 2400 seconds; an additional
+component cannot renew it. Unknown COMMIT, command, SQL or helper ownership keeps
+ROOT ownership and the held writers; it does not permit replay, adoption or
+cleanup. Physical closure may outlive the logical deadline. Private helper
+closure observations cannot turn a late result into an acknowledged effect.
+
+Role preparation preserves pre-existing roles and M1–27 function ownership.
+The 28 M28–33 function owner transfers and nine new roles are limited to the
+source-fixed manifest. Grants to existing administrative functions name only
+the new roles. Runtime EXECUTE grants name only new functions, with USAGE on
+the new replication schema. The maintenance CLI uses its
+separately qualified non-superuser operator. Its local HBA/ident metadata probe
+uses a separate fixed read-only `postgres` observer over the protected native
+Unix socket; this is not a provider-apply fallback or a permission grant.
+Preprovisioned peer/map authentication and explicitly selected existing local
+trust are distinct profiles. Local trust is not identity authentication and is
+accepted only with the qualified socket and source-owned isolated helper.
+
+## Shared epoch observations
+
+`epoch_observation.py` owns the single strict-configuration hash implementation
+and certificate-free native metadata readers. The hash retains the
+`openlegal-strict-config-v1` domain while the closed projection uses schema2 and
+an explicit mixed-media topology. SSD survivors are exactly `cache_replica` and
+`corpus_primary`; unavailable HDD roles are exactly `cache_primary` and
+`corpus_replica`. The logical marker roles are preserved.
+
+The emergency wrapper still requires its immutable pre-fault authority and
+compares the fresh shared projection with the expected configuration hash.
+Common readers do not mint authority or certificates. M33 position and snapshot
+queries are standby-only; selecting a primary is refused before dispatch. Fresh
+primary prefix/flush evidence, the actual observation and installer child exits,
+current-head installation, restart renewal and admission on every Ready path
+remain separate integration requirements. Passing the standalone source tests
+or returning an initial pair result does not satisfy those requirements.
