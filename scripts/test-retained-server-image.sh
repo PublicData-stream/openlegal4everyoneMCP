@@ -86,7 +86,7 @@ mapfile -t maintain_args < "$scratch/admin/maintain.args"
 mapfile -t rebuild_args < "$scratch/admin/rebuild.args"
 OPENLEGAL_RENDERED_CONFIG="$scratch/fixture/config/server.toml" \
     cargo test --locked -p openlegal-server --test deployment_config
-cp scripts/server-image-smoke.mjs "$scratch/fixture/"
+cp scripts/server-image-smoke.mjs scripts/retained-index-ready.mjs "$scratch/fixture/"
 python3 - "$scratch/fixture" <<'PY'
 import json, pathlib, sys, tomllib
 root = pathlib.Path(sys.argv[1])

@@ -177,7 +177,9 @@ docker run --rm --name "$probe" --platform "$platform" --network none "${hardeni
     done
     touch /tmp/allowed-write
     '
-cp scripts/server-image-smoke.mjs "$scratch/fixture/"
+cp scripts/server-image-smoke.mjs scripts/retained-index-ready.mjs "$scratch/fixture/"
+mkdir -p "$scratch/fixture/tests"
+cp scripts/tests/test-retained-index-ready.mjs "$scratch/fixture/tests/"
 # Synthetic certificate for the required WT listener, never production trust.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
     -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
@@ -185,7 +187,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
 printf '%s\n' 'not valid TOML [' > "$scratch/fixture/invalid.toml"
 printf '%s\n' 'not a certificate' > "$scratch/fixture/invalid-tls/tls.crt"
 cp "$scratch/fixture/tls/tls.key" "$scratch/fixture/invalid-tls/tls.key"
-chmod 444 "$scratch/fixture/"*.* "$scratch/fixture/config/server.toml"
+chmod 444 "$scratch/fixture/"*.* "$scratch/fixture/config/server.toml" "$scratch/fixture/tests/"*.mjs
 docker network create --internal "$network" >/dev/null
 docker volume create "$fixture_volume" >/dev/null
 tar -c -C "$scratch/fixture" . | docker run --rm -i --name "$initializer" \
@@ -203,6 +205,11 @@ docker run --rm --name "$initializer" --platform "$platform" --network none --us
     chmod 440 /fixture/tls/* /fixture/invalid-tls/*
     '
 fixture=(--mount "type=volume,source=$fixture_volume,target=/fixture,readonly")
+# Exercise the convergence gate with the same pinned Node runtime, without a
+# network or database; status/clock controls are synthetic only in these tests.
+docker run --rm --name "$client" --platform "$native_platform" --network none \
+    --user 10004:10004 "${hardening[@]}" "${fixture[@]}" \
+    --entrypoint node "$node_image" --test /fixture/tests/test-retained-index-ready.mjs
 config_mount=(--mount "type=volume,source=$fixture_volume,target=/etc/openlegal,volume-subpath=config,readonly")
 tls_mount=(--mount "type=volume,source=$fixture_volume,target=/run/secrets/backend-tls,volume-subpath=tls,readonly")
 expect_startup_failure() {

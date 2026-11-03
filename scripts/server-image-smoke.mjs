@@ -1,3 +1,4 @@
+import { waitForRetainedIndex } from './retained-index-ready.mjs';
 // Synthetic image acceptance only. No external requests or runtime dependencies.
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -160,7 +161,7 @@ for (const protocol of [legacy, modern]) {
   const packaged = await readFile('/fixture/text-diff.html', 'utf8');
   assert.equal(resource.contents[0].text, packaged.replace('__OPENLEGAL_SOURCE_URL__', source));
   if (retained) {
-    for (const name of ['database.query', 'database.get', 'database.history', 'search', 'fetch']) {
+    for (const name of ['database.query', 'database.get', 'database.history', 'database.corpus_status', 'search', 'fetch']) {
       assert.ok(listed.tools.some((tool) => tool.name === name), `missing ${name}`);
     }
     const page = await call('database.get', { object: expected.object });
@@ -169,19 +170,15 @@ for (const protocol of [legacy, modern]) {
     assert.equal(page.text, expected.body);
     const history = await call('database.history', { object: expected.object, kind: 'captures' });
     assert.deepEqual(new Set(history.entries.map((entry) => entry.capture_id)), new Set(expected.captures));
-    // Readiness and asynchronous index convergence have separate bounded gates.
+    // This finite fixture has no publications after seeding. Wait for the
+    // durable ACK (written after reader reload) before selecting a search
+    // generation; an older generation is intentionally refused by pin_session.
     const indexDeadline = Date.now() + 60000;
-    let caughtUp = false;
-    while (Date.now() < indexDeadline) {
-      const result = await call('database.query', { query: expected.query });
-      if (result.index_lag === 0 && result.hits.length === 1) {
-        assert.equal(result.hits[0].capture_id, expected.head_capture_id);
-        caughtUp = true;
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-    assert.ok(caughtUp, 'retained corpus index did not converge in 60 seconds');
+    await waitForRetainedIndex(() => call('database.corpus_status', {}), indexDeadline);
+    const result = await call('database.query', { query: expected.query });
+    assert.equal(result.index_lag, 0);
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.hits[0].capture_id, expected.head_capture_id);
     const citationQuery = `in:body:"${expected.body.trim()}"`;
     const searchResult = await rpc('tools/call', { name: 'search', arguments: { query: citationQuery } });
     assert.ok(!searchResult.isError, JSON.stringify(searchResult));
