@@ -87,25 +87,8 @@ RUN --mount=type=bind,source=scripts/install-alpine-packages.sh,target=/tmp/inst
     timeout -k 10 900 /bin/sh /tmp/install-alpine-packages.sh tar
 ARG TARGETARCH
 COPY scripts/deployment-kubectl.sha256 /pins/kubectl.sha256
-RUN mkdir /artifacts && TARGETARCH="$TARGETARCH" node --input-type=module -e '\
-    import {readFileSync, writeFileSync} from "node:fs"; \
-    import {createHash} from "node:crypto"; \
-    const arch = process.env.TARGETARCH; \
-    if (!["amd64", "arm64"].includes(arch)) throw Error("Unsupported architecture"); \
-    const pin = readFileSync("/pins/kubectl.sha256", "utf8").split("\n").find(line => line.endsWith("  " + arch))?.split(" ")[0]; \
-    if (!/^[a-f0-9]{64}$/.test(pin ?? "")) throw Error("Missing checksum"); \
-    const artifacts = [ \
-      ["kubectl", `https://dl.k8s.io/release/v1.37.0/bin/linux/${arch}/kubectl`, pin], \
-      ["kubernetes.tar.gz", "https://codeload.github.com/kubernetes/kubernetes/tar.gz/refs/tags/v1.37.0", "956ddae3b12acc08a715aea0411a168a36d5989b3e7185deeb6bf46b7dac19cf"], \
-      ["GO-LICENSE", "https://raw.githubusercontent.com/golang/go/go1.26.6/LICENSE", "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"] \
-    ]; \
-    for (const [name, url, checksum] of artifacts) { \
-      const response = await fetch(url, {signal: AbortSignal.timeout(300000)}); \
-      if (!response.ok) throw Error(`Download failed: ${response.status}`); \
-      const bytes = Buffer.from(await response.arrayBuffer()); \
-      if (createHash("sha256").update(bytes).digest("hex") !== checksum) throw Error(`${name} checksum mismatch`); \
-      writeFileSync(`/artifacts/${name}`, bytes, {mode: name === "kubectl" ? 0o755 : 0o644}); \
-    }' \
+COPY scripts/download-kubectl.mjs /tools/download-kubectl.mjs
+RUN mkdir /artifacts && TARGETARCH="$TARGETARCH" node /tools/download-kubectl.mjs \
     && tar -xzf /artifacts/kubernetes.tar.gz -C /artifacts --wildcards '*/LICENSES/*' \
     && mv /artifacts/kubernetes-1.37.0/LICENSES /artifacts/notices \
     && mv /artifacts/GO-LICENSE /artifacts/notices/GO-LICENSE \

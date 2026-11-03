@@ -177,9 +177,9 @@ docker run --rm --name "$probe" --platform "$platform" --network none "${hardeni
     done
     touch /tmp/allowed-write
     '
-cp scripts/server-image-smoke.mjs scripts/retained-index-ready.mjs "$scratch/fixture/"
+cp scripts/server-image-smoke.mjs scripts/retained-index-ready.mjs scripts/download-kubectl.mjs "$scratch/fixture/"
 mkdir -p "$scratch/fixture/tests"
-cp scripts/tests/test-retained-index-ready.mjs "$scratch/fixture/tests/"
+cp scripts/tests/test-retained-index-ready.mjs scripts/tests/test-kubectl-download.mjs "$scratch/fixture/tests/"
 # Synthetic certificate for the required WT listener, never production trust.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
     -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
@@ -205,11 +205,11 @@ docker run --rm --name "$initializer" --platform "$platform" --network none --us
     chmod 440 /fixture/tls/* /fixture/invalid-tls/*
     '
 fixture=(--mount "type=volume,source=$fixture_volume,target=/fixture,readonly")
-# Exercise the convergence gate with the same pinned Node runtime, without a
-# network or database; status/clock controls are synthetic only in these tests.
+# Exercise index admission and verified build downloads with the pinned Node
+# runtime, without a network/database or writes; controls are synthetic here.
 docker run --rm --name "$client" --platform "$native_platform" --network none \
     --user 10004:10004 "${hardening[@]}" "${fixture[@]}" \
-    --entrypoint node "$node_image" --test /fixture/tests/test-retained-index-ready.mjs
+    --entrypoint node "$node_image" --test /fixture/tests/test-retained-index-ready.mjs /fixture/tests/test-kubectl-download.mjs
 config_mount=(--mount "type=volume,source=$fixture_volume,target=/etc/openlegal,volume-subpath=config,readonly")
 tls_mount=(--mount "type=volume,source=$fixture_volume,target=/run/secrets/backend-tls,volume-subpath=tls,readonly")
 expect_startup_failure() {

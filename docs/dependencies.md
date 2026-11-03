@@ -511,6 +511,14 @@ checksums and redistribution scope are recorded in
 [kubectl notice provenance](../apps/server/kubectl-notices.md). The full upstream
 LICENSES bundle is retained conservatively, including notices for components not
 necessarily linked into kubectl. Node is used only in the download build stage;
+the standard-library-only downloader permits at most three attempts solely for
+pre-header `UND_ERR_CONNECT_TIMEOUT` failures, with one original 300-second deadline
+per artifact shared by attempts, response streaming and 1/2-second backoffs.
+HTTP, TLS, body, checksum, size and file-write failures remain terminal. New
+streaming admission caps are 128 MiB for kubectl, 256 MiB for the source archive and
+1 MiB for the Go license; they supplement the mandatory pinned SHA-256 checks.
+The deadline is checked before and after the final synchronous write; it cannot
+preempt a blocked filesystem call. A late write fails the build without retry.
 Node is not added to the final image. The Alpine base retains its standard APK and
 BusyBox utilities, including download-capable applets; runtime restrictions, not
 their absence, enforce the serving and document-sandbox boundaries.

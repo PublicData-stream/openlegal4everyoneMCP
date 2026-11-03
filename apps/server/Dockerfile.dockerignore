@@ -5,6 +5,7 @@
 !scripts/
 !scripts/deployment-kubectl.sha256
 !scripts/install-alpine-packages.sh
+!scripts/download-kubectl.mjs
 !.cargo/
 !.cargo/config.toml
 !crates/
