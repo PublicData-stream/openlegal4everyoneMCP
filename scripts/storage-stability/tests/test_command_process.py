@@ -47,7 +47,8 @@ class ProcessTests(unittest.TestCase):
         self.assertFalse(result.expired); self.assertFalse(result.output_limit_exceeded)
         self.assertFalse(result.unexpected_descendants); self.assertFalse(result.interrupted)
 
-    def retained(self, *, child_code=None, timeout=.15, cap=4096, inject=False, observe_failure=False):
+    def retained(self, *, child_code=None, timeout=.15, cap=4096, inject=False, observe_failure=False,
+                 output_failure=None):
         readfd,writefd=os.pipe2(os.O_CLOEXEC)
         lock=self.root/'retained.lock';lockfd=os.open(lock,os.O_RDWR|os.O_CREAT|os.O_EXCL,0o600)
         fcntl.flock(lockfd,fcntl.LOCK_EX|fcntl.LOCK_NB);ownerfd=os.pidfd_open(os.getpid())
@@ -72,6 +73,16 @@ if {observe_failure!r}:
   c.select.poll=broken
   return process
  c.subprocess.Popen=launch
+if {output_failure!r} is not None:
+ original_read=c.os.read
+ def read(fd,size):
+  caller=sys._getframe(1)
+  if caller.f_code.co_name=='read_output' and caller.f_back.f_code.co_name=={output_failure!r}:
+   raise OSError('injected shutdown output failure')
+  return original_read(fd,size)
+ c.os.read=read
+old_subreaper=c._subreaper()
+old_handlers={{number:c.signal.getsignal(number) for number in (c.signal.SIGCHLD,c.signal.SIGTERM,c.signal.SIGINT)}}
 try:
  result=c.execute_retained_runtime([sys.executable,'-I','-B','-c',{code!r}],executable_fd=fd,
   stdin=None,env={{'PATH':'/usr/bin','TMPDIR':'/tmp'}},dispatch_deadline=time.monotonic()+{timeout!r},
@@ -79,7 +90,13 @@ try:
   operation_lock_fd={lockfd},max_output={cap})
  print(json.dumps(dataclasses.asdict(result),default=lambda b:b.decode('ascii','replace')))
 except BaseException as error:print(json.dumps({{'failure':str(error),'children':list(c._children(os.getpid()))}}))
-finally:os.close(fd)
+finally:
+ os.close(fd)
+ assert c._subreaper()==old_subreaper
+ assert not c._children(os.getpid())
+ assert all(c.signal.getsignal(number)==handler for number,handler in old_handlers.items())
+ assert c._SERIAL.acquire(blocking=False)
+ c._SERIAL.release()
 '''
         try:
             process=subprocess.Popen([sys.executable,'-I','-B','-c',script],pass_fds=(readfd,ownerfd,lockfd),
@@ -96,6 +113,21 @@ finally:os.close(fd)
         raw,err=process.communicate(timeout=8)
         self.assertEqual(process.returncode,0,err.decode())
         return json.loads(raw)
+
+    def wait_retained_ready(self, process, ready):
+        end=time.monotonic()+3
+        while not ready.exists() and process.poll() is None and time.monotonic()<end:time.sleep(.01)
+        self.assertTrue(ready.exists())
+
+    def assert_retained_closed(self, result, pid, lock):
+        self.assertTrue(result['owned_processes_closed'])
+        self.assertFalse(Path('/proc/'+str(pid)).exists())
+        self.assert_retained_lock_released(lock)
+
+    def assert_retained_lock_released(self, lock):
+        probe=os.open(lock,os.O_RDWR)
+        try:fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        finally:os.close(probe)
 
     def test_retained_deadline_keeps_runtime_and_inherited_lock_until_explicit_permission(self):
         process,writefd,pid,lock=self.retained()
@@ -126,6 +158,65 @@ finally:os.close(fd)
         self.assertTrue(result['interrupted']);self.assertTrue(result['output_limit_exceeded'])
         self.assertLessEqual(len(result['stdout'])+len(result['stderr']),128)
         self.assertEqual(result['actual_exit_code'],0)
+
+    def test_retained_permission_drains_both_shutdown_streams_after_parent_sigterm(self):
+        ready=self.root/'ready';finished=self.root/'finished'
+        code=('\ndef stop(*args):\n'
+              ' for fd in (1,2):\n'
+              '  data=memoryview(b"x"*524288)\n'
+              '  while data:data=data[os.write(fd,data):]\n'
+              ' pathlib.Path('+repr(str(finished))+').write_text("complete")\n'
+              ' os._exit(0)\n'
+              'signal.signal(signal.SIGTERM,stop)\n'
+              'pathlib.Path('+repr(str(ready))+').write_text("ready")\n'
+              'time.sleep(30)')
+        process,writefd,pid,lock=self.retained(child_code=code,timeout=30,cap=128)
+        self.wait_retained_ready(process,ready)
+        process.send_signal(signal.SIGTERM);time.sleep(.15)
+        self.assertIsNone(process.poll());self.assertTrue(Path('/proc/'+str(pid)).exists())
+        self.assertFalse(finished.exists())
+        result=self.stop_retained(process,writefd)
+        self.assertEqual(result['actual_exit_code'],0)
+        self.assertEqual(finished.read_text(),'complete')
+        self.assertTrue(result['interrupted']);self.assertTrue(result['output_limit_exceeded'])
+        self.assertEqual(len(result['stdout'])+len(result['stderr']),128)
+        self.assertFalse(result['expired']);self.assertFalse(result['unexpected_descendants'])
+        self.assert_retained_closed(result,pid,lock)
+
+    def test_retained_shutdown_output_failure_reports_only_after_physical_closure(self):
+        ready=self.root/'ready';finished=self.root/'finished'
+        code=('\ndef stop(*args):\n time.sleep(.2)\n'
+              ' pathlib.Path('+repr(str(finished))+').write_text("complete")\n os._exit(0)\n'
+              'signal.signal(signal.SIGTERM,stop)\n'
+              'pathlib.Path('+repr(str(ready))+').write_text("ready")\ntime.sleep(30)')
+        process,writefd,pid,lock=self.retained(child_code=code,timeout=30,output_failure='_drain')
+        self.wait_retained_ready(process,ready)
+        result=self.stop_retained(process,writefd)
+        self.assertEqual(result,{'failure':'injected shutdown output failure','children':[]})
+        self.assertEqual(finished.read_text(),'complete')
+        self.assertFalse(Path('/proc/'+str(pid)).exists())
+        self.assert_retained_lock_released(lock)
+
+    def test_retained_permission_with_output_failure_still_authorizes_cleanup(self):
+        process,writefd,pid,lock=self.retained(timeout=30,output_failure='observe')
+        time.sleep(.12);self.assertIsNone(process.poll());self.assertTrue(Path('/proc/'+str(pid)).exists())
+        result=self.stop_retained(process,writefd)
+        self.assertEqual(result,{'failure':'injected shutdown output failure','children':[]})
+        self.assertFalse(Path('/proc/'+str(pid)).exists())
+        self.assert_retained_lock_released(lock)
+
+    def test_retained_permission_preserves_sigkill_escalation_for_ignoring_child(self):
+        ready=self.root/'ready'
+        code=('signal.signal(signal.SIGTERM,signal.SIG_IGN);pathlib.Path('+repr(str(ready))+
+              ').write_text("ready");time.sleep(30)')
+        process,writefd,pid,lock=self.retained(child_code=code,timeout=30)
+        self.wait_retained_ready(process,ready)
+        start=time.monotonic();result=self.stop_retained(process,writefd)
+        self.assertEqual(result['actual_exit_code'],-signal.SIGKILL)
+        self.assertGreaterEqual(time.monotonic()-start,c.TERM_GRACE)
+        for key in ('expired','interrupted','unexpected_descendants','output_limit_exceeded'):
+            self.assertFalse(result[key])
+        self.assert_retained_closed(result,pid,lock)
 
     def test_retained_exception_finally_waits_for_permission_before_drain(self):
         process,writefd,pid,_=self.retained(inject=True,timeout=3)

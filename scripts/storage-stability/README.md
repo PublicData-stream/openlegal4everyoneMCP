@@ -314,7 +314,9 @@ Docker exit and the worker's actual descendant-closure receipt. The retained
 runtime helper waits for its controller's one-use stop permission; expiry,
 owner death or pipe EOF preserves ownership and uncertainty. Source and harmless
 process tests do not replace native socket, database, shim/runc-state and ordered
-closure qualification before a diagnostic executes containers.
+closure qualification before a diagnostic executes containers. After valid stop
+permission, bounded stdout/stderr drainage continues through physical shutdown;
+excess output is discarded and read failures are reported only after closure.
 `native_pg_image` pins `{reference,image_id,os,architecture,major,uid,gid}`;
 major must be18, image ID must be immutable, local image/native-host architecture
 must match, and execution uses the image ID with `--pull=never`. The supported

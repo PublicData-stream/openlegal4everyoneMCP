@@ -214,16 +214,24 @@ def _cleanup_children():
             yield int(token)
 
 
-def _drain(process, owned, stopping):
+def _drain(process, owned, stopping, *, service_output=None):
     """Error teardown never calls capped discovery/parser/closed predicates.
 
     The known leader/descendants get a single TERM. Newly adopted direct
     children are processed one pidfd at a time, even beyond the tracking cap.
     No parser/resource error can unwind this physical-ownership loop.
+    Retained runtimes may supply bounded, nonblocking output servicing so a
+    cooperative TERM handler can finish writing. Callback errors are reported
+    only after physical closure; they never release ownership early.
     """
     first = True
+    output_failure = None
     if stopping is None: stopping = time.monotonic()
     while True:
+        if service_output is not None:
+            try: service_output()
+            except BaseException as error:
+                if output_failure is None: output_failure = error
         if process is not None: process.poll()
         killing = time.monotonic() - stopping >= TERM_GRACE
         if owned is not None:
@@ -269,12 +277,13 @@ def _drain(process, owned, stopping):
                     # closure. Stay owned until both observations agree.
                     if any(entry.alive() for entry in owned.entries.values()):
                         time.sleep(.05); continue
-                return
+                break
         except (OSError, Refused):
             # E.g. temporary descriptor exhaustion or unavailable /proc. The
             # process cannot prove closure: keep subreaper/mutex and keep trying.
             pass
         time.sleep(.05)
+    if output_failure is not None: raise output_failure
 
 
 def _validate(command, fd, stdin, env, deadline, max_output):
@@ -523,9 +532,11 @@ def execute_retained_runtime(command, *, executable_fd, stdin, env, dispatch_dea
                             break  # physical closure proved; report output failure
                         if len(stream_eof) == len(streams): break
                         time.sleep(.02); continue
-                    observe()
+                    try: observe()
+                    except BaseException as error:
+                        if failure is None: failure = error
                     if permitted:
-                        _drain(process, owned, None); continue
+                        _drain(process, owned, None, service_output=read_output); continue
                 except BaseException as error:
                     if failure is None: failure = error
                 time.sleep(.02)
