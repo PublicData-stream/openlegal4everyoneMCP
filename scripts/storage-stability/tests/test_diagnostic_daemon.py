@@ -813,7 +813,39 @@ out=root/('worker-'+action+'-complete.json');out.write_text(raw);out.chmod(0o600
         self.assertEqual(row['process'].returncode, 0); self.assertEqual((self.root / 'harmless-effect').read_text(), 'gate observed')
         self.assertFalse(d.alive(row['pidfd'])); self.assertEqual(command_process._children(os.getpid()), set())
 
+    def inert_runtime_binaries(self):
+        # A fresh Python controller does not inherit setUp's parent-only mocks.
+        # Keep its real executable validator, using private non-runtime scripts
+        # which fail harmlessly if accidentally executed instead of host tools.
+        for name in d.RUNTIME_PINS:
+            path = self.root / ('fixture-runtime-' + name)
+            path.write_bytes(('#!/bin/sh\n# Inert fixture for ' + name + '\nexit 97\n').encode())
+            path.chmod(0o555)
+            self.value['binaries'][name] = {'path': str(path), 'sha256': d.sha(path.read_bytes())}
+
+    def test_subprocess_bad_private_runtime_pin_refuses_before_worker_dispatch(self):
+        self.inert_runtime_binaries()
+        self.value['binaries']['containerd']['sha256'] = '0' * 64
+        code = f"""import sys,types,json,os
+from pathlib import Path
+sys.path.insert(0,{str(BASE)!r});import diagnostic_daemon as d;import command_process
+d.seal=lambda *a:None;d.SELF=Path({str(self.root/'must-not-open-worker.py')!r})
+p=types.SimpleNamespace(value={self.value!r},process=command_process)
+c=d.Controller(p);c.evidence=d.Evidence({str(self.root)!r});c._acquire_sigchld()
+try:
+ try:c.spawn('default-inspect')
+ except d.Refused as error:reason=str(error)
+ else:raise AssertionError('bad runtime pin admitted worker')
+ print(json.dumps({{'reason':reason,'workers':list(c.workers),'children':list(command_process._children(os.getpid()))}}))
+finally:c._restore_sigchld();c.evidence.close()
+"""
+        run = subprocess.run([sys.executable, '-I', '-B', '-X', f'pycache_prefix={self.root / "controller-cache"}', '-c', code], capture_output=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr.decode())
+        self.assertEqual(d.decode(run.stdout), {'reason': 'binary_hash', 'workers': [], 'children': []})
+        self.assertFalse(list(self.root.glob('worker-default-inspect*')))
+
     def test_sigchld_ignored_actual_exit7_is_refused_despite_success_shaped_receipt(self):
+        self.inert_runtime_binaries()
         source=self.root/'exit7-worker.py'
         source.write_text('import os,sys,pathlib;sys.path.insert(0,'+repr(str(BASE))+');import diagnostic_daemon as dd\n'
             'a=sys.argv;root=pathlib.Path(__file__).resolve().parent;action=a[a.index("--worker-action")+1]\n'
@@ -843,7 +875,7 @@ print(json.dumps({{'actual_exit':row['process'].returncode,'accepted':accepted,'
  'early_restore_refused':early_restore_refused,'previous_sigign_restored':signal.getsignal(signal.SIGCHLD)==signal.SIG_IGN}}))
 os.close(row['pidfd']);c.evidence.close()
 """
-        run=subprocess.run([sys.executable,'-I','-B','-c',code],capture_output=True,timeout=10)
+        run=subprocess.run([sys.executable,'-I','-B','-X',f'pycache_prefix={self.root / "controller-cache"}','-c',code],capture_output=True,timeout=10)
         self.assertEqual(run.returncode,0,run.stderr.decode())
         observed=d.decode(run.stdout)
         self.assertEqual(observed,{'actual_exit':7,'accepted':False,'reason':'worker_actual_exit',
