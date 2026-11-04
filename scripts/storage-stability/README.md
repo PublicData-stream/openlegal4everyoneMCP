@@ -519,6 +519,29 @@ ROOT ownership and the held writers; it does not permit replay, adoption or
 cleanup. Physical closure may outlive the logical deadline. Private helper
 closure observations cannot turn a late result into an acknowledged effect.
 
+For a future external ROOT supervisor, `initial_driver.prepare_clock` anchors
+that original window before input qualification and fork. It returns an immutable
+in-memory context bound to the exact backend, held lock object/descriptor,
+operation, approved inventory/authority references and creator PID/start/boot.
+`initial_driver.run(..., clock=clock)` consumes that same context in its creator
+or current direct child with the matching live creator identity and retains its
+original end through both driver phases. Preparation, reload and waiting all consume the approved total (at most
+2400 seconds). A prepared backend cannot omit, replace or reprepare its clock;
+failed preparation or an admitted execution attempt cannot renew its window.
+The existing four-argument call still starts its window at driver entry. Native
+commands reject nonfinite ends and cannot extend a prepared clock.
+
+The caller must retain the inherited lock descriptor; checking its number and
+inode does not independently prove an unchanged open file description. The
+parent-identity check does not prove creator-owned fork provenance (a subreaper
+can adopt descendants). This clock creates no journal, authority, native process
+or supervisor receipt. Copied Python flags are not an atomic cross-fork admission claim: existing
+exclusive journal creation still refuses operation replay, and the future
+supervisor must enforce its single ROOT fork. FD escrow, fixed staged approval
+intake, shared observer/journal reservations, actual external ROOT exit and durable
+registration remain unimplemented. Clock and synthetic fork tests do not satisfy
+those gates or authorize enrollment.
+
 Role preparation preserves pre-existing roles and M1–27 function ownership.
 The 28 M28–33 function owner transfers and nine new roles are limited to the
 source-fixed manifest. Grants to existing administrative functions name only

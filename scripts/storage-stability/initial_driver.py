@@ -10,7 +10,9 @@ from __future__ import annotations
 import array
 import copy
 import ctypes
+from dataclasses import dataclass
 import fcntl
+import math
 import os
 from pathlib import Path
 import re
@@ -45,11 +47,14 @@ class Backend(linux.LinuxBackend):
     def __init__(self):
         super().__init__()
         self._driver_deadline = None
+        self._initial_driver_clock = None
+        self._initial_driver_clock_started = None
+        self._initial_driver_clock_attempted = False
 
     def _run(self, op, binary, args, *, stdin=None, timeout=30,
              record=True, deadline=None):
         end = self._driver_deadline
-        need(type(end) is float and time.monotonic() < end, 'driver_original_deadline')
+        _check_end(self)
         if self._docker_config is not None:
             _docker_binding(self, op.operation_id)
         return super()._run(op, binary, args, stdin=stdin, timeout=timeout, record=record,
@@ -119,8 +124,113 @@ def _load(inventory_ref, authority_ref):
     return config, inv, template, authority, raw, invraw, authraw
 
 
+@dataclass(frozen=True, slots=True)
+class _Clock:
+    """In-memory timing context, never authority or an external ROOT-exit proof."""
+    backend: Backend
+    shared_lock: journals.SharedLock
+    lock_fd: int
+    inventory: tuple
+    authority: tuple
+    operation_id: str
+    duration: int
+    started: float
+    end: float
+    creator_pid: int
+    creator_ticks: str
+    boot_id: str
+
+
+def _fresh_backend(backend, shared_lock):
+    need(type(backend) is Backend and type(shared_lock) is journals.SharedLock
+         and os.geteuid() == 0 and threading.current_thread() is threading.main_thread()
+         and len(list(Path('/proc/self/task').iterdir())) == 1
+         and not processes._children(os.getpid()), 'driver_native_dedicated_parent')
+    need(not any(callable(value) for value in vars(backend).values())
+         and backend._driver_deadline is None and not hasattr(backend, '_initial_driver_journal')
+         and not backend._initial_driver_clock_attempted, 'driver_no_overrides_or_reuse')
+    need(backend._docker_config is None and not backend._owned_sql_targets
+         and not backend._pg_directory_fds, 'driver_backend_not_fresh')
+
+
+def _input_binding(inv, shared_lock):
+    need(Path('/proc/sys/kernel/random/boot_id').read_text().strip() == inv['host']['boot_id'],
+         'driver_current_boot')
+    need(shared_lock.path == Path(inv['shared_lock']['path'])
+         and shared_lock.identity == inv['shared_lock']['identity'], 'driver_shared_lock_binding')
+    shared_lock.check()
+
+
+def _clock_reference(ref):
+    need(type(ref) is dict and set(ref) == {'path', 'sha256'}
+         and type(ref['path']) is str and pin(ref['sha256']), 'driver_private_reference')
+    return (ref['path'], ref['sha256'])
+
+
+def _end(started, duration):
+    need(type(started) is float and math.isfinite(started) and started >= 0
+         and type(duration) is int and 1 <= duration <= 2400, 'driver_clock_bounds')
+    end = started + duration
+    need(math.isfinite(end), 'driver_clock_bounds')
+    return end
+
+
+def prepare_clock(backend, shared_lock, inventory_ref, authority_ref):
+    """Anchor before qualification/fork; no journal, native command or approval.
+
+    The caller retains these exact objects. A future supervisor may fork one
+    direct ROOT child with them; this clock does not provide cross-fork atomic
+    admission, FD escrow, or proof that such a supervisor exists.
+    """
+    started = time.monotonic()
+    _fresh_backend(backend, shared_lock)
+    need(backend._initial_driver_clock_started is None, 'driver_clock_already_prepared')
+    # Even a failed qualification cannot renew this backend's original window.
+    backend._initial_driver_clock_started = started
+    config, inv, _, _, _, _, _ = _load(inventory_ref, authority_ref)
+    _input_binding(inv, shared_lock)
+    end = _end(started, config['total_deadline_secs'])
+    pid = os.getpid(); ticks = processes._identity(pid)
+    need(type(ticks) is str and ticks.isdecimal(), 'driver_clock_creator')
+    clock = _Clock(backend, shared_lock, shared_lock.fd,
+                   _clock_reference(inventory_ref), _clock_reference(authority_ref),
+                   config['operation_id'], config['total_deadline_secs'], started, end,
+                   pid, ticks, inv['host']['boot_id'])
+    need(time.monotonic() < end, 'driver_original_deadline')
+    backend._initial_driver_clock = clock
+    return clock
+
+
+def _consume_clock(backend, shared_lock, clock, inventory_ref, authority_ref, now):
+    need(type(clock) is _Clock and backend._initial_driver_clock is clock
+         and clock.backend is backend and clock.shared_lock is shared_lock,
+         'driver_clock_binding')
+    # Burn this process's attempt before further IO. This flag is not a shared
+    # cross-fork claim: the future fixed supervisor must create only one ROOT.
+    backend._initial_driver_clock_attempted = True
+    need(clock.inventory == _clock_reference(inventory_ref)
+         and clock.authority == _clock_reference(authority_ref)
+         and clock.lock_fd == shared_lock.fd, 'driver_clock_inputs_changed')
+    expected_end = _end(clock.started, clock.duration)
+    need(type(clock.end) is float and math.isfinite(clock.end) and clock.end == expected_end
+         and type(now) is float and math.isfinite(now) and clock.started <= now < clock.end,
+         'driver_clock_bounds')
+    need(Path('/proc/sys/kernel/random/boot_id').read_text().strip() == clock.boot_id
+         and (os.getpid() == clock.creator_pid or os.getppid() == clock.creator_pid)
+         and processes._identity(clock.creator_pid) == clock.creator_ticks,
+         'driver_clock_creator')
+    shared_lock.check()
+    return clock.end
+
+
 def _check_end(backend):
-    need(time.monotonic() < backend._driver_deadline, 'driver_original_deadline')
+    end = backend._driver_deadline
+    clock = getattr(backend, '_initial_driver_clock', None)
+    need(type(end) is float and math.isfinite(end) and time.monotonic() < end,
+         'driver_original_deadline')
+    if clock is not None:
+        need(type(clock) is _Clock and clock.backend is backend and end == clock.end,
+             'driver_clock_deadline_changed')
 
 
 def _writer_fds(backend):
@@ -531,29 +641,26 @@ def _fresh_parent(backend, op, result):
     return copy.deepcopy(primary)
 
 
-def run(backend, shared_lock, inventory_ref, authority_ref):
+def run(backend, shared_lock, inventory_ref, authority_ref, *, clock=None):
     """Retain all objects/FDs on failure; caller must not release them to retry.
 
-    The only variable inputs are byte-pinned capability data. Native callbacks,
-    shell commands, SQL, phase handlers and pre-existing journals are not inputs.
+    The only variable inputs are byte-pinned capability data and an optional
+    exact context from prepare_clock. Native callbacks, shell commands, SQL,
+    phase handlers and pre-existing journals are not inputs. A prepared backend
+    must use its original clock; omission cannot renew the operation.
     """
     started = time.monotonic()
-    need(type(backend) is Backend and type(shared_lock) is journals.SharedLock
-         and os.geteuid() == 0 and threading.current_thread() is threading.main_thread()
-         and len(list(Path('/proc/self/task').iterdir())) == 1
-         and not processes._children(os.getpid()), 'driver_native_dedicated_parent')
-    need(not any(callable(value) for value in vars(backend).values())
-         and backend._driver_deadline is None and not hasattr(backend, '_initial_driver_journal'),
-         'driver_no_overrides_or_reuse')
-    need(backend._docker_config is None and not backend._owned_sql_targets
-         and not backend._pg_directory_fds, 'driver_backend_not_fresh')
+    _fresh_backend(backend, shared_lock)
+    if backend._initial_driver_clock_started is not None or clock is not None:
+        end = _consume_clock(backend, shared_lock, clock, inventory_ref, authority_ref, started)
+    else:
+        end = None
     config, inv, template, authority, raw, invraw, authraw = _load(inventory_ref, authority_ref)
-    need(Path('/proc/sys/kernel/random/boot_id').read_text().strip() == inv['host']['boot_id'],
-         'driver_current_boot')
-    need(shared_lock.path == Path(inv['shared_lock']['path'])
-         and shared_lock.identity == inv['shared_lock']['identity'], 'driver_shared_lock_binding')
-    shared_lock.check()
-    backend._driver_deadline = started + config['total_deadline_secs']
+    _input_binding(inv, shared_lock)
+    if clock is not None:
+        need(clock.operation_id == config['operation_id']
+             and clock.duration == config['total_deadline_secs'], 'driver_clock_inputs_changed')
+    backend._driver_deadline = _end(started, config['total_deadline_secs']) if end is None else end
     _check_end(backend)
     graph_sha = digest(canonical(config['source_graph'])); auth_sha = digest(authraw)
     binding = {'kind': 'openlegal_live_initial_driver', 'operation_id': config['operation_id'],

@@ -4,6 +4,7 @@ Two same-filesystem journal dirs are a labelled fixture only: production creates
 DualJournal normally and requires distinct media. No callback is an API input.
 """
 import copy
+from dataclasses import FrozenInstanceError
 import fcntl
 import importlib
 import os
@@ -207,8 +208,211 @@ class DriverTests(unittest.TestCase):
         config = Path('/tmp/openlegal-storage-docker-client-' + self.opid)
         if config.exists(): config.rmdir()
 
-    def run_driver(self):
-        return d.run(self.backend, self.lock, self.configref, self.authref)
+    def run_driver(self, **kwargs):
+        return d.run(self.backend, self.lock, self.configref, self.authref, **kwargs)
+
+    def prepare_clock(self):
+        return d.prepare_clock(self.backend, self.lock, self.configref, self.authref)
+
+    def assert_no_effects(self):
+        self.assertFalse(hasattr(self.backend, '_initial_driver_journal'))
+        self.assertFalse(self.backend._cgroup_fds)
+        self.assertEqual(d.processes._children(os.getpid()), set())
+        self.lock.check()
+
+    def test_preparation_load_time_is_charged_and_clock_is_immutable(self):
+        with patch.object(d.time, 'monotonic', side_effect=[100.0, 101.0]):
+            clock = self.prepare_clock()
+        self.assertEqual((clock.started, clock.end), (100.0, 130.0))
+        self.assertIsNone(self.backend._driver_deadline)
+        with self.assertRaises(FrozenInstanceError): clock.end = 160.0
+        self.assert_no_effects()
+
+    def test_prepared_clock_reaches_real_phase_children_without_renewal(self):
+        clock = self.prepare_clock()
+        time.sleep(.02)
+        self.assertEqual(self.run_driver(clock=clock)['initial_actual_exit']['actual_exit_code'], 0)
+        self.assertEqual(self.backend._driver_deadline, clock.end)
+        self.assertEqual(clock.end, clock.started + self.config['total_deadline_secs'])
+        with self.assertRaisesRegex(Refused, 'overrides_or_reuse'):
+            self.run_driver(clock=clock)
+
+    def test_prepared_backend_rejects_omitted_or_replaced_clock(self):
+        clock = self.prepare_clock()
+        for kwargs in ({}, {'clock': {}}, {'clock': copy.copy(clock)}):
+            with self.subTest(kwargs=type(kwargs.get('clock'))):
+                with self.assertRaisesRegex(Refused, 'clock_binding'): self.run_driver(**kwargs)
+                self.assert_no_effects()
+        with self.assertRaisesRegex(Refused, 'already_prepared'): self.prepare_clock()
+
+    def test_prepared_clock_cannot_be_rebound_to_another_backend_or_lock(self):
+        clock = self.prepare_clock()
+        with self.assertRaisesRegex(Refused, 'clock_binding'):
+            d.run(d.Backend(), self.lock, self.configref, self.authref, clock=clock)
+        other_lock = j.SharedLock(self.record)
+        with self.assertRaisesRegex(Refused, 'clock_binding'):
+            d.run(self.backend, other_lock, self.configref, self.authref, clock=clock)
+        self.assert_no_effects()
+
+    def test_changed_reference_path_burns_admitted_clock_attempt(self):
+        clock = self.prepare_clock()
+        alias = self.save('same-authority-other-path.json', self.auth)
+        with self.assertRaisesRegex(Refused, 'clock_inputs_changed'):
+            d.run(self.backend, self.lock, self.configref, alias, clock=clock)
+        with self.assertRaisesRegex(Refused, 'overrides_or_reuse'):
+            self.run_driver(clock=clock)
+        with self.assertRaises(Refused): self.prepare_clock()
+        self.assert_no_effects()
+
+    def test_changed_raw_input_after_preparation_is_not_retryable(self):
+        clock = self.prepare_clock()
+        Path(self.authref['path']).write_bytes(b'{}')
+        with self.assertRaisesRegex(Refused, 'private_raw_hash'):
+            self.run_driver(clock=clock)
+        with self.assertRaisesRegex(Refused, 'overrides_or_reuse'):
+            self.run_driver(clock=clock)
+        self.assert_no_effects()
+
+    def test_prepare_failure_cannot_fall_back_to_a_new_run_clock(self):
+        self.auth['approved'] = False
+        self.authref = self.save('unapproved.json', self.auth)
+        with self.assertRaisesRegex(Refused, 'driver_authority'): self.prepare_clock()
+        with self.assertRaisesRegex(Refused, 'already_prepared'): self.prepare_clock()
+        with self.assertRaisesRegex(Refused, 'clock_binding'): self.run_driver()
+        self.assert_no_effects()
+
+    def test_preparation_expiry_cannot_restart_original_window(self):
+        with patch.object(d.time, 'monotonic', side_effect=[100.0, 130.0]):
+            with self.assertRaisesRegex(Refused, 'original_deadline'): self.prepare_clock()
+        with self.assertRaisesRegex(Refused, 'already_prepared'): self.prepare_clock()
+        with self.assertRaisesRegex(Refused, 'clock_binding'): self.run_driver()
+        self.assert_no_effects()
+
+    def test_prepared_clock_expiry_is_refused_before_reload(self):
+        clock = self.prepare_clock()
+        with patch.object(d.time, 'monotonic', return_value=clock.end), patch.object(d, '_load') as load:
+            with self.assertRaisesRegex(Refused, 'clock_bounds'): self.run_driver(clock=clock)
+            load.assert_not_called()
+        self.assert_no_effects()
+
+    def test_expiry_during_prepared_reload_keeps_original_end_and_burns_attempt(self):
+        clock = self.prepare_clock(); original = d._load
+        def load(*args):
+            result = original(*args)
+            self.tick.return_value = clock.end
+            return result
+        with patch.object(d.time, 'monotonic', return_value=clock.started) as self.tick:
+            with patch.object(d, '_load', side_effect=load):
+                with self.assertRaisesRegex(Refused, 'original_deadline'): self.run_driver(clock=clock)
+        self.assertEqual(self.backend._driver_deadline, clock.end)
+        with self.assertRaisesRegex(Refused, 'overrides_or_reuse'): self.run_driver(clock=clock)
+        self.assert_no_effects()
+
+    def test_future_clock_start_is_refused(self):
+        clock = self.prepare_clock()
+        with patch.object(d.time, 'monotonic', return_value=clock.started - 1):
+            with self.assertRaisesRegex(Refused, 'clock_bounds'): self.run_driver(clock=clock)
+        self.assert_no_effects()
+
+    def test_reused_creator_ticks_are_refused(self):
+        clock = self.prepare_clock()
+        with patch.object(d.processes, '_identity', return_value='0'):
+            with self.assertRaisesRegex(Refused, 'clock_creator'): self.run_driver(clock=clock)
+        self.assert_no_effects()
+
+    def test_changed_deadline_cannot_extend_prepared_clock(self):
+        clock = self.prepare_clock(); self.backend._driver_deadline = clock.end + 1
+        with self.assertRaisesRegex(Refused, 'clock_deadline_changed'): d._check_end(self.backend)
+        with patch.object(d.linux.LinuxBackend, '_run') as native:
+            with self.assertRaisesRegex(Refused, 'clock_deadline_changed'):
+                self.backend._run(None, 'docker', ['inspect'])
+            native.assert_not_called()
+        self.assert_no_effects()
+
+    def test_nonfinite_or_nonfloat_deadline_never_reaches_native_command(self):
+        for end in (None, True, 1, float('nan'), float('inf'), -float('inf')):
+            with self.subTest(end=end), patch.object(d.linux.LinuxBackend, '_run') as native:
+                self.backend._driver_deadline = end
+                with self.assertRaisesRegex(Refused, 'original_deadline'): d._check_end(self.backend)
+                with self.assertRaisesRegex(Refused, 'original_deadline'):
+                    self.backend._run(None, 'docker', ['inspect'])
+                native.assert_not_called()
+
+    def test_clock_start_and_duration_are_bounded(self):
+        for start in (None, True, 1, -1.0, float('nan'), float('inf'), -float('inf')):
+            with self.subTest(start=start):
+                with self.assertRaisesRegex(Refused, 'clock_bounds'): d._end(start, 30)
+        for duration in (True, 1.0, 0, 2401):
+            with self.subTest(duration=duration):
+                with self.assertRaisesRegex(Refused, 'clock_bounds'): d._end(100.0, duration)
+        self.assertEqual(d._end(100.0, 2400), 2500.0)
+
+    def test_actual_direct_child_runs_with_inherited_clock_and_original_end(self):
+        clock = self.prepare_clock()
+        oldchld = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        pid = None; reaped = False
+        try:
+            pid = os.fork()
+            if pid == 0:
+                code = 1
+                try:
+                    result = self.run_driver(clock=clock)
+                    if (result['initial_actual_exit']['actual_exit_code'] == 0
+                            and self.backend._driver_deadline == clock.end): code = 0
+                except BaseException:
+                    code = 2
+                finally:
+                    try:
+                        self.cleanup_fds()
+                    except BaseException:
+                        code = 3
+                    finally:
+                        os._exit(code)
+            actual, status = os.waitpid(pid, 0); reaped = True
+            self.assertEqual((actual, os.waitstatus_to_exitcode(status)), (pid, 0))
+            # Child consumption does not mutate the supervisor's copied flags.
+            # O_EXCL, not this clock, refuses cross-fork operation replay.
+            self.assertFalse(self.backend._initial_driver_clock_attempted)
+            with self.assertRaises(FileExistsError): self.run_driver(clock=clock)
+        finally:
+            if pid is not None and pid > 0 and not reaped:
+                os.kill(pid, signal.SIGKILL); os.waitpid(pid, 0)
+            signal.signal(signal.SIGCHLD, oldchld)
+        self.lock.check()
+
+    def test_actual_grandchild_cannot_adopt_prepared_clock(self):
+        clock = self.prepare_clock()
+        oldchld = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        pid = None; reaped = False
+        try:
+            pid = os.fork()
+            if pid == 0:
+                code = 6
+                try:
+                    child = os.fork()
+                    if child == 0:
+                        child_code = 4
+                        try:
+                            self.run_driver(clock=clock)
+                        except Refused as error:
+                            child_code = 0 if 'clock_creator' in str(error) else 2
+                        except BaseException:
+                            child_code = 3
+                        finally:
+                            os._exit(child_code)
+                    actual, status = os.waitpid(child, 0)
+                    code = 0 if actual == child and os.waitstatus_to_exitcode(status) == 0 else 5
+                except BaseException:
+                    code = 6
+                finally:
+                    os._exit(code)
+            actual, status = os.waitpid(pid, 0); reaped = True
+            self.assertEqual((actual, os.waitstatus_to_exitcode(status)), (pid, 0))
+        finally:
+            if pid is not None and pid > 0 and not reaped:
+                os.kill(pid, signal.SIGKILL); os.waitpid(pid, 0)
+            signal.signal(signal.SIGCHLD, oldchld)
+        self.assert_no_effects()
 
     def test_live_two_children_actual_exit_and_raw_prerequisites(self):
         result = self.run_driver()
