@@ -110,13 +110,10 @@ impl Server {
         let private_key = directory.path().join("key.pem");
         std::fs::write(&certificate, cert.pem()).unwrap();
         std::fs::write(&private_key, signing_key.serialize_pem()).unwrap();
-        // Reserve a unique ephemeral port; endpoint ownership takes over immediately.
-        let port = std::net::UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let bind = format!("127.0.0.1:{port}").parse().unwrap();
+        // Keep the selected port reserved until the endpoint owns this socket.
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = socket.local_addr().unwrap();
+        let port = bind.port();
         let limits = Arc::new(Limits {
             // Extension discovery includes a typed rich-content tool; framing
             // rejection fixtures keep their original 4 KiB allowance.
@@ -295,9 +292,10 @@ impl Server {
                 allowed_origins: vec!["https://allowed.test".into()],
             },
         }
-        .bind(context.clone())
+        .bind_with_socket(context.clone(), socket)
         .await
         .unwrap();
+        assert_eq!(bound.addresses, vec![bind]);
         let task = tokio::spawn(async {
             bound.run.await.unwrap();
         });
@@ -634,6 +632,47 @@ async fn rejects_mixed_initialize_and_bounds_negotiation_replies() {
     timeout(Duration::from_secs(2), connection.closed())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn prebound_socket_validation_rejects_mismatch_and_releases_ownership() {
+    let server = Server::start().await;
+    for (allowed_hosts, expected) in [
+        (vec![], "configure explicit allowed host authorities"),
+        (
+            vec!["localhost".into()],
+            "prebound WebTransport socket must match the declared bind address",
+        ),
+    ] {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        #[cfg(target_os = "linux")]
+        let (fd_path, socket_identity) = {
+            use std::os::fd::AsRawFd;
+            let path = format!("/proc/self/fd/{}", socket.as_raw_fd());
+            let identity = std::fs::read_link(&path).unwrap();
+            (path, identity)
+        };
+        let error = WebTransportEndpoint {
+            edge_mtls: None,
+            // The other live endpoint owns this address, so the socket differs.
+            bind: server.address,
+            certificate: server._directory.path().join("missing-cert.pem"),
+            private_key: server._directory.path().join("missing-key.pem"),
+            access: AccessPolicy {
+                allowed_hosts,
+                allowed_origins: vec![],
+            },
+        }
+        .bind_with_socket(server.context.clone(), socket)
+        .await
+        .err()
+        .expect("invalid prebound socket must fail before certificate loading");
+        assert_eq!(error.to_string(), expected);
+        // An fd number may already be reused by a parallel test. Compare socket
+        // identity instead of reserving/rebinding a port to check cleanup.
+        #[cfg(target_os = "linux")]
+        assert_ne!(std::fs::read_link(fd_path).ok(), Some(socket_identity));
+    }
 }
 
 #[tokio::test]

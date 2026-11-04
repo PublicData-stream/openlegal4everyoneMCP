@@ -58,10 +58,40 @@ impl Endpoint for WebTransportEndpoint {
         }]
     }
     async fn bind(self, context: EndpointContext) -> Result<BoundEndpoint, ServerError> {
+        self.bind_inner(context, None).await
+    }
+}
+
+impl WebTransportEndpoint {
+    /// Consume an already bound socket without releasing its address reservation.
+    /// Its local address must exactly match `self.bind`; all transport validation
+    /// and listener ownership rules are shared with [`Endpoint::bind`].
+    pub async fn bind_with_socket(
+        self,
+        context: EndpointContext,
+        socket: std::net::UdpSocket,
+    ) -> Result<BoundEndpoint, ServerError> {
+        self.bind_inner(context, Some(socket)).await
+    }
+
+    async fn bind_inner(
+        self,
+        context: EndpointContext,
+        socket: Option<std::net::UdpSocket>,
+    ) -> Result<BoundEndpoint, ServerError> {
         self.access.validate()?;
         context.limits.validate()?;
         if context.limits.rate_limit.verified_tunnel.is_some() && self.edge_mtls.is_none() {
             return Err("verified tunnel rate limit requires WebTransport edge mTLS".into());
+        }
+        if let Some(socket) = &socket
+            && socket.local_addr()? != self.bind
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prebound WebTransport socket must match the declared bind address",
+            )
+            .into());
         }
         // Preserve wtransport's ring/TLS 1.3 defaults, but propagate invalid identity
         // errors: its default TLS builder panics on empty chains or mismatched keys.
@@ -92,8 +122,12 @@ impl Endpoint for WebTransportEndpoint {
             .send_window(u64::from(stream_window) * 2)
             .datagram_receive_buffer_size(Some(4096))
             .datagram_send_buffer_size(4096);
-        let mut config = ServerConfig::builder()
-            .with_bind_address(self.bind)
+        let builder = ServerConfig::builder();
+        let builder = match socket {
+            Some(socket) => builder.with_bind_socket(socket),
+            None => builder.with_bind_address(self.bind),
+        };
+        let mut config = builder
             .with_custom_tls_and_transport(tls, transport_config)
             .max_idle_timeout(Some(Duration::from_secs(context.limits.idle_timeout_secs)))?
             .build();

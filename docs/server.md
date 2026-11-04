@@ -168,6 +168,13 @@ their owned tasks during shutdown. The generic API does not require boxing an
 SDK transport trait object. Tests in `apps/server/tests/extensions.rs` exercise
 downstream endpoint implementations, conflicts and startup rollback.
 
+`WebTransportEndpoint::bind_with_socket` also accepts ownership of an already
+bound UDP socket. Its actual local address must exactly match the endpoint's
+`bind` address. Access, TLS and resource validation use the same path as ordinary
+binding, and the resulting `BoundEndpoint` owns the socket. This lets embedded
+callers and parallel tests retain an ephemeral port continuously while preparing
+its exact authority allowlist.
+
 The registry is immutable once the server starts; no tool-list change events are
 advertised. Registered static resources enable discovery/read; prompts, tasks,
 subscriptions, sampling and elicitation remain unsupported. New Rust modules require rebuilding. Modules are
