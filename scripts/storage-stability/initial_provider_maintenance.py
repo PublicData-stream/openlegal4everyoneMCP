@@ -969,13 +969,19 @@ def _child(m, channel, parent, parentfd):
             raw=canonical(_index(m)); need(len(raw)<=MAX_HANDOFF,'maintenance_index_bound')
             channel.sendall(raw)
         except BaseException:status=1
-        for fd in (m.socketfd,m.rootfd,parentfd):
-            if fd is not None:os.close(fd)
-        channel.close(); os._exit(status)
+        # A descriptor/socket cleanup error must never unwind into ROOT's
+        # caller. Helpers/SQL have already gone through their closure barrier.
+        try:
+            for fd in (m.socketfd,m.rootfd,parentfd):
+                if fd is not None:os.close(fd)
+            channel.close()
+        except BaseException:status=1
+        finally:os._exit(status)
 
 
 def _hold_producer(leader, owned, *, terminate):
     """Never restore parent ownership state while any owned child is unknown."""
+    if leader is None or leader.pid is None:return
     attempted=False
     while True:
         try:
@@ -1008,11 +1014,17 @@ def _fork(m):
         previous[signal.SIGCHLD]=signal.getsignal(signal.SIGCHLD); signal.signal(signal.SIGCHLD,signal.SIG_DFL)
         for number in (signal.SIGINT,signal.SIGTERM):
             previous[number]=signal.getsignal(number); signal.signal(number,lambda n,_:interrupted.append(n))
-        oldsub=processes._subreaper(); processes._subreaper(1); parent=os.getpid(); pid=os.fork()
+        oldsub=processes._subreaper(); processes._subreaper(1); parent=os.getpid()
+        # Allocate a wait-only owner before a child exists. The parent stores
+        # the actual fork PID before any fallible cleanup/ownership/identity IO.
+        leader=driver._Leader(None); pid=os.fork()
         if pid==0:
-            channel.close(); _child(m,other,parent,parentfd)
+            try:
+                channel.close(); _child(m,other,parent,parentfd)
+            finally:os._exit(1)
+        leader.pid=pid
         other.close(); other=None
-        leader=driver._Leader(pid); owned=processes._Ownership(leader)
+        owned=processes._Ownership(leader)
         witness={'pid':pid,'start_ticks':processes._identity(pid),'boot_id':m.work['host']['boot_id']}
         need(witness['start_ticks'] is not None,'maintenance_producer_identity')
         channel.sendall(b'go\n'); channel.shutdown(socket.SHUT_WR)
@@ -1038,7 +1050,7 @@ def _fork(m):
              and not stopping and not unexpected,'maintenance_producer_not_successfully_closed')
         return exitrow
     except BaseException:
-        if leader is not None:
+        if leader is not None and leader.pid is not None:
             if channel is not None:
                 try:channel.shutdown(socket.SHUT_WR)
                 except OSError:pass
@@ -1046,14 +1058,14 @@ def _fork(m):
                 except OSError:pass
                 channel=None
             _hold_producer(leader,owned,terminate=True)
-        if leader is not None:
+        if leader is not None and leader.pid is not None:
             m.b._initial_provider_maintenance_last_exit={'pid':leader.pid,
                 'start_ticks':locals().get('witness',{}).get('start_ticks'),
                 'boot_id':m.work['host']['boot_id'],'actual_exit_code':leader.returncode,'remaining_children':[]}
         m.b._initial_provider_maintenance_failure_index=bytes(raw)
         raise
     finally:
-        if leader is not None:_hold_producer(leader,owned,terminate=False)
+        if leader is not None and leader.pid is not None:_hold_producer(leader,owned,terminate=False)
         if owned is not None:owned.close_fds()
         for sock in (channel,other):
             if sock is not None:sock.close()

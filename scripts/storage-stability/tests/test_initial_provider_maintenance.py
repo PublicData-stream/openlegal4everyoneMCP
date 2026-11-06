@@ -5,6 +5,7 @@ not independent media durability. Provider state/audits are explicit synthetic
 records. Child status, waitpid/pidfd ownership and source phase handoff are real.
 """
 import copy
+from contextlib import ExitStack
 import errno
 import os
 from pathlib import Path
@@ -342,6 +343,154 @@ class RealForkTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory(dir='/tmp',prefix='maintenance-harmless-')
         self.root=Path(self.tmp.name); self.root.chmod(0o700)
     def tearDown(self):self.tmp.cleanup()
+
+    def _capture_owned_test_fork(self,captured):
+        real=os.fork;rootpid=os.getpid()
+        def fork():
+            pid=real()
+            if pid and os.getpid()==rootpid:
+                # The TEST owns the raw PID before any injected production
+                # failure, including a failure allocating its own pidfd.
+                captured['pid']=pid
+                captured['pidfd']=os.pidfd_open(pid)
+            return pid
+        return fork
+
+    def _reap_test_child(self,captured):
+        pid=captured.get('pid')
+        if pid is None:return
+        end=time.monotonic()+3
+        while time.monotonic()<end:
+            try:found,status=os.waitpid(pid,os.WNOHANG)
+            except ChildProcessError:return  # Production already reaped it.
+            if found==pid:
+                captured['outer_wait_status']=status
+                return
+            time.sleep(.01)
+        self.fail('test-owned harmless child did not close after its GO gate opened')
+
+    def _parent_postfork_fault(self,mode):
+        root=self.root/mode;root.mkdir(mode=0o700);obj=phase_fixture(root)
+        rootpid=os.getpid();captured={};read,write=os.pipe()
+        oldsub=m.processes._subreaper()
+        previous={number:signal.getsignal(number) for number in
+                  (signal.SIGCHLD,signal.SIGINT,signal.SIGTERM,signal.SIGALRM)}
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL),(0.,0.))
+        real_pair=m.socket.socketpair;real_identity=m.processes._identity
+        def gated_child(*_):
+            try:
+                # This test-only producer has no actors and exits only after
+                # its external test owner's gate, even if production sends TERM.
+                signal.signal(signal.SIGTERM,lambda *_:None)
+                os.read(read,1)
+            finally:os._exit(1)
+        class ParentCloseError:
+            def __init__(self,sock):self.sock=sock;self.raised=False
+            def close(self):
+                self.sock.close()
+                if os.getpid()==rootpid and not self.raised:
+                    self.raised=True;raise OSError(errno.EIO,'synthetic_parent_postfork_close')
+            def __getattr__(self,name):return getattr(self.sock,name)
+        def sockets():
+            a,b=real_pair();return a,ParentCloseError(b)
+        def identity(pid):
+            if os.getpid()==rootpid and pid!=rootpid:
+                raise OSError(errno.EIO,'synthetic_persistent_identity')
+            return real_identity(pid)
+        returned_with_live_child=False
+        try:
+            # An outer gate release bounds the regression even if production
+            # correctly waits with no /proc identity or Ownership constructor.
+            signal.signal(signal.SIGCHLD,signal.SIG_DFL)
+            signal.signal(signal.SIGALRM,lambda *_:os.write(write,b'g'))
+            signal.setitimer(signal.ITIMER_REAL,.15)
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(m.os,'fork',side_effect=self._capture_owned_test_fork(captured)))
+                stack.enter_context(patch.object(m,'_child',side_effect=gated_child))
+                if mode=='parent-close':
+                    stack.enter_context(patch.object(m.socket,'socketpair',side_effect=sockets))
+                elif mode=='leader-init':
+                    stack.enter_context(patch.object(m.driver,'_Leader',side_effect=OSError(errno.EMFILE,'synthetic_leader_init')))
+                elif mode=='ownership-init':
+                    stack.enter_context(patch.object(m.processes,'_Ownership',side_effect=OSError(errno.EMFILE,'synthetic_ownership_init')))
+                else:stack.enter_context(patch.object(m.processes,'_identity',side_effect=identity))
+                with self.assertRaisesRegex(OSError,'synthetic_'):m._fork(obj)
+            if captured:
+                returned_with_live_child=not bool(m.select.select([captured['pidfd']],[],[],0)[0])
+        finally:
+            if os.getpid()!=rootpid:os._exit(91)
+            signal.setitimer(signal.ITIMER_REAL,0)
+            # Restore ownership state only AFTER the outer owner's real wait.
+            signal.signal(signal.SIGCHLD,signal.SIG_DFL)
+            try:
+                os.write(write,b'g');self._reap_test_child(captured)
+            finally:
+                for fd in (read,write,captured.get('pidfd')):
+                    if fd is not None:os.close(fd)
+                for number,handler in previous.items():signal.signal(number,handler)
+                m.processes._subreaper(oldsub)
+        self.assertFalse(returned_with_live_child,'production returned before test-owned child actually closed')
+        self.assertEqual(m.processes._children(rootpid),set())
+        self.assertFalse(m._SERIAL.locked())
+
+    def test_parent_postfork_failures_keep_raw_wait_owner_through_actual_closure(self):
+        for mode in ('parent-close','leader-init','ownership-init','identity'):
+            with self.subTest(mode=mode):self._parent_postfork_fault(mode)
+
+    def _child_exit_fault(self,mode):
+        root=self.root/mode;root.mkdir(mode=0o700);obj=phase_fixture(root)
+        rootpid=os.getpid();captured={};parentfds=[]
+        real_pair=m.socket.socketpair;real_close=os.close;real_pidfd=os.pidfd_open
+        oldsub=m.processes._subreaper()
+        previous={number:signal.getsignal(number) for number in
+                  (signal.SIGCHLD,signal.SIGINT,signal.SIGTERM)}
+        class ChildCloseError:
+            def __init__(self,sock):self.sock=sock;self.raised=False
+            def close(self):
+                self.sock.close()
+                if os.getpid()!=rootpid and not self.raised:
+                    self.raised=True;raise OSError(errno.EIO,'synthetic_child_prologue_close')
+            def __getattr__(self,name):return getattr(self.sock,name)
+        def sockets():
+            a,b=real_pair();return ChildCloseError(a),b
+        def pidfd(pid,*args):
+            fd=real_pidfd(pid,*args)
+            if pid==rootpid:parentfds.append(fd)
+            return fd
+        def close(fd):
+            real_close(fd)
+            if os.getpid()!=rootpid and fd in parentfds:
+                raise OSError(errno.EIO,'synthetic_child_cleanup_close')
+        try:
+            signal.signal(signal.SIGCHLD,signal.SIG_DFL)
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(m.os,'fork',side_effect=self._capture_owned_test_fork(captured)))
+                stack.enter_context(patch.object(m,'_produce',side_effect=lambda _:None))
+                if mode=='prologue-close':
+                    stack.enter_context(patch.object(m.socket,'socketpair',side_effect=sockets))
+                else:
+                    stack.enter_context(patch.object(m.os,'pidfd_open',side_effect=pidfd))
+                    stack.enter_context(patch.object(m.os,'close',side_effect=close))
+                with self.assertRaises((Refused,OSError,ValueError)):m._fork(obj)
+        finally:
+            # A regressed child must NEVER duplicate this unittest runner. Its
+            # externally observed 91 demonstrates escape into ROOT's caller.
+            if os.getpid()!=rootpid:os._exit(91)
+            signal.signal(signal.SIGCHLD,signal.SIG_DFL)
+            try:self._reap_test_child(captured)
+            finally:
+                if captured.get('pidfd') is not None:real_close(captured['pidfd'])
+                for number,handler in previous.items():signal.signal(number,handler)
+                m.processes._subreaper(oldsub)
+        row=obj.b._initial_provider_maintenance_last_exit
+        self.assertEqual(row['pid'],captured['pid'])
+        self.assertEqual(row['actual_exit_code'],1,'fork child escaped into the ROOT caller')
+        with self.assertRaises(ChildProcessError):os.waitpid(row['pid'],os.WNOHANG)
+        self.assertFalse(m._SERIAL.locked())
+
+    def test_child_prologue_and_cleanup_errors_always_exit_in_the_fork_child(self):
+        for mode in ('prologue-close','cleanup-close'):
+            with self.subTest(mode=mode):self._child_exit_fault(mode)
 
     def test_parent_waitpid_zero_and_both_raw_phase_copies_are_real(self):
         obj=phase_fixture(self.root); parent=os.getpid()
