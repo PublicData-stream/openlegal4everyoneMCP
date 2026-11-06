@@ -554,6 +554,78 @@ Preprovisioned peer/map authentication and explicitly selected existing local
 trust are distinct profiles. Local trust is not identity authentication and is
 accepted only with the qualified socket and source-owned isolated helper.
 
+
+## First dynamic approval: provider maintenance
+
+`initial_provider_maintenance.prepare_maintenance_request` prepares the first
+runtime-dependent candidate from the same live RolePrep result, exact Backend
+and SharedLock, and consumed `initial_driver.prepare_clock` context. The caller
+supplies byte-pinned operator request/preprovision DATA, the reviewed maintenance
+source hash, and an existing root-private inbox identity. The helper derives the
+operation, predecessor and seed/driver pins from the actual role consumer. It
+archives the raw inputs and candidate on both original journal media, in the
+current role phase. Phase transition remains the existing maintenance actor's
+responsibility.
+
+The inbox must be outside both operation journal directories; accepting an
+envelope there would create an untracked journal entry. Such a location is
+refused before opening the inbox or writing candidate data.
+
+The returned request is unapproved DATA. Its `requested_authority_scope` contains
+all existing maintenance authority restrictions except `approved` and
+`valid_until`; it cannot pass the authority loader. The operator must separately
+review the concrete candidate and supply the existing exact maintenance
+approval. No role, owner ID, quiescence time, trust claim or approval is generated.
+The request records the actual ROOT identity and original deadline; it contains
+no supervisor identity or external ROOT-exit claim. The original raw request is
+retained even when its formatting differs from the canonical request hash used
+by the existing authority schema.
+
+`execute_approved_maintenance` accepts one canonical envelope from the fixed
+`provider-maintenance-capability.json` inbox filename. The closed envelope binds
+schema version 1, kind `openlegal_initial_stage_capability_envelope`, original
+operation, stage `provider_maintenance`, the pending nonce/request SHA, exact
+candidate reference and actual approved authority reference. Input and file
+metadata, retained directory FD/mount identity, nonce, source, predecessors,
+authority scope/expiry and original clock are rechecked before dispatch. The
+consumption evidence uses an exclusive fixed-name mirrored journal record;
+there is no transport-file deletion or retry. The approved authority remains at
+its original pinned private path for the existing actor's repeated validation.
+The helper calls only the existing `run`, whose actual native/child/SQL closure
+checks still determine its result. A pending or failed intake blocks direct
+`run` calls on that backend. Existing callers with no intake retain their API.
+
+The input scope reserves 10 logical records and 16,936,960 bytes within the same
+4096-record/512 MiB journal: four input/candidate/authority artifacts of at most
+4 MiB each, request and acceptance records of at most 64 KiB each, one 16 KiB
+envelope, and three 4 KiB control records including reservation begin/finish.
+Each dual write counts once. While the exclusive reservation is active, other
+writes, phase changes and writes from a forked process are refused. Successful
+finish must dual-ACK and recheck its terminal record before releasing only unused
+input allowance. Failed parsing, sealing, bounds or writes before terminal close
+retain UNKNOWN, the active reservation, descriptors and partial evidence. A
+failure after successful close still blocks dispatch and retains UNKNOWN and
+all charged evidence; the already released unused allowance is not a renewed
+input scope. Failures do not permit reprepare, replacement approval, direct
+execution or cleanup. The caller retains the inbox FD with its other live
+resources, including on failure.
+
+The maintenance producer allocates its wait owner before fork and records the
+actual child PID before post-fork cleanup, process discovery or pidfd ownership
+can fail. Prologue and descriptor-cleanup exceptions cannot return a fork child
+to ROOT's caller; they force a nonzero exit. Existing uncapped helper/SQL closure
+and TERM-only failure holds remain in place. This internal producer wait is
+separate from the still-missing external observation of ROOT's own exit.
+
+This is a callable first-boundary integration, with no enrollment CLI. Its fixed
+source dependency profile is driver18 plus seed/roles/maintenance (21); legacy15,
+driver18 and historical producer27 name sets remain unchanged. The exclusive intake reservation ends
+before maintenance effects and forks. It does not reserve or prove a complete
+S/R supervisor/observer budget. Pair/certificate dynamic intake, raw authenticated
+bootstrap, single-fork ownership, FD escrow, external exit, registration and
+start/release/Ready admission remain separate unimplemented gates. The failed
+HDD copy-fit and native operating acceptance gates still block enrollment.
+
 ## Shared epoch observations
 
 `epoch_observation.py` owns the single strict-configuration hash implementation

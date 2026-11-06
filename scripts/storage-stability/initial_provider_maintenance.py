@@ -20,6 +20,7 @@ import socket
 import stat
 import threading
 import time
+import uuid
 
 import command_process as processes
 import initial_blob_seed as seed
@@ -31,7 +32,7 @@ import linux_backend as linux
 import manual_backend as manual
 from copy_tree import root_fd
 from interface import Operation, Refused, freeze_authority, need
-from inventory import canonical, decode, digest, pin, private_bytes, valid_uuid
+from inventory import MAX_INPUT, canonical, decode, digest, pin, private_bytes, valid_uuid
 
 PHASE = 'initial_provider_maintenance'
 PROFILE = migration.PROFILE
@@ -147,7 +148,7 @@ def _provision(value, candidate):
     return value
 
 
-def _load(inventory_ref, authority_ref):
+def _load_inventory(inventory_ref):
     raw = driver._reference(inventory_ref); cfg = decode(raw)
     _shape(cfg, ('schema_version','kind','operation_id','driver_inventory_sha256',
         'driver_authority_sha256','legacy_inventory_sha256','source_sha256',
@@ -167,27 +168,308 @@ def _load(inventory_ref, authority_ref):
     _shape(cfg['role_prepare'], ('phase','name','sha256'), 'maintenance_role_prepare_reference')
     need(cfg['role_prepare']['phase'] == 'initial_role_prepare'
          and pin(cfg['role_prepare']['sha256']), 'maintenance_role_prepare_phase')
+    return cfg, raw, p, praw, sc
+
+
+_AUTHORITY_TRUE = ('maintenance_only', 'provider_apply_permitted', 'preserve_originals')
+_AUTHORITY_FALSE = ('strict_ack', 'automatic_retry', 'resume_permitted',
+    'legacy_resolution_permitted', 'provider_http_permitted', 'roles_permitted', 'provisioning_permitted',
+    'postgres_binding_permitted', 'workload_permitted', 'ready_permitted', 'cleanup_permitted')
+
+
+def _requested_scope(loaded):
+    """Restriction DATA only: deliberately lacks approval and expiry fields."""
+    cfg, raw, _, praw, _ = loaded
+    return {'schema_version': 1, 'kind': 'openlegal_initial_provider_maintenance_authority',
+        'operation_id': cfg['operation_id'], 'inventory_sha256': digest(raw),
+        **{k: cfg[k] for k in ('driver_inventory_sha256', 'driver_authority_sha256',
+                              'legacy_inventory_sha256', 'source_sha256')},
+        'provision_sha256': digest(praw), 'request_sha256': digest(canonical(cfg['request'])),
+        **dict.fromkeys(_AUTHORITY_TRUE, True), **dict.fromkeys(_AUTHORITY_FALSE, False)}
+
+
+def _load(inventory_ref, authority_ref):
+    loaded = _load_inventory(inventory_ref)
+    cfg, raw, p, praw, sc = loaded
     authraw = driver._reference(authority_ref); auth = decode(authraw)
-    fields = ('schema_version','kind','approved','operation_id','inventory_sha256',
-        'driver_inventory_sha256','driver_authority_sha256','legacy_inventory_sha256','source_sha256',
-        'provision_sha256','request_sha256','valid_until','maintenance_only','strict_ack',
-        'provider_apply_permitted','preserve_originals','automatic_retry','resume_permitted',
-        'legacy_resolution_permitted','provider_http_permitted','roles_permitted','provisioning_permitted',
-        'postgres_binding_permitted','workload_permitted','ready_permitted','cleanup_permitted')
-    _shape(auth, fields, 'maintenance_authority')
-    need(type(auth['schema_version']) is int and auth['schema_version'] == 1
-         and auth['kind'] == 'openlegal_initial_provider_maintenance_authority' and auth['approved'] is True
-         and auth['operation_id'] == cfg['operation_id'] and auth['inventory_sha256'] == digest(raw)
-         and all(auth[k] == cfg[k] for k in ('driver_inventory_sha256','driver_authority_sha256',
-             'legacy_inventory_sha256','source_sha256')) and auth['provision_sha256'] == digest(praw)
-         and auth['request_sha256'] == digest(canonical(cfg['request']))
+    scope = _requested_scope(loaded)
+    _shape(auth, (*scope, 'approved', 'valid_until'), 'maintenance_authority')
+    need(type(auth['schema_version']) is int and auth['approved'] is True
          and type(auth['valid_until']) is int and time.time() < auth['valid_until']
-         and all(auth[k] is True for k in ('maintenance_only','provider_apply_permitted','preserve_originals'))
-         and all(auth[k] is False for k in ('strict_ack','automatic_retry','resume_permitted',
-             'legacy_resolution_permitted','provider_http_permitted','roles_permitted','provisioning_permitted',
-             'postgres_binding_permitted','workload_permitted','ready_permitted','cleanup_permitted')),
-         'maintenance_authority_scope')
+         and {k: auth[k] for k in scope} == scope
+         and all(auth[k] is True for k in _AUTHORITY_TRUE)
+         and all(auth[k] is False for k in _AUTHORITY_FALSE), 'maintenance_authority_scope')
     return cfg, auth, raw, authraw, p, praw, sc
+
+
+# First dynamic boundary only. These are DATA/transport bounds, not a native
+# enrollment profile or an allocation for a future supervisor/observer.
+INTAKE_REQUEST_MAX = 64 * 1024
+INTAKE_ENVELOPE_MAX = 16 * 1024
+INTAKE_CONTROL_MAX = 4096
+INTAKE_RECORDS = 10
+INTAKE_BYTES = 4 * MAX_INPUT + 2 * INTAKE_REQUEST_MAX + INTAKE_ENVELOPE_MAX + 3 * INTAKE_CONTROL_MAX
+INTAKE_ENVELOPE = 'provider-maintenance-capability.json'
+INTAKE_LABEL = 'provider-maintenance-intake'
+
+
+class _Intake:
+    """Only prepare_maintenance_request creates and attaches a live instance."""
+    def __init__(self, backend, lock):
+        self.b = backend; self.lock = lock; self.state = 'PREPARING'
+        self.j = None; self.budget = None; self.inbox_fd = None; self.finished = None
+        self.entered_run = False
+
+
+def _dedicated_root(backend, lock):
+    need(type(backend) is driver.Backend and type(lock) is journals.SharedLock
+         and os.geteuid() == 0 and threading.current_thread() is threading.main_thread()
+         and len(list(Path('/proc/self/task').iterdir())) == 1 and not processes._children(os.getpid())
+         and not any(callable(v) for v in vars(backend).values())
+         and not getattr(backend, '_initial_provider_maintenance_started', False),
+         'maintenance_live_dedicated_root_backend')
+
+
+def _intake_parent():
+    pid = os.getpid(); ticks = processes._identity(pid)
+    need(type(ticks) is str and ticks.isdecimal(), 'maintenance_intake_parent')
+    return {'pid': pid, 'start_ticks': ticks,
+            'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+
+
+def _intake_mount(fd):
+    with open('/proc/self/fdinfo/' + str(fd), 'rb') as stream:
+        raw = stream.read(4097)
+    rows = [line.split(b':', 1)[1].strip() for line in raw.splitlines() if line.startswith(b'mnt_id:')]
+    need(len(raw) <= 4096 and len(rows) == 1 and rows[0].isdigit(), 'maintenance_intake_mount_id')
+    return int(rows[0])
+
+
+def _intake_ref(ref):
+    return driver._clock_reference(ref)
+
+
+def _intake_fail(s):
+    if type(s) is _Intake:
+        s.state = 'UNKNOWN'
+        if s.budget is not None and s.finished is None:
+            # Preserve the original error as well as every held descriptor/file.
+            try: s.j.fail_reservation(s.budget)
+            except BaseException: pass
+
+
+def _intake_context(s):
+    need(type(s) is _Intake and getattr(s.b, '_initial_provider_maintenance_intake', None) is s
+         and s.state in ('PREPARING', 'WAITING', 'ACCEPTING', 'DISPATCHING'),
+         'maintenance_intake_live_instance')
+    _dedicated_root(s.b, s.lock); driver._check_end(s.b)
+    need(_intake_parent() == s.parent and s.clock is s.b._initial_driver_clock
+         and s.clock.backend is s.b and s.clock.shared_lock is s.lock
+         and s.clock.lock_fd == s.lock.fd and s.b._driver_deadline == s.original_end == s.clock.end,
+         'maintenance_intake_original_context')
+    need(s.j is s.b._initial_driver_journal and s.j.operation == s.operation_id
+         and s.j.phase_paths and s.j.phase_paths[0][0].name == 'initial_role_prepare',
+         'maintenance_intake_original_phase')
+    s.lock.check()
+
+
+def _intake_record(s, suffix, raw, bound):
+    _intake_context(s)
+    need(type(raw) is bytes and len(raw) <= bound, 'maintenance_intake_record_bound')
+    name = 'maintenance-intake-' + suffix + '.json'
+    sha = s.j.save_bytes(name, raw, reservation=s.budget)
+    ref = {'phase': 'initial_role_prepare', 'name': name, 'sha256': sha}
+    need(s.j.read_phase_bytes(ref['phase'], name, sha) == raw, 'maintenance_intake_dual_ack')
+    _intake_context(s)
+    return {'path': str(s.j.phase_paths[0][0] / name), 'sha256': sha}, ref
+
+
+def _intake_inbox(s):
+    journals.directory(s.inbox['path'], s.inbox['identity'])
+    held = os.fstat(s.inbox_fd)
+    need((held.st_dev, held.st_ino) == (s.inbox['identity']['dev'], s.inbox['identity']['ino'])
+         and stat.S_ISDIR(held.st_mode) and held.st_uid == held.st_gid == 0
+         and stat.S_IMODE(held.st_mode) == 0o700 and _intake_mount(s.inbox_fd) == s.inbox_mount,
+         'maintenance_intake_held_inbox')
+    fresh = os.open(s.inbox['path'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        current = os.fstat(fresh)
+        need((current.st_dev, current.st_ino) == (held.st_dev, held.st_ino)
+             and _intake_mount(fresh) == s.inbox_mount, 'maintenance_intake_inbox_rebound')
+    finally: os.close(fresh)
+
+
+def _intake_read_envelope(s, ref, expected=None):
+    _intake_context(s)
+    need(_intake_ref(ref)[0] == str(Path(s.inbox['path']) / INTAKE_ENVELOPE),
+         'maintenance_intake_envelope_path')
+    _intake_inbox(s)
+    fd = os.open(INTAKE_ENVELOPE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                 dir_fd=s.inbox_fd)
+    try:
+        first = os.fstat(fd)
+        need(stat.S_ISREG(first.st_mode) and first.st_uid == first.st_gid == 0
+             and first.st_nlink == 1 and stat.S_IMODE(first.st_mode) == 0o600
+             and 0 < first.st_size <= INTAKE_ENVELOPE_MAX
+             and _intake_mount(fd) == s.inbox_mount, 'maintenance_intake_envelope_metadata')
+        with os.fdopen(fd, 'rb', closefd=False) as stream: raw = stream.read(INTAKE_ENVELOPE_MAX + 1)
+        last = os.fstat(fd); current = os.stat(INTAKE_ENVELOPE, dir_fd=s.inbox_fd, follow_symlinks=False)
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_uid', 'st_gid', 'st_nlink', 'st_mode', 'st_mtime_ns', 'st_ctime_ns')
+        identity = tuple(getattr(first, key) for key in fields)
+        need(len(raw) == first.st_size and digest(raw) == ref['sha256']
+             and all(getattr(first, key) == getattr(last, key) == getattr(current, key) for key in fields)
+             and (expected is None or expected == identity), 'maintenance_intake_envelope_changed')
+    finally: os.close(fd)
+    _intake_inbox(s); _intake_context(s)
+    return raw, identity
+
+
+def _intake_seal(s):
+    _intake_context(s)
+    s.j.check(); _intake_inbox(s)
+    for ref, raw in s.input_bytes:
+        need(driver._reference(ref) == raw, 'maintenance_intake_input_changed')
+    loaded = _load_inventory(s.inventory_ref)
+    need(loaded == s.loaded and _requested_scope(loaded) == s.scope, 'maintenance_intake_candidate_changed')
+    live = _live(s.b, s.lock, loaded[0], loaded[4])
+    need(live[0] is s.j and canonical(live[1:]) == s.live_raw, 'maintenance_intake_role_changed')
+    need(s.j.read_phase_bytes(s.request_ref['phase'], s.request_ref['name'], s.request_ref['sha256']) == s.request_raw,
+         'maintenance_intake_request_changed')
+    _intake_context(s)
+
+
+def prepare_maintenance_request(backend, shared_lock, *, provision_ref, request_ref, source_sha256, inbox):
+    """Dual-ACK unapproved candidate DATA from this live RolePrep, then wait.
+
+    The returned opaque object remains owned by this ROOT, with the inherited
+    original clock/lock and a retained inbox FD. No authority is created, native
+    command dispatched, journal phase advanced or supervisor exit observed.
+    """
+    _dedicated_root(backend, shared_lock)
+    if hasattr(backend, '_initial_provider_maintenance_intake'):
+        _intake_fail(backend._initial_provider_maintenance_intake)
+        raise Refused('maintenance_intake_no_replay')
+    s = _Intake(backend, shared_lock); backend._initial_provider_maintenance_intake = s
+    try:
+        s.parent = _intake_parent(); s.clock = backend._initial_driver_clock
+        need(type(s.clock) is driver._Clock and s.clock.backend is backend
+             and s.clock.shared_lock is shared_lock and s.clock.lock_fd == shared_lock.fd
+             and backend._initial_driver_clock_attempted is True,
+             'maintenance_intake_prepared_clock')
+        driver._check_end(backend); s.original_end = backend._driver_deadline
+        import initial_role_prepare as roles
+        prior = getattr(backend, '_initial_role_prepare_complete', None)
+        need(type(prior) is dict and 'reference' in prior, 'maintenance_intake_role_required')
+        result = roles.consume_live(backend, shared_lock, prior['reference'])
+        rc, _, _, _, sc = roles._load(result['inventory'], result['authority'])
+        s.j = backend._initial_driver_journal; s.operation_id = result['operation_id']
+        need(type(s.j) is journals.DualJournal and s.j.operation == result['operation_id']
+             and s.j.phase_paths[0][0].name == roles.PHASE, 'maintenance_intake_role_phase')
+        s.budget = s.j.reserve(INTAKE_LABEL, INTAKE_RECORDS, INTAKE_BYTES)
+        _shape(inbox, ('path', 'identity'), 'maintenance_intake_inbox')
+        _shape(inbox['identity'], ('dev', 'ino'), 'maintenance_intake_inbox_identity')
+        need(type(inbox['path']) is str and all(type(v) is int and v >= 0 for v in inbox['identity'].values()),
+             'maintenance_intake_inbox_identity')
+        s.inbox = copy.deepcopy(inbox)
+        journals.directory(s.inbox['path'], s.inbox['identity'])
+        need(not any(Path(s.inbox['path']).is_relative_to(path) for path, _ in s.j.paths),
+             'maintenance_intake_inbox_inside_journal')
+        s.inbox_fd = os.open(s.inbox['path'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        s.inbox_mount = _intake_mount(s.inbox_fd); _intake_inbox(s)
+        need(pin(source_sha256), 'maintenance_intake_source')
+        private_bytes(Path(__file__).resolve(), source_sha256)
+        _intake_ref(provision_ref); _intake_ref(request_ref)
+        praw = driver._reference(provision_ref); request_raw = driver._reference(request_ref)
+        _provision(decode(praw), sc[6]['candidate']); req = _request(decode(request_raw))
+        s.input_bytes = [(copy.deepcopy(provision_ref), praw), (copy.deepcopy(request_ref), request_raw)]
+        provision, _ = _intake_record(s, 'provision', praw, MAX_INPUT)
+        _intake_record(s, 'request-input', request_raw, MAX_INPUT)
+        cfg = {'schema_version': 1, 'kind': 'openlegal_initial_provider_maintenance_inventory',
+            'operation_id': result['operation_id'], 'driver_inventory_sha256': digest(sc[7]),
+            'driver_authority_sha256': digest(sc[9]), 'legacy_inventory_sha256': digest(sc[8]),
+            'source_sha256': source_sha256, 'seed_inventory': copy.deepcopy(rc['seed_inventory']),
+            'seed_authority': copy.deepcopy(rc['seed_authority']), 'role_prepare': copy.deepcopy(prior['reference']),
+            'provision': provision, 'request': req}
+        s.inventory_ref, _ = _intake_record(s, 'candidate', canonical(cfg), MAX_INPUT)
+        s.loaded = _load_inventory(s.inventory_ref); s.cfg = s.loaded[0]; s.scope = _requested_scope(s.loaded)
+        live = _live(backend, shared_lock, s.cfg, s.loaded[4]); need(live[0] is s.j, 'maintenance_intake_same_journal')
+        s.live_raw = canonical(live[1:]); s.nonce = str(uuid.uuid4())
+        graph = dict(sc[4]['source_graph'], **{'initial_blob_seed.py': sc[0]['source_sha256'],
+            'initial_role_prepare.py': rc['source_sha256'], 'initial_provider_maintenance.py': source_sha256})
+        value = {'schema_version': 1, 'kind': 'openlegal_initial_provider_maintenance_stage_request',
+            'operation_id': s.cfg['operation_id'], 'stage': 'provider_maintenance', 'stage_nonce': s.nonce,
+            'root': s.parent, 'original_absolute_deadline': s.original_end,
+            'source_profile': 'initial_provider_maintenance_intake_v1', 'source_graph_sha256': digest(canonical(graph)),
+            'previous_result': s.cfg['role_prepare'], 'candidate_inventory': s.inventory_ref,
+            'requested_authority_scope': s.scope, 'authority_scope_sha256': digest(canonical(s.scope)),
+            'status': 'UNAPPROVED_CANDIDATE_DATA', 'ready': False}
+        s.request_raw = canonical(value)
+        _, s.request_ref = _intake_record(s, 'request', s.request_raw, INTAKE_REQUEST_MAX)
+        s.state = 'WAITING'; _intake_seal(s)
+        return s, s.request_raw
+    except BaseException:
+        _intake_fail(s); raise
+
+
+def execute_approved_maintenance(intake, envelope_ref):
+    """Consume one external capability and dispatch only the existing run()."""
+    need(type(intake) is _Intake and getattr(intake.b, '_initial_provider_maintenance_intake', None) is intake
+         and intake.state == 'WAITING', 'maintenance_intake_one_use')
+    s = intake; s.state = 'ACCEPTING'
+    try:
+        _intake_seal(s)
+        raw, identity = _intake_read_envelope(s, envelope_ref); value = decode(raw)
+        _shape(value, ('schema_version', 'kind', 'operation_id', 'stage', 'stage_nonce', 'request_sha256',
+                       'inventory', 'authority'), 'maintenance_intake_envelope')
+        need(canonical(value) == raw and type(value['schema_version']) is int and value['schema_version'] == 1
+             and value['kind'] == 'openlegal_initial_stage_capability_envelope'
+             and value['operation_id'] == s.cfg['operation_id'] and value['stage'] == 'provider_maintenance'
+             and value['stage_nonce'] == s.nonce and value['request_sha256'] == digest(s.request_raw)
+             and value['inventory'] == s.inventory_ref, 'maintenance_intake_envelope_binding')
+        s.authority_ref = copy.deepcopy(value['authority']); _intake_ref(s.authority_ref)
+        s.envelope_ref = copy.deepcopy(envelope_ref); s.envelope_raw = raw; s.envelope_identity = identity
+        _intake_record(s, 'envelope', raw, INTAKE_ENVELOPE_MAX)
+        _intake_record(s, 'consumed', canonical({'operation_id': s.cfg['operation_id'], 'stage_nonce': s.nonce,
+            'request_sha256': digest(s.request_raw), 'envelope_sha256': digest(raw),
+            'status': 'ATTEMPT_CONSUMED_NOT_APPROVAL'}), INTAKE_CONTROL_MAX)
+        loaded = _load(s.inventory_ref, s.authority_ref)
+        need(loaded[0] == s.cfg and {k: loaded[1][k] for k in s.scope} == s.scope,
+             'maintenance_intake_approval_scope')
+        s.authority_raw = loaded[3]
+        _intake_record(s, 'authority', s.authority_raw, MAX_INPUT)
+        _, s.accepted_ref = _intake_record(s, 'accepted', canonical({'operation_id': s.cfg['operation_id'],
+            'stage_nonce': s.nonce, 'request': s.request_ref, 'inventory': s.inventory_ref,
+            'authority': s.authority_ref, 'envelope': s.envelope_ref,
+            'original_absolute_deadline': s.original_end, 'ready': False}), INTAKE_REQUEST_MAX)
+        _intake_seal(s)
+        need(_intake_read_envelope(s, s.envelope_ref, s.envelope_identity)[0] == s.envelope_raw
+             and driver._reference(s.authority_ref) == s.authority_raw, 'maintenance_intake_approval_changed')
+        _intake_context(s)
+        s.finished = s.j.finish_reservation(s.budget)
+        _intake_context(s)
+        s.state = 'DISPATCHING'
+        result = run(s.b, s.lock, s.inventory_ref, s.authority_ref)
+        s.state = 'CONSUMED'
+        return result
+    except BaseException:
+        _intake_fail(s); raise
+
+
+def _intake_run_gate(backend, lock, inventory_ref, authority_ref):
+    if not hasattr(backend, '_initial_provider_maintenance_intake'): return
+    s = backend._initial_provider_maintenance_intake
+    try:
+        need(type(s) is _Intake and s.b is backend and s.lock is lock and s.state == 'DISPATCHING'
+             and s.finished is not None and not s.entered_run
+             and inventory_ref == s.inventory_ref and authority_ref == s.authority_ref,
+             'maintenance_intake_dispatch_required')
+        _intake_seal(s)
+        need(_intake_read_envelope(s, s.envelope_ref, s.envelope_identity)[0] == s.envelope_raw
+             and driver._reference(s.authority_ref) == s.authority_raw, 'maintenance_intake_approval_changed')
+        s.j.read_phase_bytes(s.finished['phase'], s.finished['name'], s.finished['sha256'])
+        s.entered_run = True
+    except BaseException:
+        _intake_fail(s); raise
 
 
 def _raw(j, ref):
@@ -1082,12 +1364,8 @@ def run(backend, shared_lock, inventory_ref, authority_ref):
     descendant closure. The final result is then BOTH-journal ACKed in this
     phase, and the parent freshly rechecks global SQL closure before return.
     """
-    need(type(backend) is driver.Backend and type(shared_lock) is journals.SharedLock
-         and os.geteuid()==0 and threading.current_thread() is threading.main_thread()
-         and len(list(Path('/proc/self/task').iterdir()))==1 and not processes._children(os.getpid())
-         and not any(callable(v) for v in vars(backend).values())
-         and not getattr(backend,'_initial_provider_maintenance_started',False),
-         'maintenance_live_dedicated_root_backend')
+    _dedicated_root(backend, shared_lock)
+    _intake_run_gate(backend, shared_lock, inventory_ref, authority_ref)
     driver._check_end(backend); loaded=_load(inventory_ref,authority_ref)
     live=_live(backend,shared_lock,loaded[0],loaded[6])
     backend._initial_provider_maintenance_started=True
