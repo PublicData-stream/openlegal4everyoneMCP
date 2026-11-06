@@ -366,8 +366,13 @@ def _child(backend, op, sock, parent, parentfd):
             sock.sendall(raw[sent:])
         except BaseException:
             status = 1
-        sock.close(); os.close(parentfd)
-        os._exit(status)
+        # Cleanup failures belong to this child and cannot unwind into ROOT.
+        try:
+            sock.close(); os.close(parentfd)
+        except BaseException:
+            status = 1
+        finally:
+            os._exit(status)
 
 
 def _fork_phase(backend, op):
@@ -391,11 +396,17 @@ def _fork_phase(backend, op):
         oldsub = processes._subreaper(); processes._subreaper(1)
         parentfd = os.pidfd_open(os.getpid(), 0)
         channel, child = socket.socketpair()
-        parent = os.getpid(); pid = os.fork()
+        parent = os.getpid()
+        # Allocate the raw wait owner before a child exists. Store the real PID
+        # before any fallible descriptor cleanup or /proc/pidfd ownership work.
+        leader = _Leader(None); pid = os.fork()
         if pid == 0:
-            channel.close()
-            _child(backend, op, child, parent, parentfd)
-        leader = _Leader(pid)
+            try:
+                channel.close()
+                _child(backend, op, child, parent, parentfd)
+            finally:
+                os._exit(1)
+        leader.pid = pid
         child.close(); child = None; os.close(parentfd); parentfd = None
         owned = processes._Ownership(leader)
         witness = {'pid': pid, 'start_ticks': owned.leader_key[1],
@@ -436,7 +447,7 @@ def _fork_phase(backend, op):
              and index.get('phase') == op.phase, 'driver_live_child_index')
         return result, index, received
     except BaseException:
-        if leader is not None:
+        if leader is not None and leader.pid is not None:
             # Cannot unwind/restore SIGCHLD/subreaper while any owned kernel child remains.
             processes._drain(leader, owned, stopping)
             backend._initial_driver_last_exit = {

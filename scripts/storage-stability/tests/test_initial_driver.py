@@ -4,6 +4,8 @@ Two same-filesystem journal dirs are a labelled fixture only: production creates
 DualJournal normally and requires distinct media. No callback is an API input.
 """
 import copy
+from contextlib import ExitStack
+import errno
 from dataclasses import FrozenInstanceError
 import fcntl
 import importlib
@@ -593,6 +595,191 @@ class DriverTests(unittest.TestCase):
         self.backend._driver_deadline = time.monotonic() - 1
         with self.assertRaisesRegex(Refused, 'original_deadline'):
             self.backend._run(None, 'docker', ['inspect'])
+
+
+class ForkOwnershipTests(unittest.TestCase):
+    """Each injected failure retains an independent test-owned raw PID/pidfd."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir='/tmp', prefix='initial-driver-fork-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        st = os.fstat(fd)
+        self.backend = d.Backend()
+        self.backend._driver_deadline = time.monotonic() + 10
+        self.backend._cgroup_fds[str(self.root)] = (fd, {'dev': st.st_dev, 'ino': st.st_ino})
+        self.op = types.SimpleNamespace(phase=d.legacy.PHASE, operation_id=str(uuid.uuid4()),
+            inventory={'host': {'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}},
+            seal=lambda: None)
+
+    def _capture_test_fork(self, captured):
+        real = os.fork; rootpid = os.getpid()
+        def fork():
+            pid = real()
+            if pid and os.getpid() == rootpid:
+                # Raw ownership precedes even the test's own fallible pidfd open.
+                captured['pid'] = pid
+                captured['pidfd'] = os.pidfd_open(pid)
+            return pid
+        return fork
+
+    def _reap_test_child(self, captured):
+        pid = captured.get('pid')
+        if pid is None: return
+        end = time.monotonic() + 3
+        while time.monotonic() < end:
+            try: found, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError: return  # Production already really waited.
+            if found == pid:
+                captured['outer_wait_status'] = status
+                return
+            time.sleep(.01)
+        self.fail('test-owned harmless child did not close after its GO gate opened')
+
+    def _parent_fault(self, mode):
+        rootpid = os.getpid(); captured = {}; read, write = os.pipe()
+        oldsub = d.processes._subreaper()
+        previous = {n: signal.getsignal(n) for n in
+                    (signal.SIGCHLD, signal.SIGINT, signal.SIGTERM, signal.SIGALRM)}
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0., 0.))
+        real_pair = d.socket.socketpair; real_identity = d.processes._identity
+        real_signal = signal.signal; real_subreaper = d.processes._subreaper
+        premature_restore = []
+        def restoring_signal(number, handler):
+            if (os.getpid() == rootpid and captured.get('pid') is not None
+                    and number in previous and handler == previous[number]
+                    and captured['pid'] in d.processes._children(rootpid)):
+                premature_restore.append(('signal', number))
+            return real_signal(number, handler)
+        def restoring_subreaper(value=None):
+            if (os.getpid() == rootpid and value == oldsub
+                    and captured.get('pid') in d.processes._children(rootpid)):
+                premature_restore.append(('subreaper', value))
+            return real_subreaper(value) if value is not None else real_subreaper()
+        def gated_child(*_):
+            try:
+                signal.signal(signal.SIGTERM, lambda *_: None)
+                os.read(read, 1)
+            finally: os._exit(1)
+        class ParentCloseError:
+            def __init__(self, sock): self.sock = sock; self.raised = False
+            def close(self):
+                self.sock.close()
+                if os.getpid() == rootpid and not self.raised:
+                    self.raised = True
+                    raise OSError(errno.EIO, 'synthetic_parent_postfork_close')
+            def __getattr__(self, name): return getattr(self.sock, name)
+        def sockets():
+            a, b = real_pair(); return a, ParentCloseError(b)
+        def identity(pid):
+            if os.getpid() == rootpid and pid != rootpid:
+                raise OSError(errno.EIO, 'synthetic_persistent_identity')
+            return real_identity(pid)
+        returned_with_live_child = False
+        try:
+            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            signal.signal(signal.SIGALRM, lambda *_: os.write(write, b'g'))
+            signal.setitimer(signal.ITIMER_REAL, .15)
+            with ExitStack() as stack:
+                fork = stack.enter_context(patch.object(d.os, 'fork', side_effect=self._capture_test_fork(captured)))
+                stack.enter_context(patch.object(signal, 'signal', side_effect=restoring_signal))
+                stack.enter_context(patch.object(d.processes, '_subreaper', side_effect=restoring_subreaper))
+                stack.enter_context(patch.object(d, '_child', side_effect=gated_child))
+                if mode == 'fork-call':
+                    fork.side_effect = OSError(errno.EAGAIN, 'synthetic_fork_failure')
+                elif mode == 'parent-close':
+                    stack.enter_context(patch.object(d.socket, 'socketpair', side_effect=sockets))
+                elif mode == 'leader-init':
+                    stack.enter_context(patch.object(d, '_Leader', side_effect=OSError(errno.EMFILE, 'synthetic_leader_init')))
+                elif mode == 'ownership-init':
+                    stack.enter_context(patch.object(d.processes, '_Ownership', side_effect=OSError(errno.EMFILE, 'synthetic_ownership_init')))
+                else:
+                    stack.enter_context(patch.object(d.processes, '_identity', side_effect=identity))
+                with self.assertRaisesRegex(OSError, 'synthetic_'): d._fork_phase(self.backend, self.op)
+                if mode == 'leader-init': fork.assert_not_called()
+            if captured:
+                returned_with_live_child = not bool(select.select([captured['pidfd']], [], [], 0)[0])
+                self.assertEqual(self.backend._initial_driver_last_exit['pid'], captured['pid'])
+                self.assertIsInstance(self.backend._initial_driver_last_exit['actual_exit_code'], int)
+                with self.assertRaises(ChildProcessError): os.waitpid(captured['pid'], os.WNOHANG)
+            else:
+                self.assertFalse(hasattr(self.backend, '_initial_driver_last_exit'))
+        finally:
+            # Regressed children cannot enter or duplicate the unittest runner.
+            if os.getpid() != rootpid: os._exit(91)
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            try:
+                os.write(write, b'g'); self._reap_test_child(captured)
+            finally:
+                for fd in (read, write, captured.get('pidfd')):
+                    if fd is not None: os.close(fd)
+                for number, handler in previous.items(): signal.signal(number, handler)
+                d.processes._subreaper(oldsub)
+        self.assertFalse(returned_with_live_child, 'production returned before actual child closure')
+        self.assertEqual(premature_restore, [], 'ownership state restored before actual wait')
+        self.assertEqual(d.processes._children(rootpid), set())
+        self.assertFalse(d._SERIAL.locked())
+
+    def test_parent_failures_keep_raw_wait_owner_or_fail_before_fork(self):
+        for mode in ('leader-init', 'fork-call', 'parent-close', 'ownership-init', 'identity'):
+            with self.subTest(mode=mode): self._parent_fault(mode)
+
+    def _child_fault(self, mode):
+        rootpid = os.getpid(); captured = {}; parentfds = []
+        real_pair = d.socket.socketpair; real_close = os.close; real_pidfd = os.pidfd_open
+        oldsub = d.processes._subreaper()
+        previous = {n: signal.getsignal(n) for n in (signal.SIGCHLD, signal.SIGINT, signal.SIGTERM)}
+        class ChildCloseError:
+            def __init__(self, sock): self.sock = sock; self.raised = False
+            def close(self):
+                self.sock.close()
+                if os.getpid() != rootpid and not self.raised:
+                    self.raised = True
+                    raise OSError(errno.EIO, 'synthetic_child_close')
+            def __getattr__(self, name): return getattr(self.sock, name)
+        def sockets():
+            a, b = real_pair()
+            return (ChildCloseError(a), b) if mode == 'prologue-close' else (a, ChildCloseError(b))
+        def pidfd(pid, *args):
+            fd = real_pidfd(pid, *args)
+            if pid == rootpid: parentfds.append(fd)
+            return fd
+        def close(fd):
+            real_close(fd)
+            if os.getpid() != rootpid and fd in parentfds:
+                raise OSError(errno.EIO, 'synthetic_child_cleanup_close')
+        try:
+            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(d.os, 'fork', side_effect=self._capture_test_fork(captured)))
+                stack.enter_context(patch.object(d.legacy, 'run', side_effect=lambda *_: None))
+                stack.enter_context(patch.object(d, '_phase_index', return_value=(
+                    {'phase': self.op.phase, 'operation_id': self.op.operation_id}, [])))
+                if mode in ('prologue-close', 'socket-cleanup-close'):
+                    stack.enter_context(patch.object(d.socket, 'socketpair', side_effect=sockets))
+                else:
+                    stack.enter_context(patch.object(d.os, 'pidfd_open', side_effect=pidfd))
+                    stack.enter_context(patch.object(d.os, 'close', side_effect=close))
+                with self.assertRaises((Refused, OSError, ValueError)): d._fork_phase(self.backend, self.op)
+        finally:
+            if os.getpid() != rootpid: os._exit(91)
+            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            try: self._reap_test_child(captured)
+            finally:
+                if captured.get('pidfd') is not None: real_close(captured['pidfd'])
+                for number, handler in previous.items(): signal.signal(number, handler)
+                d.processes._subreaper(oldsub)
+        row = self.backend._initial_driver_last_exit
+        self.assertEqual(row['pid'], captured['pid'])
+        self.assertEqual(row['actual_exit_code'], 1, 'fork child escaped into the ROOT caller')
+        with self.assertRaises(ChildProcessError): os.waitpid(row['pid'], os.WNOHANG)
+        self.assertFalse(d._SERIAL.locked())
+
+    def test_child_prologue_and_cleanup_failures_exit_only_in_the_child(self):
+        for mode in ('prologue-close', 'socket-cleanup-close', 'fd-cleanup-close'):
+            with self.subTest(mode=mode): self._child_fault(mode)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
