@@ -3,12 +3,14 @@ import fcntl
 import os
 import re
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 from interface import Refused, need
 from inventory import canonical, digest, private_parents
 
 MAX_ARTIFACT = 256 * 1024 * 1024
 MAX_PHASE_BYTES = 512 * 1024 * 1024
+MAX_RESERVATION_RECEIPT = 4096
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
 
 def sync_directory(path):
@@ -80,6 +82,21 @@ class SharedLock:
     def __enter__(self): return self.acquire()
     def __exit__(self,*_): self.close()
 
+@dataclass(frozen=True, eq=False, slots=True)
+class _Reservation:
+    journal: object
+    owner_pid: int
+    phase: tuple
+    label: str
+    records: int
+    byte_limit: int
+    start_count: int
+    start_bytes: int
+    begin_name: str
+    begin_raw: bytes
+    finish_name: str
+    finish_raw: bytes
+
 class DualJournal:
     """No media fallback, overwrite, retry or rollback of a partial journal."""
     def __init__(self, roots, operation, binding):
@@ -94,6 +111,14 @@ class DualJournal:
         self.phase_paths = None; self.bytes = 0; self.count = 0; self.artifacts = {}; self.history = []; self.phase_names = set()
         self.save('operation.json',binding)
     def check(self):
+        self._reservation_not_poisoned()
+        try: self._check()
+        except BaseException:
+            self._poison_reservation()
+            raise
+    def _check(self):
+        if getattr(self,'_reservation',None) is not None:
+            self._reservation_phase(self._reservation)
         for path,pin in self.base + self.paths + (self.phase_paths or []): directory(path,pin)
         for paths,artifacts in self.history + [(self.current(),self.artifacts)]:
             for path,pin in paths:
@@ -110,6 +135,12 @@ class DualJournal:
                     finally: os.close(fd)
     def current(self): return self.phase_paths if self.phase_paths is not None else self.paths
     def begin(self,phase):
+        try:
+            self._reservation_not_poisoned()
+            need(getattr(self,'_reservation',None) is None,'journal_reservation_active')
+        except BaseException:
+            self._poison_reservation()
+            raise
         need(NAME.fullmatch(phase) is not None, 'phase_name')
         self.check()
         self.history.append((self.current(),self.artifacts))
@@ -120,15 +151,113 @@ class DualJournal:
         self.phase_paths=phase_paths
         self.phase_names.add(phase)
         self.save('intent.json',dict(self.binding,phase=phase,status='started',automatic_retry=False))
-    def save(self,name,value): return self.save_bytes(name,canonical(value))
-    def save_bytes(self,name,raw):
-        need(type(name) is str and NAME.fullmatch(name) is not None and type(raw) is bytes and name not in self.artifacts and len(raw) <= MAX_ARTIFACT and self.bytes+len(raw) <= MAX_PHASE_BYTES and self.count < 4096, 'journal_artifact_bound')
-        self.check()
-        for path,pin in self.current():
-            directory(path,pin); new_file(path/name,raw)
-        # Publish the in-memory receipt only after BOTH media were acknowledged.
-        self.artifacts[name]={'sha256':digest(raw),'bytes':len(raw),'raw':raw}; self.bytes+=len(raw); self.count+=1
-        self.check(); return digest(raw)
+    def save(self,name,value,*,reservation=None):
+        try: return self.save_bytes(name,canonical(value),reservation=reservation)
+        except BaseException:
+            self._poison_reservation()
+            raise
+    def save_bytes(self,name,raw,*,reservation=None):
+        return self._save_bytes(name,raw,reservation,None)
+    def _save_bytes(self,name,raw,reservation,metadata):
+        try:
+            self._reservation_not_poisoned()
+            active=getattr(self,'_reservation',None)
+            if active is not None:
+                self._reservation_token(reservation)
+            else: need(reservation is None,'journal_reservation_token')
+            need(type(name) is str and NAME.fullmatch(name) is not None and type(raw) is bytes and name not in self.artifacts and len(raw) <= MAX_ARTIFACT and self.bytes+len(raw) <= MAX_PHASE_BYTES and self.count < 4096, 'journal_artifact_bound')
+            if active is not None:
+                if metadata is None:
+                    need(name not in (active.begin_name,active.finish_name),'journal_reservation_metadata')
+                else:
+                    need((metadata=='begin' and name==active.begin_name and raw==active.begin_raw)
+                         or (metadata=='finish' and name==active.finish_name and raw==active.finish_raw),
+                         'journal_reservation_metadata')
+                tail_records=0 if metadata=='finish' else 1
+                tail_bytes=0 if metadata=='finish' else len(active.finish_raw)
+                need(self._reservation_records+1+tail_records<=active.records
+                     and self._reservation_bytes+len(raw)+tail_bytes<=active.byte_limit,
+                     'journal_reservation_bound')
+            self.check()
+            for path,pin in self.current():
+                directory(path,pin); new_file(path/name,raw)
+            # Publish the in-memory receipt only after BOTH media acknowledged.
+            self.artifacts[name]={'sha256':digest(raw),'bytes':len(raw),'raw':raw}; self.bytes+=len(raw); self.count+=1
+            if active is not None:
+                self._reservation_records+=1; self._reservation_bytes+=len(raw)
+            self.check(); return digest(raw)
+        except BaseException:
+            self._poison_reservation()
+            raise
+
+    def _reservation_not_poisoned(self):
+        need(not getattr(self,'_reservation_poisoned',False),'journal_reservation_poisoned')
+    def _poison_reservation(self):
+        if getattr(self,'_reservation',None) is not None: self._reservation_poisoned=True
+    def _phase_identity(self):
+        return tuple((str(path),pin['dev'],pin['ino']) for path,pin in self.current())
+    def _reservation_phase(self,token):
+        need(token.phase==self._phase_identity()
+             and type(self.count) is int and self.count==token.start_count+self._reservation_records
+             and type(self.bytes) is int and self.bytes==token.start_bytes+self._reservation_bytes,
+             'journal_reservation_phase_or_accounting')
+    def _reservation_token(self,token):
+        need(type(token) is _Reservation and getattr(self,'_reservation',None) is token
+             and token.journal is self and token.owner_pid==os.getpid(),'journal_reservation_token')
+        self._reservation_phase(token)
+
+    def reserve(self,label,records,byte_limit):
+        """Exclusive same-process input scope; not a cross-fork budget/authority.
+
+        Begin/finish receipts consume the allowance. Unused capacity is released
+        only by a successful finish. An interrupted scope cannot be resumed.
+        """
+        try:
+            self._reservation_not_poisoned()
+            need(getattr(self,'_reservation',None) is None,'journal_reservation_active')
+            need(type(label) is str and NAME.fullmatch(label) is not None
+                 and label not in getattr(self,'_reservation_labels',set()),'journal_reservation_label')
+            need(type(records) is int and 2<=records<=4096
+                 and type(byte_limit) is int and 0<=byte_limit<=MAX_PHASE_BYTES
+                 and type(self.count) is int and type(self.bytes) is int
+                 and self.count+records<=4096 and self.bytes+byte_limit<=MAX_PHASE_BYTES,
+                 'journal_reservation_capacity')
+            self.check()
+            phase=self._phase_identity(); prefix='reservation-'+digest(label.encode())
+            begin_name=prefix+'-begin.json';finish_name=prefix+'-finish.json'
+            common={'operation_id':self.operation,'label':label,'owner_pid':os.getpid(),
+                    'phase':self.current()[0][0].name,'records':records,'byte_limit':byte_limit}
+            begin_raw=canonical(dict(common,kind='openlegal_journal_reservation_begin'))
+            finish_raw=canonical(dict(common,kind='openlegal_journal_reservation_finished',
+                                      begin={'name':begin_name,'sha256':digest(begin_raw)}))
+            need(len(begin_raw)<=MAX_RESERVATION_RECEIPT and len(finish_raw)<=MAX_RESERVATION_RECEIPT
+                 and len(begin_raw)+len(finish_raw)<=byte_limit,'journal_reservation_overhead')
+            token=_Reservation(self,os.getpid(),phase,label,records,byte_limit,self.count,self.bytes,
+                               begin_name,begin_raw,finish_name,finish_raw)
+            self._reservation=token; self._reservation_records=0;self._reservation_bytes=0
+            self._reservation_labels=set(getattr(self,'_reservation_labels',set()))|{label}
+            self._save_bytes(begin_name,begin_raw,token,'begin')
+            return token
+        except BaseException:
+            self._poison_reservation()
+            raise
+
+    def finish_reservation(self,token):
+        try:
+            self._reservation_not_poisoned();self._reservation_token(token);self.check()
+            sha=self._save_bytes(token.finish_name,token.finish_raw,token,'finish')
+            self.check()
+            ref={'phase':self.current()[0][0].name,'name':token.finish_name,'sha256':sha}
+            self._reservation=None
+            return ref
+        except BaseException:
+            self._poison_reservation()
+            raise
+
+    def fail_reservation(self,token):
+        try:
+            self._reservation_not_poisoned();self._reservation_token(token)
+        finally: self._poison_reservation()
     def output_hashes(self):
         self.check(); return {n:r['sha256'] for n,r in self.artifacts.items()}
 
