@@ -62,8 +62,8 @@ else
     dictionary=$(realpath -- "$OPENLEGAL_TEST_MECAB_DICTIONARY")
 fi
 [[ -s $dictionary/manifest.json ]] || { echo 'Missing provisioned dictionary manifest' >&2; exit 1; }
-# The helper has a compatible libc and the daemon's native architecture, including
-# when the production image is tested through emulation. Reuse release build caches.
+# The helper uses Alpine/musl on the daemon's native architecture, including when
+# the production image is tested through emulation. Keep its build cache separate.
 docker build --platform "$native_platform" --file test-support/retained-image/Dockerfile --tag "$helper_image" .
 docker pull --platform "$native_platform" "$node_image" >/dev/null
 docker pull --platform "$native_platform" "$postgres_image" >/dev/null

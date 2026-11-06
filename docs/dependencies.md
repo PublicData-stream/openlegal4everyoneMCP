@@ -71,6 +71,16 @@ retry exhaustion, network/transaction timeouts, failed fresh metadata acquisitio
 and integrity rejection. CI requires this gate before server and worker images.
 These checks establish bounded failure handling, not continuous mirror availability.
 
+The retained-image acceptance helper also uses the pinned Rust/Alpine builder and
+Alpine runtime with this shared installer, replacing its dated Debian snapshot.
+It builds the locked fixture example for the Docker daemon's native architecture
+with dynamic musl linking, the same CPU baselines and a separate musl build cache.
+Its runtime carries CA certificates and libgcc; ELF interpreter and library checks
+fail the build on incompatible linkage. This helper is test-only and is never
+copied into a production image. Its native package versions follow the same moving
+Alpine v3.24 repositories; image acceptance still verifies actual PostgreSQL TLS
+and fixture publication rather than treating compilation as sufficient evidence.
+
 The final image retains the first-party AGPL license, bundled widget notices,
 Rust dependency and standard-library notices, and embedded Korean dictionary
 notices. Notice collection uses exact package IDs from the successful locked

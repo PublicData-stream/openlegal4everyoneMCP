@@ -12,6 +12,9 @@
 !apps/server/Cargo.toml
 !apps/server/src/
 !apps/server/src/**
+!scripts/
+scripts/**
+!scripts/install-alpine-packages.sh
 **/target/
 **/.git/
 **/.env*
