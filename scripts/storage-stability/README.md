@@ -621,10 +621,69 @@ This is a callable first-boundary integration, with no enrollment CLI. Its fixed
 source dependency profile is driver18 plus seed/roles/maintenance (21); legacy15,
 driver18 and historical producer27 name sets remain unchanged. The exclusive intake reservation ends
 before maintenance effects and forks. It does not reserve or prove a complete
-S/R supervisor/observer budget. Pair/certificate dynamic intake, raw authenticated
-bootstrap, single-fork ownership, FD escrow, external exit, registration and
-start/release/Ready admission remain separate unimplemented gates. The failed
+S/R supervisor/observer budget. Certificate dynamic intake, raw authenticated
+bootstrap, single-fork supervisor ownership, FD escrow, external exit, registration
+and start/release/Ready admission remain separate unimplemented gates. The failed
 HDD copy-fit and native operating acceptance gates still block enrollment.
+
+## Maintenance completion and PostgreSQL Pair approval
+
+The maintenance owner publishes its private completion capability only after
+actual child wait/descendant closure, dual-ACKed result and final SQL closure,
+including the final cleanup block. `completed_reference` and
+`consume_completed_live` require that exact owner and Backend, original ROOT
+identity, SharedLock, clock/deadline, source/input seals, current maintenance
+phase, native command closure and immutable audit/result references. They read
+existing evidence without executing SQL. A saved result or backend exit field
+alone cannot supply the completion capability.
+
+The completion freezes the maintenance actor's terminal accounting under its
+original 1024-record/64 MiB allowance. Later candidate DATA is independently
+charged to the original global journal. The active producer still checks its
+original allowance before commands and writes; the completed consumer checks
+frozen terminal accounting and current context without renewing that allowance.
+
+`initial_pg_pair.prepare_pair_request` derives the operation, seed references
+and actual maintenance completion reference from this live owner. Its caller
+supplies only the reviewed Pair source hash, explicit existing Pair preprovision
+reference and private inbox identity. The existing Pair proof and archived live
+role consumer independently qualify the completed maintenance and exact role
+manifest. The preprovision remains operator DATA: image/tool/network/target,
+slot, peer and trust identities are never inferred or provisioned. Referenced
+TLS private-key bytes are never archived. The existing PostgreSQL-readable trust
+file rules remain distinct from root-private approval inbox rules.
+
+The candidate and request are mirrored in the current maintenance phase. The
+request contains all existing Pair authority restrictions except `approved` and
+`valid_until`, so it grants no execution authority. `execute_approved_pair`
+accepts one canonical `openlegal_initial_stage_capability_envelope` at the fixed
+`pg-pair-capability.json` inbox filename, with stage `pg_pair`, exact operation,
+nonce, request hash, candidate and separately approved authority reference.
+Only the existing Pair `run` can be dispatched after the original loader,
+completion, role, source, input and clock checks succeed. Pending, UNKNOWN and
+malformed intake state block direct `run` bypass. Duplicate preparation and
+failed approval attempts cannot renew the request or original deadline.
+
+This second input scope reserves 10 records and 16,936,960 bytes from the same
+4096-record/512 MiB journal. It conservatively retains the first intake's four
+4 MiB input slots, two 64 KiB records, one 16 KiB envelope and three 4 KiB control
+records; unused allowance is released only after the mirrored finish receipt
+and its validation. The native Pair phase starts afterward under its existing
+separate allowance. Post-finish expiry still blocks dispatch and retains UNKNOWN
+and the charged evidence. Every inbox descriptor remains owned by its stage;
+shared filesystem helpers perform only bounded metadata/path/mount/hash checks.
+
+The driver also retains its raw child PID before any fallible parent cleanup,
+and child prologue/final cleanup cannot unwind into ROOT's caller. Its existing
+TERM/SIGKILL drain policy and actual wait before handler/subreaper restoration
+remain in force. Maintenance retains its separate uncapped TERM-only native
+closure holds.
+
+These APIs do not implement a ROOT controller, external ROOT-exit observation,
+registration or Ready. Tests use real temporary files, driver/producer forks and
+parent waits with labelled synthetic service ports. They establish source
+behavior; physical Pair enrollment, independent-media durability, provider
+acceptance and the failed HDD gate still require separate operating evidence.
 
 ## Shared epoch observations
 
