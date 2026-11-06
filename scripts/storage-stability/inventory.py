@@ -82,6 +82,93 @@ def private_bytes(path, sha=None, limit=MAX_INPUT, owner=0):
     need(sha is None or pin(sha) and digest(raw) == sha, 'private_raw_hash')
     return raw
 
+def private_fd_mount_id(fd):
+    """Return the bounded Linux mount witness for a caller-owned descriptor."""
+    need(type(fd) is int and fd >= 0, 'private_fd_shape')
+    with open('/proc/self/fdinfo/' + str(fd), 'rb') as stream:
+        raw = stream.read(4097)
+    rows = [line.split(b':', 1)[1].strip() for line in raw.splitlines() if line.startswith(b'mnt_id:')]
+    need(len(raw) <= 4096 and len(rows) == 1 and rows[0].isdigit(), 'private_fd_mount_id')
+    mount_id = int(rows[0])
+    need(mount_id > 0, 'private_fd_mount_id')
+    return mount_id
+
+def recheck_private_inbox(path, identity, held_fd, mount_id):
+    """Recheck a private root directory without taking ownership of held_fd.
+
+    Only the fresh comparison descriptor is closed here. The caller retains its
+    original descriptor immediately on open and owns all operation/context checks.
+    """
+    p = absolute(str(path))
+    need(str(p) == str(path) and '\x00' not in str(p), 'private_inbox_path')
+    need(type(identity) is dict and set(identity) == {'dev', 'ino'}
+         and all(type(v) is int and v >= 0 for v in identity.values()), 'private_inbox_identity')
+    need(type(held_fd) is int and held_fd >= 0 and type(mount_id) is int and mount_id > 0,
+         'private_inbox_descriptor')
+    expected = (identity['dev'], identity['ino'])
+    def check(st):
+        need(stat.S_ISDIR(st.st_mode) and st.st_uid == st.st_gid == 0
+             and stat.S_IMODE(st.st_mode) == 0o700 and (st.st_dev, st.st_ino) == expected,
+             'private_inbox_metadata')
+    private_parents(p)
+    need(p.resolve() == p, 'private_inbox_path')
+    check(p.lstat()); check(os.fstat(held_fd))
+    need(private_fd_mount_id(held_fd) == mount_id, 'private_inbox_mount')
+    fresh = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        check(os.fstat(fresh))
+        need(private_fd_mount_id(fresh) == mount_id, 'private_inbox_mount')
+        private_parents(p)
+        need(p.resolve() == p, 'private_inbox_path')
+        check(p.lstat()); check(os.fstat(held_fd)); check(os.fstat(fresh))
+        need(private_fd_mount_id(held_fd) == private_fd_mount_id(fresh) == mount_id,
+             'private_inbox_mount')
+    finally: os.close(fresh)
+
+def read_private_file_at(directory_fd, name, sha256, max_bytes, *, mount_id, previous=None):
+    """Read a bounded, root-private basename relative to a caller-owned inbox FD.
+
+    Return raw bytes and (dev, ino, size, uid, gid, nlink, mode, mtime_ns,
+    ctime_ns). This supplies filesystem witnesses only; operation state, context,
+    deadlines and authority remain with the caller.
+    """
+    need(type(directory_fd) is int and directory_fd >= 0, 'private_inbox_descriptor')
+    need(type(name) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', name)
+         is not None, 'private_file_name')
+    need(pin(sha256), 'private_raw_hash')
+    need(type(max_bytes) is int and 1 <= max_bytes <= MAX_INPUT, 'private_file_bound')
+    need(type(mount_id) is int and mount_id > 0, 'private_inbox_mount')
+    need(previous is None or type(previous) is tuple and len(previous) == 9
+         and all(type(v) is int for v in previous)
+         and all(v >= 0 for v in previous[:7]), 'private_file_previous')
+    def check_parent():
+        parent = os.fstat(directory_fd)
+        need(stat.S_ISDIR(parent.st_mode) and parent.st_uid == parent.st_gid == 0
+             and stat.S_IMODE(parent.st_mode) == 0o700
+             and private_fd_mount_id(directory_fd) == mount_id, 'private_inbox_metadata')
+        return parent.st_dev, parent.st_ino
+    parent_identity = check_parent()
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                 dir_fd=directory_fd)
+    try:
+        first = os.fstat(fd)
+        need(stat.S_ISREG(first.st_mode) and first.st_uid == first.st_gid == 0
+             and first.st_nlink == 1 and stat.S_IMODE(first.st_mode) == 0o600
+             and 0 < first.st_size <= max_bytes and private_fd_mount_id(fd) == mount_id,
+             'private_file_metadata')
+        with os.fdopen(fd, 'rb', closefd=False) as stream: raw = stream.read(max_bytes + 1)
+        last = os.fstat(fd); current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_uid', 'st_gid', 'st_nlink', 'st_mode',
+                  'st_mtime_ns', 'st_ctime_ns')
+        witness = tuple(getattr(first, key) for key in fields)
+        need(len(raw) == first.st_size and digest(raw) == sha256
+             and all(getattr(first, key) == getattr(last, key) == getattr(current, key) for key in fields)
+             and (previous is None or previous == witness), 'private_file_changed')
+        need(private_fd_mount_id(fd) == mount_id and check_parent() == parent_identity,
+             'private_inbox_mount')
+        return raw, witness
+    finally: os.close(fd)
+
 def all_datasets(value):
     """Original archive seven plus current active extras; neither list is rebased."""
     return copy.deepcopy(list(value['original_datasets']) + list(value['active_datasets']))
