@@ -37,6 +37,14 @@ class MaintenanceIntake(unittest.TestCase):
         original_run = driver_tests.DriverTests.run_driver
         original_artifact = m.driver.Backend._artifact
         def anchored_driver(case, **kwargs):
+            # This shared integration fixture covers driver, seed and roles
+            # before approval work (and maintenance/Pair in its consumers).
+            # Pin the whole-chain allowance before preparing the one clock;
+            # driver-only unit cases keep their original 30-second fixture.
+            case.config['total_deadline_secs'] = 180
+            case.configref = case.save('driver.json', case.config)
+            case.auth['inventory_sha256'] = case.configref['sha256']
+            case.authref = case.save('authority.json', case.auth)
             clock = case.prepare_clock()
             return original_run(case, clock=clock, **kwargs)
         def native_artifact(backend, op, label, value):

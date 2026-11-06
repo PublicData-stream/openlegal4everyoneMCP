@@ -9,6 +9,7 @@ a Docker client's successful exit never substitutes for helper closure.
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
@@ -32,7 +33,8 @@ import linux_backend as linux
 import manual_backend as manual
 from copy_tree import root_fd
 from interface import Operation, Refused, freeze_authority, need
-from inventory import MAX_INPUT, canonical, decode, digest, pin, private_bytes, valid_uuid
+from inventory import (MAX_INPUT, canonical, decode, digest, pin, private_bytes, valid_uuid,
+    private_fd_mount_id, recheck_private_inbox, read_private_file_at)
 
 PHASE = 'initial_provider_maintenance'
 PROFILE = migration.PROFILE
@@ -221,12 +223,17 @@ class _Intake:
         self.entered_run = False
 
 
-def _dedicated_root(backend, lock):
+def _root_context(backend, lock):
     need(type(backend) is driver.Backend and type(lock) is journals.SharedLock
          and os.geteuid() == 0 and threading.current_thread() is threading.main_thread()
          and len(list(Path('/proc/self/task').iterdir())) == 1 and not processes._children(os.getpid())
-         and not any(callable(v) for v in vars(backend).values())
-         and not getattr(backend, '_initial_provider_maintenance_started', False),
+         and not any(callable(v) for v in vars(backend).values()),
+         'maintenance_live_dedicated_root_backend')
+
+
+def _dedicated_root(backend, lock):
+    _root_context(backend, lock)
+    need(not getattr(backend, '_initial_provider_maintenance_started', False),
          'maintenance_live_dedicated_root_backend')
 
 
@@ -238,11 +245,7 @@ def _intake_parent():
 
 
 def _intake_mount(fd):
-    with open('/proc/self/fdinfo/' + str(fd), 'rb') as stream:
-        raw = stream.read(4097)
-    rows = [line.split(b':', 1)[1].strip() for line in raw.splitlines() if line.startswith(b'mnt_id:')]
-    need(len(raw) <= 4096 and len(rows) == 1 and rows[0].isdigit(), 'maintenance_intake_mount_id')
-    return int(rows[0])
+    return private_fd_mount_id(fd)
 
 
 def _intake_ref(ref):
@@ -285,18 +288,9 @@ def _intake_record(s, suffix, raw, bound):
 
 
 def _intake_inbox(s):
-    journals.directory(s.inbox['path'], s.inbox['identity'])
-    held = os.fstat(s.inbox_fd)
-    need((held.st_dev, held.st_ino) == (s.inbox['identity']['dev'], s.inbox['identity']['ino'])
-         and stat.S_ISDIR(held.st_mode) and held.st_uid == held.st_gid == 0
-         and stat.S_IMODE(held.st_mode) == 0o700 and _intake_mount(s.inbox_fd) == s.inbox_mount,
-         'maintenance_intake_held_inbox')
-    fresh = os.open(s.inbox['path'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        current = os.fstat(fresh)
-        need((current.st_dev, current.st_ino) == (held.st_dev, held.st_ino)
-             and _intake_mount(fresh) == s.inbox_mount, 'maintenance_intake_inbox_rebound')
-    finally: os.close(fresh)
+    # Keep the stage-owned mount hook for end-to-end context fault injection.
+    need(_intake_mount(s.inbox_fd) == s.inbox_mount, 'maintenance_intake_held_inbox')
+    recheck_private_inbox(s.inbox['path'], s.inbox['identity'], s.inbox_fd, s.inbox_mount)
 
 
 def _intake_read_envelope(s, ref, expected=None):
@@ -304,22 +298,8 @@ def _intake_read_envelope(s, ref, expected=None):
     need(_intake_ref(ref)[0] == str(Path(s.inbox['path']) / INTAKE_ENVELOPE),
          'maintenance_intake_envelope_path')
     _intake_inbox(s)
-    fd = os.open(INTAKE_ENVELOPE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                 dir_fd=s.inbox_fd)
-    try:
-        first = os.fstat(fd)
-        need(stat.S_ISREG(first.st_mode) and first.st_uid == first.st_gid == 0
-             and first.st_nlink == 1 and stat.S_IMODE(first.st_mode) == 0o600
-             and 0 < first.st_size <= INTAKE_ENVELOPE_MAX
-             and _intake_mount(fd) == s.inbox_mount, 'maintenance_intake_envelope_metadata')
-        with os.fdopen(fd, 'rb', closefd=False) as stream: raw = stream.read(INTAKE_ENVELOPE_MAX + 1)
-        last = os.fstat(fd); current = os.stat(INTAKE_ENVELOPE, dir_fd=s.inbox_fd, follow_symlinks=False)
-        fields = ('st_dev', 'st_ino', 'st_size', 'st_uid', 'st_gid', 'st_nlink', 'st_mode', 'st_mtime_ns', 'st_ctime_ns')
-        identity = tuple(getattr(first, key) for key in fields)
-        need(len(raw) == first.st_size and digest(raw) == ref['sha256']
-             and all(getattr(first, key) == getattr(last, key) == getattr(current, key) for key in fields)
-             and (expected is None or expected == identity), 'maintenance_intake_envelope_changed')
-    finally: os.close(fd)
+    raw, identity = read_private_file_at(s.inbox_fd, INTAKE_ENVELOPE, ref['sha256'],
+        INTAKE_ENVELOPE_MAX, mount_id=s.inbox_mount, previous=expected)
     _intake_inbox(s); _intake_context(s)
     return raw, identity
 
@@ -537,6 +517,7 @@ class _Maintenance:
         self.parent={'pid':os.getpid(),'start_ticks':processes._identity(os.getpid()),
             'boot_id':self.work['host']['boot_id']}
         self.original_deadline=self.b._driver_deadline
+        self.original_clock=getattr(self.b,'_initial_driver_clock',None); self._completed=None
         self.role_result=_raw(self.j,self.cfg['role_prepare'])
         self.role_live=copy.deepcopy(self.b._initial_role_prepare_complete)
         self.budget={'start_count':self.j.count,'start_bytes':self.j.bytes,'records':1024,'bytes':64*1024**2}
@@ -548,11 +529,18 @@ class _Maintenance:
             Path(self.work['backup_root']['path']),{},self.seal,freeze_authority(self.auth))
 
     def seal(self):
-        driver._check_end(self.b); need(not self.cancelled,'maintenance_interrupted')
-        need(self.b._driver_deadline==self.original_deadline,'maintenance_original_deadline_changed')
         need(self.j.count<=self.budget['start_count']+self.budget['records']
              and self.j.bytes<=self.budget['start_bytes']+self.budget['bytes'],
              'maintenance_reserved_journal_exhausted')
+        self.seal_context()
+
+    def seal_context(self):
+        # Completed native work retains its original context, while subsequent
+        # input DATA has a separate reservation in the same global journal.
+        driver._check_end(self.b); need(not self.cancelled,'maintenance_interrupted')
+        need(self.b._driver_deadline==self.original_deadline
+             and getattr(self.b,'_initial_driver_clock',None) is self.original_clock,
+             'maintenance_original_deadline_changed')
         self.lock.check(); driver._writer_fds(self.b); seed._bound(self.b)
         need(canonical(self.work)==self.frozen and time.time()<self.auth['valid_until'], 'maintenance_sealed_context')
         need(driver._reference(self.iref)==self.raw and driver._reference(self.aref)==self.authraw
@@ -1392,6 +1380,114 @@ def run(backend, shared_lock, inventory_ref, authority_ref):
             'producer_source':{'path':str(Path(__file__).resolve()),'sha256':m.cfg['source_sha256']},
             'producer_exit':exitrow,**{k:v for k,v in pending.items() if k!='sql_closure'},'sql_closure':closure}
         ref=m.save('complete',result); m.seal(); m.sessions()
-        return ref
     finally:
         _retain_sql_closed(m)
+    # The finally block is part of completion, not a post-success advisory.
+    # Neither a saved complete-shaped JSON nor a reaped child alone mints this.
+    m.seal()
+    raw=canonical(result); _completed_result(m,ref,raw)
+    m.seal(); driver._check_end(backend)
+    cap=_Completed(m,tuple(ref[k] for k in ('phase','name','sha256')),raw,
+        canonical(m.parent),m.original_deadline,m.original_clock,
+        tuple(m.budget[k] for k in ('start_count','start_bytes','records','bytes')),
+        m.j.count,m.j.bytes)
+    m._completed=cap; backend._initial_provider_maintenance_complete=cap
+    return ref
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class _Completed:
+    owner: object
+    reference: tuple
+    raw: bytes
+    parent: bytes
+    end: float
+    clock: object
+    budget: tuple
+    count: int
+    bytes: int
+
+
+def _completed_result(m, reference, raw):
+    need(m.sql_uncertain is False and m.j.phase_paths
+         and m.j.phase_paths[0][0].name == PHASE, 'maintenance_completion_not_closed')
+    need(type(reference) is dict and set(reference) == {'phase','name','sha256'}
+         and reference['phase'] == PHASE and _raw(m.j,reference) == decode(raw)
+         and m.j.read_phase_bytes(PHASE,reference['name'],reference['sha256']) == raw,
+         'maintenance_completion_raw')
+    result=decode(raw)
+    _shape(result,('schema_version','kind','operation_id','provider_recovery_operation',
+        'driver_inventory_sha256','inventory','authority','authority_sha256','source_graph_sha256',
+        'producer_source','producer_exit','plan','apply','readback','audit','native_command',
+        'sql_closure','new_uncertainty_ids'),'maintenance_completion_result')
+    need(type(result['schema_version']) is int and result['schema_version']==1
+         and result['kind']=='openlegal_initial_provider_maintenance_result'
+         and result['operation_id']==m.cfg['operation_id'] and result['inventory']==m.iref
+         and result['authority']==m.aref and result['authority_sha256']==digest(m.authraw)
+         and result['driver_inventory_sha256']==m.cfg['driver_inventory_sha256']
+         and result['source_graph_sha256']==digest(canonical(m.sc[4]['source_graph']))
+         and result['producer_source']=={'path':str(Path(__file__).resolve()),'sha256':m.cfg['source_sha256']},
+         'maintenance_completion_binding')
+    row=result['producer_exit']
+    _shape(row,('pid','start_ticks','boot_id','actual_exit_code','remaining_children'),
+        'maintenance_completion_exit')
+    need(type(row['pid']) is int and row['pid']>0 and type(row['start_ticks']) is str
+         and row['start_ticks'].isdecimal() and row['boot_id']==m.parent['boot_id']
+         and type(row['actual_exit_code']) is int and row['actual_exit_code']==0
+         and row['remaining_children']==[]
+         and canonical(row)==canonical(getattr(m.b,'_initial_provider_maintenance_last_exit',None)),
+         'maintenance_completion_parent_exit')
+    manual._process_absent({k:row[k] for k in ('pid','start_ticks','boot_id')})
+    refs={}
+    for key in ('plan','apply','readback','audit','native_command','sql_closure'):
+        need(result[key]['phase']==PHASE,'maintenance_completion_phase_ref')
+        refs[key]=_raw(m.j,result[key])
+    _command_ok(refs['native_command'])
+    need(refs['sql_closure']=={'sessions':[]} and refs['readback']==refs['apply']
+         and refs['audit']['plan']==refs['plan'] and refs['audit']['result']==refs['apply']
+         and refs['audit']['before_state']==refs['plan']['snapshot']['state']
+         and refs['audit']['operation_id']==refs['plan']['operation_id']==refs['apply']['operation_id']
+             ==result['provider_recovery_operation']
+         and refs['plan']['request']['resume'] is False
+         and refs['plan']['request']['resolve_legacy'] is False and refs['plan']['request']['waits']==[],
+         'maintenance_completion_audit')
+    return result
+
+
+def completed_reference(backend, shared_lock):
+    """Return this owner's actual final reference; historical DATA is insufficient."""
+    cap=getattr(backend,'_initial_provider_maintenance_complete',None)
+    need(type(cap) is _Completed, 'maintenance_completion_live_field')
+    ref=dict(zip(('phase','name','sha256'),cap.reference))
+    consume_completed_live(backend,shared_lock,ref)
+    return ref
+
+
+def consume_completed_live(backend, shared_lock, reference):
+    """Read only: retain final native accounting and the original ROOT context."""
+    _root_context(backend,shared_lock)
+    cap=getattr(backend,'_initial_provider_maintenance_complete',None)
+    need(type(cap) is _Completed and type(cap.owner) is _Maintenance,
+         'maintenance_completion_live_field')
+    m=cap.owner
+    need(m is getattr(backend,'_initial_provider_maintenance_live',None) and m._completed is cap
+         and m.b is backend and m.lock is shared_lock
+         and m.j is getattr(backend,'_initial_driver_journal',None)
+         and getattr(backend,'_initial_provider_maintenance_started',False) is True
+         and _intake_parent()==m.parent and canonical(m.parent)==cap.parent
+         and m.original_deadline==cap.end==backend._driver_deadline
+         and m.original_clock is cap.clock is getattr(backend,'_initial_driver_clock',None),
+         'maintenance_completion_same_owner')
+    need(type(reference) is dict and reference==dict(zip(('phase','name','sha256'),cap.reference)),
+         'maintenance_completion_reference')
+    need(tuple(m.budget[k] for k in ('start_count','start_bytes','records','bytes'))==cap.budget
+         and cap.budget[2:]==(1024,64*1024**2)
+         and cap.budget[0]<=cap.count<=cap.budget[0]+cap.budget[2]
+         and cap.budget[1]<=cap.bytes<=cap.budget[1]+cap.budget[3]
+         and cap.count<=m.j.count<=4096 and cap.bytes<=m.j.bytes<=journals.MAX_PHASE_BYTES,
+         'maintenance_completion_frozen_accounting')
+    m.seal_context()
+    result=_completed_result(m,reference,cap.raw)
+    # Recheck the original deadline after the last raw-media/identity read.
+    m.seal_context(); driver._check_end(backend)
+    return result
