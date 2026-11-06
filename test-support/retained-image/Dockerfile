@@ -2,7 +2,9 @@
 # Test-only tooling; never copied into the production image. Build natively even
 # when acceptance runs the production image under another architecture.
 FROM rust:1.98.1-slim-trixie@sha256:f47a8de237dcbb0b0ce1099901e60a89728e3d51f24e664b40e947171538ade7 AS build
-RUN rm -f /etc/apt/sources.list.d/* \
+# APT owns acquisition retries; do not retry the package installation itself.
+RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retained-fixture-acquire \
+    && rm -f /etc/apt/sources.list.d/* \
     && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260915T000000Z trixie main\n' > /etc/apt/sources.list \
     && apt-get -o APT::Update::Error-Mode=any update \
     && apt-get install -y --no-install-recommends cmake pkg-config \
