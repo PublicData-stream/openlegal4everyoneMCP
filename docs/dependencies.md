@@ -33,6 +33,25 @@ glibc compatibility loader. The Rust parser updates and vendored rhwp source are
 recorded in [document processing](document-sandbox.md#image-and-dependency-admission);
 OCR model and font assets retain their pinned versions and licenses.
 
+The isolated worker selects `html-to-markdown-rs` 3.20.0 through the existing
+Xberg 1.3.10 dependency. This is the first converter release replacing the
+unmaintained `astral-tl` 0.8.0
+([RUSTSEC-2026-0444](https://rustsec.org/advisories/RUSTSEC-2026-0444.html))
+with `astral-html` 0.0.4. Its
+[tagged release](https://github.com/xberg-io/html-to-markdown/releases/tag/v3.20.0)
+requires Rust 1.99 and changes malformed-markup tokenization. The repository
+therefore uses Rust 1.99.1 across development, CI and production builders.
+The update retains registry sources, the converter's MIT license, existing
+converter features and Xberg/native-PDF versions. The tokenizer uses MIT OR
+Apache-2.0; neither crate adds a native build script or needs a new license or
+advisory exception.
+The replacement is confined to the document worker, where Xberg can normalize
+HTML markup found in native PDF text. Direct HTML inputs still use scraper.
+Binary-format processor identities include both converter and tokenizer versions;
+previous retained captures are unchanged. The worker gate covers a fictional PDF
+with literal markup, native Korean text and source/page association, alongside
+the existing native/OCR fixtures and sandbox limits.
+
 The isolated document-worker lockfile selects `pulldown-cmark` 0.13.6 through
 Xberg 1.3.10. The earlier 0.13.5 update replaced 0.13.4 to address
 [RUSTSEC-2026-0414](https://rustsec.org/advisories/RUSTSEC-2026-0414/).

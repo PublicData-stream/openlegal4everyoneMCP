@@ -1224,6 +1224,7 @@ impl LawClient {
                                 return Err(DatabaseError::SourceDataInvalid);
                             }
                             let digest = attachment.source_sha256.clone();
+                            let attachment_processor = attachment.processor_version.clone();
                             let pages = if attachment.pages.is_empty() {
                                 vec![openlegal_application::document::DocumentPage {
                                     page: 1,
@@ -1269,6 +1270,12 @@ impl LawClient {
                             record
                                 .validate()
                                 .map_err(|_| DatabaseError::SourceDataInvalid)?;
+                            retain_attachment_processor(
+                                &mut record,
+                                ordinal + 1,
+                                digest,
+                                attachment_processor,
+                            )?;
                             Ok(bytes)
                         },
                     )
@@ -1800,6 +1807,68 @@ impl LawClient {
         }
         output
     }
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AttachmentProcessor {
+    ordinal: usize,
+    source_sha256: String,
+    processor_version: String,
+}
+
+/// Commit provenance only after a processed attachment's sections validate.
+/// Failed metadata admission restores the previous mapping; the caller restores
+/// its existing section/byte checkpoints on the same error path.
+fn retain_attachment_processor(
+    record: &mut LegalRecord,
+    ordinal: usize,
+    source_sha256: String,
+    processor_version: String,
+) -> Result<(), DatabaseError> {
+    if !(1..=64).contains(&ordinal)
+        || !openlegal_domain::history::valid_snapshot_id(&source_sha256)
+        || processor_version.is_empty()
+        || processor_version.len() > 256
+    {
+        return Err(DatabaseError::SourceDataInvalid);
+    }
+    record
+        .validate()
+        .map_err(|_| DatabaseError::SourceDataInvalid)?;
+    let mut processors: Vec<AttachmentProcessor> = record
+        .metadata
+        .get("attachment_processors")
+        .map(|value| serde_json::from_str(value))
+        .transpose()
+        .map_err(|_| DatabaseError::StorageCorrupt)?
+        .unwrap_or_default();
+    if processors.len() >= 64 || processors.iter().any(|entry| entry.ordinal >= ordinal) {
+        return Err(DatabaseError::SourceDataInvalid);
+    }
+    processors.push(AttachmentProcessor {
+        ordinal,
+        source_sha256,
+        processor_version,
+    });
+    let value = serde_json::to_string(&processors).map_err(|_| DatabaseError::StorageCorrupt)?;
+    let previous = record
+        .metadata
+        .insert("attachment_processors".into(), value);
+    if record.validate().is_err() {
+        match previous {
+            Some(previous) => {
+                record
+                    .metadata
+                    .insert("attachment_processors".into(), previous);
+            }
+            None => {
+                record.metadata.remove("attachment_processors");
+            }
+        }
+        return Err(DatabaseError::SourceDataInvalid);
+    }
+    Ok(())
 }
 /// The original canary deadline covers DNS, proxy/TLS negotiation, request send
 /// and response-body work. Expiry is uncertain, so settle_fetch retains its owner
@@ -5169,6 +5238,216 @@ mod tests {
         ));
         assert!(expected_document_magic(b"PK\x03\x04", DocumentFormat::Hwpx));
         assert!(!looks_like_html(b"%PDF-1.7"));
+    }
+    struct FictionalAttachmentProcessor(String);
+    impl DocumentProcessor for FictionalAttachmentProcessor {
+        fn process(
+            &self,
+            input: DocumentInput,
+            _cancellation: CancellationToken,
+        ) -> futures::future::BoxFuture<'static, Result<DocumentOutput, DocumentError>> {
+            let processor_version = self.0.clone();
+            Box::pin(async move {
+                if input.raw.ends_with(b"invalid") {
+                    return Err(DocumentError::InvalidDocument);
+                }
+                Ok(DocumentOutput {
+                    source_sha256: input.source_sha256,
+                    processor_version,
+                    format: input.format,
+                    tree: None,
+                    text: "Fictional attachment 가상".into(),
+                    pages: vec![],
+                    ocr_pages: vec![],
+                    diagnostics: vec![],
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_processor_metadata_binds_only_validated_projection_callbacks() {
+        let first_version = format!("fictional-binary-v1;{}", "x".repeat(160));
+        let second_version = format!("fictional-binary-v2;{}", "x".repeat(160));
+        let mut records = Vec::new();
+        for version in [&first_version, &second_version] {
+            let mut record = project(
+                &item(),
+                &statute_sections_fixture(vec![source_article(
+                    Some("0001001"),
+                    "Fictional article",
+                    "Fictional primary body",
+                )]),
+            )
+            .unwrap();
+            assert!(!record.metadata.contains_key("attachment_processors"));
+            let processor = FictionalAttachmentProcessor(version.clone());
+            // Synthetic callback outcomes only: no HTTP request/retry is run.
+            // The same signature gate excludes HTML before processing; only its
+            // later valid PDF reply contributes the ordinal's provenance.
+            let fixtures: Vec<(usize, SourceRights, Vec<&[u8]>)> = vec![
+                (
+                    1,
+                    SourceRights::legal_information(),
+                    vec![b"%PDF-1.7 first"],
+                ),
+                (
+                    2,
+                    SourceRights::legal_information(),
+                    vec![b"<html>Fictional busy</html>", b"%PDF-1.7 second"],
+                ),
+                (
+                    3,
+                    SourceRights::legal_information(),
+                    vec![b"%PDF-1.7 invalid"],
+                ),
+                (4, SourceRights::default(), vec![b"%PDF-1.7 unknown-rights"]),
+                (
+                    5,
+                    SourceRights::kogl(
+                        3,
+                        "https://www.kogl.or.kr/fixture".into(),
+                        "Fictional issuer".into(),
+                    ),
+                    vec![b"%PDF-1.7 original-only"],
+                ),
+                (
+                    6,
+                    SourceRights::legal_information(),
+                    vec![b"%PDF-1.7 third"],
+                ),
+            ];
+            for (ordinal, rights, replies) in fixtures {
+                if !rights.can_process() {
+                    continue;
+                }
+                for raw in replies {
+                    let previous = record.metadata.get("attachment_processors").cloned();
+                    if !expected_document_magic(raw, DocumentFormat::Pdf) {
+                        assert_eq!(
+                            record.metadata.get("attachment_processors"),
+                            previous.as_ref()
+                        );
+                        continue;
+                    }
+                    let input = DocumentInput {
+                        format: DocumentFormat::Pdf,
+                        source_sha256: Sha256::digest(raw)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect(),
+                        raw: raw.to_vec(),
+                        ocr: true,
+                    };
+                    let Ok(attachment) = processor
+                        .process(input.clone(), CancellationToken::new())
+                        .await
+                    else {
+                        assert_eq!(
+                            record.metadata.get("attachment_processors"),
+                            previous.as_ref()
+                        );
+                        continue;
+                    };
+                    openlegal_application::document::validate_output(&attachment, &input).unwrap();
+                    record.sections.push(LegalSection {
+                        id: format!("attachment:{ordinal}:extracted:1"),
+                        title: "Fictional attachment".into(),
+                        text: attachment.text,
+                        kind: SectionKind::Extracted,
+                        source_document_sha256: Some(attachment.source_sha256.clone()),
+                        page: Some(1),
+                    });
+                    retain_attachment_processor(
+                        &mut record,
+                        ordinal,
+                        attachment.source_sha256,
+                        attachment.processor_version,
+                    )
+                    .unwrap();
+                    break;
+                }
+            }
+            let processors: Vec<AttachmentProcessor> =
+                serde_json::from_str(&record.metadata["attachment_processors"]).unwrap();
+            assert_eq!(
+                processors
+                    .iter()
+                    .map(|entry| entry.ordinal)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 6]
+            );
+            for (entry, raw) in processors.iter().zip([
+                b"%PDF-1.7 first".as_slice(),
+                b"%PDF-1.7 second".as_slice(),
+                b"%PDF-1.7 third".as_slice(),
+            ]) {
+                let digest: String = Sha256::digest(raw)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                assert_eq!(entry.source_sha256, digest);
+                assert_eq!(&entry.processor_version, version);
+            }
+            record.validate().unwrap();
+            records.push(record);
+        }
+        assert_eq!(records[0].body, records[1].body);
+        assert_eq!(records[0].sections, records[1].sections);
+        assert_ne!(
+            records[0].metadata["attachment_processors"],
+            records[1].metadata["attachment_processors"]
+        );
+        assert_ne!(
+            Sha256::digest(serde_json::to_vec(&records[0]).unwrap()),
+            Sha256::digest(serde_json::to_vec(&records[1]).unwrap())
+        );
+    }
+
+    #[test]
+    fn attachment_processor_metadata_rejects_invalid_binding_and_restores_bounded_mapping() {
+        let original = project(
+            &item(),
+            &statute_sections_fixture(vec![source_article(
+                Some("0001001"),
+                "Fictional article",
+                "Fictional primary body",
+            )]),
+        )
+        .unwrap();
+        for (ordinal, digest, version) in [
+            (0, "a".repeat(64), "v1".into()),
+            (65, "a".repeat(64), "v1".into()),
+            (1, "not-a-digest".into(), "v1".into()),
+            (1, "a".repeat(64), String::new()),
+            (1, "a".repeat(64), "x".repeat(257)),
+        ] {
+            let mut record = original.clone();
+            assert_eq!(
+                retain_attachment_processor(&mut record, ordinal, digest, version),
+                Err(DatabaseError::SourceDataInvalid)
+            );
+            assert_eq!(record.metadata, original.metadata);
+        }
+        let mut record = original;
+        retain_attachment_processor(&mut record, 1, "a".repeat(64), "x".repeat(256)).unwrap();
+        let current = record
+            .metadata
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>();
+        record.metadata.insert(
+            "fixture_padding".into(),
+            "x".repeat(65536 - current - "fixture_padding".len() - 1),
+        );
+        record.validate().unwrap();
+        let previous = record.metadata.clone();
+        assert_eq!(
+            retain_attachment_processor(&mut record, 2, "b".repeat(64), "v2".into()),
+            Err(DatabaseError::SourceDataInvalid)
+        );
+        assert_eq!(record.metadata, previous);
+        record.validate().unwrap();
     }
     #[test]
     fn terminal_provider_failures_and_typed_judgment_dates() {

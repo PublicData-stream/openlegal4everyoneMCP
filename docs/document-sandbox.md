@@ -157,10 +157,12 @@ scripts/test-document-worker.sh
 
 It builds the separate `fixture-tests` image target, checks formatting, native
 Clippy, pure parser tests, the standalone advisory/license policy, then runs
-seven fictional PDF/HWP5/HWPX native and OCR fixtures with the worker's seccomp profile,
+fictional PDF/HWP5/HWPX native and OCR fixtures with the worker's seccomp profile,
 no network, a read-only root and its CPU/memory/PID/scratch limits. Tests require
 positive English and Korean native extraction and OCR recognition, including a
-PDF with only glyph outlines and no native text layer;
+PDF with only glyph outlines and no native text layer. A separate PDF fixture
+proves literal markup reaches native extraction before normalization, then checks
+the maintained tokenizer, Korean text and retained source/page association;
 merely returning an empty success is insufficient. The production image excludes
 the fixture executable. Rustfmt/Clippy follow the pinned toolchain; cargo-audit
 0.22.2 and cargo-deny 0.20.2 are installed with their locked dependencies. Advisory
@@ -192,6 +194,17 @@ The following source/version selections were reviewed on 2026-10-23:
 | [tessdata_fast](https://github.com/tesseract-ocr/tessdata_fast/tree/65727574dfcd264acbb0c3e07860e4e9e9b22185) | 4.1.0 English/Korean model assets, SHA-256 checked | Apache-2.0 |
 | [Noto Sans CJK](https://github.com/notofonts/noto-cjk/tree/523d033d6cb47f4a80c58a35753646f5c3608a78) | 2.004 Korean regular OTF, SHA-256 checked | SIL OFL-1.1 |
 
+The Xberg converter dependency was updated separately to
+[`html-to-markdown-rs` 3.20.0](https://github.com/xberg-io/html-to-markdown/releases/tag/v3.20.0),
+which replaces unmaintained `astral-tl` 0.8.0 with `astral-html` 0.0.4 and
+requires Rust 1.99. The worker retains Xberg/native-PDF 1.3.10 and its existing
+features. Native PDF text containing markup can pass through this converter;
+direct HTML inputs still use scraper. The binary-format `document-v1` processor
+identity now includes `html-to-markdown=3.20.0;astral-html=0.0.4` so newly
+processed projections distinguish this tokenizer change without rewriting
+retained captures. No advisory exception was added for
+[RUSTSEC-2026-0444](https://rustsec.org/advisories/RUSTSEC-2026-0444.html).
+
 rhwp has no crates.io release. Its minimal stable source closure is committed under
 `apps/document-worker/vendor/rhwp`, with original Git blob and SHA-256 inventory,
 local patch description, effective source checksums and upstream notices. This
@@ -215,7 +228,10 @@ unnecessary Unix socketpair. The worker's policy continues to deny socket creati
 The profile returns ENOSYS for clone3 so glibc can use the filtered clone fallback;
 EPERM would prevent thread startup before the PID limit can be tested.
 
-The image includes model/font, dependency and project notices. Dependency admission
+The image includes model/font, dependency and project notices. The replacement astral-html
+entity table has a separate WHATWG BSD-3-Clause notice in its generated source;
+the image retains that complete header alongside the crate notices, and the worker
+gate checks its presence. Dependency admission
 also covers the standalone lockfile; a successful serving-workspace check does not
 cover it:
 

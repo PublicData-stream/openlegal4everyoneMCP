@@ -59,6 +59,9 @@ docker run --pull never --rm --network none --read-only --cap-drop ALL \
     test -s /opt/tessdata/kor.traineddata
     test -s /opt/fonts/NotoSansCJKkr-Regular.otf
     test -s /opt/notices/OPENLEGAL-LICENSE
+    test -s /opt/notices/dependencies/astral-html/WHATWG-ENTITIES-LICENSE
+    grep -F "Copyright © WHATWG" /opt/notices/dependencies/astral-html/WHATWG-ENTITIES-LICENSE
+    grep -F "BSD 3-Clause License" /opt/notices/dependencies/astral-html/WHATWG-ENTITIES-LICENSE
     test -s /opt/notices/dependencies/rhwp/LICENSE
     test -s /opt/notices/dependencies/rhwp/THIRD_PARTY_LICENSES.md
     test -s /opt/notices/dependencies/rhwp/UPSTREAM.json

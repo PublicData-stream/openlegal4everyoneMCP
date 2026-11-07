@@ -219,7 +219,13 @@ failed link ordinals, expected formats and optional response digests. A digest i
 absent when no response bytes were received. Actual unexpected bytes are retained
 as private evidence for the terminal failed attempt, not exposed as legal text; earlier HTML retry responses are discarded. `attachment_evidence_ordinals`
 maps stored attachment evidence to advertised link ordinals. Successful
-attachments retain their source sections. A valid PDF containing only `삭제` is
+attachments retain their source sections. The bounded `attachment_processors`
+metadata array binds each successfully processed attachment's advertised `ordinal`,
+`source_sha256` and exact `processor_version` to the retained record, including
+when a parser update produces identical text. Skipped, original-only and failed
+attachments add no processor entry; records without processed attachments omit
+the key. The primary response keeps its own processor identity, and historical
+captures are not rewritten. A valid PDF containing only `삭제` is
 preserved as PDF evidence and text without inferring a legal withdrawal.
 
 An incomplete result never replaces an existing complete HEAD or advances that

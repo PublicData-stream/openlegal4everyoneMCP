@@ -7,42 +7,48 @@ use sha2::{Digest, Sha256};
 
 const TEXT: &str = "FICTIONAL OPENLEGAL TEST 12345. 가상 문서 검증.";
 
-#[tokio::test]
-async fn html_error_page_is_not_a_pdf() {
+#[test]
+fn html_error_page_is_not_a_pdf() {
     let raw = b"<!doctype html><html><body>Fictional service busy</body></html>".to_vec();
     let source_sha256 = Sha256::digest(&raw)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
     assert!(matches!(
-        openlegal_document_worker::process(DocumentInput {
-            format: DocumentFormat::Pdf,
-            raw,
-            source_sha256,
-            ocr: false,
-        })
-        .await
-        .err(),
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(openlegal_document_worker::process(DocumentInput {
+                format: DocumentFormat::Pdf,
+                raw,
+                source_sha256,
+                ocr: false,
+            }))
+            .err(),
         Some(DocumentError::InvalidDocument)
     ));
 }
 
-#[tokio::test]
-async fn pdf_header_with_broken_body_is_invalid_document() {
+#[test]
+fn pdf_header_with_broken_body_is_invalid_document() {
     let raw = b"%PDF-1.7\nfictional damaged body\n".to_vec();
     let source_sha256 = Sha256::digest(&raw)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
     assert_eq!(
-        openlegal_document_worker::process(DocumentInput {
-            format: DocumentFormat::Pdf,
-            raw,
-            source_sha256,
-            ocr: false,
-        })
-        .await
-        .err(),
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(openlegal_document_worker::process(DocumentInput {
+                format: DocumentFormat::Pdf,
+                raw,
+                source_sha256,
+                ocr: false,
+            }))
+            .err(),
         Some(DocumentError::InvalidDocument)
     );
 }
@@ -74,19 +80,26 @@ async fn check(format: DocumentFormat, ocr: bool, outlined_pdf: bool) {
         DocumentFormat::Hwpx => document.export_hwpx_native().unwrap(),
         _ => unreachable!(),
     };
-    let source_sha256 = Sha256::digest(&raw)
+    let source_sha256: String = Sha256::digest(&raw)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
     let result = openlegal_document_worker::process(DocumentInput {
         format,
         raw,
-        source_sha256,
+        source_sha256: source_sha256.clone(),
         ocr,
     })
     .await
     .unwrap();
+    assert_eq!(result.source_sha256, source_sha256);
+    assert!(
+        result
+            .processor_version
+            .contains(";xberg=1.3.10;html-to-markdown=3.20.0;astral-html=0.0.4;")
+    );
     assert_eq!(result.pages.len(), 1);
+    assert_eq!(result.pages[0].page, 1);
     if outlined_pdf {
         assert!(
             result.text.trim().is_empty(),
@@ -155,6 +168,81 @@ fn pdf_without_text_layer_ocr() {
         .build()
         .unwrap()
         .block_on(check(DocumentFormat::Pdf, true, true));
+}
+
+#[test]
+#[ignore = "requires isolated worker image with pinned font"]
+fn pdf_markup_uses_maintained_tokenizer_and_preserves_provenance() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            // The tagged converter 3.20.0 issue_965 regression treats b.c as
+            // an unknown element, yielding t rather than bold text. Insert
+            // literal markup as PDF text; escaping it here would miss Xberg's
+            // native-page <p> detection and leave the converter unexercised.
+            const MARKUP: &str = "<p><b.c>t</b.c></p>";
+            let mut document = rhwp::DocumentCore::new_empty();
+            document.create_blank_document_native().unwrap();
+            document
+                .insert_text_native(0, 0, 0, &format!("{MARKUP} FICTIONAL 가상"))
+                .unwrap();
+            let raw = document
+                .render_document_pdf_native_with_options(&rhwp::renderer::pdf::PdfExportOptions {
+                    fallback_serif: "Noto Sans CJK KR".into(),
+                    fallback_sans: "Noto Sans CJK KR".into(),
+                    fallback_mono: "Noto Sans CJK KR".into(),
+                    font_paths: vec!["/opt/fonts".into()],
+                    embed_text: true,
+                    ..Default::default()
+                })
+                .unwrap();
+            let native = xberg_native_pdf::PdfDocument::from_bytes(raw.clone())
+                .unwrap()
+                .extract_text(0)
+                .unwrap();
+            assert!(
+                native.contains(MARKUP),
+                "PDF lost converter trigger: {native:?}"
+            );
+            let source_sha256: String = Sha256::digest(&raw)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let result = openlegal_document_worker::process(DocumentInput {
+                format: DocumentFormat::Pdf,
+                raw,
+                source_sha256: source_sha256.clone(),
+                ocr: false,
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.source_sha256, source_sha256);
+            assert_eq!(result.format, DocumentFormat::Pdf);
+            assert_eq!(result.pages.len(), 1);
+            assert_eq!(result.pages[0].page, 1);
+            assert!(result.ocr_pages.is_empty());
+            assert!(
+                result
+                    .processor_version
+                    .contains(";xberg=1.3.10;html-to-markdown=3.20.0;astral-html=0.0.4;")
+            );
+            for text in [&result.text, &result.pages[0].text] {
+                assert!(text.contains("FICTIONAL"), "English text lost: {text:?}");
+                assert!(text.contains("가상"), "Korean text lost: {text:?}");
+                assert!(
+                    text.split_whitespace().any(|word| word == "t"),
+                    "t lost: {text:?}"
+                );
+                assert!(!text.contains("**t**"), "unknown tag became bold: {text:?}");
+                assert!(!text.contains("<b.c>"), "tag was not normalized: {text:?}");
+                assert!(
+                    !text.contains("</b.c>"),
+                    "end tag was not normalized: {text:?}"
+                );
+            }
+        });
 }
 
 struct ArchiveFixtureDirectory(std::path::PathBuf);

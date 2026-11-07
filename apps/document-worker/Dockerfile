@@ -44,6 +44,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=t
     && find /tmp/rust/target/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable -exec cp {} /assets/document-format-tests \; \
     && test -x /assets/document-format-tests \
     && find /usr/local/cargo/registry/src -type f \( -iname "license*" -o -iname "copying*" -o -iname "notice*" \) -exec cp --parents {} /assets/notices \;
+# astral-html's generated entity table carries a separate WHATWG BSD notice.
+# Keep its complete source header alongside the crate's MIT/Apache notices.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    set -- /usr/local/cargo/registry/src/*/astral-html-0.0.4/src/entities_data.rs \
+    && test "$#" -eq 1 && test -f "$1" \
+    && mkdir -p /assets/notices/astral-html \
+    && sed -n '1,/^$/p' "$1" > /assets/notices/astral-html/WHATWG-ENTITIES-LICENSE \
+    && grep -F 'BSD 3-Clause License' /assets/notices/astral-html/WHATWG-ENTITIES-LICENSE \
+    && grep -F 'OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.' /assets/notices/astral-html/WHATWG-ENTITIES-LICENSE
 WORKDIR /assets
 COPY apps/document-worker/assets.sha256 ./
 RUN curl -fsSLO https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/65727574dfcd264acbb0c3e07860e4e9e9b22185/eng.traineddata \
@@ -79,7 +88,7 @@ CMD ["--idle"]
 FROM runtime AS fixture-tests
 COPY --from=build /assets/document-format-tests /usr/local/bin/document-format-tests
 ENTRYPOINT ["/usr/local/bin/document-format-tests"]
-CMD ["--ignored", "--test-threads=1"]
+CMD ["--include-ignored", "--test-threads=1"]
 
 FROM runtime AS worker
 ARG REVISION=unknown

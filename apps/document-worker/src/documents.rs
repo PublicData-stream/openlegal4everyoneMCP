@@ -117,7 +117,7 @@ pub async fn extract(
     input: &DocumentInput,
     output: &mut DocumentOutput,
 ) -> Result<(), DocumentError> {
-    output.processor_version = "document-v1;rhwp=0.8.7@1a76570e8339+zip9.0.5;xberg=1.3.10;resvg=0.48.1;tessdata=4.1.0;NotoSansCJK=2.004;render=150dpi-max4000;ocr=plaintext".into();
+    output.processor_version = "document-v1;rhwp=0.8.7@1a76570e8339+zip9.0.5;xberg=1.3.10;html-to-markdown=3.20.0;astral-html=0.0.4;resvg=0.48.1;tessdata=4.1.0;NotoSansCJK=2.004;render=150dpi-max4000;ocr=plaintext".into();
     match input.format {
         DocumentFormat::Pdf => pdf(input, output).await?,
         DocumentFormat::Hwp5 | DocumentFormat::Hwpx => hwp(input, output).await?,
