@@ -365,12 +365,15 @@ class ContractsAndActualFiles(unittest.TestCase):
     def test_first_bind_native_raw_receipt_not_boolean_and_operation_bound(self):
         j=journal_fixture(self.root,e.pair_module.PHASE);b=binding();a=peer(b);z=peer(b,flush='0/110')
         name=e.pair_module.PHASE+'-0001-first-bind-intent.json'
-        raw=canonical({'operation_id':j.operation,'expected_old':None,'proposed_binding':b})
+        raw=canonical({'operation_id':j.operation,'expected_old':None,'proposed_binding':b,
+            'candidate':e.pair_module._peer(peer(b,prefix='0/80',candidate=True),b)})
         intent=j.save_bytes(name,raw)
         bound={'operation_id':j.operation,'intent_sha256':intent,'previous_binding':None,'new_binding':b,'peer_before_commit':peer(b,prefix='0/90')}
         native={'kind':'openlegal_initial_pair_native_sql','query_kind':'bind','actual_exit_code':0,'started':True,'owned_processes_closed':True,
             **dict.fromkeys(('expired','interrupted','unexpected_descendants','output_limit_exceeded'),False),
             'stdout_hex':b''.join(canonical(r) for r in (bound,a,z)).hex()}
+        out=bytes.fromhex(native['stdout_hex']);native.update(stdout_bytes=len(out),stdout_sha256=digest(out),
+            native_started_at=10.,native_finished_at=11.,native_absolute_deadline=12.,original_operation_deadline=100.)
         n=e.pair_module.PHASE+'-0002-native.json';sha=j.save(n,native)
         v=dict(e.pair_module._proof(a,z,b),observation_status='historical_native_proof',
             native_command_refs=[{'phase':e.pair_module.PHASE,'name':n,'sha256':sha}],native_window={'started':10.,'finished':11.,'deadline':12.})
@@ -382,6 +385,7 @@ class ContractsAndActualFiles(unittest.TestCase):
             if change=='operation':nb['operation_id']=str(uuid.uuid4())
             if change=='window':vb['native_window']['deadline']=13.
             if change in ('previous','operation'):nv['stdout_hex']=b''.join(canonical(r) for r in (nb,a,z)).hex()
+            out=bytes.fromhex(nv['stdout_hex']);nv.update(stdout_bytes=len(out),stdout_sha256=digest(out))
             nn=e.pair_module.PHASE+'-negative-'+change+'.json';ss=j.save(nn,nv)
             vb['native_command_refs']=[{'phase':e.pair_module.PHASE,'name':nn,'sha256':ss}]
             with self.subTest(change=change),self.assertRaises(Refused):e._ack(j,vb,b,first=True)
@@ -631,6 +635,43 @@ class InstallerIntegration(unittest.TestCase):
         with self.assertRaisesRegex(Refused,'metadata_estimated_bound'):e._Producer(b,lock,{}, {},(cfg,{},canonical(cfg),canonical({})),p,{})
         p.budget['baseline_raw_bytes']=100;m.j.count=4096-383
         with self.assertRaisesRegex(Refused,'global_budget'):e._Producer(b,lock,{}, {},(cfg,{},canonical(cfg),canonical({})),p,{})
+
+
+
+
+@unittest.skipUnless(os.geteuid()==0,'actual root private /tmp inputs')
+class FinalSealDeadline(unittest.TestCase):
+    def test_expiry_during_final_journal_read_cannot_pass_seal(self):
+        # Isolate the final-read boundary. Entry/FD/native qualification is a
+        # separate port here; all pinned input reads and the original end are real.
+        with tempfile.TemporaryDirectory(dir='/tmp') as td:
+            root=Path(td);ref=private(root,'dependency.json',{})
+            q={k:ref for k in ('original_inventory','driver_inventory','driver_authority',
+                'seed_inventory','seed_authority','strict_preprovision','pair_inventory','pair_authority')}
+            cfg={'operation_id':str(uuid.uuid4()),'source_graph':{},'epoch_certificate':q};auth={'valid_until':int(time.time())+300}
+            inv=private(root,'inventory.json',cfg);approval=private(root,'authority.json',auth)
+            backend=e.driver.Backend();backend._driver_deadline=time.monotonic()+5
+            end=backend._driver_deadline;clock_patch=None
+            def late_read():
+                nonlocal clock_patch
+                clock_patch=patch.object(e.time,'monotonic',return_value=end+1)
+                clock_patch.start()
+            journal=types.SimpleNamespace(check=late_read,count=0,bytes=0,
+                phase_paths=[(root/e.OBSERVATION,{})])
+            work={'fixture_only':'native context separately qualified'};value={}
+            m=types.SimpleNamespace(b=backend,j=journal,inventory_ref=inv,authority_ref=approval,
+                raw=canonical(cfg),authraw=canonical(auth),cfg=cfg,auth=auth,input_raw=canonical(cfg),
+                q=q,p=types.SimpleNamespace(work=work),pair_value=value,
+                pair_raw=(canonical({}),canonical({}),canonical(work),canonical(value)),
+                phase=e.OBSERVATION,count_end=e.RECORDS,bytes_end=e.BYTES,
+                local=lambda:e.driver._check_end(backend))
+            try:
+                with patch.object(e,'_source_seal',return_value=None), \
+                     patch.object(e.driver,'_docker_binding',return_value=None), \
+                     self.assertRaisesRegex(Refused,'driver_original_deadline'):
+                    e._Producer.seal(m)
+            finally:
+                if clock_patch is not None:clock_patch.stop()
 
 
 if __name__=='__main__':unittest.main()

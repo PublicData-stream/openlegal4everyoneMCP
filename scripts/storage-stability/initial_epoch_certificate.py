@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import tomllib
+import uuid
 
 import bootstrap_backend as blobs
 import command_process as processes
@@ -45,7 +46,8 @@ import linux_backend as linux
 import manual_backend as manual
 from copy_tree import root_fd
 from interface import Operation, Refused, freeze_authority, need
-from inventory import canonical, decode, digest, pin, private_bytes, valid_uuid
+from inventory import (MAX_INPUT, canonical, decode, digest, pin, private_bytes, valid_uuid,
+    private_fd_mount_id, recheck_private_inbox, read_private_file_at)
 
 OBSERVATION = 'initial_epoch_observation'
 INSTALL = 'initial_epoch_install_verify'
@@ -97,7 +99,7 @@ def _source_seal(graph):
             need(Path(loaded.__file__).resolve()==base/name,'initial_epoch_loaded_source_mismatch')
 
 
-def _load(inventory_ref,authority_ref):
+def _load_inventory(inventory_ref):
     raw=driver._reference(inventory_ref);cfg=decode(raw);_shape(cfg,BASE_FIELDS,'initial_epoch_inventory')
     need(type(cfg['schema_version']) is int and cfg['schema_version']==1
          and cfg['kind']=='openlegal_initial_epoch_certificate_inventory' and valid_uuid(cfg['operation_id'])
@@ -108,60 +110,306 @@ def _load(inventory_ref,authority_ref):
          and q['generation']==1 and q['predecessor_certificate_sha256'] is None,'initial_epoch_first_only')
     for key in ('original_inventory','driver_inventory','driver_authority','seed_inventory','seed_authority',
                 'pair_inventory','pair_authority','strict_preprovision'):driver._reference(q[key])
+    return cfg,raw
+
+
+_AUTHORITY_TRUE=('epoch_certificate_observation_permitted','epoch_certificate_install_permitted',
+    'initial_bind_only','preserve_originals')
+_AUTHORITY_FALSE=('automatic_retry','roles_permitted','credentials_permitted','trust_permitted',
+    'provider_permitted','kubernetes_mutation_permitted','pg_mutation_permitted','ready_permitted',
+    'release_permitted','promotion_permitted','cleanup_permitted')
+
+
+def _requested_scope(loaded):
+    cfg,raw=loaded
+    return {'schema_version':1,'kind':'openlegal_initial_epoch_certificate_authority',
+        'operation_id':cfg['operation_id'],'inventory_sha256':digest(raw),
+        'source_graph_sha256':digest(canonical(cfg['source_graph'])),
+        'source_sha256':cfg['source_graph']['initial_epoch_certificate.py'],
+        **dict.fromkeys(_AUTHORITY_TRUE,True),**dict.fromkeys(_AUTHORITY_FALSE,False)}
+
+
+def _load(inventory_ref,authority_ref):
+    loaded=_load_inventory(inventory_ref);cfg,raw=loaded;scope=_requested_scope(loaded)
     authraw=driver._reference(authority_ref);auth=decode(authraw)
-    fields=('schema_version','kind','approved','operation_id','inventory_sha256','source_graph_sha256','source_sha256',
-        'valid_until','epoch_certificate_observation_permitted','epoch_certificate_install_permitted','initial_bind_only',
-        'preserve_originals','automatic_retry','roles_permitted','credentials_permitted','trust_permitted','provider_permitted',
-        'kubernetes_mutation_permitted','pg_mutation_permitted','ready_permitted','release_permitted','promotion_permitted','cleanup_permitted')
-    _shape(auth,fields,'initial_epoch_authority')
-    need(type(auth['schema_version']) is int and auth['schema_version']==1
-         and auth['kind']=='openlegal_initial_epoch_certificate_authority' and auth['operation_id']==cfg['operation_id']
-         and auth['inventory_sha256']==digest(raw) and auth['source_graph_sha256']==digest(canonical(cfg['source_graph']))
-         and auth['source_sha256']==cfg['source_graph']['initial_epoch_certificate.py']
+    _shape(auth,(*scope,'approved','valid_until'),'initial_epoch_authority')
+    need(type(auth['schema_version']) is int and auth['approved'] is True
          and type(auth['valid_until']) is int and time.time()<auth['valid_until']
-         and all(auth[k] is True for k in ('approved','epoch_certificate_observation_permitted',
-             'epoch_certificate_install_permitted','initial_bind_only','preserve_originals'))
-         and all(auth[k] is False for k in ('automatic_retry','roles_permitted','credentials_permitted','trust_permitted',
-             'provider_permitted','kubernetes_mutation_permitted','pg_mutation_permitted','ready_permitted',
-             'release_permitted','promotion_permitted','cleanup_permitted')),'initial_epoch_authority_scope')
+         and {k:auth[k] for k in scope}==scope
+         and all(auth[k] is True for k in _AUTHORITY_TRUE)
+         and all(auth[k] is False for k in _AUTHORITY_FALSE),'initial_epoch_authority_scope')
     return cfg,auth,raw,authraw
 
 
+# Approval transport is bounded DATA within the completed Pair phase.
+INTAKE_REQUEST_MAX=64*1024
+INTAKE_ENVELOPE_MAX=16*1024
+INTAKE_CONTROL_MAX=4096
+INTAKE_RECORDS=9
+INTAKE_BYTES=3*MAX_INPUT+2*INTAKE_REQUEST_MAX+INTAKE_ENVELOPE_MAX+3*INTAKE_CONTROL_MAX
+INTAKE_ENVELOPE='initial-certificate-capability.json'
+INTAKE_LABEL='initial-certificate-intake'
+_ACTIVE_KEYS=frozenset(('workloads','jobs','config_maps','persistent_volumes',
+    'serving_image','serving_runtime_image_id','serving_service'))
+
+
+class _Intake:
+    def __init__(self,b,lock):
+        self.b=b;self.lock=lock;self.state='PREPARING';self.j=None;self.budget=None
+        self.inbox_fd=None;self.finished=None;self.entered_run=False
+
+
+def _dedicated_root(b,lock):
+    need(type(b) is driver.Backend and type(lock) is journals.SharedLock and os.geteuid()==0
+         and threading.current_thread() is threading.main_thread()
+         and len(list(Path('/proc/self/task').iterdir()))==1 and not processes._children(os.getpid())
+         and not any(callable(v) for v in vars(b).values())
+         and not getattr(b,'_initial_epoch_certificate_started',False),'initial_epoch_live_dedicated_root')
+
+
+def _intake_fail(s):
+    if type(s) is _Intake:
+        s.state='UNKNOWN'
+        if s.budget is not None and s.finished is None:
+            try:s.j.fail_reservation(s.budget)
+            except BaseException:pass
+
+
+def _intake_context(s):
+    need(type(s) is _Intake and getattr(s.b,'_initial_epoch_certificate_intake',None) is s
+         and s.state in ('PREPARING','WAITING','ACCEPTING','DISPATCHING'),
+         'initial_epoch_intake_live_instance')
+    _dedicated_root(s.b,s.lock);driver._check_end(s.b)
+    need(_parent()==s.parent and type(s.clock) is driver._Clock and s.clock is s.b._initial_driver_clock
+         and s.clock.backend is s.b and s.clock.shared_lock is s.lock and s.clock.lock_fd==s.lock.fd
+         and s.b._initial_driver_clock_attempted is True
+         and s.original_end==s.b._driver_deadline==s.clock.end,'initial_epoch_intake_original_context')
+    need(s.j is s.b._initial_driver_journal and s.j.operation==s.operation_id and s.j.phase_paths
+         and s.j.phase_paths[0][0].name==pair_module.PHASE,'initial_epoch_intake_original_phase')
+    s.lock.check();driver._check_end(s.b)
+
+
+def _intake_record(s,suffix,raw,limit):
+    _intake_context(s)
+    need(type(raw) is bytes and len(raw)<=limit,'initial_epoch_intake_record_bound')
+    name='certificate-intake-'+suffix+'.json';sha=s.j.save_bytes(name,raw,reservation=s.budget)
+    _intake_context(s)
+    ref={'phase':pair_module.PHASE,'name':name,'sha256':sha}
+    need(s.j.read_phase_bytes(ref['phase'],name,sha)==raw,'initial_epoch_intake_dual_ack')
+    _intake_context(s)
+    return {'path':str(s.j.phase_paths[0][0]/name),'sha256':sha},ref
+
+
+def _intake_inbox(s):
+    _intake_context(s)
+    recheck_private_inbox(s.inbox['path'],s.inbox['identity'],s.inbox_fd,s.inbox_mount)
+    _intake_context(s)
+
+
+def _intake_read_envelope(s,ref,previous=None):
+    _intake_context(s)
+    need(driver._clock_reference(ref)[0]==str(Path(s.inbox['path'])/INTAKE_ENVELOPE),
+         'initial_epoch_intake_envelope_path')
+    _intake_inbox(s)
+    raw,witness=read_private_file_at(s.inbox_fd,INTAKE_ENVELOPE,ref['sha256'],
+        INTAKE_ENVELOPE_MAX,mount_id=s.inbox_mount,previous=previous)
+    _intake_context(s);_intake_inbox(s)
+    return raw,witness
+
+
+def _preprovision_data(data,p):
+    _shape(data,('schema_version','kind','operation_id','revision','linux','strict_preprovision','epoch_roots'),
+        'initial_epoch_intake_preprovision')
+    need(type(data['schema_version']) is int and data['schema_version']==1
+         and data['kind']=='openlegal_initial_certificate_preprovision'
+         and data['operation_id']==p.cfg['operation_id'] and type(data['revision']) is str
+         and re.fullmatch('[0-9a-f]{40}',data['revision']),'initial_epoch_intake_preprovision_identity')
+    _shape(data['linux'],_ACTIVE_KEYS,'initial_epoch_intake_mutable_fields')
+    _profile(decode(driver._reference(data['strict_preprovision'])))
+    rows=data['epoch_roots']
+    need(type(rows) is list and len(rows)==2,'initial_epoch_two_control_roots')
+    for row in rows:
+        _shape(row,('label','path','descriptor','media'),'initial_epoch_control_shape')
+        manual._path(row['path'])
+        need(type(row['label']) is str and row['label'] in ('hdd','ssd')
+             and type(row['descriptor']) is dict and type(row['media']) is dict,'initial_epoch_control_data')
+    need({r['label'] for r in rows}=={'hdd','ssd'}
+         and {r['path'] for r in rows}=={str(path) for path,_ in p.j.base},
+         'initial_epoch_intake_original_control_bases')
+    return data
+
+
+def _candidate_inventory(p,value,data,graph,certificate_id):
+    _preprovision_data(data,p)
+    cfg=copy.deepcopy(p.work)
+    cfg.update(kind='openlegal_initial_epoch_certificate_inventory',operation_id=p.cfg['operation_id'],
+        revision=data['revision'],managed_epoch=value['managed_epoch'],source_graph=copy.deepcopy(graph))
+    cfg['linux'].update(copy.deepcopy(data['linux']))
+    native=getattr(p.b,'_initial_pg_pair_standby_native',None)
+    need(type(native) is dict and native.get('container_id')==p.standby
+         and type(native.get('observed_mounts')) is list,'initial_epoch_intake_observed_standby_mounts')
+    cfg['linux']['postgres']={'database':'openlegal','admin_user':p.role_context['names']['recovery_login'],
+        'uid':70,'primary':copy.deepcopy(p.work['linux']['postgres']['primary']),
+        'standby':{'container_id':p.standby,'image_id':p.p['image_id'],
+            'mounts':copy.deepcopy(native['observed_mounts'])},'binding':copy.deepcopy(value['binding'])}
+    cfg['linux']['bound_roots']=sorted([{'role':r['role'],'path':r['host_path'],'uid':r['root_uid'],
+        'dev':r['root_dev'],'ino':r['root_ino']} for r in value['blob_roots']],key=lambda r:r['role'])
+    cfg['linux']['blob_binding_sha256']=value['binding']['blob_binding_sha256']
+    cfg['epoch_certificate']={'certificate_id':certificate_id,'reason':'initial_bind','generation':1,
+        'predecessor_certificate_sha256':None,'original_inventory':copy.deepcopy(p.sc[4]['legacy_inventory']),
+        'driver_inventory':copy.deepcopy(p.sc[0]['driver_inventory']),
+        'driver_authority':copy.deepcopy(p.sc[0]['driver_authority']),
+        'seed_inventory':copy.deepcopy(p.cfg['seed_inventory']),'seed_authority':copy.deepcopy(p.cfg['seed_authority']),
+        'pair_inventory':copy.deepcopy(p.inventory_ref),'pair_authority':copy.deepcopy(p.authority_ref),
+        'pair_complete':pair_module.completed_reference(p.b,p.lock),
+        'role_prepare':copy.deepcopy(p.role_context['reference']),'maintenance':copy.deepcopy(p.cfg['maintenance']),
+        'strict_preprovision':copy.deepcopy(data['strict_preprovision']),'epoch_roots':copy.deepcopy(data['epoch_roots'])}
+    _shape(cfg,BASE_FIELDS,'initial_epoch_inventory');_active(cfg,p,value)
+    return cfg
+
+
+def _intake_seal(s):
+    _intake_context(s);s.j.check();_intake_context(s);_intake_inbox(s)
+    for ref,raw in s.input_bytes:
+        need(driver._reference(ref)==raw,'initial_epoch_intake_input_changed');_intake_context(s)
+    loaded=_load_inventory(s.inventory_ref);_intake_context(s)
+    need(loaded==s.loaded and _requested_scope(loaded)==s.scope,'initial_epoch_intake_candidate_changed')
+    p,value=_consume_pair(s.b,s.lock,loaded[0]);_intake_context(s)
+    need(p is s.p and canonical(value)==s.pair_raw,'initial_epoch_intake_pair_changed')
+    rebuilt=_candidate_inventory(p,value,decode(s.preprovision_raw),s.cfg['source_graph'],s.certificate_id)
+    _intake_context(s)
+    need(canonical(rebuilt)==s.loaded[1],'initial_epoch_intake_derived_candidate_changed')
+    _active(s.cfg,p,value)
+    need(_ref(s.j,s.request_ref)==s.request_raw,'initial_epoch_intake_request_changed');_intake_context(s)
+    if hasattr(s,'authority_raw'):
+        approved=_load(s.inventory_ref,s.authority_ref);_intake_context(s)
+        need(approved==(s.loaded[0],decode(s.authority_raw),s.loaded[1],s.authority_raw),
+             'initial_epoch_intake_approval_changed')
+
+
+def prepare_certificate_request(backend,shared_lock,*,preprovision_ref,source_sha256,inbox):
+    """Archive unapproved candidate DATA from this ROOT's genuine Pair owner."""
+    _dedicated_root(backend,shared_lock)
+    if hasattr(backend,'_initial_epoch_certificate_intake'):
+        _intake_fail(backend._initial_epoch_certificate_intake);raise Refused('initial_epoch_intake_no_replay')
+    s=_Intake(backend,shared_lock);backend._initial_epoch_certificate_intake=s
+    try:
+        s.parent=_parent();s.clock=backend._initial_driver_clock;s.original_end=backend._driver_deadline
+        s.j=backend._initial_driver_journal
+        need(type(s.j) is journals.DualJournal,'initial_epoch_intake_live_journal')
+        s.operation_id=s.j.operation;_intake_context(s)
+        ref=pair_module.completed_reference(backend,shared_lock);_intake_context(s)
+        value=pair_module.consume_completed_live(backend,shared_lock,ref);_intake_context(s)
+        p=backend._initial_pg_pair_live;s.p=p;s.pair_raw=canonical(value)
+        need(value['operation_id']==s.operation_id,'initial_epoch_intake_same_operation')
+        s.budget=s.j.reserve(INTAKE_LABEL,INTAKE_RECORDS,INTAKE_BYTES);_intake_context(s)
+        _shape(inbox,('path','identity'),'initial_epoch_intake_inbox')
+        _shape(inbox['identity'],('dev','ino'),'initial_epoch_intake_inbox_identity')
+        need(type(inbox['path']) is str and Path(inbox['path']).is_absolute()
+             and str(Path(inbox['path']))==inbox['path'] and '..' not in Path(inbox['path']).parts
+             and all(type(v) is int and v>=0 for v in inbox['identity'].values()),
+             'initial_epoch_intake_inbox_identity')
+        s.inbox=copy.deepcopy(inbox)
+        need(not any(Path(s.inbox['path']).is_relative_to(path) for path,_ in s.j.paths),
+             'initial_epoch_intake_inbox_inside_journal')
+        journals.directory(s.inbox['path'],s.inbox['identity']);_intake_context(s)
+        s.inbox_fd=os.open(s.inbox['path'],os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+        _intake_context(s);s.inbox_mount=private_fd_mount_id(s.inbox_fd);_intake_context(s);_intake_inbox(s)
+        need(pin(source_sha256),'initial_epoch_intake_source')
+        private_bytes(Path(__file__).resolve(),source_sha256);_intake_context(s)
+        driver._clock_reference(preprovision_ref)
+        s.preprovision_raw=driver._reference(preprovision_ref);_intake_context(s)
+        data=_preprovision_data(decode(s.preprovision_raw),p);_intake_context(s)
+        graph=copy.deepcopy(p.sc[4]['source_graph'])
+        graph.update({'initial_blob_seed.py':p.sc[0]['source_sha256'],
+            'initial_role_prepare.py':p.role_context['producer_source']['sha256'],
+            'initial_provider_maintenance.py':p.role_context['maintenance_source']['sha256'],
+            'initial_pg_pair.py':p.cfg['source_sha256'],'initial_epoch_certificate.py':source_sha256})
+        base=Path(__file__).resolve().parent
+        for name in ('epoch_observation.py','epoch_primary_fence.py','epoch_certificate.py','epoch_current.py'):
+            graph[name]=digest(private_bytes(base/name));_intake_context(s)
+        _source_seal(graph);_intake_context(s)
+        s.input_bytes=[(copy.deepcopy(preprovision_ref),s.preprovision_raw)]
+        _intake_record(s,'preprovision',s.preprovision_raw,MAX_INPUT)
+        s.certificate_id=str(uuid.uuid4())
+        cfg=_candidate_inventory(p,value,data,graph,s.certificate_id);_intake_context(s)
+        s.inventory_ref,_=_intake_record(s,'candidate',canonical(cfg),MAX_INPUT)
+        s.loaded=_load_inventory(s.inventory_ref);_intake_context(s)
+        s.cfg=s.loaded[0];s.scope=_requested_scope(s.loaded);s.nonce=str(uuid.uuid4())
+        _consume_pair(backend,shared_lock,s.cfg);_intake_context(s)
+        request={'schema_version':1,'kind':'openlegal_initial_certificate_stage_request',
+            'operation_id':s.operation_id,'stage':'initial_epoch_certificate','stage_nonce':s.nonce,
+            'root':s.parent,'original_absolute_deadline':s.original_end,
+            'source_profile':'initial_epoch_certificate_intake_v1','source_graph_sha256':digest(canonical(graph)),
+            'previous_result':ref,'candidate_inventory':s.inventory_ref,'requested_authority_scope':s.scope,
+            'authority_scope_sha256':digest(canonical(s.scope)),'status':'UNAPPROVED_CANDIDATE_DATA','ready':False}
+        s.request_raw=canonical(request)
+        _,s.request_ref=_intake_record(s,'request',s.request_raw,INTAKE_REQUEST_MAX)
+        s.state='WAITING';_intake_seal(s)
+        return s,s.request_raw
+    except BaseException:
+        _intake_fail(s);raise
+
+
+def execute_approved_certificate(intake,envelope_ref):
+    """Consume one external exact authority and dispatch the fixed producer."""
+    need(type(intake) is _Intake and getattr(intake.b,'_initial_epoch_certificate_intake',None) is intake
+         and intake.state=='WAITING','initial_epoch_intake_one_use')
+    s=intake;s.state='ACCEPTING'
+    try:
+        _intake_seal(s);raw,witness=_intake_read_envelope(s,envelope_ref);value=decode(raw)
+        _shape(value,('schema_version','kind','operation_id','stage','stage_nonce','request_sha256',
+            'inventory','authority'),'initial_epoch_intake_envelope')
+        need(canonical(value)==raw and type(value['schema_version']) is int and value['schema_version']==1
+             and value['kind']=='openlegal_initial_stage_capability_envelope'
+             and value['operation_id']==s.operation_id and value['stage']=='initial_epoch_certificate'
+             and value['stage_nonce']==s.nonce and value['request_sha256']==digest(s.request_raw)
+             and value['inventory']==s.inventory_ref,'initial_epoch_intake_envelope_binding')
+        s.authority_ref=copy.deepcopy(value['authority']);driver._clock_reference(s.authority_ref)
+        s.envelope_ref=copy.deepcopy(envelope_ref);s.envelope_raw=raw;s.envelope_identity=witness
+        _intake_record(s,'envelope',raw,INTAKE_ENVELOPE_MAX)
+        _intake_record(s,'consumed',canonical({'operation_id':s.operation_id,'stage_nonce':s.nonce,
+            'request_sha256':digest(s.request_raw),'envelope_sha256':digest(raw),
+            'status':'ATTEMPT_CONSUMED_NOT_APPROVAL'}),INTAKE_CONTROL_MAX)
+        loaded=_load(s.inventory_ref,s.authority_ref);_intake_context(s)
+        need(loaded[0]==s.cfg and {k:loaded[1][k] for k in s.scope}==s.scope,
+             'initial_epoch_intake_approval_scope')
+        s.authority_raw=loaded[3]
+        _intake_record(s,'authority',s.authority_raw,MAX_INPUT)
+        _,s.accepted_ref=_intake_record(s,'accepted',canonical({'operation_id':s.operation_id,
+            'stage_nonce':s.nonce,'request':s.request_ref,'inventory':s.inventory_ref,
+            'authority':s.authority_ref,'authority_sha256':digest(s.authority_raw),
+            'original_absolute_deadline':s.original_end,'ready':False}),INTAKE_REQUEST_MAX)
+        _intake_seal(s)
+        need(_intake_read_envelope(s,s.envelope_ref,s.envelope_identity)[0]==s.envelope_raw,
+             'initial_epoch_intake_approval_changed')
+        _intake_context(s);s.finished=s.j.finish_reservation(s.budget)
+        _intake_seal(s);s.state='DISPATCHING'
+        result=run(s.b,s.lock,s.inventory_ref,s.authority_ref);s.state='CONSUMED'
+        return result
+    except BaseException:
+        _intake_fail(s);raise
+
+
+def _intake_run_gate(b,lock,inventory_ref,authority_ref):
+    if not hasattr(b,'_initial_epoch_certificate_intake'):return
+    s=b._initial_epoch_certificate_intake
+    try:
+        need(type(s) is _Intake and s.b is b and s.lock is lock and s.state=='DISPATCHING'
+             and s.finished is not None and not s.entered_run
+             and inventory_ref==s.inventory_ref and authority_ref==s.authority_ref,
+             'initial_epoch_intake_dispatch_required')
+        _intake_seal(s)
+        need(_intake_read_envelope(s,s.envelope_ref,s.envelope_identity)[0]==s.envelope_raw,
+             'initial_epoch_intake_approval_changed')
+        _ref(s.j,s.finished);_intake_context(s);s.entered_run=True
+    except BaseException:
+        _intake_fail(s);raise
+
+
 def _ack(j,value,binding,*,first):
-    """Recompute genuine historical native read/first-bind results, not a boolean."""
-    need(value['observation_status']=='historical_native_proof','initial_epoch_pair_ack_kind')
-    records=[]
-    for ref in value['native_command_refs']:
-        row=decode(_ref(j,ref));fences._command_ok(row)
-        need(row['kind']=='openlegal_initial_pair_native_sql' and row['query_kind'] in ('bind','proof','flush'),
-             'initial_epoch_pair_native_query')
-        records.append(row)
-    need(records and records[0]['query_kind']==('bind' if first else 'proof')
-         and all(r['query_kind']=='flush' for r in records[1:]),'initial_epoch_pair_ack_sequence')
-    initial=[decode(line) for line in bytes.fromhex(records[0]['stdout_hex']).splitlines()]
-    need(len(initial)==(3 if first else 2),'initial_epoch_pair_native_output')
-    if first:
-        bound=initial[0]
-        need(bound['previous_binding'] is None and pair_module._normalized_binding(bound['new_binding'])==binding,
-             'initial_epoch_pair_not_first_bind')
-        intents=[row['raw'] for paths,rows in j.history+[(j.current(),j.artifacts)] for name,row in rows.items()
-                 if paths and paths[0][0].name==pair_module.PHASE and name.endswith('-first-bind-intent.json')]
-        need(len(intents)==1 and digest(intents[0])==bound['intent_sha256'],'initial_epoch_pair_bind_intent')
-        intent=decode(intents[0]);need(intent['operation_id']==bound['operation_id']==j.operation and intent['expected_old'] is None
-                                     and intent['proposed_binding']==binding,
-                                     'initial_epoch_pair_initial_intent')
-    before=initial[-2]
-    final=initial[-1] if len(records)==1 else decode(bytes.fromhex(records[-1]['stdout_hex']).strip())
-    if first:
-        committed=pair_module._peer(initial[0]['peer_before_commit'],binding)
-        pair_module._proof(committed,final,binding)
-        proof=pair_module._proof(before,final,binding,previous=committed)
-    else:proof=pair_module._proof(before,final,binding)
-    need(all(value[k]==proof[k] for k in ('before','after','fixed_target')),'initial_epoch_pair_ack_proof')
-    window=value['native_window']
-    need(all(type(window[k]) in (int,float) for k in ('started','finished','deadline'))
-         and window['started']<=window['finished']<window['deadline']<=window['started']+2,
-         'initial_epoch_pair_native_budget')
+    """Use the Pair owner's native historical proof reconstruction."""
+    return pair_module._completed_ack(j,value,binding,first=first)
 
 
 def _consume_pair(backend,lock,cfg):
@@ -172,7 +420,7 @@ def _consume_pair(backend,lock,cfg):
          and p.j.phase_paths and p.j.phase_paths[0][0].name==pair_module.PHASE
          and getattr(backend,'_initial_pg_pair_bind_state',None)=='ACKNOWLEDGED'
          and not getattr(backend,'_initial_pg_pair_cancelled',False),'initial_epoch_live_pair_required')
-    p.seal()
+    completed=pair_module.consume_completed_live(backend,lock,q['pair_complete'])
     need(q['pair_inventory']==p.inventory_ref and q['pair_authority']==p.authority_ref
          and driver._reference(q['pair_inventory'])==p.raw and driver._reference(q['pair_authority'])==p.authraw
          and q['driver_inventory']==p.sc[0]['driver_inventory'] and q['driver_authority']==p.sc[0]['driver_authority']
@@ -182,6 +430,7 @@ def _consume_pair(backend,lock,cfg):
          'initial_epoch_pair_input_chain')
     need(q['pair_complete']['phase']==pair_module.PHASE,'initial_epoch_pair_current_complete')
     value=decode(_ref(p.j,q['pair_complete']))
+    need(canonical(value)==canonical(completed),'initial_epoch_pair_completed_owner_changed')
     need(value['kind']=='openlegal_initial_pg_pair_result' and value['operation_id']==cfg['operation_id']==p.cfg['operation_id']
          and value['inventory_sha256']==digest(p.raw) and value['authority_sha256']==digest(p.authraw)
          and value['source_sha256']==p.cfg['source_sha256']==cfg['source_graph']['initial_pg_pair.py']
@@ -235,7 +484,8 @@ class _Producer:
     def __init__(self,b,lock,inventory_ref,authority_ref,loaded,p,value):
         self.b=b;self.lock=lock;self.inventory_ref=inventory_ref;self.authority_ref=authority_ref
         self.cfg,self.auth,self.raw,self.authraw=loaded;self.q=self.cfg['epoch_certificate'];self.p=p;self.pair_value=value
-        self.j=p.j;self.parent=_parent();self.original_end=b._driver_deadline;self.phase=OBSERVATION
+        self.j=p.j;self.parent=_parent();self.original_end=b._driver_deadline;self.original_clock=getattr(b,'_initial_driver_clock',None)
+        self.pair_cap=getattr(b,'_initial_pg_pair_complete',None);self.phase=OBSERVATION
         self.serial=0;self.child=False;self.parentfd=None;self.cancelled=False;self.control=[]
         self.start_count=self.j.count;self.start_bytes=self.j.bytes;self.count_end=self.start_count+RECORDS;self.bytes_end=self.start_bytes+BYTES
         need(self.count_end<=4096 and self.bytes_end<=journals.MAX_PHASE_BYTES,'initial_epoch_global_budget')
@@ -263,7 +513,10 @@ class _Producer:
 
     def local(self):
         driver._check_end(self.b)
-        need(self.b._driver_deadline==self.original_end and not self.cancelled
+        need(self.b._driver_deadline==self.original_end
+             and getattr(self.b,'_initial_driver_clock',None) is self.original_clock
+             and self.pair_cap is not None and getattr(self.b,'_initial_pg_pair_complete',None) is self.pair_cap
+             and not self.cancelled
              and not getattr(self.b,'_initial_epoch_certificate_unknown',False),'initial_epoch_original_end_or_unknown')
         need(Path('/proc/sys/kernel/random/boot_id').read_text().strip()==self.parent['boot_id'],'initial_epoch_boot_changed')
         if self.child:
@@ -299,6 +552,7 @@ class _Producer:
         need(self.j.phase_paths and self.j.phase_paths[0][0].name==self.phase,'initial_epoch_current_phase_changed')
         need(self.j.count+1<=self.count_end and self.j.bytes+COMMAND_HEADROOM<=self.bytes_end,
              'initial_epoch_reserved_budget_exhausted')
+        driver._check_end(self.b)
 
     def save(self,label,value):
         self.seal();self.serial+=1;name=self.phase+'-epoch-%04d-'%self.serial+label+'.json';raw=canonical(value)
@@ -916,10 +1170,8 @@ def _readback(m):
 
 def run(backend,shared_lock,inventory_ref,authority_ref):
     """Initial only; failure keeps the same backend, locks, roots and both PGs held."""
-    need(type(backend) is driver.Backend and type(shared_lock) is journals.SharedLock and os.geteuid()==0
-         and threading.current_thread() is threading.main_thread() and len(list(Path('/proc/self/task').iterdir()))==1
-         and not processes._children(os.getpid()) and not any(callable(v) for v in vars(backend).values())
-         and not getattr(backend,'_initial_epoch_certificate_started',False),'initial_epoch_live_dedicated_root')
+    _dedicated_root(backend,shared_lock)
+    _intake_run_gate(backend,shared_lock,inventory_ref,authority_ref)
     driver._check_end(backend);loaded=_load(inventory_ref,authority_ref);cfg,auth,raw,authraw=loaded
     p,value=_consume_pair(backend,shared_lock,cfg);_active(cfg,p,value)
     backend._initial_epoch_certificate_started=True;backend._initial_epoch_certificate_unknown=False

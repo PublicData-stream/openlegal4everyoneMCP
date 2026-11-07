@@ -621,7 +621,7 @@ This is a callable first-boundary integration, with no enrollment CLI. Its fixed
 source dependency profile is driver18 plus seed/roles/maintenance (21); legacy15,
 driver18 and historical producer27 name sets remain unchanged. The exclusive intake reservation ends
 before maintenance effects and forks. It does not reserve or prove a complete
-S/R supervisor/observer budget. Certificate dynamic intake, raw authenticated
+S/R supervisor/observer budget. Raw authenticated
 bootstrap, single-fork supervisor ownership, FD escrow, external exit, registration
 and start/release/Ready admission remain separate unimplemented gates. The failed
 HDD copy-fit and native operating acceptance gates still block enrollment.
@@ -684,6 +684,60 @@ registration or Ready. Tests use real temporary files, driver/producer forks and
 parent waits with labelled synthetic service ports. They establish source
 behavior; physical Pair enrollment, independent-media durability, provider
 acceptance and the failed HDD gate still require separate operating evidence.
+
+## Pair completion and initial-certificate approval
+
+Pair publishes its source-owned completion only after its native result and
+signal-handler restoration both succeed. The completion binds the actual owner,
+ROOT/backend/lock/clock, input and source pins, first-bind and final native ACKs,
+helper wait/closure, preservation evidence and retained primary/standby handles.
+Its consumer performs local process/FD/mount and mirrored historical checks;
+preparing the next candidate does not issue SQL or Docker commands. The held
+standby stays running. Frozen terminal Pair accounting remains within the
+original native allowance; subsequent input DATA uses its own global reservation.
+
+`initial_epoch_certificate.prepare_certificate_request` takes a byte-pinned
+`openlegal_initial_certificate_preprovision` object with schema version 1,
+operation ID, revision, `linux`, `strict_preprovision` reference and `epoch_roots`.
+The supplied `linux` keys are exactly `workloads`, `jobs`, `config_maps`,
+`persistent_volumes`, `serving_image`, `serving_runtime_image_id` and
+`serving_service`. Writer/job name and UID sets must retain their original
+identities. The existing strict profile grammar and source-derived inventory
+whitelist still apply. These inputs describe operator-preprovisioned resources;
+actual runtime/configuration/media admission remains with the existing producer.
+
+The helper derives all history, seed/role/maintenance/Pair references, binding,
+managed epoch, native PostgreSQL identities and four blob roots from the live
+Pair owner. The standby mount map comes from its actual retained native inspect
+observation, including any version-dependent tmpfs entries. Referenced TLS
+private-key bytes are never archived. The closed existing source graph is
+retained; no source profile or authority membership is added.
+
+The candidate fixes a fresh certificate ID, `initial_bind`, generation 1 and
+no predecessor, then archives canonical unapproved request DATA in the current
+Pair phase. Its requested authority scope excludes `approved` and `valid_until`.
+Only an external exact authority can permit the existing observation/install
+actor. `execute_approved_certificate` accepts one canonical envelope at
+`initial-certificate-capability.json`, with stage `initial_epoch_certificate`,
+exact operation/nonce/request/candidate and authority references. Pending,
+UNKNOWN or malformed intake state blocks direct producer bypass and replay.
+
+The input scope reserves 9 records and 12,742,656 bytes: three 4 MiB inputs,
+two 64 KiB records, one 16 KiB envelope and three 4 KiB control records including
+reservation begin/finish. All remain within the original 4096-record/512 MiB
+journal and its original clock. The mirrored finish must succeed before fixed
+certificate dispatch advances the phase. Late expiry still blocks dispatch and
+retains UNKNOWN and charged evidence. The existing certificate actor retains
+its separate 384-record/128 MiB bound and actual Pair M32 metadata sizing.
+
+Source fixtures run genuine driver/seed/role/maintenance and Pair control flow,
+including actual helper waits and source-owned completion. SQL, Docker, media,
+namespace mounts and the held standby's external parentage use explicitly
+synthetic native ports. Intake tests stop at a labelled readonly qualification
+seam; they do not claim certificate installation or native physical acceptance.
+The external ROOT-exit observer, bootstrap, full supervisor budget/FD escrow,
+registration and start/release/Ready gates remain separate work. The failed HDD
+fit gate still blocks actual enrollment.
 
 ## Shared epoch observations
 
