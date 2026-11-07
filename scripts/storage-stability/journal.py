@@ -31,7 +31,9 @@ def readback(fd, name, expected):
     with os.fdopen(child, 'rb') as stream:
         a = os.fstat(stream.fileno())
         need(stat.S_ISREG(a.st_mode) and a.st_uid == a.st_gid == 0 and a.st_nlink == 1 and stat.S_IMODE(a.st_mode) == 0o600 and a.st_size == len(expected), 'journal_file_metadata')
-        value = stream.read(MAX_ARTIFACT + 1); z = os.fstat(stream.fileno()); now = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        # Size is already pinned above. One extra byte detects growth without
+        # allocating the global 256 MiB allowance for every small history file.
+        value = stream.read(min(len(expected) + 1, MAX_ARTIFACT + 1)); z = os.fstat(stream.fileno()); now = os.stat(name, dir_fd=fd, follow_symlinks=False)
     need(value == expected and all(getattr(a,k) == getattr(z,k) == getattr(now,k) for k in ('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns')), 'journal_readback')
 
 def new_file(path, raw):
