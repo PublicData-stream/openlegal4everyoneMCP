@@ -620,7 +620,7 @@ impl LawClient {
             return Err(DatabaseError::StorageUnavailable);
         }
         if let Some(cap) = &self.local_cap {
-            cap.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            cap.try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 left.checked_sub(1)
             })
             .map_err(|_| DatabaseError::BudgetExhausted)?;

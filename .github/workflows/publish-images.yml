@@ -147,14 +147,14 @@ jobs:
       - name: Isolate pinned Rust toolchain
         run: echo "RUSTUP_HOME=$RUNNER_TEMP/openlegal-rustup" >> "$GITHUB_ENV"
       - name: Provision pinned Rust toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
       - name: Stamp validated tag into Rust release definitions
         env:
           RELEASE_VERSION: ${{ needs.contract.outputs.version }}
         run: |
           python3 scripts/sync_release_version.py "$RELEASE_VERSION"
-          cargo +1.98.1 metadata --locked --no-deps --format-version 1 >/dev/null
-          cargo +1.98.1 metadata --manifest-path apps/document-worker/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
+          cargo +1.99.1 metadata --locked --no-deps --format-version 1 >/dev/null
+          cargo +1.99.1 metadata --manifest-path apps/document-worker/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
           git diff --check
       - name: Check x86-64-v3 support
         if: matrix.arch == 'amd64'

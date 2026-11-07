@@ -12,7 +12,7 @@ COPY apps/widget/scripts/build.mjs ./apps/widget/scripts/build.mjs
 COPY apps/widget/THIRD_PARTY_NOTICES.md ./apps/widget/
 RUN pnpm --dir apps/widget build
 
-FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
+FROM rust:1.99.1-alpine3.24@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS build
 # Native build helpers only; nothing from this toolchain is installed at runtime.
 RUN --mount=type=bind,source=scripts/install-alpine-packages.sh,target=/tmp/install-alpine-packages.sh \
     timeout -k 10 900 /bin/sh /tmp/install-alpine-packages.sh build-base binutils cmake pkgconf python3
@@ -27,11 +27,11 @@ COPY apps/server/collect-notices.py ./apps/server/
 COPY apps/server/notices ./apps/server/notices
 COPY apps/server/tests/test_collect_notices.py ./apps/server/tests/
 RUN python3 apps/server/tests/test_collect_notices.py
-ENV CARGO_TARGET_DIR=/build
+ENV CARGO_TARGET_DIR=/tmp/rust/target
 ARG TARGETARCH
 ARG BUILD_JOBS=2
 RUN --mount=type=cache,id=openlegal-server-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=openlegal-server-musl-rust-1.98.1-${TARGETARCH},target=/build,sharing=locked \
+    --mount=type=cache,id=openlegal-server-musl-rust-1.99.1-${TARGETARCH},target=/tmp/rust/target,sharing=locked \
     case "$TARGETARCH" in \
         amd64) export RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=-crt-static"; interpreter=/lib/ld-musl-x86_64.so.1 ;; \
         arm64) export RUSTFLAGS="-C target-feature=-crt-static"; interpreter=/lib/ld-musl-aarch64.so.1 ;; \
@@ -40,10 +40,10 @@ RUN --mount=type=cache,id=openlegal-server-registry,target=/usr/local/cargo/regi
     && mkdir -p /assets \
     && cargo build --locked --release -p openlegal-server -j "$BUILD_JOBS" \
         --message-format=json-render-diagnostics > /assets/build-messages.jsonl \
-    && readelf -l /build/release/openlegal-server | grep -F "[Requesting program interpreter: $interpreter]" \
-    && ! readelf -d /build/release/openlegal-server | grep -F 'libc.so.6' \
+    && readelf -l /tmp/rust/target/release/openlegal-server | grep -F "[Requesting program interpreter: $interpreter]" \
+    && ! readelf -d /tmp/rust/target/release/openlegal-server | grep -F 'libc.so.6' \
     && mkdir -p /assets/notices \
-    && cp /build/release/openlegal-server /assets/openlegal-server \
+    && cp /tmp/rust/target/release/openlegal-server /assets/openlegal-server \
     && cargo metadata --locked --format-version 1 > /assets/metadata.json \
     && python3 apps/server/collect-notices.py /assets/metadata.json /assets/build-messages.jsonl /assets/notices \
     && mkdir -p /assets/notices/rust-standard-library \

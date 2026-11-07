@@ -166,7 +166,7 @@ the fixture executable. Rustfmt/Clippy follow the pinned toolchain; cargo-audit
 0.22.2 and cargo-deny 0.20.2 are installed with their locked dependencies. Advisory
 data is intentionally refreshed when this validation stage executes.
 
-The Dockerfile pins Rust 1.98.1 and Alpine 3.24 base digests and builds a native,
+The Dockerfile pins Rust 1.99.1 and Alpine 3.24 base digests and builds a native,
 dynamically linked musl executable. Signed moving Alpine v3.24 repositories supply
 Tesseract/Leptonica/Fontconfig; `/opt/notices/alpine-packages.txt` records installed
 runtime versions. The standalone lockfile fixes Rust dependencies. Both native

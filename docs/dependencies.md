@@ -1,6 +1,6 @@
 # Rust dependency admission
 
-Baseline: Rust 1.98.1, edition 2024, Linux GNU development and Alpine 3.24 musl
+Baseline: Rust 1.99.1, edition 2024, Linux GNU development and Alpine 3.24 musl
 production images on x86_64 (x86-64-v3) and ARM64 (generic CPU). The separate
 document-worker graph remains x86_64-only.
 There is one supported
@@ -18,7 +18,7 @@ and Cargo environment-variable precedence.
 
 ## Production image build inputs
 
-Every production Dockerfile stage uses Alpine 3.24: official Rust 1.98.1 and
+Every production Dockerfile stage uses Alpine 3.24: official Rust 1.99.1 and
 Node 24.21.0 builders and the Alpine runtime, pinned by multi-platform index
 digests. The Dockerfile frontend is digest-pinned too. pnpm 12.3.4 installs the
 frozen widget graph. Native musl builds explicitly select dynamic C-runtime

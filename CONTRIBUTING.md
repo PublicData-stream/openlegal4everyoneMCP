@@ -131,7 +131,7 @@ as well. Do not create Rust tests that merely assert policy wording or headings.
 
 ### Rust baseline
 
-The development baseline is Rust 1.98.1 on Linux GNU, with x86-64-v3 on x86_64 and the
+The development baseline is Rust 1.99.1 on Linux GNU, with x86-64-v3 on x86_64 and the
 generic Rust CPU baseline on ARM64. Both transports compile together with no
 optional first-party features. Native CI runs the Rust baseline on both
 `ubuntu-26.04` and `ubuntu-26.04-arm`. The separate document worker remains

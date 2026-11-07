@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
-FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS toolchain
+FROM rust:1.99.1-alpine3.24@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS toolchain
 # Native musl build; APK signatures and branch admission are enforced by the helper.
 RUN --mount=type=bind,source=scripts/install-alpine-packages.sh,target=/tmp/install-alpine-packages.sh \
     timeout -k 10 900 /bin/sh /tmp/install-alpine-packages.sh \
@@ -21,9 +21,9 @@ COPY crates ./crates
 COPY apps/server ./apps/server
 COPY apps/document-worker ./apps/document-worker
 RUN cd apps/document-worker/vendor/rhwp && sha256sum -c SHA256SUMS >/dev/null
-ENV CARGO_TARGET_DIR=/build
+ENV CARGO_TARGET_DIR=/tmp/rust/target
 ARG ADMISSION_REFRESH=manual
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=type=cache,target=/usr/local/cargo/git,sharing=locked --mount=type=cache,id=openlegal-worker-musl-rust-1.98.1-amd64,target=/build,sharing=locked \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=type=cache,target=/usr/local/cargo/git,sharing=locked --mount=type=cache,id=openlegal-worker-musl-rust-1.99.1-amd64,target=/tmp/rust/target,sharing=locked \
     export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name libclang.so -print -quit)")" \
     && test -f "$LIBCLANG_PATH/libclang.so" \
     && test -n "$ADMISSION_REFRESH" \
@@ -32,16 +32,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=t
     && cargo deny --manifest-path apps/document-worker/Cargo.toml --config apps/document-worker/deny.toml check \
     && cargo clippy --manifest-path apps/document-worker/Cargo.toml --locked --all-targets -j 2 -- -D warnings \
     && cargo test --manifest-path apps/document-worker/Cargo.toml --locked --release --lib -j 2 \
-    && find /build/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable -delete \
+    && find /tmp/rust/target/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable -delete \
     && cargo test --manifest-path apps/document-worker/Cargo.toml --locked --release --test binary_formats --no-run -j 2 \
     && cargo build --manifest-path apps/document-worker/Cargo.toml --locked --release -j 2 \
-    && readelf -l /build/release/openlegal-document-worker | grep -F '[Requesting program interpreter: /lib/ld-musl-x86_64.so.1]' \
-    && ! readelf -d /build/release/openlegal-document-worker | grep -F 'libc.so.6' \
+    && readelf -l /tmp/rust/target/release/openlegal-document-worker | grep -F '[Requesting program interpreter: /lib/ld-musl-x86_64.so.1]' \
+    && ! readelf -d /tmp/rust/target/release/openlegal-document-worker | grep -F 'libc.so.6' \
     && mkdir -p /assets/notices/rhwp \
-    && cp /build/release/openlegal-document-worker /assets/openlegal-document-worker \
+    && cp /tmp/rust/target/release/openlegal-document-worker /assets/openlegal-document-worker \
     && cp apps/document-worker/vendor/rhwp/LICENSE apps/document-worker/vendor/rhwp/THIRD_PARTY_LICENSES.md apps/document-worker/vendor/rhwp/README.openlegal.md apps/document-worker/vendor/rhwp/UPSTREAM.json apps/document-worker/vendor/rhwp/SHA256SUMS /assets/notices/rhwp/ \
-    && test "$(find /build/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable | wc -l)" -eq 1 \
-    && find /build/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable -exec cp {} /assets/document-format-tests \; \
+    && test "$(find /tmp/rust/target/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable | wc -l)" -eq 1 \
+    && find /tmp/rust/target/release/deps -maxdepth 1 -type f -name 'binary_formats-*' -executable -exec cp {} /assets/document-format-tests \; \
     && test -x /assets/document-format-tests \
     && find /usr/local/cargo/registry/src -type f \( -iname "license*" -o -iname "copying*" -o -iname "notice*" \) -exec cp --parents {} /assets/notices \;
 WORKDIR /assets

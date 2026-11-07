@@ -112,7 +112,7 @@ fn elapsed_us(start: std::time::Instant) -> u64 {
     start.elapsed().as_micros().min(999_999_999_999) as u64
 }
 fn add_timing(counter: &AtomicU64, value: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
         Some(old.saturating_add(value).min(999_999_999_999))
     });
 }

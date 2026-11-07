@@ -16,7 +16,7 @@ async fn actual_cache_root_verifier_rejection_precedes_any_postgres_connection()
             Err(Error::StorageCorrupt)
         }
     }
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let directory = tempfile::tempdir().unwrap();
     let blobs = crate::blob::MirroredBlobStore::open(
         &directory.path().join("primary"),
         &directory.path().join("replica"),
@@ -73,7 +73,7 @@ async fn strict_health_capacity_never_becomes_recovery_or_uncertain_commit() {
 #[tokio::test]
 async fn strict_constructor_rejects_plaintext_before_connecting() {
     let _io = crate::blob::test_io_admission().await;
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let directory = tempfile::tempdir().unwrap();
     let blobs = crate::blob::FsBlobStore::open(&directory.path().join("blobs"))
         .await
         .unwrap();

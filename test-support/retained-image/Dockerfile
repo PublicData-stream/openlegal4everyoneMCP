@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 # Test-only tooling; never copied into the production image. Build natively even
 # when acceptance runs the production image under another architecture.
-FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
+FROM rust:1.99.1-alpine3.24@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS build
 # Share verified, bounded acquisition with the production image builds.
 RUN --mount=type=bind,source=scripts/install-alpine-packages.sh,target=/tmp/install-alpine-packages.sh \
     timeout -k 10 900 /bin/sh /tmp/install-alpine-packages.sh build-base binutils cmake pkgconf
@@ -15,7 +15,7 @@ COPY apps/server/src ./apps/server/src
 ENV CARGO_TARGET_DIR=/tmp/rust/target
 ARG TARGETARCH
 RUN --mount=type=cache,id=openlegal-server-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=openlegal-retained-musl-rust-1.98.1-${TARGETARCH},target=/tmp/rust/target,sharing=locked \
+    --mount=type=cache,id=openlegal-retained-musl-rust-1.99.1-${TARGETARCH},target=/tmp/rust/target,sharing=locked \
     case "$TARGETARCH" in \
         amd64) export RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=-crt-static"; interpreter=/lib/ld-musl-x86_64.so.1 ;; \
         arm64) export RUSTFLAGS="-C target-feature=-crt-static"; interpreter=/lib/ld-musl-aarch64.so.1 ;; \

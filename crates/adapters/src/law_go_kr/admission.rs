@@ -1080,7 +1080,7 @@ async fn reserve_locked_with_canary(
         .checked_add(i64::from(mode == RequestBudgetMode::Pilot))
         .ok_or(DatabaseError::StorageCorrupt)?;
     if let Some(cap) = local_cap {
-        cap.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+        cap.try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
             left.checked_sub(1)
         })
         .map_err(|_| DatabaseError::BudgetExhausted)?;
