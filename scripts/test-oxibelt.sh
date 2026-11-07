@@ -239,7 +239,7 @@ assert config.count('rate = "1000r/s"\nburst = 1000') == 1
 # route has a later independent bucket with the same rate.
 assert config.count('rate = "100r/s"\nburst = 100') in (1, 2)
 (source.parent / "oxibelt-wt-throttled.toml").write_text(config.replace(
-    'rate = "100r/s"\nburst = 100', 'rate = "1r/s"\nburst = 1', 1))
+    'rate = "100r/s"\nburst = 100', 'rate = "6r/m"\nburst = 1', 1))
 backend = pathlib.Path(sys.argv[2])
 (backend.parent / "backend-wrong-san.toml").write_text(backend.read_text().replace(
     '/cert/backend.pem', '/cert/wrong-backend.pem').replace(
@@ -389,10 +389,24 @@ print("HTTP edge rate limit: 429 and refill recovery", flush=True)
 # A WebTransport rate limit counts CONNECT handshakes, not calls in a session.
 docker rm -f "$edge" >/dev/null
 start_edge /fixture/config/oxibelt-wt-throttled.toml
-client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
-reject_client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
-sleep 1.2
-client https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28
+# Keep fresh client processes together and prove rejection precedes token refill.
+# The generated one-token 6r/m fixture allows ten seconds for this probe pair.
+docker run --rm "${hardening[@]}" --entrypoint python3 "$image" -c '
+import subprocess, time
+args = ["/usr/local/bin/wt_client", "https://edge:8443/mcp-wt/v1", "/fixture/cert/ca.pem", "2026-07-28"]
+started = time.monotonic()
+subprocess.run(args, check=True, timeout=20)
+rejected = subprocess.run(args, capture_output=True, text=True, timeout=20)
+elapsed = time.monotonic() - started
+if rejected.returncode == 0:
+    raise SystemExit("Unexpected WebTransport success: " + args[1])
+assert "SessionRejected" in rejected.stderr, "expected a handshake rejection, not a client failure"
+assert elapsed < 10, f"WebTransport probe exceeded its ten-second refill window: {elapsed:.3f}s"
+print(f"WebTransport rate limit: rejected within {elapsed:.3f}s of initial probe", flush=True)
+time.sleep(10.2)
+subprocess.run(args, check=True, timeout=20)
+print("WebTransport rate limit: refill recovery verified", flush=True)
+'
 # Change only upstream trust and prove both private TLS handshakes fail.
 docker rm -f "$edge" >/dev/null
 start_edge /fixture/config/oxibelt-untrusted.toml skip-ready

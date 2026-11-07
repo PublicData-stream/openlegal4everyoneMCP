@@ -100,6 +100,9 @@ The test fails unless all of these checks pass:
 - Edge HTTP 429 and refill recovery under a temporary one-request bucket, plus
   WebTransport CONNECT rejection and refill recovery under its temporary
   one-handshake bucket.
+  The generated WebTransport fixture uses a ten-second refill interval and three
+  fresh client processes in one container. It measures rejection before refill
+  and requires a handshake rejection, then verifies recovery after 10.2 seconds.
   The normal fixture sets the ordinary backend tool-call bucket to one and
   verifies that authenticated edge traffic uses the alternate 1,000-call bucket.
 
