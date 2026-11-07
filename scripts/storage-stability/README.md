@@ -180,8 +180,22 @@ qualification are not actual checkpoint/restore acceptance.
 Run the offline tests using only disposable `/tmp` fixtures:
 
 ```sh
-sudo -n python3 -I -B -m unittest discover -s scripts/storage-stability/tests -v
+sudo -n env TMPDIR=/tmp python3 -I -B -m unittest discover -s scripts/storage-stability/tests -v
 ```
+
+CI runs the same complete discovery in four separate jobs. To run one shard:
+
+```sh
+sudo -n env TMPDIR=/tmp python3 -I -B scripts/run_storage_stability_tests.py --shard core
+```
+
+Run all four values: `core`, `maintenance`, `pair` and `certificate`. Maintenance
+contains its intake/completion modules; Pair contains its intake/completion
+modules; certificate contains its intake module. All remaining and newly added
+modules belong to core. The runner verifies an exact partition without duplicate
+tests, missing required modules or empty shards. Tests run sequentially within
+each process, with immediate test names and the slowest 20 durations. Any skipped
+test fails the shard as incomplete. Keep test data, caches and logs under `/tmp`.
 
 Install the local PostgreSQL client library (`libpq5`), or set
 `OPENLEGAL_TEST_LIBPQ` to a reviewed native library for the libpq environment

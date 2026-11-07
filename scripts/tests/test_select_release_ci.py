@@ -139,6 +139,20 @@ class ReleaseCIReuseTests(unittest.TestCase):
         api.latest["run_attempt"] = 2
         self.assertIsNone(reuse.select_reusable_ci(api, REVISION, NOW))
 
+    def test_every_storage_shard_is_required_for_the_exact_attempt(self):
+        for shard in ("core", "maintenance", "pair", "certificate"):
+            name = f"storage-operator ({shard})"
+            self.assertIn(name, reuse.EXPECTED_JOBS)
+            for kind in ("missing", "failure", "cancelled", "skipped", "wrong_attempt"):
+                attempt_jobs = jobs()
+                item = next(row for row in attempt_jobs if row["name"] == name)
+                if kind == "missing": attempt_jobs.remove(item)
+                elif kind == "wrong_attempt": item["run_attempt"] = 2
+                else: item["conclusion"] = kind
+                with self.subTest(shard=shard, kind=kind):
+                    self.assertIsNone(reuse.select_reusable_ci(
+                        FakeApi(attempt_jobs=attempt_jobs), REVISION, NOW))
+
     def test_malformed_or_incomplete_pagination_is_unavailable(self):
         def missing_page(path):
             if path == "/actions/workflows/ci.yml":

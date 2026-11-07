@@ -188,6 +188,15 @@ permission cases; a non-root run that skips those cases is an incomplete gate.
 The libpq environment regression also requires a local PostgreSQL client library
 (`libpq5`, or `OPENLEGAL_TEST_LIBPQ` pointing to a reviewed native library); CI
 installs it explicitly. A run that skips this regression is incomplete.
+CI separates the complete operator suite into `core`, `maintenance`, `pair` and
+`certificate` jobs. Run any shard with
+`sudo -n env TMPDIR=/tmp python3 -I -B scripts/run_storage_stability_tests.py --shard core`
+(replace `core` with each other shard). All four shards are required; the runner
+checks the complete discovery partition and rejects skipped tests. Each process
+runs its tests sequentially, prints test names immediately and reports the slowest
+20 tests. New test modules join `core` automatically. The full discovery command
+above remains the complete local gate; check its summary for zero skips. Keep all
+disposable test files, caches and logs under `/tmp`.
 The fixtures use disposable `/tmp` storage, controlled local processes and
 synthetic service backends.
 Changes in these authority,

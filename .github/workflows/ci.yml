@@ -107,21 +107,33 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-26.04
-    # Real fork/wait histories add to the complete root operator regression gate.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check GHCR release event and source invariants
-        run: python3 -m unittest scripts.tests.test_release_image_contract scripts.tests.test_select_release_ci
+        run: python3 -B -m unittest scripts.tests.test_release_image_contract scripts.tests.test_select_release_ci scripts.tests.test_storage_operator_runner
+  storage-operator:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [core, maintenance, pair, certificate]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Provision PostgreSQL client library for operator regression tests
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libpq5
           python3 -c "import ctypes.util; assert ctypes.util.find_library('pq')"
       - name: Test isolated storage operation authority and preservation
-        run: sudo -n env TMPDIR=/tmp python3 -I -B -m unittest discover -s scripts/storage-stability/tests -p 'test_*.py'
+        run: sudo -n env TMPDIR=/tmp python3 -I -B scripts/run_storage_stability_tests.py --shard '${{ matrix.shard }}'
   oxibelt:
     permissions:
       contents: read
@@ -287,6 +299,7 @@ jobs:
       - postgres
       - dependencies
       - release-contract
+      - storage-operator
       - oxibelt
       - widget
       - alpine-packages
