@@ -19,10 +19,9 @@ pub use service::{CacheKey, CacheStore, MetricsSnapshot, RetrievalService, Store
 use futures::future::BoxFuture;
 use openlegal_domain::{Query, RetrievalData, RetrievalError};
 use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 pub const FRESH_SECONDS: u64 = 60;
@@ -64,24 +63,82 @@ pub trait Clock: Send + Sync + 'static {
 }
 
 pub struct SystemClock {
-    started: Instant,
-    unix_seconds: u64,
+    anchor: &'static ClockAnchor,
 }
+
+struct ClockAnchor {
+    started: Instant,
+    unix_time: Duration,
+}
+
+// Publication and later reads must share one timeline even when their clocks
+// are constructed on opposite sides of a second boundary or a wall-clock change.
+static SYSTEM_CLOCK_ANCHOR: LazyLock<ClockAnchor> = LazyLock::new(|| ClockAnchor {
+    started: Instant::now(),
+    unix_time: SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default(),
+});
+
+impl ClockAnchor {
+    fn unix_seconds_after(&self, elapsed: Duration) -> u64 {
+        self.unix_time.saturating_add(elapsed).as_secs()
+    }
+}
+
 impl Default for SystemClock {
     fn default() -> Self {
         Self {
-            started: Instant::now(),
-            unix_seconds: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            anchor: &SYSTEM_CLOCK_ANCHOR,
         }
     }
 }
 impl Clock for SystemClock {
     fn now(&self) -> u64 {
-        self.unix_seconds
-            .saturating_add(self.started.elapsed().as_secs())
+        self.anchor
+            .unix_seconds_after(self.anchor.started.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn fractional_epoch_and_elapsed_cross_the_same_second_boundary() {
+        let anchor = ClockAnchor {
+            started: Instant::now(),
+            unix_time: Duration::from_millis(100_900),
+        };
+        assert_eq!(anchor.unix_seconds_after(Duration::from_millis(99)), 100);
+        assert_eq!(anchor.unix_seconds_after(Duration::from_millis(100)), 101);
+        assert_eq!(anchor.unix_seconds_after(Duration::from_millis(200)), 101);
+        assert_eq!(anchor.unix_seconds_after(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn independently_constructed_clocks_share_one_nondecreasing_timeline() {
+        let publication = SystemClock::default();
+        let published_at = publication.now();
+        let reader = SystemClock::default();
+        assert!(std::ptr::eq(publication.anchor, reader.anchor));
+        let served_at = reader.now();
+        assert!(served_at >= published_at);
+        assert!(publication.now() >= served_at);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tokio_virtual_time_does_not_advance_the_system_epoch() {
+        let clock = SystemClock::default();
+        let started = Instant::now();
+        let before = clock.now();
+        tokio::time::advance(Duration::from_secs(86400)).await;
+        let after = clock.now();
+        let later_clock = SystemClock::default();
+        let elapsed = started.elapsed();
+        assert!(after >= before);
+        assert!(after - before <= elapsed.as_secs().saturating_add(1));
+        assert!(later_clock.now() >= after);
     }
 }
 

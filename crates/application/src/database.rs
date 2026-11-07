@@ -321,7 +321,12 @@ mod tests {
             self.0
         }
     }
-    struct Mock;
+    struct Mock([u64; 3]);
+    impl Default for Mock {
+        fn default() -> Self {
+            Self([100; 3])
+        }
+    }
     impl DatabaseStore for Mock {
         fn resolve(
             &self,
@@ -330,6 +335,7 @@ mod tests {
             _: u64,
             _: CancellationToken,
         ) -> BoxFuture<'static, Result<Capture, DatabaseError>> {
+            let [retrieved_at, captured_at, validated_at] = self.0;
             Box::pin(async move {
                 Ok(Capture {
                     capture_id: "a".repeat(64),
@@ -346,9 +352,9 @@ mod tests {
                         representation: "text_v1".into(),
                         sections: vec![],
                     },
-                    retrieved_at: 100,
-                    captured_at: 100,
-                    validated_at: 100,
+                    retrieved_at,
+                    captured_at,
+                    validated_at,
                     processor_version: "v1".into(),
                     raw_sha256: "b".repeat(64),
                 })
@@ -388,7 +394,7 @@ mod tests {
             (86501, None),
         ] {
             for fresh_only in [false, true] {
-                let service = DatabaseService::new(Arc::new(Mock), Arc::new(Fixed(now)));
+                let service = DatabaseService::new(Arc::new(Mock::default()), Arc::new(Fixed(now)));
                 let mut input = request(RevisionSelector::Head);
                 input.fresh_only = fresh_only;
                 let content = service.get(input.clone(), CancellationToken::new()).await;
@@ -405,8 +411,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_content_and_metadata_reject_each_future_timestamp() {
+        for timestamps in [[101, 100, 100], [100, 101, 100], [100, 100, 101]] {
+            let service = DatabaseService::new(Arc::new(Mock(timestamps)), Arc::new(Fixed(100)));
+            for fresh_only in [false, true] {
+                let mut input = request(RevisionSelector::Head);
+                input.fresh_only = fresh_only;
+                assert!(matches!(
+                    service.get(input.clone(), CancellationToken::new()).await,
+                    Err(DatabaseError::FreshnessUnavailable)
+                ));
+                assert!(matches!(
+                    service.get_metadata(input, CancellationToken::new()).await,
+                    Err(DatabaseError::FreshnessUnavailable)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn historical_content_and_metadata_ignore_current_head_freshness() {
-        let service = DatabaseService::new(Arc::new(Mock), Arc::new(Fixed(999999)));
+        let service = DatabaseService::new(Arc::new(Mock::default()), Arc::new(Fixed(999999)));
         for selector in [
             RevisionSelector::Revision { id: "r1".into() },
             RevisionSelector::Capture { id: "a".repeat(64) },
