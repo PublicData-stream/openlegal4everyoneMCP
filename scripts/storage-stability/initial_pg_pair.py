@@ -11,6 +11,7 @@ Native qualification and the future maintenance producer are separate gates.
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 import hashlib
 import ipaddress
 import math
@@ -727,6 +728,9 @@ class _Pair:
         self.parent = os.getpid(); self.ticks = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
         self.native = []; self.fds = []; self.created = {}; self.helpers = []; self.frozen_work = canonical(self.work); self.budget = None; self.serial = 0
         self.b._initial_pg_pair_pending_ownership = {}
+        self.original_end = backend._driver_deadline
+        self.original_clock = getattr(backend, '_initial_driver_clock', None)
+        self._completed = None; self._run_return = None
         self.primary = self.work['linux']['postgres']['primary']['container_id']; self.standby = None
         self.role_context = _role_context(self,maintenance)
         self.op = Operation(cfg['operation_id'], 'strict_prepare', PHASE, self.work, digest(raw),
@@ -737,7 +741,18 @@ class _Pair:
             Path(self.work['backup_root']['path']), {}, self.seal, freeze_authority(auth))
 
     def seal(self):
+        if self.budget is not None:
+            need(self.j.count <= self.budget['start_count'] + self.budget['records']
+                 and self.j.bytes <= self.budget['start_bytes'] + self.budget['bytes'], 'pair_reserved_journal_exhausted')
+        self.seal_context()
+
+    def seal_context(self):
+        # Later stages reserve input DATA separately; the native Pair budget is
+        # never renewed, cleared or charged for that later historical read.
         _check(self.b); need(not getattr(self.b,'_initial_pg_pair_cancelled',False),'pair_cancelled')
+        need(self.b._driver_deadline == self.original_end
+             and getattr(self.b, '_initial_driver_clock', None) is self.original_clock,
+             'pair_original_clock_changed')
         need(canonical(self.work)==self.frozen_work and Path('/proc/sys/kernel/random/boot_id').read_text().strip()==self.work['host']['boot_id'], 'pair_work_or_boot_changed')
         self.lock.check(); driver._writer_fds(self.b); seed._bound(self.b)
         need(os.getpid() == self.parent and self.ticks == Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
@@ -757,10 +772,7 @@ class _Pair:
             fresh = root_fd(path)
             try: need(_fd_id(fd) == ident == _fd_id(fresh), 'pair_held_root_rebound')
             finally: os.close(fresh)
-        self.j.check()
-        if self.budget is not None:
-            need(self.j.count <= self.budget['start_count'] + self.budget['records']
-                 and self.j.bytes <= self.budget['start_bytes'] + self.budget['bytes'], 'pair_reserved_journal_exhausted')
+        self.j.check(); _check(self.b, self.original_end)
 
     def save(self, name, value):
         self.seal(); self.serial += 1; name = PHASE + '-%04d-' % self.serial + name + '.json'
@@ -1406,6 +1418,10 @@ def _start(pair, action):
     # startup is a helper teardown target; later bind/audit failure cannot stop
     # the already returned standby or downgrade synchronous configuration.
     if action=='standby':
+        # Preserve exactly Docker's observed normalized mounts, including only
+        # tmpfs entries actually returned by this Docker version.
+        owned['observed_mounts'] = sorted([{'source':m['Source'],'destination':m['Destination'],
+            'rw':m['RW'],'type':m['Type']} for m in item['Mounts']],key=lambda m:m['destination'])
         pair.b._initial_pg_pair_standby_native=owned
         pair.helpers.remove(owned)
         del pair.b._initial_pg_pair_pending_ownership[cid]
@@ -1774,8 +1790,9 @@ def _run(backend, shared_lock, inventory_ref, authority_ref):
         _audit_legacy(pair, maintenance, audit); binding = _roots(pair)
         control_state=pair.sql('SELECT openlegal_checkpoint.state()')[0]
         baseline = _m32(pair)
+        pair.preservation_baseline = copy.deepcopy(baseline)
         pair.budget = _reserve(pair.j, baseline['bundles'], baseline['raw_bytes'], len(pair.old['payloads']['preservation']['tables']))
-        pair.save('global-journal-reservation', dict(pair.budget, whole_cluster=whole,
+        pair.reservation_ref = pair.save('global-journal-reservation', dict(pair.budget, whole_cluster=whole,
             acknowledged_seed_reference_pages=pair.seed_result['reference_pages']))
         # Last read-only boundaries precede the first mutation. The selected
         # observed-SSD or explicit-ZFS profile, journal budget, maintenance and
@@ -1838,8 +1855,10 @@ def _run(backend, shared_lock, inventory_ref, authority_ref):
             'ready': False, 'provider_called': False, 'roles_created': False, 'released': False,
             'automatic_retry': False, 'outer_actual_os_exit': 'NOT_OBSERVABLE_IN_PROCESS'})
         pair.seal()
-        return {'kind': 'openlegal_initial_pg_pair_pending_parent', 'complete':complete_ref, 'standby_container_id': standby,
+        pending = {'kind': 'openlegal_initial_pg_pair_pending_parent', 'complete':complete_ref, 'standby_container_id': standby,
                 'binding': expected, 'ready': False, 'outer_actual_os_exit': 'NOT_OBSERVABLE_IN_PROCESS'}
+        pair._run_return = canonical(pending)
+        return pending
     except BaseException:
         for helper in pair.helpers:_stop_owned_helper(pair,helper)
         try: pair.save('failed', {'status': 'FAILED_OR_UNKNOWN', 'bind_state': backend._initial_pg_pair_bind_state,
@@ -1881,9 +1900,398 @@ def run(backend, shared_lock, inventory_ref, authority_ref):
     try:
         for number in (signal.SIGTERM,signal.SIGINT):
             previous[number]=signal.getsignal(number);signal.signal(number,interrupted)
-        return _run(backend,shared_lock,inventory_ref,authority_ref)
+        pending = _run(backend,shared_lock,inventory_ref,authority_ref)
     finally:
         for number,handler in previous.items():signal.signal(number,handler)
+    # Restoring BOTH handlers is part of success. No saved JSON, native bind or
+    # successful inner return can mint completion before that finally succeeds.
+    _complete_run(backend, shared_lock, pending)
+    return pending
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class _Completed:
+    """Identity-only live completion, minted after the outer finally succeeds."""
+    owner: object
+    backend: object
+    lock: object
+    journal: object
+    lock_fd: int
+    reference: tuple
+    raw: bytes
+    pending: bytes
+    parent: bytes
+    end: float
+    clock: object
+    budget: bytes
+    count: int
+    bytes: int
+    context: bytes
+    native: bytes
+    held: tuple
+
+
+def _completed_command(row):
+    need(type(row) is dict and type(row.get('actual_exit_code')) is int
+         and row['actual_exit_code'] == 0 and row.get('started') is True
+         and row.get('owned_processes_closed') is True
+         and all(row.get(k) is False for k in ('expired', 'interrupted',
+             'unexpected_descendants', 'output_limit_exceeded')), 'pair_completed_native_not_closed_zero')
+
+
+def _completed_ack(j, value, binding, *, first):
+    """Reconstruct the actual archived native first-bind/final proof, read only."""
+    _binding(binding)
+    _shape(value, ('before','after','fixed_target','native_window','native_command_refs','observation_status'),
+           'pair_completed_ack_shape')
+    need(value['observation_status'] == 'historical_native_proof'
+         and type(value['native_command_refs']) is list
+         and 1 <= len(value['native_command_refs']) <= 33, 'pair_completed_ack_kind')
+    records = []; outputs = []
+    for ref in value['native_command_refs']:
+        need(ref['phase'] == PHASE, 'pair_completed_ack_phase')
+        row = _raw_reference(j, ref); _completed_command(row)
+        need(row['kind'] == 'openlegal_initial_pair_native_sql'
+             and row['query_kind'] in ('bind','proof','flush'), 'pair_completed_native_query')
+        need(type(row['stdout_hex']) is str and len(row['stdout_hex']) <= 2 * 65536,
+             'pair_completed_native_output_bound')
+        raw = bytes.fromhex(row['stdout_hex'])
+        need(type(row['stdout_bytes']) is int and row['stdout_bytes'] == len(raw)
+             and row['stdout_sha256'] == digest(raw), 'pair_completed_native_output_hash')
+        records.append(row); outputs.append([decode(line) for line in raw.splitlines()])
+    need(records[0]['query_kind'] == ('bind' if first else 'proof')
+         and all(r['query_kind'] == 'flush' for r in records[1:])
+         and len(outputs[0]) == (3 if first else 2)
+         and all(len(v) == 1 for v in outputs[1:]), 'pair_completed_ack_sequence')
+    initial = outputs[0]
+    if first:
+        bound = initial[0]
+        _shape(bound, ('operation_id','intent_sha256','previous_binding','new_binding','peer_before_commit'),
+               'pair_completed_bind_shape')
+        need(bound['previous_binding'] is None and _normalized_binding(bound['new_binding']) == binding,
+             'pair_completed_not_first_bind')
+        intents = [row['raw'] for paths, rows in j.history + [(j.current(), j.artifacts)]
+                   for name, row in rows.items()
+                   if paths and paths[0][0].name == PHASE and name.endswith('-first-bind-intent.json')]
+        need(len(intents) == 1 and digest(intents[0]) == bound['intent_sha256'],
+             'pair_completed_bind_intent')
+        intent = decode(intents[0])
+        need(intent['operation_id'] == bound['operation_id'] == j.operation
+             and intent['expected_old'] is None and canonical(intent['proposed_binding']) == canonical(binding),
+             'pair_completed_initial_intent')
+    before = initial[-2]; final = initial[-1] if len(records) == 1 else outputs[-1][0]
+    if first:
+        committed = _peer(bound['peer_before_commit'], binding)
+        _proof(committed, final, binding, previous=intent['candidate'])
+        proof = _proof(before, final, binding, previous=committed)
+    else:
+        proof = _proof(before, final, binding)
+    need(all(canonical(value[k]) == canonical(proof[k]) for k in ('before','after','fixed_target')),
+         'pair_completed_ack_proof')
+    window = value['native_window']
+    _shape(window, ('started','finished','deadline'), 'pair_completed_native_window')
+    need(all(type(window[k]) in (int,float) and math.isfinite(window[k]) for k in window)
+         and window['started'] <= window['finished'] < window['deadline'] <= window['started'] + 2,
+         'pair_completed_native_budget')
+    last = window['started']
+    for row in records:
+        need(all(type(row[k]) in (int,float) and math.isfinite(row[k]) for k in
+                 ('native_started_at','native_finished_at','native_absolute_deadline','original_operation_deadline'))
+             and last <= row['native_started_at'] <= row['native_finished_at'] <= window['finished']
+             and row['native_absolute_deadline'] == window['deadline'] <= row['original_operation_deadline'],
+             'pair_completed_native_history')
+        last = row['native_finished_at']
+    return records
+
+
+def _completed_context(p):
+    # Preserve exact original inputs (including source/role/history bytes), not
+    # merely the mutable Python fields used to recheck their filesystem pins.
+    context = {k: (digest(v) if type(v) is bytes else v) for k,v in p.role_context.items()}
+    return canonical({'cfg':p.cfg, 'authority':p.auth, 'provision':p.p,
+        'inventory_ref':p.inventory_ref, 'authority_ref':p.authority_ref,
+        'raw_sha256':[digest(v) for v in (p.raw,p.authraw,p.praw)],
+        'seed_chain':[digest(v if type(v) is bytes else canonical(v)) for v in p.sc],
+        'work':p.work, 'old':p.old, 'baseline':p.baseline, 'seed_result':p.seed_result,
+        'role_context':context, 'preservation_baseline':p.preservation_baseline,
+        'reservation_ref':p.reservation_ref,
+        'held_roots':[(fd,path,list(identity)) for fd,path,identity in p.fds],
+        'operation_source_graph_sha256':p.op.source_graph_sha256,
+        'journal_binding':p.j.binding, 'journal_operation':p.j.operation})
+
+
+def _completed_native_binding(p):
+    def row(native):
+        return {k:native[k] for k in ('container_id','process','groups','pidfd','cgroup_fd','spec',
+                                      'closure','observed_mounts','data_fd','wal_fd',
+                                      'authority_binding','start_transmitted','payload_end') if k in native}
+    return canonical({'primary_pidfd':p.primary_pidfd, 'primary':p.primary,
+        'primary_native':{k:p.native[0][k] for k in ('process','data_fd','wal_fd','cgroup_fd','groups')},
+        'standby':p.standby, 'standby_native':row(p.b._initial_pg_pair_standby_native),
+        'helpers':[row(v) for v in p.helpers], 'created':p.created})
+
+
+def _completed_held(p):
+    descriptors = set(p.b._initial_pg_pair_retained)
+    descriptors.add(p.lock.fd)
+    descriptors.update(getattr(p.b,name) for name in driver.GUARDS if hasattr(p.b,name))
+    descriptors.update(row[0] for row in p.b._cgroup_fds.values())
+    descriptors.update(row[0] for row in p.b._initial_blob_seed_fds.values())
+    descriptors.update(getattr(p.b,'_legacy_prepare_primary_fds',[]))
+    descriptors.update(getattr(p.b,'_initial_blob_seed_native_fds',[]))
+    rows = []
+    for fd in sorted(descriptors):
+        st = os.fstat(fd)
+        rows.append((fd,st.st_dev,st.st_ino,st.st_mode,st.st_uid,st.st_gid))
+    return tuple(rows)
+
+
+def _completed_local_mounts(p, native, container_path):
+    """Only held namespace FDs and procfs; never Docker inspection or fresh SQL."""
+    process = native['process']; pid = process['pid']
+    need(type(pid) is int and pid > 0 and process['boot_id'] == p.work['host']['boot_id']
+         and driver.processes._identity(pid) == process['start_ticks'], 'pair_completed_native_lifetime')
+    data = p.b._container_directory(pid, container_path)
+    wal = None
+    try:
+        wal = p.b._container_directory(pid, container_path + '/pg_wal')
+        # Retained primary FDs name HOST paths; these fresh FDs name the
+        # postmaster's bind mounts. Compare the underlying file/FS identity,
+        # preserving namespace mount IDs for the separate native validator.
+        for actual, held in ((data,native['data_fd']),(wal,native['wal_fd'])):
+            a, b = _fd_id(actual), _fd_id(held)
+            need(a[:3] + a[4:] == b[:3] + b[4:], 'pair_completed_native_mount_rebound')
+        legacy._native_mounts(pid, container_path, data, wal)
+        need(driver.processes._identity(pid) == process['start_ticks'], 'pair_completed_native_reused')
+    finally:
+        os.close(data)
+        if wal is not None: os.close(wal)
+
+
+def _completed_native(p):
+    need(type(p.helpers) is list and len(p.helpers) == 2
+         and getattr(p.b,'_initial_pg_pair_pending_ownership',None) == {}, 'pair_completed_pending_ownership')
+    authority_binding = canonical({'operation_id':p.cfg['operation_id'],'parent_pid':p.parent,
+        'parent_start_ticks':p.ticks,'journal_operation':p.j.operation,
+        'inventory_sha256':digest(p.raw),'authority_sha256':digest(p.authraw),
+        'original_absolute_deadline':p.original_end})
+    tools = []
+    for helper in p.helpers:
+        cid = helper['container_id']; tools.append(Path(helper['spec']['command'][0]).name)
+        need(canonical(helper['authority_binding']) == authority_binding
+             and p.created.get(cid) is helper['spec'] and helper['closure'] is not None
+             and helper['start_transmitted'] is True
+             and select.select([helper['pidfd']],[],[],0)[0] and linux.members(helper['groups']) == [],
+             'pair_completed_helper_not_closed')
+        os.fstat(helper['cgroup_fd']); manual._process_absent(helper['process'])
+        closure = _raw_reference(p.j, helper['closure'])
+        need(helper['closure']['phase'] == PHASE and closure['container_id'] == cid
+             and canonical(closure['process']) == canonical(helper['process'])
+             and type(closure['actual_exit_code']) is int and closure['actual_exit_code'] == 0
+             and closure['owned_members'] == [], 'pair_completed_helper_closure')
+        need(closure['wait_command']['phase'] == PHASE, 'pair_completed_helper_wait_phase')
+        wait = _raw_reference(p.j, closure['wait_command']); _completed_command(wait)
+        dispatch = ['--config',str(p.b._docker_config[0]),'--host','unix:///var/run/docker.sock','wait',cid]
+        need(wait['binary'] == 'docker' and wait['arguments_sha256'] == digest(canonical(dispatch))
+             and wait['stdin_sha256'] is None and wait['stdout_sha256'] == digest(b'0\n')
+             and type(wait['stdout_bytes']) is int and wait['stdout_bytes'] == 2,
+             'pair_completed_helper_wait_zero')
+    need(sorted(tools) == ['pg_basebackup','pg_verifybackup'], 'pair_completed_backup_verify_required')
+    standby = p.b._initial_pg_pair_standby_native
+    need(canonical(standby['authority_binding']) == authority_binding
+         and standby['container_id'] == p.standby and p.created.get(p.standby) is standby['spec']
+         and standby['spec']['command'][0] == '/usr/local/bin/postgres'
+         and standby['closure'] is None and standby['start_transmitted'] is True
+         and not select.select([p.primary_pidfd,standby['pidfd']],[],[],0)[0], 'pair_completed_held_pair_exited')
+    mounts = standby['observed_mounts']
+    need(type(mounts) is list and mounts == sorted(mounts,key=lambda m:m['destination'])
+         and canonical([m for m in mounts if m['type'] != 'tmpfs'])
+             == canonical(sorted(standby['spec']['mounts'],key=lambda m:m['destination']))
+         and all(m['destination'] in ('/tmp','/var/run/postgresql') for m in mounts if m['type'] == 'tmpfs'),
+         'pair_completed_observed_mounts')
+    need(linux.process_cgroup(p.native[0]['process']['pid']) == p.native[0]['groups'],
+         'pair_completed_primary_cgroup')
+    need(linux.process_cgroup(standby['process']['pid']) == standby['groups'], 'pair_completed_standby_cgroup')
+    _completed_local_mounts(p,p.native[0],p.work['legacy_prepare']['pgdata']['container_path'])
+    _completed_local_mounts(p,standby,PGDATA)
+
+
+def _completed_result(p, reference, raw):
+    _shape(reference, ('phase','name','sha256'), 'pair_completed_reference')
+    need(reference['phase'] == PHASE and pin(reference['sha256']) and type(raw) is bytes
+         and p.j.read_phase_bytes(PHASE,reference['name'],reference['sha256']) == raw,
+         'pair_completed_raw')
+    value = decode(raw)
+    _shape(value, ('kind','operation_id','input_binding','source_sha256','inventory_sha256','authority_sha256',
+        'managed_epoch','primary_container_id','standby_container_id','primary_process','standby_process','binding',
+        'first_bind_ack','final_ack','blob_roots','preservation_page_hashes','maintenance_audit_sha256',
+        'provider_recovery_operation','media_profile','ready','provider_called','roles_created','released',
+        'automatic_retry','outer_actual_os_exit'), 'pair_completed_result')
+    need(value['kind'] == 'openlegal_initial_pg_pair_result' and value['operation_id'] == p.cfg['operation_id']
+         and value['inventory_sha256'] == digest(p.raw) and value['authority_sha256'] == digest(p.authraw)
+         and value['source_sha256'] == p.cfg['source_sha256']
+         and value['managed_epoch'] == value['binding']['managed_epoch'] == p.sc[0]['managed_epoch']
+         and value['primary_container_id'] == p.primary and value['standby_container_id'] == p.standby
+         and canonical(value['primary_process']) == canonical(p.native[0]['process'])
+         and canonical(value['standby_process']) == canonical(p.b._initial_pg_pair_standby_native['process'])
+         and canonical(value['blob_roots']) == canonical(p.seed_result['roots'])
+         and canonical(value['preservation_page_hashes']) == canonical(p.preservation_baseline['page_hashes'])
+         and value['binding']['blob_binding_sha256'] == p.seed_result['blob_binding_sha256']
+         and value['binding']['primary_system_identifier'] == p.work['legacy_prepare']['expected_system_identifier']
+         and type(value['binding']['timeline']) is int
+         and value['binding']['timeline'] == p.work['legacy_prepare']['expected_timeline']
+         and value['media_profile'] == blobs.MEDIA_PROFILE
+         and all(value[k] is False for k in ('ready','provider_called','roles_created','released','automatic_retry'))
+         and value['outer_actual_os_exit'] == 'NOT_OBSERVABLE_IN_PROCESS', 'pair_completed_result_binding')
+    reservation = _raw_reference(p.j,p.reservation_ref)
+    need(p.reservation_ref['phase'] == PHASE
+         and all(type(reservation[k]) is type(v) and reservation[k] == v for k,v in p.budget.items())
+         and reservation['acknowledged_seed_reference_pages'] == p.seed_result['reference_pages'],
+         'pair_completed_original_reservation')
+    maintenance, audit = _maintenance(p.j,p.cfg['maintenance'],p.cfg,p.sc[4],p.sc[8],p.sc[9],
+        getattr(p.b,'_initial_provider_maintenance_last_exit',None),p.sc[7])
+    need(value['maintenance_audit_sha256'] == digest(canonical(audit))
+         and value['provider_recovery_operation'] == maintenance['provider_recovery_operation'],
+         'pair_completed_maintenance_binding')
+    need(value['input_binding']['phase'] == PHASE, 'pair_completed_input_phase')
+    inputs = _raw_reference(p.j,value['input_binding'])
+    expected = {'inventory':p.inventory_ref,'authority':p.authority_ref,
+        'inventory_sha256':digest(p.raw),'authority_sha256':digest(p.authraw),'source_sha256':p.cfg['source_sha256'],
+        'source_graph_sha256':p.op.source_graph_sha256,'original_absolute_deadline':p.original_end,
+        'role_prepare':p.role_context['reference'],'role_source':p.role_context['producer_source'],
+        'maintenance':p.cfg['maintenance'],'seed_inventory':p.cfg['seed_inventory'],'seed_authority':p.cfg['seed_authority']}
+    need(canonical(inputs) == canonical(expected), 'pair_completed_input_binding')
+    for first,key in ((True,'first_bind_ack'),(False,'final_ack')):
+        records = _completed_ack(p.j,value[key],value['binding'],first=first)
+        need(all(type(r['original_operation_deadline']) is type(p.original_end)
+                 and r['original_operation_deadline'] == p.original_end for r in records),
+             'pair_completed_native_original_end')
+    return value
+
+
+def _completed_clock(p):
+    """Retain supported driver clocks; this is no supervisor fork provenance."""
+    _check(p.b,p.original_end)
+    clock = p.original_clock
+    need(clock is getattr(p.b,'_initial_driver_clock',None)
+         and type(p.original_end) is float and p.b._driver_deadline == p.original_end,
+         'pair_completed_original_clock')
+    if clock is None:
+        # Legacy driver.run(...), without prepare_clock, remains supported.
+        # A failed/prepared/consumed clock can never downgrade to this branch.
+        need(p.b._initial_driver_clock_started is None
+             and p.b._initial_driver_clock_attempted is False,
+             'pair_completed_unprepared_clock')
+        return
+    need(type(clock) is driver._Clock and clock.backend is p.b
+         and clock.shared_lock is p.lock and clock.lock_fd == p.lock.fd
+         and type(clock.end) is float and clock.end == p.original_end
+         and p.b._initial_driver_clock_attempted is True
+         and type(p.b._initial_driver_clock_started) is float
+         and p.b._initial_driver_clock_started == clock.started
+         and clock.boot_id == p.work['host']['boot_id']
+         == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+         'pair_completed_original_clock')
+    need(type(clock.creator_pid) is int and clock.creator_pid > 0
+         and clock.creator_pid in (os.getpid(),os.getppid())
+         and driver.processes._identity(clock.creator_pid) == clock.creator_ticks,
+         'pair_completed_clock_creator')
+    _check(p.b,p.original_end)
+
+
+def _complete_run(backend, shared_lock, pending):
+    p = getattr(backend,'_initial_pg_pair_live',None)
+    need(type(p) is _Pair and p.b is backend and p.lock is shared_lock
+         and p.j is getattr(backend,'_initial_driver_journal',None) and p._completed is None
+         and type(pending) is dict and canonical(pending) == p._run_return,
+         'pair_completed_actual_run_return')
+    p.seal()
+    _shape(pending, ('kind','complete','standby_container_id','binding','ready','outer_actual_os_exit'),
+           'pair_completed_pending_result')
+    need(pending['kind'] == 'openlegal_initial_pg_pair_pending_parent' and pending['ready'] is False
+         and pending['standby_container_id'] == p.standby
+         and pending['outer_actual_os_exit'] == 'NOT_OBSERVABLE_IN_PROCESS'
+         and p.j.phase_paths and p.j.phase_paths[0][0].name == PHASE
+         and getattr(backend,'_initial_pg_pair_bind_state',None) == 'ACKNOWLEDGED',
+         'pair_completed_current_result')
+    ref = pending['complete']; raw = p.j.read_phase_bytes(ref['phase'],ref['name'],ref['sha256'])
+    result = _completed_result(p,ref,raw)
+    need(canonical(result['binding']) == canonical(pending['binding']), 'pair_completed_pending_binding')
+    _completed_native(p); p.seal()
+    context = _completed_context(p); native = _completed_native_binding(p); held = _completed_held(p)
+    parent = canonical(_intake_parent())
+    p.seal(); _check(backend,p.original_end)
+    cap = _Completed(p,backend,shared_lock,p.j,shared_lock.fd,tuple(ref[k] for k in ('phase','name','sha256')),
+        raw,canonical(pending),parent,p.original_end,p.original_clock,canonical(p.budget),
+        p.j.count,p.j.bytes,context,native,held)
+    _completed_clock(p)
+    need(not getattr(backend,'_initial_pg_pair_cancelled',False), 'pair_cancelled')
+    _check(backend,p.original_end)
+    p._completed = cap; backend._initial_pg_pair_complete = cap
+
+
+def completed_reference(backend, shared_lock):
+    """Return this live owner's final reference after full outer completion."""
+    cap = getattr(backend,'_initial_pg_pair_complete',None)
+    need(type(cap) is _Completed, 'pair_completed_live_field')
+    ref = dict(zip(('phase','name','sha256'),cap.reference))
+    consume_completed_live(backend,shared_lock,ref)
+    return ref
+
+
+def _consume_completed(backend, shared_lock, reference, *, archived):
+    need(type(backend) is driver.Backend and type(shared_lock) is journals.SharedLock
+         and os.geteuid() == 0 and threading.current_thread() is threading.main_thread()
+         and len(list(Path('/proc/self/task').iterdir())) == 1
+         and not driver.processes._children(os.getpid())
+         and not any(callable(v) for v in vars(backend).values()), 'pair_completed_root_context')
+    cap = getattr(backend,'_initial_pg_pair_complete',None)
+    need(type(cap) is _Completed and type(cap.owner) is _Pair, 'pair_completed_live_field')
+    p = cap.owner
+    need(p is getattr(backend,'_initial_pg_pair_live',None) and p._completed is cap
+         and cap.backend is p.b is backend and cap.lock is p.lock is shared_lock
+         and cap.journal is p.j is getattr(backend,'_initial_driver_journal',None)
+         and type(shared_lock.fd) is int and shared_lock.fd == cap.lock_fd
+         and canonical(_intake_parent()) == cap.parent and p.parent == os.getpid()
+         and p.ticks == driver.processes._identity(os.getpid())
+         and type(p.original_end) is type(cap.end) is type(backend._driver_deadline)
+         and p.original_end == cap.end == backend._driver_deadline
+         and p.original_clock is cap.clock is getattr(backend,'_initial_driver_clock',None)
+         and getattr(backend,'_initial_pg_pair_started',False) is True
+         and getattr(backend,'_initial_pg_pair_bind_state',None) == 'ACKNOWLEDGED',
+         'pair_completed_same_owner')
+    need(p.j.phase_paths and p.j.phase_paths[0][0].name in
+         (('initial_epoch_observation','initial_epoch_install_verify') if archived else (PHASE,)),
+         'pair_completed_current_phase')
+    need(type(reference) is dict and canonical(reference) == canonical(dict(zip(('phase','name','sha256'),cap.reference))),
+         'pair_completed_reference')
+    need(type(p.budget) is dict and canonical(p.budget) == cap.budget
+         and type(cap.count) is int and type(cap.bytes) is int
+         and all(type(p.budget[k]) is int for k in ('start_count','start_bytes','records','bytes'))
+         and p.budget['start_count'] <= cap.count <= p.budget['start_count'] + p.budget['records']
+         and p.budget['start_bytes'] <= cap.bytes <= p.budget['start_bytes'] + p.budget['bytes']
+         and type(p.j.count) is int and type(p.j.bytes) is int
+         and cap.count <= p.j.count <= 4096 and cap.bytes <= p.j.bytes <= journals.MAX_PHASE_BYTES,
+         'pair_completed_frozen_accounting')
+    p.seal_context()
+    need(_completed_context(p) == cap.context and _completed_native_binding(p) == cap.native
+         and _completed_held(p) == cap.held and p._run_return == cap.pending,
+         'pair_completed_frozen_context')
+    result = _completed_result(p,reference,cap.raw)
+    _completed_native(p)
+    # No slow raw/source/mount read may renew or outlive the original clock.
+    p.seal_context(); _completed_clock(p); _check(backend,cap.end)
+    return result
+
+
+def consume_completed_live(backend, shared_lock, reference):
+    """Read-only Pair-phase consumer; no native commands, SQL or new budget."""
+    return _consume_completed(backend,shared_lock,reference,archived=False)
+
+
+def consume_archived_completed_live(backend, shared_lock, reference):
+    """Only the two fixed existing certificate producer phases may read history."""
+    return _consume_completed(backend,shared_lock,reference,archived=True)
 
 
 def _host_address(value):

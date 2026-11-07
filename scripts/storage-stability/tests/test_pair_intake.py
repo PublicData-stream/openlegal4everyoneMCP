@@ -97,8 +97,11 @@ class PairIntake(history.GenuineMaintenance):
         return {'path': str(path), 'sha256': digest(data)}
 
     def readonly_dispatch(self, backend, lock, inventory_ref, authority_ref):
-        # run has already enforced its actual sticky intake gate. Reproduce the
-        # unchanged _run admission and only its genuine readonly qualification.
+        # Qualify the actual intake gate and readonly admission only. This
+        # synthetic seam returns before native Pair work or completion minting;
+        # the genuine-history fixture covers actual run and its final cleanup.
+        p._dedicated_root(backend, lock)
+        p._intake_run_gate(backend, lock, inventory_ref, authority_ref)
         self.assertIs(type(backend), p.driver.Backend); self.assertIs(type(lock), p.journals.SharedLock)
         self.assertEqual(os.geteuid(), 0)
         self.assertFalse(any(callable(v) for v in vars(backend).values()))
@@ -162,7 +165,7 @@ class PairIntake(history.GenuineMaintenance):
         s, _ = self.prepare(); authority = self.authority(s)
         self.assertEqual(p._load(s.inventory_ref, authority)[0], s.cfg)
         ref = self.envelope(s, authority_ref=authority)
-        with patch.object(p, '_run', side_effect=self.readonly_dispatch) as native:
+        with patch.object(p, 'run', side_effect=self.readonly_dispatch) as native:
             result = p.execute_approved_pair(s, ref)
             self.assertEqual(result['status'], 'SYNTHETIC_DISPATCH_QUALIFIED_NONREADY')
             self.assertFalse(result['ready']); self.assertEqual(s.state, 'CONSUMED')
